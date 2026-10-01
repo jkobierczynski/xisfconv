@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libzstd-dev libtiff-tools fitsverify pngcheck
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install zstd
+
+      - name: Install dependencies (Windows)
+        if: runner.os == 'Windows'
+        run: vcpkg install zlib:x64-windows zstd:x64-windows
+
+      - name: Configure
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+          else
+            cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          fi
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Test
+        shell: bash
+        run: |
+          pip install numpy astropy tifffile xisf lz4 zstandard pillow
+          EXE=build/xisfconv
+          [ -f build/Release/xisfconv.exe ] && EXE=build/Release/xisfconv.exe
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            # vcpkg DLLs sit next to the executable in Release/
+            export PATH="$PWD/build/Release:$PATH"
+          fi
+          python tests/run_tests.py "$EXE"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xisfconv-${{ runner.os }}
+          path: |
+            build/xisfconv
+            build/Release/*.exe
+            build/Release/*.dll
+          if-no-files-found: ignore

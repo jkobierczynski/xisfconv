@@ -1,0 +1,3 @@
+build*/
+*.part
+__pycache__/
