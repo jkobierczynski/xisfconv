@@ -159,7 +159,7 @@ checked against synthetic astrometric solutions (with and without distortion) th
 Bump the version in `src/common.hpp` and `CMakeLists.txt`, commit, then push a matching tag:
 
 ```
-git tag v0.3.2 && git push origin v0.3.2
+git tag v0.3.3 && git push origin v0.3.3
 ```
 
 CI builds and tests all three platforms and, only if every one passes, publishes a GitHub release with

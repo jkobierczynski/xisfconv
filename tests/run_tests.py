@@ -749,6 +749,20 @@ def decode_png(path):
     return arr.reshape(h, w, ch), depth, chunks
 
 
+def test_tiff_predictors():
+    """Each sample format gets the predictor that libtiff >= 4.0 can decode (no predictor 2 on 64-bit)."""
+    expected = {np.uint8: 2, np.uint16: 2, np.uint32: 2, np.uint64: 1, np.float32: 3, np.float64: 3}
+    for dtype, pred in expected.items():
+        a = test_image(dtype, 9, 11, 1, 1)
+        p = os.path.join(TMP, f"pred_{np.dtype(dtype).name}.xisf")
+        write_xisf(p, [image_entry(a)])
+        out = p + ".tif"
+        run(p, "-o", out, "-f", "-q", "-c")
+        with tifffile.TiffFile(out) as t:
+            got = int(t.pages[0].tags["Predictor"].value) if "Predictor" in t.pages[0].tags else 1
+        check(got == pred, f"TIFF predictor for {np.dtype(dtype).name}: {got}, expected {pred}")
+
+
 def test_png():
     have_pngcheck = shutil.which("pngcheck") is not None
     cases = {
@@ -823,7 +837,7 @@ if __name__ == "__main__":
            else "no -- compressed float TIFF checks will be SKIPPED (pip install imagecodecs)"))
     for t in (test_python_xisf_codecs, test_hand_written, test_checksum_mismatch, test_truncated_and_garbage,
               test_keywords_and_properties, test_multi_image_icc_resolution, test_bits_conversion,
-              test_batch_and_outdir, test_stretch, test_wcs, test_png):
+              test_batch_and_outdir, test_stretch, test_wcs, test_tiff_predictors, test_png):
         try:
             t()
         except Exception as e:  # noqa: BLE001

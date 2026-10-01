@@ -139,6 +139,10 @@ void writePage(Output& out, const TiffPage& page, bool deflate, uint64_t& prevNe
     const size_t plane = width * height;
     const bool little = hostIsLittleEndian();
     const bool floatData = isFloat(px.format);
+    // Predictor: floating point (3) for floats, horizontal differencing (2) for 8/16/32-bit
+    // integers. libtiff only decodes predictor 2 on 64-bit samples since 4.4, so 64-bit integer
+    // data is compressed without a predictor to stay readable by older installations.
+    const uint16_t predictor = !deflate ? 1 : floatData ? 3 : (sb <= 4 ? 2 : 1);
 
     std::vector<uint32_t> offsets, counts;
     std::vector<uint8_t> strip, compressed, tmp;
@@ -158,18 +162,17 @@ void writePage(Output& out, const TiffPage& page, bool deflate, uint64_t& prevNe
                 }
             }
         }
-        if (deflate) {
+        if (predictor != 1) {
             for (size_t r = 0; r < rows; ++r) {
                 uint8_t* row = strip.data() + r * rowBytes;
-                if (floatData) floatingPointDiff(row, rowSamples, spp, sb, tmp);
+                if (predictor == 3) floatingPointDiff(row, rowSamples, spp, sb, tmp);
                 else if (sb == 1) horizontalDiff<uint8_t>(row, rowSamples, spp);
                 else if (sb == 2) horizontalDiff<uint16_t>(row, rowSamples, spp);
-                else if (sb == 4) horizontalDiff<uint32_t>(row, rowSamples, spp);
-                else horizontalDiff<uint64_t>(row, rowSamples, spp);
+                else horizontalDiff<uint32_t>(row, rowSamples, spp);
             }
         }
         // File is little-endian; the floating point predictor output is already a byte stream.
-        if (!little && sb > 1 && !(deflate && floatData)) byteSwapInPlace(strip.data(), strip.size() / sb, sb);
+        if (!little && sb > 1 && predictor != 3) byteSwapInPlace(strip.data(), strip.size() / sb, sb);
 
         out.align2();
         offsets.push_back(static_cast<uint32_t>(out.pos()));
@@ -205,7 +208,7 @@ void writePage(Output& out, const TiffPage& page, bool deflate, uint64_t& prevNe
     entries.push_back(shorts(284, {1}));
     entries.push_back(shorts(296, {static_cast<uint16_t>(page.resolutionInCm ? 3 : 2)}));
     entries.push_back(ascii(305, std::string("xisfconv ") + kVersion));
-    if (deflate) entries.push_back(shorts(317, {static_cast<uint16_t>(floatData ? 3 : 2)}));
+    if (predictor != 1) entries.push_back(shorts(317, {predictor}));
     if (spp > colorSamples) {
         std::vector<uint16_t> extra(spp - colorSamples, 0);
         extra[0] = 2;  // first extra channel: unassociated alpha (PixInsight's convention)

@@ -12,7 +12,7 @@
 
 namespace xisfconv {
 
-constexpr const char* kVersion = "0.3.2";
+constexpr const char* kVersion = "0.3.3";
 
 struct Error : std::runtime_error {
     using std::runtime_error::runtime_error;
