@@ -46,7 +46,7 @@ jobs:
       - name: Test
         shell: bash
         run: |
-          pip install numpy astropy tifffile xisf lz4 zstandard pillow
+          pip install numpy astropy tifffile imagecodecs xisf lz4 zstandard pillow
           EXE=build/xisfconv
           [ -f build/Release/xisfconv.exe ] && EXE=build/Release/xisfconv.exe
           if [ "$RUNNER_OS" = "Windows" ]; then

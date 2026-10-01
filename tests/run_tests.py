@@ -11,8 +11,9 @@ XISF inputs come from two independent sources:
 
 Outputs are checked with astropy (FITS) and with libtiff's tiffcp + tifffile (TIFF).
 
-Requirements: pip install numpy astropy tifffile xisf lz4 zstandard
-Optional:     libtiff tools (tiffcp) and fitsverify, used as extra independent checkers
+Requirements: pip install numpy astropy tifffile imagecodecs xisf lz4 zstandard pillow
+Optional:     libtiff tools (tiffcp), fitsverify and pngcheck, used as extra independent checkers.
+              Without tiffcp and imagecodecs, compressed float TIFF checks are skipped.
 Usage: python3 tests/run_tests.py path/to/xisfconv
 """
 import base64
@@ -39,6 +40,14 @@ EXE = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else "build/xisfconv")
 TMP = tempfile.mkdtemp(prefix="xisfconv-test-")
 HAVE_TIFFCP = shutil.which("tiffcp") is not None
 HAVE_FITSVERIFY = shutil.which("fitsverify") is not None
+try:
+    import imagecodecs  # noqa: F401  (lets tifffile decode the floating-point predictor)
+    HAVE_IMAGECODECS = True
+except ImportError:
+    HAVE_IMAGECODECS = False
+# Deflate-compressed float TIFFs use predictor 3, which needs libtiff's tiffcp or imagecodecs.
+CAN_DECODE_FLOAT_PREDICTOR = HAVE_TIFFCP or HAVE_IMAGECODECS
+skipped = []
 failures = []
 passed = 0
 
@@ -131,6 +140,9 @@ def roundtrip(label, path, expected_hwc, fits_check=True, tiff_check=True, extra
         compare(f"{label} -> FITS", got, exp)
     if tiff_check:
         for comp in ([], ["-c"]):
+            if comp and np.issubdtype(expected_hwc.dtype, np.floating) and not CAN_DECODE_FLOAT_PREDICTOR:
+                skipped.append(f"{label} -> TIFF deflate (float predictor)")
+                continue
             out = os.path.join(TMP, os.path.basename(path) + (".c" if comp else "") + ".tif")
             run(path, "-o", out, "-f", "-q", *comp, *extra)
             page = tiff_array(out)[0]
@@ -806,6 +818,9 @@ if __name__ == "__main__":
     print(subprocess.run([EXE, "--version"], capture_output=True, text=True).stdout.strip())
     print("libtiff tiffcp:", "yes" if HAVE_TIFFCP else "no (TIFF decoded by tifffile only)")
     print("NASA fitsverify:", "yes" if HAVE_FITSVERIFY else "no (FITS checked by astropy only)")
+    print("imagecodecs:", "yes" if HAVE_IMAGECODECS else
+          ("no (tiffcp decodes compressed float TIFFs)" if HAVE_TIFFCP
+           else "no -- compressed float TIFF checks will be SKIPPED (pip install imagecodecs)"))
     for t in (test_python_xisf_codecs, test_hand_written, test_checksum_mismatch, test_truncated_and_garbage,
               test_keywords_and_properties, test_multi_image_icc_resolution, test_bits_conversion,
               test_batch_and_outdir, test_stretch, test_wcs, test_png):
@@ -814,6 +829,8 @@ if __name__ == "__main__":
         except Exception as e:  # noqa: BLE001
             failures.append(f"{t.__name__}: {type(e).__name__}: {e}")
             print("ERROR in", t.__name__, ":", e)
+    if skipped:
+        print(f"\nskipped {len(skipped)} checks that need tiffcp or imagecodecs, e.g. {skipped[0]}")
     print(f"\n{passed} checks passed, {len(failures)} failed")
     if not failures:
         shutil.rmtree(TMP, ignore_errors=True)

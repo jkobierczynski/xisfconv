@@ -124,7 +124,7 @@ rest are still converted (exit status 1).
 ## Testing
 
 ```
-pip install numpy astropy tifffile xisf lz4 zstandard
+pip install numpy astropy tifffile imagecodecs xisf lz4 zstandard pillow
 python3 tests/run_tests.py build/xisfconv
 ```
 
