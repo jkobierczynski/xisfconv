@@ -1,5 +1,5 @@
-cmake_minimum_required(VERSION 3.14)
-project(xisfconv VERSION 0.3.1 LANGUAGES CXX)
+cmake_minimum_required(VERSION 3.15)
+project(xisfconv VERSION 0.3.2 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -9,6 +9,16 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 option(XISFCONV_WITH_ZSTD "Support Zstandard-compressed XISF files (needs libzstd)" ON)
+option(XISFCONV_PORTABLE "Build a self-contained binary for distribution (static zstd/zlib/C++ runtime)" OFF)
+
+if(XISFCONV_PORTABLE)
+  # MSVC: static C runtime (pair with the vcpkg x64-windows-static triplet).
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+  # Prefer static zlib where the platform ships one (CMake >= 3.24 honors this).
+  if(NOT APPLE)
+    set(ZLIB_USE_STATIC_LIBS ON)
+  endif()
+endif()
 
 find_package(ZLIB REQUIRED)
 
@@ -36,8 +46,26 @@ endif()
 # Zstandard: try the CMake package (vcpkg, recent distros), then pkg-config, then a plain search.
 if(XISFCONV_WITH_ZSTD)
   set(_zstd_target "")
-  find_package(zstd CONFIG QUIET)
-  if(TARGET zstd::libzstd_shared)
+  if(XISFCONV_PORTABLE AND NOT MSVC)
+    # Link the static archive so the binary doesn't need libzstd at run time.
+    find_path(ZSTD_INCLUDE_DIR zstd.h)
+    find_library(ZSTD_STATIC_LIBRARY NAMES libzstd.a)
+    if(ZSTD_INCLUDE_DIR AND ZSTD_STATIC_LIBRARY)
+      add_library(xisfconv_zstd_static STATIC IMPORTED)
+      set_target_properties(xisfconv_zstd_static PROPERTIES
+        IMPORTED_LOCATION "${ZSTD_STATIC_LIBRARY}"
+        INTERFACE_INCLUDE_DIRECTORIES "${ZSTD_INCLUDE_DIR}")
+      set(_zstd_target xisfconv_zstd_static)
+    else()
+      message(WARNING "XISFCONV_PORTABLE: static libzstd.a not found; linking it dynamically")
+    endif()
+  endif()
+  if(NOT _zstd_target)
+    find_package(zstd CONFIG QUIET)
+  endif()
+  if(_zstd_target)
+    # already chosen (portable static build)
+  elseif(TARGET zstd::libzstd_shared)
     set(_zstd_target zstd::libzstd_shared)
   elseif(TARGET zstd::libzstd_static)
     set(_zstd_target zstd::libzstd_static)
@@ -72,6 +100,11 @@ if(XISFCONV_WITH_ZSTD)
     message(WARNING "libzstd not found: zstd-compressed XISF files will not be readable. "
                     "Install libzstd-dev (Debian/Ubuntu), libzstd-devel (Fedora) or zstd (Homebrew/vcpkg).")
   endif()
+endif()
+
+if(XISFCONV_PORTABLE AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND NOT APPLE)
+  # Avoid depending on the build machine's libstdc++ version.
+  target_link_options(xisfconv PRIVATE -static-libgcc -static-libstdc++)
 endif()
 
 include(GNUInstallDirs)

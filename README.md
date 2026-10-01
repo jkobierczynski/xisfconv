@@ -76,6 +76,12 @@ xisfconv --info light_0001.xisf               # geometry, codecs, FITS keywords,
 - float → integer: the XISF `bounds` range (normally [0,1]) maps to the full integer range, clipped
 - float → float: values unchanged
 
+## Download
+
+Ready-to-run binaries for Linux (x86_64), macOS (Apple Silicon) and Windows (x64) are attached to each
+[GitHub release](https://github.com/jkobierczynski/xisfconv/releases), with SHA-256 checksums. They
+need no extra libraries: Zstandard (and on Windows the C runtime) is linked in.
+
 ## Building
 
 Requirements: a C++17 compiler, CMake ≥ 3.14, zlib. libzstd is optional but recommended
@@ -147,6 +153,17 @@ checked against synthetic astrometric solutions (with and without distortion) th
   the bottom-up order); WCS generated from a PixInsight solution follows the chosen row order.
 - The PixInsight spline distortion model is approximated by SIP polynomials, not carried over exactly.
 - Please report any file that fails to convert, ideally with `xisfconv --info` output.
+
+## Releasing
+
+Bump the version in `src/common.hpp` and `CMakeLists.txt`, commit, then push a matching tag:
+
+```
+git tag v0.3.2 && git push origin v0.3.2
+```
+
+CI builds and tests all three platforms and, only if every one passes, publishes a GitHub release with
+the packaged binaries. A tag that doesn't match the program version fails the build.
 
 ## Verified against PixInsight
 

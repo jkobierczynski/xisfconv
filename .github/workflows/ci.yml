@@ -1,17 +1,31 @@
 name: CI
 
+# Every push and pull request: build and test on Linux, macOS and Windows.
+# Pushing a tag like v0.3.2 additionally packages the binaries and publishes a GitHub Release.
+
 on:
   push:
+    branches: ["**"]
+    tags: ["v*"]
   pull_request:
+
+permissions:
+  contents: read
 
 jobs:
   build:
-    name: ${{ matrix.os }}
+    name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - name: linux-x86_64
+            os: ubuntu-22.04        # older glibc (2.35) so the binary runs on more distributions
+          - name: macos-arm64
+            os: macos-14            # Apple Silicon
+          - name: windows-x64
+            os: windows-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -25,19 +39,43 @@ jobs:
 
       - name: Install dependencies (Windows)
         if: runner.os == 'Windows'
-        run: vcpkg install zlib:x64-windows zstd:x64-windows
+        run: vcpkg install zlib:x64-windows-static zstd:x64-windows-static
 
+      # XISFCONV_PORTABLE links zstd (and the C++ runtime where needed) statically, so the
+      # binary that is tested here is exactly the one that gets released.
       - name: Configure
         shell: bash
         run: |
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
-          else
-            cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-          fi
+          case "$RUNNER_OS" in
+            Windows)
+              cmake -S . -B build -DXISFCONV_PORTABLE=ON \
+                -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" \
+                -DVCPKG_TARGET_TRIPLET=x64-windows-static ;;
+            macOS)
+              cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DXISFCONV_PORTABLE=ON \
+                -DCMAKE_PREFIX_PATH="$(brew --prefix zstd)" ;;
+            *)
+              cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DXISFCONV_PORTABLE=ON ;;
+          esac
 
       - name: Build
         run: cmake --build build --config Release --parallel
+
+      - name: Locate binary
+        id: bin
+        shell: bash
+        run: |
+          if [ -f build/Release/xisfconv.exe ]; then echo "path=build/Release/xisfconv.exe" >> "$GITHUB_OUTPUT"
+          else echo "path=build/xisfconv" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Show linked libraries
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            Linux) ldd "${{ steps.bin.outputs.path }}" ;;
+            macOS) otool -L "${{ steps.bin.outputs.path }}" ;;
+          esac
+          "${{ steps.bin.outputs.path }}" --version
 
       - uses: actions/setup-python@v5
         with:
@@ -47,19 +85,62 @@ jobs:
         shell: bash
         run: |
           pip install numpy astropy tifffile imagecodecs xisf lz4 zstandard pillow
-          EXE=build/xisfconv
-          [ -f build/Release/xisfconv.exe ] && EXE=build/Release/xisfconv.exe
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            # vcpkg DLLs sit next to the executable in Release/
-            export PATH="$PWD/build/Release:$PATH"
-          fi
-          python tests/run_tests.py "$EXE"
+          python tests/run_tests.py "${{ steps.bin.outputs.path }}"
 
-      - uses: actions/upload-artifact@v4
+      - name: Check tag matches program version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          want="${GITHUB_REF_NAME#v}"
+          have="$("${{ steps.bin.outputs.path }}" --version | head -1 | awk '{print $2}')"
+          echo "tag: $want  binary: $have"
+          if [ "$want" != "$have" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match the version in src/common.hpp ($have)"
+            exit 1
+          fi
+
+      - name: Package
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          pkg="xisfconv-${GITHUB_REF_NAME#v}-${{ matrix.name }}"
+          mkdir -p "dist/$pkg"
+          cp "${{ steps.bin.outputs.path }}" README.md LICENSE "dist/$pkg/"
+          cd dist
+          if [ "$RUNNER_OS" = "Windows" ]; then 7z a -tzip "$pkg.zip" "$pkg" > /dev/null
+          else tar czf "$pkg.tar.gz" "$pkg"; fi
+          ls -la
+
+      - name: Upload package
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
         with:
-          name: xisfconv-${{ runner.os }}
+          name: package-${{ matrix.name }}
           path: |
-            build/xisfconv
-            build/Release/*.exe
-            build/Release/*.dll
-          if-no-files-found: ignore
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build              # only runs when every platform built and passed its tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write         # needed to create the release
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: package-*
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: xisfconv ${{ github.ref_name }}
+          generate_release_notes: true
+          files: dist/*
