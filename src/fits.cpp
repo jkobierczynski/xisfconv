@@ -13,18 +13,7 @@ namespace {
 
 constexpr size_t kBlock = 2880;
 
-// Maps text to printable ASCII. Each UTF-8 multi-byte sequence becomes a single '?'.
-std::string sanitize(const std::string& s) {
-    std::string out;
-    out.reserve(s.size());
-    for (unsigned char c : s) {
-        if (c >= 0x80 && c < 0xC0) continue;  // UTF-8 continuation byte
-        if (c >= 0xC0) out += '?';
-        else if (c < 32 || c == 127) out += ' ';
-        else out += static_cast<char>(c);
-    }
-    return out;
-}
+std::string sanitize(const std::string& s) { return fitsSanitize(s); }
 
 std::string padRight(std::string s, size_t width) {
     if (s.size() < width) s.append(width - s.size(), ' ');
@@ -50,13 +39,7 @@ std::string intCard(const std::string& name, long long v, const std::string& com
     return valueCard(name, padLeft(std::to_string(v), 20), comment);
 }
 
-bool isValidFitsName(const std::string& name) {
-    if (name.empty() || name.size() > 8) return false;
-    for (char c : name) {
-        if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-')) return false;
-    }
-    return true;
-}
+bool isValidFitsName(const std::string& name) { return isStandardFitsName(name); }
 
 std::string unescapeFitsString(const std::string& s) {
     std::string out;
@@ -228,6 +211,26 @@ void writeData(std::ofstream& out, const PixelBuffer& px) {
 }
 
 }  // namespace
+
+std::string fitsSanitize(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (unsigned char c : s) {
+        if (c >= 0x80 && c < 0xC0) continue;  // UTF-8 continuation byte
+        if (c >= 0xC0) out += '?';
+        else if (c < 32 || c == 127) out += ' ';
+        else out += static_cast<char>(c);
+    }
+    return out;
+}
+
+bool isStandardFitsName(const std::string& name) {
+    if (name.empty() || name.size() > 8) return false;
+    for (char c : name) {
+        if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-')) return false;
+    }
+    return true;
+}
 
 std::string fitsString(const std::string& s) {
     std::string escaped;

@@ -1,14 +1,19 @@
-// xisfconv - convert PixInsight XISF images to FITS, TIFF or PNG, and FITS images to XISF.
+// xisfconv - convert PixInsight XISF images to FITS, ASDF, TIFF or PNG, and FITS or ASDF images to XISF.
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Jurgen Kobierczynski
 #include <algorithm>
 #include <cstdio>
 #include <filesystem>
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
 #include <iostream>
 #include <optional>
 #include <string>
 #include <vector>
 
+#include "asdf.hpp"
 #include "codecs.hpp"
 #include "common.hpp"
 #include "convert.hpp"
@@ -19,13 +24,16 @@
 #include "wcs.hpp"
 #include "xisf.hpp"
 #include "xisfwrite.hpp"
+#include "yaml.hpp"
 
 namespace fs = std::filesystem;
 using namespace xisfconv;
 
 namespace {
 
-enum class Format { Fits, Tiff, Png, Xisf };
+enum class Format { Fits, Tiff, Png, Xisf, Asdf };
+
+enum class InputKind { Fits, Asdf };
 
 enum class Stretch { None, Auto, Linked, Unlinked, Stored };
 
@@ -39,7 +47,7 @@ struct Options {
     bool compress = false;
     bool bottomUp = true;  // FITS convention: first stored row is the bottom of the image
     bool rowOrderGiven = false;  // --top-down / --bottom-up given explicitly (overrides ROWORDER on FITS input)
-    std::string codec;           // XISF output: zlib or zstd
+    std::string codec;           // XISF and ASDF output: zlib or zstd
     std::string checksum;        // XISF output: sha1, sha256 or sha512
     std::optional<std::pair<double, double>> bounds;  // XISF output: range of floating point data
     uint64_t subblockSize = 1u << 30;
@@ -50,50 +58,58 @@ struct Options {
     bool force = false;
     bool info = false;
     bool dumpHeader = false;
+    bool treeJson = false;  // undocumented: print the parsed ASDF tree as JSON (for the tests)
     bool quiet = false;
     std::vector<std::string> inputs;
 };
 
 void usage(std::ostream& os) {
-    os << "xisfconv " << kVersion << " - convert PixInsight XISF images to FITS, TIFF or PNG, and FITS to XISF\n\n"
+    os << "xisfconv " << kVersion << " - convert between PixInsight XISF, FITS and ASDF images; export TIFF and PNG\n\n"
           "Usage: xisfconv [options] <file>...\n"
-          "       XISF inputs are converted to FITS (default), TIFF or PNG; FITS inputs to XISF.\n\n"
+          "       XISF inputs are converted to FITS (default), ASDF, TIFF or PNG;\n"
+          "       FITS inputs to XISF (default) or ASDF; ASDF inputs to XISF (default) or FITS.\n\n"
           "Output:\n"
-          "  -t, --to <fits|tiff|png|xisf>  output format (default: fits for XISF input, xisf for FITS input,\n"
-          "                              or taken from -o's extension)\n"
+          "  -t, --to <fits|asdf|tiff|png|xisf>\n"
+          "                              output format (default: fits for XISF input, xisf for FITS and ASDF\n"
+          "                              input, or taken from -o's extension)\n"
           "  -o, --output <file>         output file name (single input only)\n"
           "  -d, --outdir <dir>          directory for output files (default: next to each input)\n"
           "  -f, --force                 overwrite existing output files\n\n"
           "Conversion:\n"
           "  -b, --bits <fmt>            output sample format: u8, u16, u32, f32, f64 (default: as stored)\n"
           "  -i, --image <n>             convert only image n (0-based); default: all images\n"
-          "                              (FITS: extra images become IMAGE extensions; TIFF: extra pages)\n"
+          "                              (FITS, ASDF: extra images become further HDUs; TIFF: extra pages)\n"
           "  -c, --compress              TIFF: Deflate compression with predictor\n"
           "                              XISF: compress the pixel data (zstd, or zlib without libzstd)\n"
+          "                              ASDF: compress the pixel data (zlib)\n"
           "  -s, --stretch[=mode]        apply a screen stretch for viewing linear data:\n"
           "                                auto     (default) the STF saved by PixInsight if any, else linked\n"
           "                                linked   auto-STF with shared statistics (keeps color balance)\n"
           "                                unlinked auto-STF per channel (neutralizes color casts)\n"
           "                                stf      only the STF saved in the file\n"
           "                              (TIFF: stretched float data becomes 16-bit unless --bits is given)\n"
-          "      --top-down              XISF -> FITS: keep XISF's top-down row order (ROWORDER='TOP-DOWN')\n"
-          "                              instead of the FITS convention, bottom-up (the default)\n"
-          "                              FITS -> XISF: the FITS rows are stored top-down (don't flip them)\n"
-          "      --bottom-up             FITS -> XISF: the FITS rows are stored bottom-up, whatever ROWORDER says\n"
-          "      --no-property-keywords  FITS: don't add missing keywords (EXPTIME, DATE-OBS, BAYERPAT...)\n"
+          "      --top-down              XISF input: keep XISF's top-down row order in FITS and ASDF output\n"
+          "                              (ROWORDER='TOP-DOWN') instead of the FITS convention, bottom-up\n"
+          "                              FITS and ASDF input: the rows are stored top-down\n"
+          "      --bottom-up             FITS and ASDF input: the rows are stored bottom-up, whatever ROWORDER says\n"
+          "      --no-property-keywords  from XISF: don't add missing keywords (EXPTIME, DATE-OBS, BAYERPAT...)\n"
           "                              derived from XISF properties\n"
-          "      --no-wcs                to FITS: don't write WCS keywords from a PixInsight astrometric solution\n"
+          "      --no-wcs                from XISF: don't write WCS keywords from a PixInsight astrometric solution\n"
           "                              to XISF: don't write PixInsight solution properties from WCS keywords\n"
-          "      --sip-order <n>         FITS: SIP distortion order fitted to the solution (2-7, default 3; 0 = off)\n"
+          "      --sip-order <n>         from XISF: SIP distortion order fitted to the solution (2-7, default 3;\n"
+          "                              0 = off)\n"
           "      --no-verify             don't verify data block checksums\n\n"
-          "XISF output (FITS -> XISF):\n"
-          "      --codec <zlib|zstd>     compression codec (implies --compress); byte shuffling is always used\n"
-          "      --checksum <sha1|sha256|sha512>  store a checksum of the pixel data block\n"
-          "      --bounds <lo:hi>        range of floating point data (default: 0:1 if the data fits,\n"
+          "XISF and ASDF output:\n"
+          "      --codec <zlib|zstd>     compression codec (implies --compress). XISF blocks are also byte\n"
+          "                              shuffled. zstd in ASDF needs the asdf-compression package in Python\n"
+          "      --checksum <sha1|sha256|sha512>  XISF: store a checksum of the pixel data block\n"
+          "                              (ASDF blocks always carry an MD5 checksum)\n"
+          "      --bounds <lo:hi>        XISF: range of floating point data (default: 0:1 if the data fits,\n"
           "                              else 0:65535 if it fits, else the data's minimum and maximum)\n\n"
           "Inspection:\n"
           "  -I, --info                  print image geometry, keywords and properties; no conversion\n"
-          "      --dump-header           print the raw XML header (XISF) or all keywords (FITS); no conversion\n\n"
+          "      --dump-header           print the raw XML header (XISF), all keywords (FITS) or the YAML tree\n"
+          "                              (ASDF); no conversion\n\n"
           "  -q, --quiet                 suppress warnings\n"
           "  -h, --help                  show this help\n"
           "  -V, --version               show version and enabled codecs\n";
@@ -107,6 +123,7 @@ std::optional<Format> formatFromExtension(const std::string& path) {
     if (e == ".tif" || e == ".tiff") return Format::Tiff;
     if (e == ".png") return Format::Png;
     if (e == ".xisf") return Format::Xisf;
+    if (e == ".asdf") return Format::Asdf;
     return std::nullopt;
 }
 
@@ -270,11 +287,18 @@ std::string outputPathFor(const std::string& input, const Options& opt, Format f
     fs::path p(input);
     fs::path dir = opt.outdir.empty() ? p.parent_path() : fs::path(opt.outdir);
     fs::path name = p.stem();
-    name += format == Format::Fits ? ".fits" : format == Format::Tiff ? ".tif" : format == Format::Png ? ".png" : ".xisf";
+    switch (format) {
+        case Format::Fits: name += ".fits"; break;
+        case Format::Tiff: name += ".tif"; break;
+        case Format::Png: name += ".png"; break;
+        case Format::Xisf: name += ".xisf"; break;
+        case Format::Asdf: name += ".asdf"; break;
+    }
     return (dir / name).string();
 }
 
 void convertXisfFile(const std::string& input, const Options& opt) {
+    if (opt.treeJson) throw Error("--asdf-tree-json needs an ASDF file");
     XisfFile file(input);
     if (opt.dumpHeader) {
         std::cout << file.headerXml() << "\n";
@@ -305,7 +329,9 @@ void convertXisfFile(const std::string& input, const Options& opt) {
         }
     }
     if (indices.empty()) throw Error("no convertible images in file");
-    if (format == Format::Xisf) throw Error("the input is already an XISF file; choose fits, tiff or png as output");
+    if (format == Format::Xisf) throw Error("the input is already an XISF file; choose fits, asdf, tiff or png as output");
+    // ASDF output holds the images as FITS HDUs, so both formats are prepared the same way.
+    const bool fitsLike = format == Format::Fits || format == Format::Asdf;
     if (format == Format::Png) {
         if (indices.size() > 1) {
             warn("PNG holds one image; writing image " + std::to_string(indices[0]) + " only (use --image to choose)");
@@ -348,7 +374,7 @@ void convertXisfFile(const std::string& input, const Options& opt) {
                 how = linked ? "linked auto-STF" : "unlinked auto-STF";
             }
             applyStretch(px, params, img.lowerBound, img.upperBound);
-            SampleFormat target = isFloat(img.format) ? (format == Format::Fits ? SampleFormat::Float32
+            SampleFormat target = isFloat(img.format) ? (fitsLike ? SampleFormat::Float32
                                                                                 : SampleFormat::UInt16)
                                                       : img.format;
             if (opt.bits) target = *opt.bits;
@@ -381,7 +407,7 @@ void convertXisfFile(const std::string& input, const Options& opt) {
                 std::cerr << "info: linear data may look dark in PNG; add --stretch for a viewable image\n";
             }
         }
-        if (format == Format::Fits && opt.bottomUp) flipVertical(px);
+        if (fitsLike && opt.bottomUp) flipVertical(px);
         if (format == Format::Tiff && (px.format == SampleFormat::UInt32 || px.format == SampleFormat::UInt64 ||
                                        px.format == SampleFormat::Float64)) {
             warn(std::string("image ") + std::to_string(idx) + ": " + sampleFormatName(px.format) +
@@ -395,7 +421,7 @@ void convertXisfFile(const std::string& input, const Options& opt) {
 
     const std::string tmpPath = outPath + ".part";
     try {
-        if (format == Format::Fits) {
+        if (fitsLike) {
             std::vector<FitsHdu> hdus;
             for (size_t n = 0; n < indices.size(); ++n) {
                 const size_t idx = indices[n];
@@ -438,7 +464,13 @@ void convertXisfFile(const std::string& input, const Options& opt) {
                 if (n < stretchNotes.size()) hdu.keywords.push_back({"HISTORY", "", stretchNotes[n]});
                 hdus.push_back(std::move(hdu));
             }
-            writeFits(tmpPath, hdus);
+            if (format == Format::Asdf) {
+                AsdfWriteOptions aopt;
+                if (opt.compress) aopt.codec = opt.codec.empty() ? "zlib" : opt.codec;
+                writeAsdf(tmpPath, hdus, aopt);
+            } else {
+                writeFits(tmpPath, hdus);
+            }
         } else if (format == Format::Tiff) {
             std::vector<TiffPage> pages;
             for (size_t n = 0; n < indices.size(); ++n) {
@@ -495,6 +527,17 @@ void convertXisfFile(const std::string& input, const Options& opt) {
     if (!opt.quiet) std::cout << input << " -> " << outPath << "\n";
 }
 
+void printKeywords(const std::vector<FitsKeyword>& keywords) {
+    std::cout << "  Keywords (" << keywords.size() << "):\n";
+    for (const auto& k : keywords) {
+        std::cout << "    " << k.name;
+        if (k.name.size() < 8) std::cout << std::string(8 - k.name.size(), ' ');
+        if (!k.value.empty()) std::cout << "= " << k.value;
+        if (!k.comment.empty()) std::cout << (k.value.empty() ? " " : " / ") << k.comment;
+        std::cout << "\n";
+    }
+}
+
 void printFitsInfo(const FitsFile& f) {
     std::cout << f.path << ": FITS, " << f.fileSize << " bytes, " << f.images.size() << " image HDU(s)\n";
     for (const auto& img : f.images) {
@@ -506,16 +549,77 @@ void printFitsInfo(const FitsFile& f) {
         std::cout << ", rows " << (img.hasRowOrder ? (img.topDown ? "top-down (ROWORDER)" : "bottom-up (ROWORDER)")
                                                     : "bottom-up (FITS default, no ROWORDER)")
                   << "\n";
-        std::cout << "  Keywords (" << img.keywords.size() << "):\n";
-        for (const auto& k : img.keywords) {
-            std::cout << "    " << k.name;
-            if (k.name.size() < 8) std::cout << std::string(8 - k.name.size(), ' ');
-            if (!k.value.empty()) std::cout << "= " << k.value;
-            if (!k.comment.empty()) std::cout << (k.value.empty() ? " " : " / ") << k.comment;
-            std::cout << "\n";
-        }
+        printKeywords(img.keywords);
     }
     for (const auto& s : f.skipped) std::cout << "\nSkipped " << s << "\n";
+}
+
+void printAsdfInfo(const FitsFile& f) {
+    std::cout << f.path << ": " << f.formatNote << ", " << f.fileSize << " bytes, " << f.images.size() << " image(s)\n";
+    for (const auto& img : f.images) {
+        std::cout << "\nImage " << img.hduIndex << " at " << img.source;
+        if (!img.generic && !img.name.empty()) std::cout << " \"" << img.name << "\"";
+        std::cout << ": " << img.pixels.width << " x " << img.pixels.height << " x " << img.pixels.channels << ", "
+                  << img.storage << "\n";
+        std::cout << "  rows:        "
+                  << (img.hasRowOrder ? (img.topDown ? "top-down (ROWORDER)" : "bottom-up (ROWORDER)")
+                                      : img.generic ? "assumed bottom-up (plain array)" : "bottom-up (FITS default, no ROWORDER)")
+                  << "\n";
+        if (!img.generic) printKeywords(img.keywords);
+    }
+    for (const auto& s : f.skipped) std::cout << "\nSkipped " << s << "\n";
+}
+
+std::string jsonString(const std::string& text) {
+    std::string out = "\"";
+    char buf[8];
+    for (unsigned char c : text) {
+        if (c == '"' || c == '\\') {
+            out += '\\';
+            out += static_cast<char>(c);
+        } else if (c < 0x20) {
+            std::snprintf(buf, sizeof buf, "\\u%04x", c);
+            out += buf;
+        } else {
+            out += static_cast<char>(c);
+        }
+    }
+    return out + "\"";
+}
+
+// Prints a parsed YAML tree as JSON (mappings as {"m": [[key, value], ...]}); used by the tests.
+void printYamlJson(const YamlNode& node, int depth) {
+    if (depth > 1000) throw Error("tree too deep");
+    if (node.isSequence()) {
+        std::cout << "[";
+        for (size_t i = 0; i < node.items.size(); ++i) {
+            if (i) std::cout << ",";
+            printYamlJson(*node.items[i], depth + 1);
+        }
+        std::cout << "]";
+    } else if (node.isMapping()) {
+        std::cout << "{\"t\":" << jsonString(node.tag) << ",\"m\":[";
+        for (size_t i = 0; i < node.pairs.size(); ++i) {
+            std::cout << (i ? ",[" : "[");
+            printYamlJson(*node.pairs[i].first, depth + 1);
+            std::cout << ",";
+            printYamlJson(*node.pairs[i].second, depth + 1);
+            std::cout << "]";
+        }
+        std::cout << "]}";
+    } else {
+        const YamlValue v = yamlResolve(node);
+        switch (v.type) {
+            case YamlValue::Type::Null: std::cout << "null"; break;
+            case YamlValue::Type::Bool: std::cout << (v.boolean ? "true" : "false"); break;
+            case YamlValue::Type::Int: std::cout << v.text; break;
+            case YamlValue::Type::Float:
+                if (v.number != v.number || v.number - v.number != 0) std::cout << "{\"f\":" << jsonString(v.text) << "}";
+                else std::cout << "{\"f\":" << jsonString(formatDouble(v.number)) << "}";
+                break;
+            case YamlValue::Type::String: std::cout << jsonString(v.text); break;
+        }
+    }
 }
 
 // Chooses the XISF bounds attribute for floating point data.
@@ -538,9 +642,38 @@ std::pair<double, double> floatBounds(const FitsImage& img, const Options& opt, 
     return {img.dataMin, img.dataMax > img.dataMin ? img.dataMax : img.dataMin + 1};
 }
 
-void convertFitsFile(const std::string& input, const Options& opt) {
+void replaceFile(const std::string& tmpPath, const std::string& outPath) {
+    std::error_code ec;
+    fs::rename(tmpPath, outPath, ec);
+    if (ec) {
+        fs::remove(outPath, ec);
+        fs::rename(tmpPath, outPath);
+    }
+}
+
+// Converts a FITS or ASDF file. Both readers deliver the images in the same form.
+void convertFitsOrAsdfFile(const std::string& input, InputKind kind, const Options& opt) {
+    const bool asdfInput = kind == InputKind::Asdf;
+    const char* inputName = asdfInput ? "ASDF" : "FITS";
+    if (asdfInput && opt.treeJson) {
+        printYamlJson(*parseYaml(readAsdfTree(input)), 0);
+        std::cout << "\n";
+        return;
+    }
+    if (opt.treeJson) throw Error("--asdf-tree-json needs an ASDF file");
+    if (asdfInput && opt.dumpHeader) {
+        const std::string tree = readAsdfTree(input);
+#ifdef _WIN32
+        // The tree is printed byte for byte; text mode would turn its CR LF into CR CR LF.
+        std::cout.flush();
+        _setmode(_fileno(stdout), _O_BINARY);
+#endif
+        std::cout << tree;
+        return;
+    }
     if (opt.info || opt.dumpHeader) {
-        printFitsInfo(readFits(input, true));
+        if (asdfInput) printAsdfInfo(readAsdf(input, true, opt.verify));
+        else printFitsInfo(readFits(input, true));
         return;
     }
     Format format = Format::Xisf;
@@ -548,14 +681,19 @@ void convertFitsFile(const std::string& input, const Options& opt) {
     else if (!opt.output.empty()) {
         if (auto f = formatFromExtension(opt.output)) format = *f;
     }
-    if (format != Format::Xisf) {
-        throw Error("FITS input can only be converted to XISF (omit --to, or use --to xisf)");
+    if (format == Format::Tiff || format == Format::Png) {
+        throw Error(std::string(inputName) + " input can be converted to XISF or " + (asdfInput ? "FITS" : "ASDF") +
+                    ", not to TIFF or PNG (convert to XISF first)");
     }
-    if (opt.stretch != Stretch::None) throw Error("--stretch is not available for XISF output");
+    if (format == (asdfInput ? Format::Asdf : Format::Fits)) {
+        throw Error(std::string("the input is already ") + (asdfInput ? "an ASDF" : "a FITS") + " file; choose xisf or " +
+                    (asdfInput ? "fits" : "asdf") + " as output");
+    }
+    if (opt.stretch != Stretch::None) throw Error("--stretch is only available for XISF input");
 
-    FitsFile fits = readFits(input);
+    FitsFile fits = asdfInput ? readAsdf(input, false, opt.verify) : readFits(input);
     for (const auto& s : fits.skipped) warn("skipped " + s);
-    if (fits.images.empty()) throw Error("no image data found in this FITS file");
+    if (fits.images.empty()) throw Error(std::string("no image data found in this ") + inputName + " file");
 
     std::vector<size_t> indices;
     if (opt.imageIndex) {
@@ -571,6 +709,60 @@ void convertFitsFile(const std::string& input, const Options& opt) {
     const std::string outPath = outputPathFor(input, opt, format);
     if (fs::exists(outPath) && !opt.force) throw Error(outPath + " already exists (use --force to overwrite)");
     if (fs::exists(outPath) && fs::equivalent(outPath, input)) throw Error("output would overwrite the input file");
+
+    auto origin = [&](const FitsImage& img) {
+        return asdfInput ? " (" + img.source + ")" : " (HDU " + std::to_string(img.hduIndex) + ")";
+    };
+    const std::string history = std::string("Converted from ") + inputName + " by xisfconv " + kVersion;
+    const std::string tmpPath = outPath + ".part";
+
+    if (format != Format::Xisf) {
+        // FITS <-> ASDF: the same HDUs in another container. Rows stay in the order they are stored in.
+        std::vector<FitsHdu> hdus;
+        for (size_t idx : indices) {
+            FitsImage& img = fits.images[idx];
+            PixelBuffer& px = img.pixels;
+            const std::string label = "image " + std::to_string(idx);
+            const bool topDown = opt.rowOrderGiven ? !opt.bottomUp : img.topDown;
+            std::string boundsNote;
+            if (opt.bits && *opt.bits != px.format) {
+                std::pair<double, double> bounds{0.0, 1.0};
+                if (isFloat(px.format)) bounds = floatBounds(img, opt, boundsNote);
+                convertSampleFormat(px, *opt.bits, bounds.first, bounds.second);
+            }
+            if (img.hasNaN && isFloat(px.format)) warn(label + ": the data contains NaN/Inf values, which are copied as they are");
+            FitsHdu hdu;
+            hdu.pixels = &px;
+            hdu.keywords = img.keywords;
+            hdu.extname = img.name;
+            hdu.bottomUp = !topDown;
+            hdu.keywords.push_back({"HISTORY", "", history});
+            if (!opt.quiet) {
+                std::cerr << "info: " << label << origin(img) << ": " << img.note << ", rows "
+                          << (img.hasRowOrder || opt.rowOrderGiven || !img.generic ? "" : "assumed ")
+                          << (topDown ? "top-down" : "bottom-up") << " (kept)";
+                if (!boundsNote.empty()) std::cerr << "; " << boundsNote;
+                std::cerr << "\n";
+            }
+            hdus.push_back(std::move(hdu));
+        }
+        try {
+            if (format == Format::Asdf) {
+                AsdfWriteOptions aopt;
+                if (opt.compress) aopt.codec = opt.codec.empty() ? "zlib" : opt.codec;
+                writeAsdf(tmpPath, hdus, aopt);
+            } else {
+                writeFits(tmpPath, hdus);
+            }
+            replaceFile(tmpPath, outPath);
+        } catch (...) {
+            std::error_code ec;
+            fs::remove(tmpPath, ec);
+            throw;
+        }
+        if (!opt.quiet) std::cout << input << " -> " << outPath << "\n";
+        return;
+    }
 
     std::vector<XisfOutImage> out;
     for (size_t idx : indices) {
@@ -637,10 +829,14 @@ void convertFitsFile(const std::string& input, const Options& opt) {
                 solutionNote.clear();
             }
         }
-        o.keywords.push_back({"HISTORY", "", std::string("Converted from FITS by xisfconv ") + kVersion});
+        o.keywords.push_back({"HISTORY", "", history});
         if (!opt.quiet) {
-            std::cerr << "info: " << label << " (HDU " << img.hduIndex << "): " << img.note << ", rows "
-                      << (topDown ? "top-down (kept)" : "bottom-up (flipped to XISF's top-down order)");
+            const bool assumed = img.generic && !img.hasRowOrder && !opt.rowOrderGiven;
+            std::cerr << "info: " << label << origin(img) << ": " << img.note << ", rows "
+                      << (topDown ? "top-down (kept)"
+                                  : assumed ? "assumed bottom-up (flipped to XISF's top-down order; add --top-down "
+                                              "if the image comes out upside down)"
+                                            : "bottom-up (flipped to XISF's top-down order)");
             if (!boundsNote.empty()) std::cerr << "; " << boundsNote;
             std::cerr << "\n";
             if (!solutionNote.empty()) std::cerr << "info: " << label << ": " << solutionNote << "\n";
@@ -653,15 +849,9 @@ void convertFitsFile(const std::string& input, const Options& opt) {
     wopt.checksum = opt.checksum;
     wopt.subblockSize = opt.subblockSize;
 
-    const std::string tmpPath = outPath + ".part";
     try {
         writeXisf(tmpPath, out, wopt);
-        std::error_code ec;
-        fs::rename(tmpPath, outPath, ec);
-        if (ec) {
-            fs::remove(outPath, ec);
-            fs::rename(tmpPath, outPath);
-        }
+        replaceFile(tmpPath, outPath);
     } catch (...) {
         std::error_code ec;
         fs::remove(tmpPath, ec);
@@ -695,7 +885,8 @@ bool parseArgs(int argc, char** argv, Options& opt, int& exitCode) {
             else if (v == "tiff" || v == "tif") opt.format = Format::Tiff;
             else if (v == "png") opt.format = Format::Png;
             else if (v == "xisf") opt.format = Format::Xisf;
-            else throw Error("unknown output format '" + v + "' (use fits, tiff, png or xisf)");
+            else if (v == "asdf") opt.format = Format::Asdf;
+            else throw Error("unknown output format '" + v + "' (use fits, asdf, tiff, png or xisf)");
         } else if (a == "-o" || a == "--output") opt.output = need(i, a);
         else if (a == "-d" || a == "--outdir") opt.outdir = need(i, a);
         else if (a == "-b" || a == "--bits") {
@@ -759,6 +950,7 @@ bool parseArgs(int argc, char** argv, Options& opt, int& exitCode) {
         else if (a == "-f" || a == "--force") opt.force = true;
         else if (a == "-I" || a == "--info") opt.info = true;
         else if (a == "--dump-header") opt.dumpHeader = true;
+        else if (a == "--asdf-tree-json") opt.treeJson = true;
         else if (a == "-q" || a == "--quiet") opt.quiet = true;
         else throw Error("unknown option '" + a + "' (see --help)");
     }
@@ -769,7 +961,7 @@ bool parseArgs(int argc, char** argv, Options& opt, int& exitCode) {
     }
     if (!opt.output.empty() && opt.inputs.size() > 1) throw Error("-o/--output can only be used with a single input");
     if (!opt.output.empty() && !opt.format && !formatFromExtension(opt.output)) {
-        throw Error("cannot infer output format from '" + opt.output + "'; add --to fits|tiff|png|xisf");
+        throw Error("cannot infer output format from '" + opt.output + "'; add --to fits|asdf|tiff|png|xisf");
     }
     if (!opt.outdir.empty() && !fs::is_directory(opt.outdir)) throw Error("output directory does not exist: " + opt.outdir);
     return true;
@@ -791,7 +983,8 @@ int main(int argc, char** argv) {
     for (const auto& input : opt.inputs) {
         setWarningContext(input);
         try {
-            if (looksLikeFits(input)) convertFitsFile(input, opt);
+            if (looksLikeFits(input)) convertFitsOrAsdfFile(input, InputKind::Fits, opt);
+            else if (looksLikeAsdf(input)) convertFitsOrAsdfFile(input, InputKind::Asdf, opt);
             else convertXisfFile(input, opt);
         } catch (const std::bad_alloc&) {
             std::cerr << "error: " << input << ": out of memory\n";

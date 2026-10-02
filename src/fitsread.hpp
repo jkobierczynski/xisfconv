@@ -23,6 +23,10 @@ struct FitsImage {
     double dataMin = 0, dataMax = 0;    // finite range of floating point data (after BSCALE/BZERO)
     bool hasNaN = false;
     std::string note;                   // how the samples were mapped (for the console)
+    // ASDF input only:
+    std::string source;                 // location of the array in the tree, e.g. fits[0].data
+    std::string storage;                // datatype, byte order, block and compression
+    bool generic = false;               // a plain array, not an HDU of a FITS-tagged node
 };
 
 struct FitsFile {
@@ -30,11 +34,15 @@ struct FitsFile {
     uint64_t fileSize = 0;
     std::vector<FitsImage> images;
     std::vector<std::string> skipped;   // descriptions of HDUs that are not convertible images
+    std::string formatNote;             // ASDF input: versions and block count
 };
 
 // Reads all image HDUs. With headersOnly the pixel data is skipped (for --info).
 // Throws xisfconv::Error on malformed files.
 FitsFile readFits(const std::string& path, bool headersOnly = false);
+
+// Sets dataMin, dataMax and hasNaN from floating point pixels (no-op for integer data).
+void updateFloatRange(FitsImage& img);
 
 // True if the file starts with a FITS primary header.
 bool looksLikeFits(const std::string& path);

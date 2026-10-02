@@ -84,7 +84,7 @@ jobs:
       - name: Test
         shell: bash
         run: |
-          pip install numpy astropy tifffile imagecodecs xisf lz4 zstandard pillow
+          pip install numpy astropy tifffile imagecodecs xisf lz4 zstandard pillow asdf asdf-astropy asdf-compression
           python tests/run_tests.py "${{ steps.bin.outputs.path }}"
 
       - name: Check tag matches program version

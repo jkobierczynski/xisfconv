@@ -280,13 +280,18 @@ void decodeSamples(FitsImage& img, std::vector<uint8_t>& raw) {
         default:
             throw Error("unsupported BITPIX " + std::to_string(img.bitpix));
     }
-    if (px.format == SampleFormat::Float32) floatRange<float>(img, n);
-    else if (px.format == SampleFormat::Float64) floatRange<double>(img, n);
+    updateFloatRange(img);
 }
 
 uint64_t padded(uint64_t bytes) { return (bytes + kBlock - 1) / kBlock * kBlock; }
 
 }  // namespace
+
+void updateFloatRange(FitsImage& img) {
+    const size_t n = static_cast<size_t>(img.pixels.samples());
+    if (img.pixels.format == SampleFormat::Float32) floatRange<float>(img, n);
+    else if (img.pixels.format == SampleFormat::Float64) floatRange<double>(img, n);
+}
 
 std::string fitsUnquote(const std::string& value) {
     const std::string v = trim(value);

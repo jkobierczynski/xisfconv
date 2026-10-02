@@ -10,9 +10,13 @@ XISF inputs come from two independent sources:
     CFA, ICC profile, multiple images, odd shuffle remainders, tricky FITS keywords).
 
 Outputs are checked with astropy (FITS) and with libtiff's tiffcp + tifffile (TIFF).
+ASDF is checked in both directions against Python's asdf library with asdf-astropy, and with
+files assembled byte by byte below.
 
 Requirements: pip install numpy astropy tifffile imagecodecs xisf lz4 zstandard pillow
-Optional:     libtiff tools (tiffcp), fitsverify and pngcheck, used as extra independent checkers.
+Optional:     pip install asdf asdf-astropy asdf-compression  (without them the ASDF checks that
+              need the library are skipped; xisfconv's own reader still checks its output)
+              libtiff tools (tiffcp), fitsverify and pngcheck, used as extra independent checkers.
               Without tiffcp and imagecodecs, compressed float TIFF checks are skipped.
 Usage: python3 tests/run_tests.py path/to/xisfconv
 """
@@ -35,6 +39,24 @@ try:
     import zstandard
 except ImportError:  # pragma: no cover
     lz4 = zstandard = None
+
+try:
+    import yaml
+    HAVE_YAML = True
+except ImportError:  # pragma: no cover
+    HAVE_YAML = False
+try:
+    import asdf
+    import asdf_astropy  # noqa: F401  (turns the FITS tag into an astropy HDUList)
+    HAVE_ASDF = True
+except ImportError:  # pragma: no cover
+    asdf = None
+    HAVE_ASDF = False
+try:
+    import asdf_compression  # noqa: F401  (zstd blocks for the asdf library)
+    HAVE_ASDF_ZSTD = HAVE_ASDF and zstandard is not None
+except ImportError:  # pragma: no cover
+    HAVE_ASDF_ZSTD = False
 
 EXE = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else "build/xisfconv")
 TMP = tempfile.mkdtemp(prefix="xisfconv-test-")
@@ -1242,7 +1264,7 @@ def test_fits_to_xisf_bounds_bits_hdus():
 
     # errors
     r = run(fpath, "-t", "tiff", "-f", expect_ok=False)
-    check(r.returncode == 1 and "only be converted to XISF" in r.stderr, "FITS -> TIFF is refused clearly")
+    check(r.returncode == 1 and "not to TIFF or PNG" in r.stderr, "FITS -> TIFF is refused clearly")
     r = run(fpath, "-s", "-f", expect_ok=False)
     check(r.returncode == 1 and "--stretch" in r.stderr, "--stretch refused for XISF output")
     r = run(xpath, "-t", "xisf", "-f", expect_ok=False)
@@ -1274,11 +1296,836 @@ def test_xisf_fits_xisf_roundtrip():
                 compare(f"XISF -> FITS{flags} -> XISF {np.dtype(dtype).name} {c}ch", got, a)
 
 
+# ---------------------------------------------------------------- ASDF
+
+ASDF_HEAD = "#ASDF 1.0.0\n#ASDF_STANDARD 1.5.0\n%YAML 1.1\n%TAG ! tag:stsci.edu:asdf/\n--- !core/asdf-1.1.0\n"
+STRUCTURAL = {"SIMPLE", "BITPIX", "NAXIS", "NAXIS1", "NAXIS2", "NAXIS3", "EXTEND", "BZERO", "BSCALE", "XTENSION",
+              "PCOUNT", "GCOUNT", "LONGSTRN"}
+ZSTD_BUILD = "zstd" in subprocess.run([EXE, "--version"], capture_output=True, text=True).stdout
+
+
+def asdf_block(data, compression=b"", flags=0, header_size=48, extra_alloc=0, checksum="ok", data_size=None):
+    """One ASDF binary block, written independently of xisfconv and of the asdf library."""
+    stored = data
+    if compression == b"zlib":
+        stored = zlib.compress(data)
+    elif compression == b"zstd":
+        stored = zstandard.ZstdCompressor().compress(data)
+    elif compression == b"lz4":  # the asdf library's framing: chunks with a big-endian size prefix
+        stored = b""
+        for i in range(0, len(data), 1000):
+            c = lz4.block.compress(data[i:i + 1000])
+            stored += len(c).to_bytes(4, "big") + c
+    digest = {"ok": hashlib.md5(stored).digest(), "zero": b"\0" * 16, "bad": b"\x01" * 16,
+              "uncompressed": hashlib.md5(data).digest()}[checksum]
+    used = 0 if flags & 1 else len(stored)
+    return (b"\xd3BLK" + header_size.to_bytes(2, "big") + flags.to_bytes(4, "big") + compression.ljust(4, b"\0") +
+            (used + extra_alloc).to_bytes(8, "big") + used.to_bytes(8, "big") +
+            (0 if flags & 1 else len(data) if data_size is None else data_size).to_bytes(8, "big") + digest +
+            b"\0" * (header_size - 48) + stored + b"\0" * extra_alloc)
+
+
+def write_asdf_raw(path, tree, blocks, pad=b"", newline="\n", head=ASDF_HEAD, tail=b""):
+    text = (head + tree + "...\n").replace("\n", newline).encode()
+    with open(path, "wb") as f:
+        f.write(text + pad + b"".join(blocks) + tail)
+
+
+def user_cards(header):
+    """(keyword, value, comment) of every card that is not structural."""
+    out = []
+    for c in header.cards:
+        if c.keyword in STRUCTURAL:
+            continue
+        out.append((c.keyword, None if undefined(c.value) else c.value, c.comment))
+    return out
+
+
+def undefined(value):
+    return value is None or isinstance(value, fits.card.Undefined)
+
+
+def xisf_keyword_values(path):
+    """{name: value} of the FITS keywords of the first image, read straight from the XISF header."""
+    import re
+    raw = open(path, "rb").read()
+    hdr = raw[16:16 + int.from_bytes(raw[8:12], "little")].decode()
+    first = hdr[:hdr.index("</Image>")] if "</Image>" in hdr else hdr
+    import html
+    return {m.group(1): html.unescape(m.group(2)) for m in re.finditer(r'<FITSKeyword name="([^"]*)" value="([^"]*)"', first)}
+
+
+def open_asdf(path, validate=True):
+    """Opens a file with the asdf library, treating every warning of asdf and astropy as an error.
+    Returns the tree's HDUs as (array, header) pairs plus the asdf_library entry.
+    (Reading validates the tree against the schemas; validate() also re-serializes the HDU list,
+    which asdf-astropy cannot do for uint64 data because of the BZERO = 2^63 card astropy adds.)"""
+    import warnings
+    from astropy.utils.exceptions import AstropyWarning
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", asdf.exceptions.AsdfWarning)
+        warnings.simplefilter("error", AstropyWarning)
+        with asdf.open(path, validate_checksums=True, memmap=False) as af:
+            if validate:
+                af.validate()
+            hdul = af["fits"]
+            assert isinstance(hdul, fits.HDUList), type(hdul)
+            hdus = [(np.array(h.data), h.header.copy()) for h in hdul]
+            return hdus, dict(af["asdf_library"])
+
+
+def test_asdf_yaml():
+    """The YAML reader against PyYAML (the parser behind the asdf library), on random documents
+    in every output style PyYAML has, and on constructs PyYAML never writes itself."""
+    if not HAVE_YAML:
+        skipped.append("YAML reader vs PyYAML (pip install pyyaml)")
+        return
+    import json
+    import random
+
+    class Loader(yaml.SafeLoader):
+        pass
+    Loader.add_constructor("tag:yaml.org,2002:timestamp", lambda l, n: l.construct_scalar(n))
+    strings = ["", " lead", "trail ", "a: b", "a #b", "- x", "yes", "No", "null", "~", "1e5", "1.5", "0x1F", "012",
+               "1_000", "12:30:00", "2024-01-01", "multi\nline", "tab\there", "\u00e9", "\u65e5\u672c\u8a9e",
+               "\U0001F600", "it's", 'say "hi"', "back\\slash", "{a}", "[b]", "a, b", "!tag", "&anc", "*ali", "|", ">",
+               "%", "@", "`", "a\n", "\n", "a\n\nb", "  indented\n lines\n", "x" * 150, "word " * 40, "a:b",
+               "http://x.y/z?q=1#frag", "key", "value with spaces", "-", "--- x", "...", "?", ": x", "#c", "a\tb",
+               "ends with colon:", "'", '"', "\\", "<<", "=", "TRUE", "off", "0o17", "+12", ".5", "-.inf", ".NaN", "1.",
+               "0", "-0", "\x07bell", "\u00a0nbsp", "trailing\n\n\n", " \n ", "a\r\nb", "1.5e5", "1.5e+5", "-.5",
+               "x" * 80 + "\t tail words here", "tab\t \t" + "y" * 70 + " \t z", "1.0e+400"]
+    rnd = random.Random(20261002)
+
+    def value(depth=0):
+        r = rnd.random()
+        if depth > 4 or r < 0.45:
+            k = rnd.randrange(8)
+            if k == 0:
+                return None
+            if k == 1:
+                return rnd.choice([True, False])
+            if k == 2:
+                return rnd.choice([0, -1, 7, 2 ** 70, -2 ** 63, 123456789])
+            if k == 3:
+                return rnd.choice([1.5, -0.0, 1e300, 1e-300, float("inf"), float("-inf"), float("nan"), 3.0, 0.1,
+                                   -2.5e-7, 1e16])
+            return rnd.choice(strings)
+        if r < 0.72:
+            return [value(depth + 1) for _ in range(rnd.randrange(5))]
+        out = {}
+        for _ in range(rnd.randrange(5)):
+            key = (rnd.choice([rnd.choice(strings), rnd.randrange(100), 2.5, True, None]) if rnd.random() < 0.5
+                   else "key%d" % rnd.randrange(1000))
+            out[key] = value(depth + 1)
+        return out
+
+    def norm(o):   # PyYAML's result
+        if isinstance(o, dict):
+            return ("m", [(norm(k), norm(v)) for k, v in o.items()])
+        if isinstance(o, list):
+            return [norm(x) for x in o]
+        if isinstance(o, float):
+            return ("f", "nan" if o != o else repr(o))
+        return o
+
+    def mine(o):   # xisfconv's JSON dump of its parse
+        if isinstance(o, dict):
+            if "f" in o:
+                return ("f", "nan" if o["f"] == "nan" else repr(float(o["f"])))
+            return ("m", [(mine(k), mine(v)) for k, v in o["m"]])
+        if isinstance(o, list):
+            return [mine(x) for x in o]
+        return o
+
+    def parsed(text, newline="\n"):
+        path = os.path.join(TMP, "yaml_case.asdf")
+        with open(path, "wb") as f:
+            f.write(("#ASDF 1.0.0" + newline + "%YAML 1.1" + newline + text + "..." + newline).encode())
+        r = subprocess.run([EXE, path, "--asdf-tree-json"], capture_output=True)   # bytes: the output is UTF-8
+        if r.returncode != 0:
+            return ("error", r.stderr.decode("utf-8", "replace").strip())
+        return mine(json.loads(r.stdout.decode("utf-8")))
+
+    dumpers = [yaml.SafeDumper] + ([yaml.CSafeDumper] if hasattr(yaml, "CSafeDumper") else [])
+    bad = []
+    n = 0
+    while n < 300:
+        obj = value()
+        if rnd.random() < 0.3 and isinstance(obj, (list, dict)):
+            shared = [1, {"a": [2, 3]}, "s"]            # emitted with anchors and aliases
+            obj = {"x": shared, "y": [shared, obj], "z": obj}
+        opts = dict(default_flow_style=rnd.choice([None, False, True]), width=rnd.choice([20, 80, 1000]),
+                    indent=rnd.choice([2, 4, 7]), allow_unicode=rnd.choice([True, False]),
+                    default_style=rnd.choice([None, None, None, '"', "'", "|", ">"]), explicit_start=True,
+                    sort_keys=False, line_break=rnd.choice([None, "\r\n"]))
+        try:
+            text = yaml.dump(obj, Dumper=rnd.choice(dumpers), **opts)
+            ref = norm(yaml.load(text, Loader=Loader))
+        except yaml.YAMLError:
+            continue
+        n += 1
+        got = parsed(text, "\r\n" if opts["line_break"] else "\n")
+        if got != ref:
+            bad.append((opts, text, got))
+    check(not bad, f"YAML reader agrees with PyYAML on 300 random documents ({len(bad)} differ"
+                   + (f"; first: {bad[0][0]}\n{bad[0][1][:800]}\n-> {str(bad[0][2])[:300]}" if bad else "") + ")")
+
+    cases = {
+        "comments and blank lines": "# top\n---\na: 1   # trailing\n\n# between\nb:\n  # inside\n  - x\n\n  - y # c\n",
+        "sequence at the key's indentation": "---\nk:\n- 1\n- 2\nm:\n- a: 1\n  b: 2\n- - nested\n  - seq\n",
+        "tags and handles": "%TAG !e! tag:example.org,2000:\n--- !e!root\na: !!str 123\nb: !!float 3\nc: !e!x {p: 1}\n"
+                            "d: !<tag:verbatim:x> [1, 2]\ne: !!int \"42\"\nf: !local value\n",
+        "anchors and aliases": "---\nbase: &b {x: 1, y: [1, 2]}\nagain: *b\nlist: &l\n- 1\n- 2\ncopy: *l\ns: &s text\nt: *s\n",
+        "block scalars": "---\nlit: |\n  line one\n    indented\n\n  after blank\nfold: >\n  folded\n  text\n\n  para\n"
+                         "keep: |+\n  kept\n\nstrip: >-\n  stripped\nind: |2\n   one extra space\n",
+        "multi-line flow": "---\na: [1, 2,\n  3, {x: 1,\n       y: [a, b]},\n  'q']\nb: {k: v, 'k2': \"v2\",\n  k3: [  ]}\n",
+        "multi-line scalars": "---\nplain: first\n  second\n  third\n\n  after blank\nsingle: 'it''s\n  folded'\n"
+                              "double: \"esc \\t tab \\u00e9 \\x41 \\\n  continued\"\n",
+        "complex keys": "---\n? [1, 2]\n: pair\n? plain key\n: value\n? no value\n",
+        "complex scalar keys": "---\n? plain key\n: value\n? no value\n? |\n  block key\n: - a\n  - b\n",
+        "document end and second document": "---\na: 1\n...\n---\nb: 2\n",
+        "comments after properties": "---\nk:\n- &a # note: v\n    - x\n- y\nimg: !!map # block 0: the frame\n  source: 0\n"
+                                     "seq: !!seq # items: two\n- 1\n- 2\n",
+        "escaped white space at a fold": '---\na: "x\\t\n  y"\nb: "one\\ \n  two"\nc: "one\\\n\n  two"\nd: "p \n\n  q"\n',
+        "comment after a closing bracket or quote": "---\na: [1, 2]# c\nd: 'e'#f\ng: \"h\"# i\nj: {k: 1}# l\n",
+        "floats beyond the double range": "---\n- 1.0e+400\n- -1.0e+400\n- 5.0e-324\n- 1.0e-400\n",
+        "alias as a flow key": "---\n- &a x\n- {*a : 1}\n- [*a, *a]\n- &b-1_c y\n- *b-1_c\n",
+        "numbers": "---\n- 0x1F\n- 0b101\n- 017\n- 1_000\n- +12\n- 190:20:30\n- 1.5e+3\n- 1.5e3\n- 1e3\n- .5\n- -.5\n- 5.\n"
+                   "- .inf\n- -.Inf\n- .NAN\n- 1:30.5\n- ~\n- Null\n- yes\n- Off\n- TRUE\n- y\n- n\n- 0o17\n- 1__0.0_1\n",
+    }
+    for name, text in cases.items():
+        got = parsed(text)
+        try:   # PyYAML itself cannot build custom tags or unhashable keys
+            ref = norm(yaml.load(text.split("\n...\n")[0] + "\n", Loader=Loader))
+        except yaml.YAMLError:
+            ref = None
+        if ref is not None:
+            check(got == ref, f"YAML {name}: {str(got)[:300]} vs PyYAML {str(ref)[:300]}")
+        else:
+            check(got[0] == "m", f"YAML {name}: parsed ({str(got)[:200]})")
+    # Tags: the JSON dump carries the tags of mappings.
+    path = os.path.join(TMP, "yaml_tags.asdf")
+    write_asdf_raw(path, "a: !core/software-1.0.0 {name: x}\nb: !<tag:verbatim:t>\n  k: v\nc: !!map {k: v}\n", [])
+    out = run(path, "--asdf-tree-json").stdout
+    for tag in ("tag:stsci.edu:asdf/core/asdf-1.1.0", "tag:stsci.edu:asdf/core/software-1.0.0", "tag:verbatim:t",
+                "tag:yaml.org,2002:map"):
+        check(f'"t":"{tag}"' in out, f"YAML tag {tag} resolved")
+    for name, text, msg in [("unknown alias", "---\na: *nope\n", "unknown anchor"),
+                            ("unterminated flow", "---\na: [1, 2\n", "flow"),
+                            ("unterminated string", "---\na: \"abc\n", "unterminated"),
+                            ("bad indentation", "---\na:\n    b: 1\n  c: 2\n", "indentation"),
+                            ("undefined handle", "---\na: !x!y 1\n", "handle"),
+                            ("too deep", "---\n" + "[" * 500 + "]" * 500 + "\n", "deep")]:
+        got = parsed(text)
+        check(got[0] == "error" and msg in got[1], f"YAML error for {name}: {str(got)[:200]}")
+
+
+def test_asdf_hand_written():
+    """ASDF files assembled byte by byte: block layout options, compression, checksums, damage."""
+    d = os.path.join(TMP, "asdfraw")
+    os.makedirs(d, exist_ok=True)
+    rng = np.random.default_rng(71)
+    a = rng.integers(0, 65535, (3, 5, 7), dtype=np.uint16)
+    tree = ("fits: !fits/fits-1.0.0\n- header:\n  - [SIMPLE, true, conforms]\n  - [BITPIX, 16]\n  - [NAXIS, 3]\n"
+            "  - [EXTNAME, sci image, name]\n  - [OBJECT, M 31, target]\n  - [EXPTIME, 300.5, seconds]\n  - [GAIN, 120]\n"
+            "  - [FLAG, true]\n  - [\"NO\", false]\n  - [PSF, 1.7870e+04, flux]\n"
+            "  - [DATE-OBS, '2026-08-12T01:02:13.428']\n  - [NUMSTR, '123']\n  - [UNDEF]\n"
+            "  - [NULLV, null, undefined value]\n  - [HISTORY, processed with something]\n  - [COMMENT, a comment]\n"
+            "  - [HIERARCH ESO DET NAME, abc, long name]\n  - [lower case key, 17]\n  - [BZERO, 32768]\n"
+            "  - [CPLX, !core/complex-1.0.0 1.5-2.5j]\n  - [NEGZ, -0.5]\n  - [BIGF, 6.02e+23]\n  - []\n"
+            "  - [ROWORDER, TOP-DOWN]\n"
+            "  data: !core/ndarray-1.0.0\n    source: 0\n    datatype: uint16\n    byteorder: big\n    shape: [3, 5, 7]\n")
+    p = os.path.join(d, "stsci.asdf")
+    # old FITS tag, big-endian data, long block header, padding after the tree and in the block, CRLF, no index
+    write_asdf_raw(p, tree, [asdf_block(a.astype(">u2").tobytes(), header_size=56, extra_alloc=13)],
+                   pad=b"\0" * 37, newline="\r\n")
+    out = os.path.join(d, "stsci.fits")
+    r = run(p, "-o", out, "-f")
+    check("rows top-down (kept)" in r.stderr, f"ASDF -> FITS reports the row order: {r.stderr.strip()}")
+    with fits.open(out) as h:
+        compare("hand-written ASDF -> FITS pixels", np.array(h[0].data), a)
+        hd = h[0].header
+        want = {"EXTNAME": "sci image", "OBJECT": "M 31", "EXPTIME": 300.5, "GAIN": 120, "FLAG": True, "NO": False,
+                "PSF": 17870.0, "DATE-OBS": "2026-08-12T01:02:13.428", "NUMSTR": "123", "ESO DET NAME": "abc",
+                "lower case key": 17, "ROWORDER": "TOP-DOWN", "CPLX": complex(1.5, -2.5), "NEGZ": -0.5, "BIGF": 6.02e23,
+                "BZERO": 32768}
+        for k, v in want.items():
+            check(k in hd and hd[k] == v and type(hd[k]) is type(v), f"ASDF header {k}: {hd.get(k)!r} vs {v!r}")
+        check(hd.comments["OBJECT"] == "target" and hd.comments["ESO DET NAME"] == "long name", "ASDF header comments")
+        check(undefined(hd["UNDEF"]) and undefined(hd["NULLV"]) and hd.comments["NULLV"] == "undefined value",
+              "undefined values stay undefined")
+        check("processed with something" in str(hd["HISTORY"]) and "a comment" in str(hd["COMMENT"]), "commentary cards")
+    if HAVE_FITSVERIFY:
+        v = subprocess.run(["fitsverify", "-q", out], capture_output=True, text=True)
+        check("0 errors" in v.stdout, f"fitsverify on ASDF -> FITS: {v.stdout.strip()}")
+    x = os.path.join(d, "stsci.xisf")
+    run(p, "-o", x, "-f", "-q")
+    compare("hand-written ASDF -> XISF (top-down rows are not flipped)", read_xisf_any(x), np.transpose(a, (1, 2, 0)))
+    info = run(p, "--info").stdout
+    check("standard 1.5.0, 1 binary block(s)" in info and 'fits[0].data "sci image": 7 x 5 x 3, uint16, big-endian, block 0'
+          in info and "top-down (ROWORDER)" in info, f"--info on ASDF: {info[:300]}")
+    dump = subprocess.run([EXE, p, "--dump-header"], capture_output=True).stdout   # bytes: the tree as stored
+    check(dump.startswith(b"%YAML 1.1\r\n%TAG ! tag:stsci.edu:asdf/\r\n--- ") and dump.endswith(b"\r\n...\r\n"),
+          f"--dump-header prints the tree byte for byte: {dump[:40]!r}")
+
+    # generic arrays: two arrays in one block (offset), explicit C strides, an alias, a streamed block
+    f32 = rng.random((4, 6), dtype=np.float32)
+    i16 = rng.integers(-1000, 1000, (2, 4, 6)).astype(np.int16)
+    stream = rng.integers(0, 255, (9, 6), dtype=np.uint8)
+    tree = ("meta: {instrument: cam, exposure: 30.5}\n"
+            "first: &arr !core/ndarray-1.0.0 {source: 0, datatype: float32, byteorder: little, shape: [4, 6], offset: 16}\n"
+            "again: *arr\n"
+            "group:\n  second: !core/ndarray-1.0.0\n    source: 1\n    datatype: int16\n    byteorder: big\n"
+            "    shape: [2, 4, 6]\n    strides: [48, 12, 2]\n"
+            "  small: !core/ndarray-1.0.0 {source: 0, datatype: float32, byteorder: little, shape: [4]}\n"
+            "rows: !core/ndarray-1.0.0 {source: 2, datatype: uint8, byteorder: little, shape: ['*', 6]}\n")
+    p = os.path.join(d, "generic.asdf")
+    write_asdf_raw(p, tree, [asdf_block(b"\xff" * 16 + f32.tobytes()), asdf_block(i16.astype(">i2").tobytes(), b"zlib"),
+                             asdf_block(stream.tobytes(), flags=1)])
+    out = os.path.join(d, "generic.fits")
+    r = run(p, "-o", out, "-f")
+    with fits.open(out) as h:
+        check(len(h) == 3 and [x.header["EXTNAME"] for x in h] == ["first", "group.second", "rows"],
+              f"generic arrays become HDUs named by their tree path: {[x.header.get('EXTNAME') for x in h]}")
+        compare("array at an offset in its block", np.array(h[0].data), f32)
+        compare("big-endian int16 array in a zlib block", np.array(h[1].data).astype(np.int16), i16)
+        compare("streamed block", np.array(h[2].data), stream)
+    check("int16 with negative values -> Float32" in r.stderr, "signed data with negative values is reported")
+    x = os.path.join(d, "generic.xisf")
+    r = run(p, "-o", x, "-f", "-i", "0")
+    compare("generic ASDF array -> XISF (rows assumed bottom-up)", read_xisf_any(x), f32[::-1, :, None])
+    check("assumed bottom-up" in r.stderr, "the assumption about the row order is reported")
+    run(p, "-o", x, "-f", "-q", "-i", "0", "--top-down")
+    compare("generic ASDF array -> XISF with --top-down", read_xisf_any(x), f32[:, :, None])
+    r = run(p, "-o", x, "-f", "-i", "7", expect_ok=False)
+    check(r.returncode == 1 and "out of range" in r.stderr, "ASDF image index out of range")
+
+    # [rows, columns, channels] arrays are recognized
+    rgb = rng.integers(0, 255, (6, 8, 3), dtype=np.uint8)
+    p = os.path.join(d, "rgb.asdf")
+    write_asdf_raw(p, "img: !core/ndarray-1.0.0 {source: 0, datatype: uint8, byteorder: little, shape: [6, 8, 3]}\n",
+                   [asdf_block(rgb.tobytes())])
+    run(p, "-o", x, "-f", "-q", "--top-down")
+    compare("[rows, columns, channels] array", read_xisf_any(x), rgb)
+
+    # a data product in the style of mission pipelines: custom tags, arrays next to metadata,
+    # one of them wrapped in a quantity
+    sci = rng.random((6, 9), dtype=np.float32)
+    dq = rng.integers(0, 2 ** 31, (6, 9), dtype=np.uint32)
+    err = rng.random((6, 9)).astype(np.float16)
+    tree = ("history:\n  extensions:\n  - !core/extension_metadata-1.0.0\n    extension_class: some.Extension\n"
+            "    software: !core/software-1.0.0 {name: pipeline, version: 1.2.3}\n"
+            "roman: !<asdf://stsci.edu/datamodels/roman/tags/wfi_image-1.0.0>\n"
+            "  meta: !<asdf://example.org/tags/meta-1.0.0>\n    exposure: {start_time: !time/time-1.1.0 2026-01-01T00:00:00.000, "
+            "type: WFI_IMAGE}\n    wcs: !<tag:stsci.edu:gwcs/wcs-1.2.0>\n      name: w\n      steps: []\n"
+            "  data: !unit/quantity-1.1.0\n    unit: !unit/unit-1.0.0 DN / s\n"
+            "    value: !core/ndarray-1.1.0\n      source: 0\n      datatype: float32\n      byteorder: little\n"
+            "      shape: [6, 9]\n"
+            "  dq: !core/ndarray-1.1.0 {source: 1, datatype: uint32, byteorder: little, shape: [6, 9]}\n"
+            "  err: !core/ndarray-1.1.0 {source: 2, datatype: float16, byteorder: little, shape: [6, 9]}\n")
+    p = os.path.join(d, "product.asdf")
+    codec = b"lz4" if lz4 else b"zlib"
+    write_asdf_raw(p, tree, [asdf_block(sci.tobytes(), codec), asdf_block(dq.tobytes(), codec), asdf_block(err.tobytes())],
+                   head=ASDF_HEAD.replace("1.5.0", "1.6.0"))
+    r = run(p, "-o", out, "-f")
+    with fits.open(out) as h:
+        check([x.header["EXTNAME"] for x in h] == ["roman.data.value", "roman.dq", "roman.err"],
+              f"data product: arrays found under custom tags: {[x.header.get('EXTNAME') for x in h]}")
+        compare("data product: science array", np.array(h[0].data), sci)
+        compare("data product: uint32 array", np.array(h[1].data), dq)
+        compare("data product: float16 array", np.array(h[2].data), err.astype(np.float32))
+    run(p, "-o", x, "-f", "-q", "-i", "0")
+    compare("data product -> XISF", read_xisf_any(x), sci[::-1, :, None])
+
+    # compression codecs
+    data = rng.integers(0, 4000, (40, 50), dtype=np.uint16)
+    one = "img: !core/ndarray-1.0.0 {source: 0, datatype: uint16, byteorder: little, shape: [40, 50]}\n"
+    codecs = [b"", b"zlib"] + ([b"lz4"] if lz4 else []) + ([b"zstd"] if zstandard and ZSTD_BUILD else [])
+    for codec in codecs:
+        p = os.path.join(d, f"codec_{codec.decode() or 'none'}.asdf")
+        write_asdf_raw(p, one, [asdf_block(data.tobytes(), codec)])
+        run(p, "-o", out, "-f", "-q")
+        compare(f"block compression {codec.decode() or 'none'}", np.array(fits.getdata(out)), data)
+    for label, codec, msg in [("bzp2", b"bzp2", "bzip2 compression is not supported"), ("blsc", b"blsc", "not supported")]:
+        p = os.path.join(d, f"codec_{label}.asdf")
+        write_asdf_raw(p, one, [asdf_block(data.tobytes(), codec)])
+        r = run(p, "-o", out, "-f", expect_ok=False)
+        check(r.returncode == 1 and msg in r.stderr, f"{label} block: {r.stderr.strip()}")
+
+    # checksums
+    p = os.path.join(d, "badsum.asdf")
+    write_asdf_raw(p, one, [asdf_block(data.tobytes(), checksum="bad")])
+    r = run(p, "-o", out, "-f", expect_ok=False)
+    check(r.returncode == 1 and "MD5 checksum mismatch" in r.stderr, "wrong MD5 checksum is reported")
+    check(not os.path.exists(out + ".part"), "no partial file after a checksum error")
+    run(p, "-o", out, "-f", "-q", "--no-verify")
+    compare("--no-verify reads a block with a wrong checksum", np.array(fits.getdata(out)), data)
+    write_asdf_raw(p, one, [asdf_block(data.tobytes(), b"zlib", checksum="bad")])
+    r = run(p, "-o", out, "-f", expect_ok=False)
+    check(r.returncode == 1 and "MD5 checksum mismatch" in r.stderr, "wrong MD5 checksum of a compressed block")
+    write_asdf_raw(p, one, [asdf_block(data.tobytes(), checksum="zero")])
+    run(p, "-o", out, "-f", "-q")
+    compare("block without checksum", np.array(fits.getdata(out)), data)
+    # asdf 2.x stored the MD5 of the uncompressed data in compressed blocks
+    write_asdf_raw(p, one, [asdf_block(data.tobytes(), b"zlib", checksum="uncompressed")])
+    run(p, "-o", out, "-f", "-q")
+    compare("compressed block with the checksum convention of asdf 2.x", np.array(fits.getdata(out)), data)
+
+    # damaged and unusual files
+    good = asdf_block(data.tobytes())
+    bad_cases = [
+        ("truncated block", one, [good[:-100]], "beyond the end of the file"),
+        ("missing block", one.replace("source: 0", "source: 3"), [good], "the file has 1 block(s)"),
+        ("array larger than its block", one.replace("[40, 50]", "[41, 50]"), [good], "holds 4000"),
+        ("corrupt zlib data", one, [asdf_block(data.tobytes(), b"zlib", data_size=5000)], "block 0"),
+        ("unterminated tree", None, [], "end of the YAML tree was not found"),
+        ("YAML error", "a: [1, 2\n", [good], "YAML"),
+        ("no arrays", "a: 1\n", [], "no image data found in this ASDF file"),
+        ("inline array", "img: !core/ndarray-1.0.0 {data: [[1, 2], [3, 4]], datatype: int64, shape: [2, 2]}\n", [],
+         "no image data"),
+        ("external array", one.replace("source: 0", "source: other.asdf"), [good], "no image data"),
+        ("complex data", one.replace("uint16", "complex64").replace("[40, 50]", "[5, 50]"), [good], "no image data"),
+        ("bad shape", one.replace("[40, 50]", "[40, x]"), [good], "invalid shape"),
+    ]
+    for name, t, blocks, msg in bad_cases:
+        p = os.path.join(d, "bad.asdf")
+        if t is None:
+            open(p, "wb").write((ASDF_HEAD + "a: 1\n").encode())
+        else:
+            write_asdf_raw(p, t, blocks)
+        r = run(p, "-o", out, "-f", expect_ok=False)
+        check(r.returncode == 1 and msg in r.stderr, f"{name}: {r.stderr.strip()[:200]}")
+    open(p, "wb").write(b"#ASDF 1.0.0\n#ASDF_STANDARD 1.5.0\n" + good)
+    r = run(p, "-o", out, "-f", expect_ok=False)
+    check(r.returncode == 1 and "has no tree" in r.stderr, f"file without a tree: {r.stderr.strip()}")
+    p = os.path.join(d, "skips.asdf")
+    write_asdf_raw(p, one + "view: !core/ndarray-1.0.0 {source: 0, datatype: uint16, byteorder: little, shape: [20, 50], "
+                   "strides: [200, 2]}\ncube: !core/ndarray-1.0.0 {source: 0, datatype: uint8, byteorder: little, "
+                   "shape: [2, 2, 20, 50]}\n", [good])
+    r = run(p, "-o", out, "-f")
+    check("skipped view: " in r.stderr and "strides" in r.stderr and "skipped cube: 4-dimensional" in r.stderr,
+          f"unreadable arrays are named: {r.stderr.strip()[:300]}")
+    r = run(out, "--asdf-tree-json", "-f", expect_ok=False)
+    check(r.returncode == 1 and "needs an ASDF file" in r.stderr, "--asdf-tree-json refuses other formats")
+    # refusals
+    for args, msg in [(["-t", "asdf"], "already an ASDF"), (["-t", "tiff"], "not to TIFF or PNG"), (["-s"], "--stretch")]:
+        r = run(p, "-f", *args, expect_ok=False)
+        check(r.returncode == 1 and msg in r.stderr, f"ASDF input with {args}: {r.stderr.strip()}")
+    run(p, "-f", "-q")
+    check(os.path.exists(os.path.join(d, "skips.xisf")), "ASDF input is converted to XISF by default")
+    r = run(p, expect_ok=False)
+    check(r.returncode == 1 and "already exists" in r.stderr, "ASDF input: refuses to overwrite without --force")
+
+
+def with_id(entry, name):
+    entry["attrs"]["id"] = name
+    return entry
+
+
+def torture_keywords():
+    return "".join([
+        '<FITSKeyword name="SIMPLE" value="T" comment="should be dropped"/>',
+        '<FITSKeyword name="OBJECT" value="\'M 31 &amp; friends\'" comment="target"/>',
+        '<FITSKeyword name="OBSERVER" value="\'O\'\'Brien\'" comment="quote inside"/>',
+        '<FITSKeyword name="DQUOTE" value="\'say &quot;hi&quot; \\ there\'" comment="double quotes, backslash"/>',
+        '<FITSKeyword name="GAIN" value="120" comment="sensor gain"/>',
+        '<FITSKeyword name="LEADZERO" value="007" comment="not octal"/>',
+        '<FITSKeyword name="PLUS" value="+5" comment=""/>',
+        '<FITSKeyword name="PSFFLX00" value="1.7870e+04" comment="lower-case exponent"/>',
+        '<FITSKeyword name="NODOT" value="1E5" comment="no decimal point"/>',
+        '<FITSKeyword name="NOSIGN" value="1.5E5" comment="no exponent sign"/>',
+        '<FITSKeyword name="DEXP" value="1.D3" comment="Fortran exponent"/>',
+        '<FITSKeyword name="HALF" value=".5" comment=""/>',
+        '<FITSKeyword name="NEGHALF" value="-.5" comment=""/>',
+        '<FITSKeyword name="YES" value="T" comment="logical"/>',
+        '<FITSKeyword name="NO" value="F" comment="logical, and a YAML word"/>',
+        '<FITSKeyword name="ON" value="\'off\'" comment="YAML words as text"/>',
+        '<FITSKeyword name="NUMSTR" value="\'123\'" comment="a string of digits"/>',
+        '<FITSKeyword name="DATE-OBS" value="\'2026-08-12T01:02:13\'" comment="looks like a timestamp"/>',
+        '<FITSKeyword name="COLON" value="\'a: b #c [d] {e}, f\'" comment="YAML: syntax, [in] {a} #comment"/>',
+        '<FITSKeyword name="UNDEF" value="" comment="no value"/>',
+        '<FITSKeyword name="BIGINT" value="9223372036854775807" comment="largest ASDF integer"/>',
+        '<FITSKeyword name="HUGEINT" value="9223372036854775808" comment="too large"/>',
+        '<FITSKeyword name="CPLX" value="(1.5, -2.5E3)" comment="complex"/>',
+        '<FITSKeyword name="UTF" value="\'caf&#233; &#956;m\'" comment="&#956;m pixel"/>',
+        '<FITSKeyword name="HISTORY" value="" comment="calibrated with master dark"/>',
+        '<FITSKeyword name="COMMENT" value="" comment="' + "x" * 150 + '"/>',
+        '<FITSKeyword name="LONGNAMEKEY" value="1.5" comment="needs HIERARCH"/>',
+        '<FITSKeyword name="lower" value="2" comment="lower-case name"/>',
+        '<FITSKeyword name="NOTES" value="\'' + "y" * 90 + '\'" comment="long"/>',
+    ])
+
+
+def test_asdf_output():
+    """XISF -> ASDF, read back with Python's asdf library: no warnings, schema-valid, checksums right,
+    and the same HDUs that XISF -> FITS produces."""
+    if not HAVE_ASDF:
+        skipped.append("ASDF output vs the asdf library (pip install asdf asdf-astropy)")
+        return
+    import warnings
+    d = os.path.join(TMP, "asdfout")
+    os.makedirs(d, exist_ok=True)
+    codec_sets = [[], ["-c"], ["--codec", "zlib"]] + ([["--codec", "zstd"]] if HAVE_ASDF_ZSTD and ZSTD_BUILD else [])
+    n = 0
+    for dtype in (np.uint8, np.uint16, np.uint32, np.uint64, np.float32, np.float64):
+        for c in (1, 3):
+            a = test_image(dtype, 15, 22, c, 80 + c)
+            p = os.path.join(d, f"o_{np.dtype(dtype).name}_{c}.xisf")
+            kws = ('<FITSKeyword name="OBJECT" value="\'M 31\'" comment="target"/>'
+                   '<FITSKeyword name="EXPTIME" value="300.5" comment="seconds"/>'
+                   '<FITSKeyword name="GAIN" value="120" comment="sensor gain"/>'
+                   '<FITSKeyword name="HISTORY" value="" comment="calibrated"/>')
+            write_xisf(p, [image_entry(a, children=kws, codec="zlib", shuffle_item=np.dtype(dtype).itemsize)])
+            for row in ([], ["--top-down"]):
+                flags = codec_sets[n % len(codec_sets)]
+                n += 1
+                out, ref = p + ".asdf", p + ".fits"
+                run(p, "-o", out, "-f", "-q", *row, *flags)
+                run(p, "-o", ref, "-f", "-q", *row)
+                label = f"XISF -> ASDF {np.dtype(dtype).name} {c}ch {row + flags}"
+                try:
+                    hdus, lib = open_asdf(out, validate=dtype is not np.uint64)
+                except Exception as e:  # noqa: BLE001
+                    check(False, f"{label}: the asdf library rejects the file: {type(e).__name__}: {e}")
+                    continue
+                data, hd = hdus[0]
+                check(data.dtype == np.dtype(dtype), f"{label}: stored as {data.dtype}")
+                with fits.open(ref) as h:
+                    compare(label + " pixels equal FITS output", data, np.array(h[0].data))
+                    check(user_cards(hd) == user_cards(h[0].header),
+                          f"{label}: header equals FITS output\n{user_cards(hd)}\n{user_cards(h[0].header)}")
+                exp = as_planes(a if row else a[::-1])
+                compare(label + " pixels", data, exp[0] if c == 1 else exp)
+                check(lib.get("name") == "xisfconv" and str(lib.get("version")) == run("--version").stdout.split()[1],
+                      f"asdf_library entry: {lib}")
+                raw = open(out, "rb").read()
+                want = b"zstd" if "zstd" in flags else b"zlib" if flags else b"\0\0\0\0"
+                check(raw[raw.index(b"\xd3BLK") + 10:][:4] == want, f"{label}: block compression label")
+                check(raw.rstrip().endswith(b"...") and b"#ASDF BLOCK INDEX" in raw, f"{label}: block index written")
+
+    # keywords of every kind
+    a = test_image(np.uint16, 12, 16, 1, 90)
+    p = os.path.join(d, "kw.xisf")
+    write_xisf(p, [with_id(image_entry(a, children=torture_keywords()), "main_image")])
+    out = os.path.join(d, "kw.asdf")
+    r = run(p, "-o", out, "-f")
+    check("HUGEINT" in r.stderr and "written as a string" in r.stderr, "integer beyond ASDF's range is reported")
+    hdus, _ = open_asdf(out)
+    hd = hdus[0][1]
+    want = {"OBJECT": "M 31 & friends", "OBSERVER": "O'Brien", "DQUOTE": 'say "hi" \\ there', "GAIN": 120, "LEADZERO": 7,
+            "PLUS": 5, "PSFFLX00": 17870.0, "NODOT": 1e5, "NOSIGN": 1.5e5, "DEXP": 1000.0, "HALF": 0.5, "NEGHALF": -0.5,
+            "YES": True, "NO": False, "ON": "off", "NUMSTR": "123", "DATE-OBS": "2026-08-12T01:02:13",
+            "COLON": "a: b #c [d] {e}, f", "BIGINT": 9223372036854775807, "HUGEINT": "9223372036854775808",
+            "CPLX": complex(1.5, -2500.0), "UTF": "caf? ?m", "LONGNAMEKEY": 1.5, "LOWER": 2, "NOTES": "y" * 90,
+            "ROWORDER": "BOTTOM-UP", "EXTNAME": "main_image", "PROGRAM": "xisfconv " + run("--version").stdout.split()[1]}
+    for k, v in want.items():
+        check(k in hd and hd[k] == v and type(hd[k]) is type(v), f"ASDF keyword {k}: {hd.get(k)!r} vs {v!r}")
+    check(undefined(hd["UNDEF"]) and hd.comments["UNDEF"] == "no value", f"keyword without a value: {hd['UNDEF']!r}")
+    check(hd.comments["COLON"] == "YAML: syntax, [in] {a} #comment" and hd.comments["UTF"] == "?m pixel",
+          f"ASDF keyword comments: {hd.comments['COLON']!r}")
+    check("SIMPLE" in hd and hd.comments["SIMPLE"] != "should be dropped", "structural keywords are not carried over")
+    check("calibrated with master dark" in str(hd["HISTORY"]) and "x" * 150 in str(hd["COMMENT"]).replace("\n", ""),
+          "commentary keywords in ASDF")
+    # astropy can write the HDU list it got as a FITS file
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with asdf.open(out) as af:
+            af["fits"].writeto(os.path.join(d, "kw_astropy.fits"), overwrite=True, output_verify="exception")
+    with fits.open(os.path.join(d, "kw_astropy.fits")) as h:
+        compare("FITS written by astropy from the ASDF HDU list", np.array(h[0].data), a[::-1, :, 0])
+        check(h[0].header["LONGNAMEKEY"] == 1.5 and h[0].header["NOTES"] == "y" * 90, "astropy keeps HIERARCH and long strings")
+    # the same header through xisfconv's own reader
+    back = os.path.join(d, "kw_back.fits")
+    run(out, "-o", back, "-f", "-q")
+    ref = os.path.join(d, "kw_ref.fits")
+    run(p, "-o", ref, "-f", "-q")
+    with fits.open(back) as hb, fits.open(ref) as hr:
+        cb = [c for c in user_cards(hb[0].header) if c[0] != "HUGEINT" and "from ASDF" not in str(c[1])]
+        cr = [c for c in user_cards(hr[0].header) if c[0] != "HUGEINT"]
+        check(cb == cr, "XISF -> ASDF -> FITS has the header of XISF -> FITS\n" +
+              f"{[c for c in cb if c not in cr]}\n{[c for c in cr if c not in cb]}")
+
+    # several images
+    imgs = [test_image(np.uint16, 10, 14, 1, 91), test_image(np.float32, 8, 9, 3, 92), test_image(np.uint8, 6, 7, 1, 93)]
+    p = os.path.join(d, "multi.xisf")
+    write_xisf(p, [with_id(image_entry(x), f"img{i}") for i, x in enumerate(imgs)])
+    out = os.path.join(d, "multi.asdf")
+    run(p, "-o", out, "-f", "-q", "-c")
+    hdus, _ = open_asdf(out)
+    check(len(hdus) == 3 and [h["EXTNAME"] for _, h in hdus] == ["img0", "img1", "img2"], "multi-image XISF -> ASDF HDUs")
+    for i, (data, _) in enumerate(hdus):
+        exp = as_planes(imgs[i][::-1])
+        compare(f"multi-image ASDF HDU {i}", data, exp[0] if exp.shape[0] == 1 else exp)
+    run(p, "-t", "asdf", "-f", "-q", "-i", "1")
+    hdus, _ = open_asdf(os.path.join(d, "multi.asdf"))
+    check(len(hdus) == 1 and hdus[0][1]["EXTNAME"] == "img1", "-t asdf with --image")
+    # --bits and --stretch apply as for FITS output
+    run(p, "-o", out, "-f", "-q", "-i", "1", "-b", "u16")
+    ref = os.path.join(d, "bits.fits")
+    run(p, "-o", ref, "-f", "-q", "-i", "1", "-b", "u16")
+    hdus, _ = open_asdf(out)
+    check(hdus[0][0].dtype == np.uint16, "--bits u16 for ASDF output")
+    compare("--bits for ASDF output equals FITS output", hdus[0][0], np.array(fits.getdata(ref)))
+    run(p, "-o", out, "-f", "-q", "-i", "1", "--stretch=linked")
+    run(p, "-o", ref, "-f", "-q", "-i", "1", "--stretch=linked")
+    hdus, _ = open_asdf(out)
+    compare("--stretch for ASDF output equals FITS output", hdus[0][0], np.array(fits.getdata(ref)))
+
+
+def test_asdf_python_files():
+    """Files written by Python's asdf library and by asdf-astropy."""
+    if not HAVE_ASDF:
+        skipped.append("ASDF files written by the asdf library (pip install asdf asdf-astropy)")
+        return
+    import warnings
+    d = os.path.join(TMP, "asdfpy")
+    os.makedirs(d, exist_ok=True)
+    rng = np.random.default_rng(72)
+    base = rng.random((10, 12))
+    arrays = {
+        "u8": rng.integers(0, 255, (5, 7), dtype=np.uint8), "u16": rng.integers(0, 65535, (5, 7), dtype=np.uint16),
+        "u32": rng.integers(0, 2 ** 32 - 1, (5, 7), dtype=np.uint32), "u64": rng.integers(0, 2 ** 63, (5, 7), dtype=np.uint64),
+        "i8": rng.integers(-100, 100, (5, 7), dtype=np.int8), "i16pos": rng.integers(0, 30000, (5, 7), dtype=np.int16),
+        "i16neg": rng.integers(-30000, 30000, (5, 7), dtype=np.int16),
+        "i32": rng.integers(-2 ** 31, 2 ** 31 - 1, (5, 7), dtype=np.int32),
+        "i64": rng.integers(0, 2 ** 62, (5, 7), dtype=np.int64), "f16": rng.random((5, 7)).astype(np.float16),
+        "f32": rng.random((5, 7), dtype=np.float32), "f64": rng.random((3, 5, 7)),
+        "be": rng.random((5, 7)).astype(">f4"), "be16": rng.integers(0, 65535, (2, 5, 7)).astype(">u2"),
+        "rgb": rng.integers(0, 255, (6, 8, 3), dtype=np.uint8), "lead1": rng.random((1, 1, 5, 7)).astype(np.float32),
+        "rows": base[4:8],
+    }
+    skips = {"cube4": rng.random((2, 3, 5, 7)), "bool": rng.random((5, 7)) > 0.5,
+             "cplx": rng.random((5, 7)).astype(np.complex64), "view": base[2:7, 3:10],
+             "fortran": np.asfortranarray(rng.random((5, 7)))}
+    tree = {"meta": {"instrument": "cam", "exposure": 30.5, "n": 3, "flag": True, "note": None, "list": [1, 2, 3],
+                     "text": "multi\nline text", "long": "word " * 60},
+            "vec": np.arange(10.0), "nested": {"deep": [{"img": arrays["u16"]}]}, **arrays, **skips}
+    expected = dict(arrays)
+    expected["nested.deep[0].img"] = expected.pop("u16")   # the shared array appears once, at its first place
+    expected["rgb"] = arrays["rgb"].transpose(2, 0, 1)
+    expected["lead1"] = arrays["lead1"][0, 0]
+    variants = [("none", {}), ("zlib", {"all_array_compression": "zlib"})]
+    if lz4:
+        variants.append(("lz4", {"all_array_compression": "lz4"}))
+    if HAVE_ASDF_ZSTD and ZSTD_BUILD:
+        variants.append(("zstd", {"all_array_compression": "zstd"}))
+    out = os.path.join(d, "gen.fits")
+    for name, kw in variants:
+        p = os.path.join(d, f"gen_{name}.asdf")
+        asdf.AsdfFile(tree).write_to(p, **kw)
+        r = run(p, "-o", out, "-f")
+        with fits.open(out) as h:
+            names = [x.header["EXTNAME"] for x in h]
+            check(sorted(names) == sorted(expected), f"asdf-written file ({name}): images {names}")
+            for x in h:
+                exp = expected.get(x.header["EXTNAME"])
+                if exp is not None:
+                    got = np.array(x.data)
+                    check(got.shape == exp.shape and np.array_equal(got.astype(np.float64), exp.astype(np.float64)),
+                          f"asdf-written file ({name}): array {x.header['EXTNAME']} ({exp.dtype} -> {got.dtype})")
+        for key in ("bool", "cplx", "cube4", "view", "fortran"):
+            check(f"skipped {key}: " in r.stderr, f"asdf-written file ({name}): {key} is reported as skipped")
+        check("skipped vec" not in r.stderr and "skipped meta" not in r.stderr, "arrays that are no images are passed over")
+    info = run(os.path.join(d, "gen_zlib.asdf"), "--info").stdout
+    check("Image 0 at be: 7 x 5 x 1, float32, big-endian, block" in info and "zlib compressed" in info and
+          "assumed bottom-up" in info and "Skipped bool: datatype bool8" in info, f"--info on a generic file: {info[:200]}")
+    p = os.path.join(d, "gen_bz2.asdf")
+    asdf.AsdfFile(tree).write_to(p, all_array_compression="bzp2")
+    r = run(p, "-o", out, "-f", expect_ok=False)
+    check(r.returncode == 1 and "bzip2 compression is not supported" in r.stderr, "bzip2 block from the asdf library")
+    # a stream, as the library writes it: source -1, first axis open, data appended after the tree
+    try:
+        from asdf.tags.core import Stream
+    except ImportError:  # pragma: no cover
+        Stream = None
+    if Stream is not None:
+        p = os.path.join(d, "stream.asdf")
+        rows = rng.integers(0, 255, (9, 6), dtype=np.uint8)
+        with open(p, "wb") as fd:
+            asdf.AsdfFile({"img": arrays["u16"], "stream": Stream([6], np.uint8)}).write_to(fd)
+            fd.write(rows.tobytes())
+        run(p, "-o", out, "-f", "-q")
+        with fits.open(out) as h:
+            check([x.header["EXTNAME"] for x in h] == ["img", "stream"], "streamed array written by the asdf library is found")
+            compare("streamed array written by the asdf library", np.array(h[-1].data), rows)
+    p = os.path.join(d, "gen_inline.asdf")
+    asdf.AsdfFile({"img": arrays["u16"]}).write_to(p, all_array_storage="inline")
+    r = run(p, "-o", out, "-f", expect_ok=False)
+    check(r.returncode == 1 and "stored inline" in r.stderr and "no image data" in r.stderr, "inline arrays are explained")
+
+    # an HDU list serialized by asdf-astropy (its newest tag and standard version, big-endian data)
+    hd = fits.Header()
+    hd["OBJECT"] = ("M 31", "target")
+    hd["EXPTIME"] = (300.5, "[s] exposure")
+    hd["GAIN"] = 120
+    hd["FLAG"] = True
+    hd["SMALL"] = 1.5e-12
+    hd["QUOTE"] = "it's a 'test'"
+    hd["YES"] = "yes"
+    hd["NUMSTR"] = "123"
+    hd["DATE-OBS"] = "2026-08-12T01:02:13.428"
+    hd["LONGSTR"] = "x" * 150 + " end"
+    hd["HIERARCH ESO DET CHIP1 NAME"] = ("abc", "eso")
+    hd["HIERARCH lower case key"] = 17
+    hd["CPLX"] = complex(1.5, -2.5)
+    hd["UNDEF"] = fits.card.Undefined()
+    hd.add_comment("a comment")
+    hd.add_history("history line one")
+    hd.add_history("h" * 100)
+    d0 = rng.integers(0, 65535, (5, 7), dtype=np.uint16)
+    d1 = rng.random((3, 4, 6)).astype(np.float32)
+    d2 = rng.integers(-1000, 1000, (4, 6)).astype(np.int32)
+    h1 = fits.Header()
+    h1["EXTNAME"] = "second"
+    h1["BUNIT"] = "adu"
+    src = os.path.join(d, "hl.fits")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        fits.HDUList([fits.PrimaryHDU(d0, hd), fits.ImageHDU(d1, h1), fits.ImageHDU(d2)]).writeto(src, overwrite=True)
+        with fits.open(src) as orig:
+            for name, kw in [("plain", {}), ("zlib", {"all_array_compression": "zlib"})]:
+                p = os.path.join(d, f"hl_astropy_{name}.asdf")
+                asdf.AsdfFile({"hdul": orig, "other": {"x": 1}}).write_to(p, **kw)
+                back = os.path.join(d, "hl_back.fits")
+                r = run(p, "-o", back, "-f")
+                with fits.open(back) as b:
+                    check(len(b) == 3, f"asdf-astropy HDU list ({name}): 3 HDUs")
+                    for i in range(3):
+                        compare(f"asdf-astropy HDU list ({name}) HDU {i} pixels", np.array(b[i].data).astype(np.float64),
+                                np.array(orig[i].data).astype(np.float64))
+                    cb = [c for c in user_cards(b[0].header) if c[0] not in ("ROWORDER", "PROGRAM") and "xisfconv" not in str(c[1])]
+                    check(cb == user_cards(orig[0].header),
+                          f"asdf-astropy HDU list ({name}): header\n{[c for c in cb if c not in user_cards(orig[0].header)]}\n"
+                          f"{[c for c in user_cards(orig[0].header) if c not in cb]}")
+                    check(b[1].header["EXTNAME"] == "second" and b[1].header["BUNIT"] == "adu", "extension header")
+                check("hdul[0].data" in r.stderr and "rows bottom-up (kept)" in r.stderr, "HDU list rows are bottom-up")
+                x = os.path.join(d, "hl.xisf")
+                run(p, "-o", x, "-f", "-q")
+                compare(f"asdf-astropy HDU list ({name}) -> XISF", read_xisf_any(x), d0[::-1, :, None])
+                compare(f"asdf-astropy HDU list ({name}) -> XISF, HDU 1", read_xisf_any(x, 1),
+                        np.transpose(d1, (1, 2, 0))[::-1])
+
+            # FITS -> ASDF by xisfconv, read by the asdf library
+            for flags in ([], ["-c"]):
+                p = os.path.join(d, "hl_x.asdf")
+                run(src, "-o", p, "-f", "-q", *flags)
+                hdus, _ = open_asdf(p)
+                check(len(hdus) == 3, "FITS -> ASDF: 3 HDUs")
+                for i, (data, header) in enumerate(hdus):
+                    compare(f"FITS -> ASDF {flags} HDU {i} pixels", data.astype(np.float64),
+                            np.array(orig[i].data).astype(np.float64))
+                    got = [c for c in user_cards(header) if c[0] not in ("ROWORDER", "PROGRAM", "EXTNAME") and
+                           "xisfconv" not in str(c[1])]
+                    exp = [c for c in user_cards(orig[i].header) if c[0] != "EXTNAME"]
+                    check(got == exp, f"FITS -> ASDF {flags} HDU {i}: header\n{[c for c in got if c not in exp]}\n"
+                                      f"{[c for c in exp if c not in got]}")
+                check(hdus[0][0].dtype == np.uint16 and hdus[1][1]["EXTNAME"] == "second" and
+                      hdus[0][1]["ROWORDER"] == "BOTTOM-UP", "FITS -> ASDF: types, names and row order")
+
+
+def test_asdf_roundtrips():
+    """xisfconv reading its own ASDF output."""
+    d = os.path.join(TMP, "asdfrt")
+    os.makedirs(d, exist_ok=True)
+    n = 0
+    for dtype in (np.uint8, np.uint16, np.uint32, np.uint64, np.float32, np.float64):
+        for c in (1, 3):
+            a = test_image(dtype, 15, 22, c, 60 + c)
+            p = os.path.join(d, f"rt_{np.dtype(dtype).name}_{c}.xisf")
+            kws = '<FITSKeyword name="OBJECT" value="\'M 31\'" comment="target"/>'
+            write_xisf(p, [image_entry(a, children=kws, codec="zlib", shuffle_item=np.dtype(dtype).itemsize)])
+            for row in ([], ["--top-down"]):
+                comp = [[], ["-c"]][n % 2]
+                n += 1
+                mid, back = p + ".asdf", p + ".back.xisf"
+                run(p, "-o", mid, "-f", "-q", *row, *comp)
+                run(mid, "-o", back, "-f", "-q", "-c")
+                got = read_xisf_any(back)
+                check(got.dtype == np.dtype(dtype), f"XISF -> ASDF -> XISF {np.dtype(dtype).name}: dtype {got.dtype}")
+                compare(f"XISF -> ASDF{row + comp} -> XISF {np.dtype(dtype).name} {c}ch", got, a)
+                kw = xisf_keyword_values(back)
+                check(unq(kw.get("OBJECT", "")).strip() == "M 31", f"keyword survives XISF -> ASDF -> XISF: {kw.get('OBJECT')}")
+                # ASDF -> FITS is the file XISF -> FITS gives
+                f1, f2 = p + ".a.fits", p + ".x.fits"
+                run(mid, "-o", f1, "-f", "-q")
+                run(p, "-o", f2, "-f", "-q", *row)
+                with fits.open(f1) as h1, fits.open(f2) as h2:
+                    compare("ASDF -> FITS pixels equal XISF -> FITS", np.array(h1[0].data), np.array(h2[0].data))
+                    check(h1[0].header["ROWORDER"] == h2[0].header["ROWORDER"], "ASDF -> FITS keeps ROWORDER")
+                    c1 = [x for x in user_cards(h1[0].header) if "from ASDF" not in str(x[1])]
+                    check(c1 == user_cards(h2[0].header), "ASDF -> FITS header equals XISF -> FITS")
+                # FITS -> ASDF -> FITS
+                mid2, f3 = p + ".f.asdf", p + ".f.fits"
+                run(f2, "-o", mid2, "-f", "-q", *comp)
+                run(mid2, "-o", f3, "-f", "-q")
+                with fits.open(f3) as h3, fits.open(f2) as h2:
+                    compare("FITS -> ASDF -> FITS pixels", np.array(h3[0].data), np.array(h2[0].data))
+                    c3 = [x for x in user_cards(h3[0].header) if "xisfconv" not in str(x[1]) or x[0] != "HISTORY"]
+                    c2 = [x for x in user_cards(h2[0].header) if "xisfconv" not in str(x[1]) or x[0] != "HISTORY"]
+                    check(c3 == c2, "FITS -> ASDF -> FITS header")
+    if HAVE_FITSVERIFY:
+        v = subprocess.run(["fitsverify", "-q", f3], capture_output=True, text=True)
+        check("verification OK" in v.stdout, f"fitsverify on FITS -> ASDF -> FITS: {v.stdout.strip()}")
+
+    # --bits and the row order options when repackaging
+    a = test_image(np.float32, 12, 16, 1, 66)
+    f = os.path.join(d, "bits.fits")
+    fits.PrimaryHDU(a[:, :, 0]).writeto(f, overwrite=True)
+    mid = os.path.join(d, "bits.asdf")
+    r = run(f, "-o", mid, "-f", "-b", "u16", "--top-down")
+    back = os.path.join(d, "bits_back.fits")
+    run(mid, "-o", back, "-f", "-q")
+    with fits.open(back) as h:
+        compare("FITS -> ASDF --bits u16", np.array(h[0].data), np.round(a[:, :, 0].astype(np.float64) * 65535).astype(np.uint16))
+        check(h[0].header["ROWORDER"] == "TOP-DOWN" and "rows top-down (kept)" in r.stderr, "--top-down marks the stored rows")
+    x = os.path.join(d, "bits.xisf")
+    run(mid, "-o", x, "-f", "-q")
+    compare("top-down ASDF -> XISF is not flipped", read_xisf_any(x),
+            np.round(a.astype(np.float64) * 65535).astype(np.uint16))
+    # output naming
+    run(f, "-t", "asdf", "-f", "-q", "-d", d)
+    check(os.path.exists(os.path.join(d, "bits.asdf")), "-t asdf names the output .asdf")
+    r = run(f, "-o", os.path.join(d, "x.asdf"), "--codec", "zstd", "-f", "-q", expect_ok=False)
+    check((r.returncode == 0) == ZSTD_BUILD, "--codec zstd for ASDF output follows the build")
+
+    # WCS: a PixInsight solution becomes the same keywords in ASDF as in FITS
+    P = "PCL:AstrometricSolution:"
+    props = "".join([
+        f'<Property id="{P}ProjectionSystem" type="String">Gnomonic</Property>',
+        f64_prop(P + "ReferenceCelestialCoordinates", [328.178, 47.358]),
+        f64_prop(P + "ReferenceImageCoordinates", [300.3, 199.3]),
+        f64_prop(P + "ReferenceNativeCoordinates", [0, 90]),
+        f64_prop(P + "CelestialPoleNativeCoordinates", [180, 90]),
+        f64_prop(P + "LinearTransformationMatrix", [-2.3565e-4, 1.1696e-5, -1.1715e-5, -2.3575e-4], 2, 2),
+    ])
+    a = test_image(np.uint16, 400, 600, 1, 67)
+    p = os.path.join(d, "wcs.xisf")
+    write_xisf(p, [image_entry(a, children=props)])
+    for row in ([], ["--top-down"]):
+        mid, ref, viaf = os.path.join(d, "wcs.asdf"), os.path.join(d, "wcs.fits"), os.path.join(d, "wcs_via.fits")
+        r = run(p, "-o", mid, "-f", *row)
+        check("WCS TAN" in r.stderr, "XISF -> ASDF writes WCS keywords from the solution")
+        run(p, "-o", ref, "-f", "-q", *row)
+        run(mid, "-o", viaf, "-f", "-q")
+        h1, h2 = fits.getheader(viaf), fits.getheader(ref)
+        keys = ["CTYPE1", "CTYPE2", "CRVAL1", "CRVAL2", "CRPIX1", "CRPIX2", "CD1_1", "CD1_2", "CD2_1", "CD2_2"]
+        check(all(h1[k] == h2[k] for k in keys), f"WCS keywords in ASDF equal those in FITS {row}")
+        # and they come back as PixInsight solution properties
+        x = os.path.join(d, "wcs_back.xisf")
+        r = run(mid, "-o", x, "-f")
+        check("PixInsight solution properties" in r.stderr, f"ASDF -> XISF restores the solution {row}")
+        m = xisf_property(x, P + "LinearTransformationMatrix")
+        check(m is not None and np.allclose(np.ravel(m), [-2.3565e-4, 1.1696e-5, -1.1715e-5, -2.3575e-4], rtol=1e-9),
+              f"solution matrix after XISF -> ASDF -> XISF {row}: {m}")
+
+
 if __name__ == "__main__":
     print("xisfconv:", EXE)
     print(subprocess.run([EXE, "--version"], capture_output=True, text=True).stdout.strip())
     print("libtiff tiffcp:", "yes" if HAVE_TIFFCP else "no (TIFF decoded by tifffile only)")
     print("NASA fitsverify:", "yes" if HAVE_FITSVERIFY else "no (FITS checked by astropy only)")
+    print("asdf + asdf-astropy:", "yes" if HAVE_ASDF else "no -- ASDF files are checked by xisfconv's own reader only "
+          "(pip install asdf asdf-astropy)")
     print("imagecodecs:", "yes" if HAVE_IMAGECODECS else
           ("no (tiffcp decodes compressed float TIFFs)" if HAVE_TIFFCP
            else "no -- compressed float TIFF checks will be SKIPPED (pip install imagecodecs)"))
@@ -1286,14 +2133,17 @@ if __name__ == "__main__":
               test_keywords_and_properties, test_multi_image_icc_resolution, test_bits_conversion,
               test_batch_and_outdir, test_stretch, test_wcs, test_solution_properties_forms, test_tiff_predictors, test_png,
               test_fits_to_xisf_formats, test_fits_to_xisf_metadata, test_fits_to_xisf_bounds_bits_hdus,
-              test_xisf_fits_xisf_roundtrip):
+              test_xisf_fits_xisf_roundtrip, test_asdf_yaml, test_asdf_hand_written, test_asdf_output,
+              test_asdf_python_files, test_asdf_roundtrips):
         try:
             t()
         except Exception as e:  # noqa: BLE001
             failures.append(f"{t.__name__}: {type(e).__name__}: {e}")
             print("ERROR in", t.__name__, ":", e)
     if skipped:
-        print(f"\nskipped {len(skipped)} checks that need tiffcp or imagecodecs, e.g. {skipped[0]}")
+        print(f"\nskipped {len(skipped)} checks that need optional tools:")
+        for what in sorted(set(skipped))[:8]:
+            print("  -", what)
     print(f"\n{passed} checks passed, {len(failures)} failed")
     if not failures:
         shutil.rmtree(TMP, ignore_errors=True)

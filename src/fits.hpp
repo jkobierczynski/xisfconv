@@ -24,6 +24,13 @@ std::string fitsString(const std::string& s);
 // Formats a floating point value for a FITS card (always contains '.' or 'E').
 std::string fitsReal(double v);
 
+// Maps text to printable ASCII, as FITS headers require. Each UTF-8 multi-byte sequence
+// becomes a single '?', control characters become spaces.
+std::string fitsSanitize(const std::string& s);
+// True for names that fit a standard card: 1-8 characters from A-Z, 0-9, '_' and '-'.
+// Other names are written with the HIERARCH convention.
+bool isStandardFitsName(const std::string& name);
+
 // True for keywords the writer generates itself (SIMPLE, BITPIX, NAXISn, BZERO, ...).
 bool isReservedFitsKeyword(const std::string& name);
 

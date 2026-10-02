@@ -1,11 +1,13 @@
 # xisfconv
 
-A small, dependency-light command-line converter between PixInsight **XISF** and **FITS**, in both
-directions, with **TIFF** and **PNG** export from XISF.
+A small, dependency-light command-line converter between PixInsight **XISF**, **FITS** and **ASDF**,
+in every direction, with **TIFF** and **PNG** export from XISF.
 
 ```
 xisfconv M31_integration.xisf                 # -> M31_integration.fits
 xisfconv -c light_0001.fits                   # -> light_0001.xisf (zstd-compressed)
+xisfconv -t asdf M31_integration.xisf         # -> M31_integration.asdf
+xisfconv observation.asdf                     # -> observation.xisf
 xisfconv -t tiff -c -b u16 *.xisf -d export/  # batch to 16-bit Deflate TIFFs
 xisfconv -t tiff -s -b u8 integration.xisf     # stretched 8-bit TIFF for GIMP
 xisfconv -t png -s -b u8 integration.xisf      # stretched 8-bit PNG for the web
@@ -76,6 +78,66 @@ xisfconv --info light_0001.xisf               # geometry, codecs, FITS keywords,
   settings PixInsight uses; `--codec zlib` for zlib), blocks over 1 GiB are written as subblocks, and
   `--checksum sha1|sha256|sha512` adds an integrity checksum.
 
+**ASDF output** (`-t asdf` or `-o name.asdf`, from XISF or FITS)
+- [ASDF](https://www.asdf-format.org) is the YAML-plus-binary-blocks format of the Python astronomy
+  world (asdf, astropy, the Roman Space Telescope pipeline). xisfconv writes the images as a FITS HDU
+  list under the tree's `fits` key, using the tag `tag:astropy.org:astropy/fits/fits-1.0.0`: every
+  HDU has its header as `[keyword, value, comment]` entries, with numbers, logicals and strings as
+  YAML values of that type, and the pixels as an `ndarray` of shape `[height, width]` or
+  `[channels, height, width]` in a binary block. With `asdf` and `asdf-astropy` installed, Python
+  gets an astropy `HDUList`:
+
+  ```python
+  import asdf
+  with asdf.open("M31_integration.asdf") as af:
+      hdul = af["fits"]                    # astropy.io.fits.HDUList
+      pixels = hdul[0].data                # numpy array
+      exposure = hdul[0].header["EXPTIME"]
+  ```
+
+  Without `asdf-astropy` the same data arrives as plain lists and arrays
+  (`af["fits"][0]["data"]`, `af["fits"][0]["header"]`), with a warning about the unknown tag.
+- The content is what the FITS output would hold: the same keywords (including those derived from
+  XISF properties and the WCS of a PixInsight plate solution), the same row order (bottom-up by
+  default, recorded in `ROWORDER`; `--top-down` keeps XISF's order), the same `--bits` and
+  `--stretch` handling. Unsigned samples are stored as they are (no BZERO offset).
+- `-c` compresses the blocks with zlib, which every ASDF reader has. `--codec zstd` uses Zstandard,
+  which Python reads once the `asdf-compression` package is installed. Every block carries an MD5
+  checksum, and a block index is written at the end of the file.
+- The file declares ASDF Standard 1.5.0, which old and current releases of the Python library read:
+  tested with asdf 5.4 / asdf-astropy 0.11 and with asdf 2.15 / asdf-astropy 0.4. One caveat for
+  asdf 2.x: its optional `validate_checksums=True` rejects compressed blocks written to the
+  standard (by xisfconv or by asdf 3 and later), because it expected the checksum of the uncompressed
+  data. Opening without that option, the default, works.
+- Keyword text is reduced to printable ASCII, as in FITS (astropy rejects anything else in a header).
+  An integer keyword beyond 64 bits is written as a string, because ASDF does not allow such
+  literals in the tree; xisfconv says so when it happens.
+
+**ASDF input** (an ASDF file is converted to XISF by default, or to FITS with `-t fits`)
+- FITS HDU lists, as xisfconv, asdf-astropy and older writers store them (`fits/fits-1.x` tags of
+  astropy.org and stsci.edu), are read with their headers. The pixels follow the same path as a FITS
+  input: flipped to XISF's top-down order unless `ROWORDER` says otherwise, WCS keywords turned into
+  PixInsight solution properties, and so on.
+- Any other numeric array in the tree with two or three dimensions is taken as an image as well, so
+  a file made with `asdf.AsdfFile({"image": array}).write_to(...)` converts too, and so should data
+  products that keep their pixels in arrays under custom tags (tested with files of that shape, not
+  yet with real mission data). The image is named after its place in the tree (`roman.data`);
+  `--info` lists what was found and `--image n` picks one. Three-dimensional arrays are read as
+  `[channels, rows, columns]`, or as `[rows, columns, channels]` when the last axis has at most four
+  entries. Such arrays carry no row order: bottom-up is assumed (the FITS and numpy/astropy habit),
+  and `--top-down` says otherwise. Only the pixels of these arrays are converted; the rest of the
+  tree (metadata, generalized WCS objects) is not carried over.
+- Data types: 8/16/32/64-bit integers, signed and unsigned, and 16/32/64-bit floats, little- or
+  big-endian. Signed integers are mapped as for FITS input; 16-bit floats become Float32.
+- Blocks: uncompressed, zlib, LZ4 and Zstandard (the asdf library's `lz4` and `zstd` layouts), with
+  padding, streamed blocks and arrays that share a block. MD5 checksums are verified
+  (`--no-verify` skips that), in both conventions in use: the asdf library computed them over the
+  uncompressed data before version 3 and over the stored bytes since.
+- The YAML tree is read by a built-in parser (no libyaml needed) that follows PyYAML, the parser
+  behind the Python library, in how plain values become numbers, logicals or strings.
+  `--dump-header` prints the tree.
+- FITS ↔ ASDF is a repackaging: same HDUs, same keywords, rows left in the order they are stored in.
+
 **TIFF output**
 - 8/16/32/64-bit unsigned or 32/64-bit IEEE float samples, chunky (interleaved) layout
 - Optional Deflate compression (`-c`) with horizontal or floating-point predictor
@@ -113,7 +175,7 @@ need no extra libraries: Zstandard (and on Windows the C runtime) is linked in.
 
 ## Building
 
-Requirements: a C++17 compiler, CMake ≥ 3.14, zlib. libzstd is optional but recommended
+Requirements: a C++17 compiler, CMake ≥ 3.15, zlib. libzstd is optional but recommended
 (PixInsight can write Zstandard-compressed files).
 
 ```
@@ -132,29 +194,30 @@ Windows (vcpkg): `vcpkg install zlib zstd`, then configure with
 ## Usage
 
 ```
-xisfconv [options] <file>...      # XISF -> FITS/TIFF/PNG, FITS -> XISF
+xisfconv [options] <file>...      # XISF -> FITS/ASDF/TIFF/PNG, FITS -> XISF/ASDF, ASDF -> XISF/FITS
 
-  -t, --to <fits|tiff|png|xisf>  output format (default: fits for XISF input, xisf for FITS input)
+  -t, --to <fits|asdf|tiff|png|xisf>
+                              output format (default: fits for XISF input, xisf for FITS and ASDF input)
   -o, --output <file>         output file name (single input only)
   -d, --outdir <dir>          directory for output files (default: next to each input)
   -f, --force                 overwrite existing output files
   -b, --bits <fmt>            output sample format: u8, u16, u32, f32, f64 (default: as stored)
   -i, --image <n>             convert only image n (0-based); default: all images
-  -c, --compress              TIFF: Deflate with predictor; XISF: zstd + byte shuffling
+  -c, --compress              TIFF: Deflate with predictor; XISF: zstd + byte shuffling; ASDF: zlib
   -s, --stretch[=mode]        screen stretch for viewing: auto (default), linked, unlinked, stf
-      --top-down              to FITS: keep XISF's top-down row order (default: bottom-up)
-                              from FITS: the rows are stored top-down (don't flip them)
-      --bottom-up             from FITS: the rows are stored bottom-up, whatever ROWORDER says
-      --no-property-keywords  FITS: don't derive missing keywords from XISF properties
-      --no-wcs                to FITS: don't write WCS from a PixInsight astrometric solution
+      --top-down              from XISF: keep XISF's top-down row order in FITS/ASDF (default: bottom-up)
+                              from FITS/ASDF: the rows are stored top-down
+      --bottom-up             from FITS/ASDF: the rows are stored bottom-up, whatever ROWORDER says
+      --no-property-keywords  from XISF: don't derive missing keywords from XISF properties
+      --no-wcs                from XISF: don't write WCS from a PixInsight astrometric solution
                               to XISF: don't write PixInsight solution properties from WCS
-      --sip-order <n>         FITS: SIP distortion order (2-7, default 3; 0 = linear only)
+      --sip-order <n>         from XISF: SIP distortion order (2-7, default 3; 0 = linear only)
       --no-verify             don't verify data block checksums
-      --codec <zlib|zstd>     XISF output: compression codec (implies -c)
+      --codec <zlib|zstd>     XISF and ASDF output: compression codec (implies -c)
       --checksum <sha1|sha256|sha512>  XISF output: checksum of the pixel data
       --bounds <lo:hi>        XISF output: range of floating point data
   -I, --info                  print image geometry, keywords and properties; no conversion
-      --dump-header           print the raw XML header (XISF) or all keywords (FITS)
+      --dump-header           print the raw XML header (XISF), all keywords (FITS) or the YAML tree (ASDF)
   -q, --quiet                 suppress warnings
 ```
 
@@ -165,7 +228,7 @@ rest are still converted (exit status 1).
 ## Testing
 
 ```
-pip install numpy astropy tifffile imagecodecs xisf lz4 zstandard pillow
+pip install numpy astropy tifffile imagecodecs xisf lz4 zstandard pillow asdf asdf-astropy asdf-compression
 python3 tests/run_tests.py build/xisfconv
 ```
 
@@ -183,6 +246,15 @@ reference. The XISF output is read back by the `xisf` package, and by a separate
 script for what that package lacks (subblocks, UInt64); checksums are verified there as well. Round
 trips XISF → FITS → XISF and FITS → XISF → FITS must return identical pixels, keywords and WCS.
 
+ASDF is checked against Python's `asdf` library with `asdf-astropy` (the tests are skipped if those
+are not installed). Files written by xisfconv must open without a warning, pass schema validation
+and checksum validation, and yield an astropy HDU list with the pixels and header cards of the
+corresponding FITS output. In the other direction the inputs are written by the library: plain trees
+with arrays of every data type, byte order and compression, views and shared arrays, and HDU lists
+serialized by asdf-astropy. A third set of files is assembled byte by byte in the test script (old
+tags, padded and streamed blocks, both checksum conventions, damaged files). The YAML reader is
+compared with PyYAML on random documents in all of PyYAML's output styles.
+
 ## Limitations / not yet done
 
 - Distributed XISF units (`.xish` + `.xisb`) are not supported, only monolithic `.xisf` files.
@@ -199,7 +271,14 @@ trips XISF → FITS → XISF and FITS → XISF → FITS must return identical pi
 - A PixInsight spline solution that goes XISF → FITS → XISF comes back as a spline rebuilt from the
   SIP approximation, not as the original: on the test frame the two agree to 0.5 arcsec rms.
 - FITS input: tile-compressed images (fpack) and tables are not read; BLANK pixels of integer images
-  are kept as ordinary values; FITS can only be converted to XISF, not directly to TIFF or PNG.
+  are kept as ordinary values.
+- FITS and ASDF inputs are converted to XISF or to each other, not directly to TIFF or PNG.
+- ASDF input: arrays stored inline in the tree or in another file, non-contiguous views, Fortran-ordered
+  arrays, tables and structured or complex data types are skipped with a message; bzip2- and
+  Blosc-compressed blocks are not read. Line breaks written as U+0085, U+2028 or U+2029 inside the
+  tree are not recognized as such.
+- ASDF output always uses the FITS HDU list layout described above; it does not write generalized WCS
+  (gwcs) objects or instrument-specific data models.
 - XISF output is not compressed with LZ4 (zlib and Zstandard only).
 - The PixInsight spline distortion model is approximated by SIP polynomials, not carried over exactly.
 - Please report any file that fails to convert, ideally with `xisfconv --info` output.
@@ -209,7 +288,7 @@ trips XISF → FITS → XISF and FITS → XISF → FITS must return identical pi
 Bump the version in `src/common.hpp` and `CMakeLists.txt`, commit, then push a matching tag:
 
 ```
-git tag v0.5.0 && git push origin v0.5.0
+git tag v0.6.0 && git push origin v0.6.0
 ```
 
 CI builds and tests all three platforms and, only if every one passes, publishes a GitHub release with
@@ -240,10 +319,6 @@ model to under 0.01 arcseconds, once one behaviour of PixInsight itself is taken
 the very border of the image its 8-pixel point grid returns the value belonging to a point
 1.33 pixels inside, so the printed corner coordinates sit about 1.4 arcseconds inside the true
 corners, with `ex`/`ey` round-trip errors of 1 to 2 pixels there.
-
-## Made with Claude
-
-Made with Claude Opus 5.5 High
 
 ## License
 

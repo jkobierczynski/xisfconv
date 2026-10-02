@@ -1,4 +1,4 @@
-// xisfconv - XISF <-> FITS converter with TIFF/PNG export
+// xisfconv - XISF <-> FITS <-> ASDF converter with TIFF/PNG export
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Jurgen Kobierczynski
 #pragma once
@@ -12,7 +12,7 @@
 
 namespace xisfconv {
 
-constexpr const char* kVersion = "0.5.0";
+constexpr const char* kVersion = "0.6.0";
 
 struct Error : std::runtime_error {
     using std::runtime_error::runtime_error;

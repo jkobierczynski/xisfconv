@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(xisfconv VERSION 0.5.0 LANGUAGES CXX)
+project(xisfconv VERSION 0.6.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -24,6 +24,7 @@ find_package(ZLIB REQUIRED)
 
 add_executable(xisfconv
   src/main.cpp
+  src/asdf.cpp
   src/common.cpp
   src/xml.cpp
   src/codecs.cpp
@@ -35,6 +36,7 @@ add_executable(xisfconv
   src/tiff.cpp
   src/png.cpp
   src/wcs.cpp
+  src/yaml.cpp
 )
 target_link_libraries(xisfconv PRIVATE ZLIB::ZLIB)
 

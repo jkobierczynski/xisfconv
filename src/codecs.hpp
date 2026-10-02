@@ -18,6 +18,8 @@ std::vector<uint8_t> zlibDecompress(const uint8_t* src, size_t srcSize, size_t e
 std::vector<uint8_t> lz4BlockDecompress(const uint8_t* src, size_t srcSize, size_t expectedSize);
 std::vector<uint8_t> zstdDecompress(const uint8_t* src, size_t srcSize, size_t expectedSize);
 bool zstdAvailable();
+// Size of the data a Zstandard frame holds, if the frame states it.
+bool zstdFrameContentSize(const uint8_t* src, size_t srcSize, uint64_t& size);
 
 // Compressors used when writing XISF. zstdCompress throws if the build has no Zstandard support.
 std::vector<uint8_t> zlibCompress(const uint8_t* src, size_t srcSize, int level = 6);
@@ -34,5 +36,8 @@ void unshuffle(std::vector<uint8_t>& data, size_t itemSize);
 std::string sha1Hex(const uint8_t* data, size_t size);
 std::string sha256Hex(const uint8_t* data, size_t size);
 std::string sha512Hex(const uint8_t* data, size_t size);
+
+// MD5 digest (16 raw bytes), used for ASDF block checksums.
+void md5(const uint8_t* data, size_t size, uint8_t digest[16]);
 
 }  // namespace xisfconv
