@@ -241,6 +241,10 @@ the very border of the image its 8-pixel point grid returns the value belonging 
 1.33 pixels inside, so the printed corner coordinates sit about 1.4 arcseconds inside the true
 corners, with `ex`/`ey` round-trip errors of 1 to 2 pixels there.
 
+## Made with Claude
+
+Made with Claude Opus 5.5 High
+
 ## License
 
 Copyright (C) 2026 Jurgen Kobierczynski
