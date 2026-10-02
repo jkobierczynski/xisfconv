@@ -82,7 +82,8 @@ void usage(std::ostream& os) {
           "      --bottom-up             FITS -> XISF: the FITS rows are stored bottom-up, whatever ROWORDER says\n"
           "      --no-property-keywords  FITS: don't add missing keywords (EXPTIME, DATE-OBS, BAYERPAT...)\n"
           "                              derived from XISF properties\n"
-          "      --no-wcs                FITS: don't write WCS keywords from a PixInsight astrometric solution\n"
+          "      --no-wcs                to FITS: don't write WCS keywords from a PixInsight astrometric solution\n"
+          "                              to XISF: don't write PixInsight solution properties from WCS keywords\n"
           "      --sip-order <n>         FITS: SIP distortion order fitted to the solution (2-7, default 3; 0 = off)\n"
           "      --no-verify             don't verify data block checksums\n\n"
           "XISF output (FITS -> XISF):\n"
@@ -626,12 +627,23 @@ void convertFitsFile(const std::string& input, const Options& opt) {
             }
         }
         o.keywords = img.keywords;
+        std::string solutionNote;
+        if (opt.wcs) {
+            // The keywords are now in the bottom-up convention PixInsight uses. PixInsight reads only
+            // their linear part, so the solution is also written as its native properties.
+            if (!wcsToAstrometricSolution(o.keywords, px.width, px.height, o.properties, solutionNote) &&
+                !solutionNote.empty()) {
+                warn(label + ": no PixInsight solution properties written: " + solutionNote);
+                solutionNote.clear();
+            }
+        }
         o.keywords.push_back({"HISTORY", "", std::string("Converted from FITS by xisfconv ") + kVersion});
         if (!opt.quiet) {
             std::cerr << "info: " << label << " (HDU " << img.hduIndex << "): " << img.note << ", rows "
                       << (topDown ? "top-down (kept)" : "bottom-up (flipped to XISF's top-down order)");
             if (!boundsNote.empty()) std::cerr << "; " << boundsNote;
             std::cerr << "\n";
+            if (!solutionNote.empty()) std::cerr << "info: " << label << ": " << solutionNote << "\n";
         }
         out.push_back(std::move(o));
     }

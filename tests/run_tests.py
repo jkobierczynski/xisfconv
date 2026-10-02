@@ -624,6 +624,43 @@ def f64_prop(pid, values, rows=None, cols=None):
     return f'<Property id="{pid}" type="F64Vector" length="{len(values)}" location="inline:base64">{b64}</Property>'
 
 
+def xisf_property(path, pid):
+    """Reads one image property straight from the XISF header: a str for scalars and strings,
+    a float64 array for F64Vector / F64Matrix (inline or attached). None if absent."""
+    import re
+    raw = open(path, "rb").read()
+    hdr = raw[16:16 + int.from_bytes(raw[8:12], "little")].decode()
+    m = re.search(r'<Property id="%s"([^>]*?)(/>|>([^<]*)</Property>)' % re.escape(pid), hdr)
+    if not m:
+        return None
+    attrs = m.group(1)
+    loc = re.search(r'location="([^"]+)"', attrs)
+    if not loc:
+        v = re.search(r'value="([^"]*)"', attrs)
+        return v.group(1) if v else m.group(3)
+    if loc.group(1).startswith("inline:base64"):
+        data = base64.b64decode(m.group(3))
+    else:
+        _, pos, size = loc.group(1).split(":")
+        data = raw[int(pos):int(pos) + int(size)]
+    v = np.frombuffer(data, "<f8")
+    shape = re.search(r'rows="(\d+)" columns="(\d+)"', attrs)
+    return v.reshape(int(shape.group(1)), int(shape.group(2))) if shape else v
+
+
+def hide_wcs_keywords(src, dst):
+    """Copies an XISF file with its WCS FITS keywords renamed (same length, so block offsets stay
+    valid), leaving the PixInsight solution properties as the only astrometry in the file."""
+    import re
+    raw = open(src, "rb").read()
+    hlen = int.from_bytes(raw[8:12], "little")
+    hdr = raw[16:16 + hlen]
+    pat = rb'(<FITSKeyword name=")(WCSAXES|CTYPE\d|CUNIT\d|CRVAL\d|CRPIX\d|CD\d_\d|LONPOLE|LATPOLE|RADESYS|(?:A|B|AP|BP)_\w+)(")'
+    hdr2 = re.sub(pat, lambda m: m.group(1) + b"X" + m.group(2)[1:] + m.group(3), hdr)
+    assert len(hdr2) == len(hdr) and hdr2 != hdr
+    open(dst, "wb").write(raw[:16] + hdr2 + raw[16 + hlen:])
+
+
 def test_wcs():
     from astropy.wcs import WCS
     import warnings
@@ -706,12 +743,103 @@ def test_wcs():
         run(p, "-o", f1, "-f", "-q", *first)
         run(f1, "-o", x2, "-f", "-q")
         compare(f"WCS round trip pixels ({first or 'bottom-up'})", XISF.read(x2), a)
+
+        # FITS -> XISF also writes PixInsight's native solution properties. The control points
+        # sampled from the SIP model must reproduce the distortion the test started from.
+        S = P + "SplineWorldTransformation:"
+        pts = xisf_property(x2, S + "ControlPoints:Image").reshape(-1, 2)
+        wld = xisf_property(x2, S + "ControlPoints:World").reshape(-1, 2)
+        dd = pts - ref_img
+        truth = (dd @ M.T) * (1 + 4e-4 * ((dd / 300.0) ** 2).sum(1)[:, None])
+        err = np.hypot(*(wld - truth).T).max() * 3600
+        check(len(pts) >= 200 and err < 0.02, f"solution properties {first}: {len(pts)} control points, max error {err:.4f} arcsec")
+        check(pts[:, 0].min() == 0 and pts[:, 0].max() == W and pts[:, 1].min() == 0 and pts[:, 1].max() == H,
+              "control points cover the image up to its borders")
+        check(xisf_property(x2, P + "ProjectionSystem") == "Gnomonic" and
+              xisf_property(x2, S + "Version") == "2.0" and
+              xisf_property(x2, S + "RBFType") == "DDMThinPlateSpline" and
+              float(xisf_property(x2, S + "SplineSmoothness")) == 0 and
+              xisf_property(x2, S + "UseSimplifiers") == "false" and
+              xisf_property(x2, "Observation:CelestialReferenceSystem") == "ICRS", "solution property identifiers")
+        check(np.allclose(xisf_property(x2, P + "ReferenceCelestialCoordinates"), ref_cel, atol=1e-9) and
+              np.allclose(xisf_property(x2, P + "ReferenceNativeCoordinates"), [0, 90]) and
+              np.allclose(xisf_property(x2, P + "CelestialPoleNativeCoordinates"), [180, 90]), "reference coordinates")
+        lin = xisf_property(x2, S + "LinearApproximation")
+        ref_xy = xisf_property(x2, P + "ReferenceImageCoordinates")
+        check(lin.shape == (2, 3) and np.allclose(lin[:, :2], xisf_property(x2, P + "LinearTransformationMatrix")) and
+              np.allclose(lin[:, :2] @ ref_xy + lin[:, 2], 0, atol=1e-12), "linear approximation is consistent")
+        # With the WCS keywords hidden, the properties alone must carry the solution back to FITS.
+        x3 = os.path.join(TMP, "wcs_rt_props_only.xisf")
+        hide_wcs_keywords(x2, x3)
+        for second, bottom in (([], True), (["--top-down"], False)):
+            f3 = os.path.join(TMP, "wcs_rt3.fits")
+            r3 = run(x3, "-o", f3, "-f", *second)
+            err, hdr = star_error(f3, uv, bottom)
+            check("SIP order 3" in r3.stderr and err < 0.02,
+                  f"solution properties alone -> FITS{second}: max error {err:.4f} arcsec")
         for second, bottom in (([], True), (["--top-down"], False)):
             f2 = os.path.join(TMP, "wcs_rt2.fits")
             run(x2, "-o", f2, "-f", "-q", *second)
             err, hdr = star_error(f2, uv, bottom)
             check(err < 0.02 and hdr["CTYPE1"] == "RA---TAN-SIP",
                   f"WCS after FITS{first}->XISF->FITS{second}: max error {err:.4f} arcsec")
+
+
+def test_solution_properties_forms():
+    """PixInsight solution properties from the different ways FITS expresses the linear WCS."""
+    from astropy.wcs import WCS
+    import warnings
+    warnings.simplefilter("ignore")
+    H, W = 40, 60
+    data = test_image(np.uint16, H, W, 1, 61)[..., 0]
+    P = "PCL:AstrometricSolution:"
+    out = os.path.join(TMP, "sp.xisf")
+
+    def convert(cards, *flags, expect_props=True):
+        hdu = fits.PrimaryHDU(data)
+        for k, v in cards.items():
+            hdu.header[k] = v
+        src = os.path.join(TMP, "sp.fits")
+        hdu.writeto(src, overwrite=True)
+        r = run(src, "-o", out, "-f", *flags)
+        m = xisf_property(out, P + "LinearTransformationMatrix")
+        check((m is not None) == expect_props, f"solution properties {'written' if expect_props else 'absent'} for {list(cards)[:3]} {flags}")
+        return src, m, r
+
+    base = {"CTYPE1": "RA---TAN", "CTYPE2": "DEC--TAN", "CRVAL1": 150.25, "CRVAL2": -32.5, "CRPIX1": 30.5, "CRPIX2": 21.25}
+    forms = {
+        "CD matrix": {"CD1_1": -2.1e-4, "CD1_2": 3.0e-5, "CD2_1": 2.9e-5, "CD2_2": 2.2e-4},
+        "CDELT + CROTA2": {"CDELT1": -2.0e-4, "CDELT2": 2.0e-4, "CROTA2": 31.0},
+        "PC + CDELT": {"CDELT1": -2.0e-4, "CDELT2": 2.1e-4, "PC1_1": 0.9, "PC1_2": -0.4, "PC2_1": 0.42, "PC2_2": 0.91},
+        "CDELT only": {"CDELT1": -1.9e-4, "CDELT2": 1.9e-4},
+    }
+    for name, extra in forms.items():
+        src, m, r = convert({**base, **extra})
+        cd = WCS(fits.getheader(src)).pixel_scale_matrix        # astropy is the oracle for the CD matrix
+        check(np.allclose(m, [[cd[0, 0], -cd[0, 1]], [cd[1, 0], -cd[1, 1]]], rtol=1e-9, atol=1e-15), f"{name}: matrix {m.ravel()}")
+        check(np.allclose(xisf_property(out, P + "ReferenceImageCoordinates"), [30.5 - 0.5, H + 0.5 - 21.25]) and
+              np.allclose(xisf_property(out, P + "ReferenceCelestialCoordinates"), [150.25, -32.5]), f"{name}: reference point")
+        check(xisf_property(out, P + "SplineWorldTransformation:Version") is None and "linear" in r.stderr,
+              f"{name}: linear solution has no spline properties")
+
+    # a top-down FITS describes the same sky: after conversion the properties must be identical
+    cdform = {**base, **forms["CD matrix"]}
+    _, m_bottom, _ = convert(cdform)
+    ref_bottom = xisf_property(out, P + "ReferenceImageCoordinates")
+    flipped = dict(cdform, CRPIX2=H + 1 - cdform["CRPIX2"], CD1_2=-cdform["CD1_2"], CD2_2=-cdform["CD2_2"], ROWORDER="TOP-DOWN")
+    _, m_top, _ = convert(flipped)
+    check(np.allclose(m_top, m_bottom) and np.allclose(xisf_property(out, P + "ReferenceImageCoordinates"), ref_bottom),
+          "top-down FITS gives the same solution properties")
+
+    _, _, r = convert(cdform, "--no-wcs", expect_props=False)
+    check(b"PCL:AstrometricSolution" not in open(out, "rb").read(20000), "--no-wcs writes no solution properties")
+    _, _, r = convert({**cdform, "CTYPE1": "RA---CAR", "CTYPE2": "DEC--CAR"}, expect_props=False)
+    check("no PixInsight solution properties" in r.stderr and "CAR" in r.stderr, "unsupported projection is reported")
+    _, _, r = convert({**cdform, "CTYPE1": "GLON-TAN", "CTYPE2": "GLAT-TAN"}, expect_props=False)
+    check("not RA/Dec" in r.stderr, "non-equatorial WCS is reported")
+    _, _, r = convert({}, expect_props=False)
+    check("solution" not in r.stderr, "no WCS, no message")
+    compare("pixels unaffected by properties", XISF.read(out), fits_expected(os.path.join(TMP, "sp.fits")))
 
 
 # ---------------------------------------------------------------- PNG output
@@ -1156,7 +1284,7 @@ if __name__ == "__main__":
            else "no -- compressed float TIFF checks will be SKIPPED (pip install imagecodecs)"))
     for t in (test_python_xisf_codecs, test_hand_written, test_checksum_mismatch, test_truncated_and_garbage,
               test_keywords_and_properties, test_multi_image_icc_resolution, test_bits_conversion,
-              test_batch_and_outdir, test_stretch, test_wcs, test_tiff_predictors, test_png,
+              test_batch_and_outdir, test_stretch, test_wcs, test_solution_properties_forms, test_tiff_predictors, test_png,
               test_fits_to_xisf_formats, test_fits_to_xisf_metadata, test_fits_to_xisf_bounds_bits_hdus,
               test_xisf_fits_xisf_roundtrip):
         try:

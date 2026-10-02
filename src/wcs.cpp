@@ -162,6 +162,233 @@ bool flipWcsRowOrder(std::vector<FitsKeyword>& keywords, uint64_t height) {
     return true;
 }
 
+namespace {
+
+const FitsKeyword* findCard(const std::vector<FitsKeyword>& kw, const std::string& name) {
+    for (const auto& k : kw)
+        if (toUpper(trim(k.name)) == name) return &k;
+    return nullptr;
+}
+
+bool cardNumber(const std::vector<FitsKeyword>& kw, const std::string& name, double& out) {
+    const FitsKeyword* k = findCard(kw, name);
+    return k && numericValue(k->value, out);
+}
+
+std::string cardString(const std::vector<FitsKeyword>& kw, const std::string& name) {
+    const FitsKeyword* k = findCard(kw, name);
+    if (!k) return {};
+    std::string v = trim(k->value);
+    if (v.size() >= 2 && v.front() == '\'' && v.back() == '\'') v = trim(v.substr(1, v.size() - 2));
+    return v;
+}
+
+// PixInsight projection names for the zenithal projections (native reference point at the pole).
+std::string projectionName(const std::string& code) {
+    static const struct { const char* fits; const char* pi; } map[] = {
+        {"TAN", "Gnomonic"}, {"STG", "Stereographic"}, {"ZEA", "ZenithalEqualArea"},
+        {"SIN", "Orthographic"}, {"ARC", "ZenithalEqualDistance"},
+    };
+    for (const auto& m : map)
+        if (code == m.fits) return m.pi;
+    return {};
+}
+
+XisfOutProperty scalarProperty(const std::string& id, const char* type, const std::string& value) {
+    XisfOutProperty p;
+    p.id = id;
+    p.type = type;
+    p.value = value;
+    return p;
+}
+
+XisfOutProperty vectorProperty(const std::string& id, std::vector<double> data) {
+    XisfOutProperty p;
+    p.id = id;
+    p.type = "F64Vector";
+    p.data = std::move(data);
+    return p;
+}
+
+XisfOutProperty matrixProperty(const std::string& id, size_t rows, size_t columns, std::vector<double> data) {
+    XisfOutProperty p;
+    p.id = id;
+    p.type = "F64Matrix";
+    p.rows = rows;
+    p.columns = columns;
+    p.data = std::move(data);
+    return p;
+}
+
+}  // namespace
+
+bool wcsToAstrometricSolution(const std::vector<FitsKeyword>& kw, uint64_t width, uint64_t height,
+                              std::vector<XisfOutProperty>& properties, std::string& summary) {
+    const std::string ctype1 = toUpper(cardString(kw, "CTYPE1")), ctype2 = toUpper(cardString(kw, "CTYPE2"));
+    if (ctype1.empty() || ctype2.empty()) return false;  // no WCS at all: nothing to say
+    if (ctype1.compare(0, 4, "RA--") != 0 || ctype2.compare(0, 4, "DEC-") != 0 || ctype1.size() < 8 ||
+        ctype2.size() < 8) {
+        summary = "WCS axes are not RA/Dec in that order (" + ctype1 + ", " + ctype2 + ")";
+        return false;
+    }
+    const std::string code = ctype1.substr(5, 3);
+    const std::string projection = projectionName(code);
+    if (projection.empty() || ctype2.substr(5, 3) != code) {
+        summary = "projection " + code + " has no PixInsight solution mapping here";
+        return false;
+    }
+    for (const char* unit : {"CUNIT1", "CUNIT2"}) {
+        const std::string u = toLower(cardString(kw, unit));
+        if (!u.empty() && u != "deg" && u != "degree" && u != "degrees") {
+            summary = std::string(unit) + " is not degrees";
+            return false;
+        }
+    }
+    double crval1, crval2, crpix1, crpix2;
+    if (!cardNumber(kw, "CRVAL1", crval1) || !cardNumber(kw, "CRVAL2", crval2) ||
+        !cardNumber(kw, "CRPIX1", crpix1) || !cardNumber(kw, "CRPIX2", crpix2)) {
+        summary = "WCS keywords are incomplete (CRVAL/CRPIX)";
+        return false;
+    }
+
+    // Linear part as a CD matrix [deg/pixel], from CD, PC + CDELT, or CDELT + CROTA2.
+    double cd[4] = {0, 0, 0, 0};
+    const char* cdNames[4] = {"CD1_1", "CD1_2", "CD2_1", "CD2_2"};
+    bool hasCd = false;
+    for (int i = 0; i < 4; ++i) hasCd = cardNumber(kw, cdNames[i], cd[i]) || hasCd;
+    if (!hasCd) {
+        double cdelt1, cdelt2;
+        if (!cardNumber(kw, "CDELT1", cdelt1) || !cardNumber(kw, "CDELT2", cdelt2)) {
+            summary = "WCS keywords are incomplete (no CD matrix or CDELT)";
+            return false;
+        }
+        double pc[4] = {1, 0, 0, 1};
+        const char* pcNames[4] = {"PC1_1", "PC1_2", "PC2_1", "PC2_2"};
+        bool hasPc = false;
+        for (int i = 0; i < 4; ++i) hasPc = cardNumber(kw, pcNames[i], pc[i]) || hasPc;
+        double crota = 0;
+        if (!hasPc && cardNumber(kw, "CROTA2", crota)) {
+            const double r = crota * 3.14159265358979323846 / 180;
+            cd[0] = cdelt1 * std::cos(r);
+            cd[1] = -cdelt2 * std::sin(r);
+            cd[2] = cdelt1 * std::sin(r);
+            cd[3] = cdelt2 * std::cos(r);
+        } else {
+            cd[0] = cdelt1 * pc[0];
+            cd[1] = cdelt1 * pc[1];
+            cd[2] = cdelt2 * pc[2];
+            cd[3] = cdelt2 * pc[3];
+        }
+    }
+    const double det = cd[0] * cd[3] - cd[1] * cd[2];
+    if (!(std::fabs(det) > 0)) {
+        summary = "WCS linear transformation is singular";
+        return false;
+    }
+
+    // PixInsight image coordinates: origin at the top-left corner of the top-left pixel, y down.
+    // The keywords use FITS pixel coordinates of the bottom-up image: i = x + 0.5, j = H + 0.5 - y.
+    const double H = static_cast<double>(height), W = static_cast<double>(width);
+    const double x0 = crpix1 - 0.5, y0 = H + 0.5 - crpix2;
+    const double m[4] = {cd[0], -cd[1], cd[2], -cd[3]};  // native = m * (image - reference)
+
+    // SIP distortion polynomials, if any.
+    std::vector<Term> terms;
+    std::vector<double> A, B;
+    int sipOrder = 0;
+    if (ctype1.size() >= 12 && ctype1.compare(ctype1.size() - 4, 4, "-SIP") == 0) {
+        double ao = 0, bo = 0;
+        if (cardNumber(kw, "A_ORDER", ao) && cardNumber(kw, "B_ORDER", bo) && ao >= 2 && bo >= 2 && ao <= 9 &&
+            bo <= 9) {
+            sipOrder = static_cast<int>(std::max(ao, bo));
+            terms = sipTerms(2, sipOrder);
+            for (const auto& t : terms) {
+                const std::string suffix = "_" + std::to_string(t.p) + "_" + std::to_string(t.q);
+                double a = 0, b = 0;
+                cardNumber(kw, "A" + suffix, a);
+                cardNumber(kw, "B" + suffix, b);
+                A.push_back(a);
+                B.push_back(b);
+            }
+        }
+    }
+
+    double lonpole = 180, latpole = 90;
+    cardNumber(kw, "LONPOLE", lonpole);
+    cardNumber(kw, "LATPOLE", latpole);
+    std::string system = toUpper(cardString(kw, "RADESYS"));
+    if (system.empty()) system = toUpper(cardString(kw, "RADECSYS"));
+    if (system != "ICRS" && system != "FK5" && system != "FK4" && system != "GCRS") system = "ICRS";
+    double equinox = 2000;
+    cardNumber(kw, "EQUINOX", equinox);
+
+    const std::string P = "PCL:AstrometricSolution:";
+    auto& out = properties;
+    out.push_back(scalarProperty("Observation:CelestialReferenceSystem", "String", system));
+    out.push_back(scalarProperty("Observation:Equinox", "Float64", formatDouble(equinox)));
+    out.push_back(vectorProperty(P + "CelestialPoleNativeCoordinates", {lonpole, latpole}));
+    out.push_back(scalarProperty(P + "CreationTime", "TimePoint", utcTimestamp()));
+    out.push_back(scalarProperty(P + "CreatorApplication", "String", std::string("xisfconv ") + kVersion));
+    out.push_back(matrixProperty(P + "LinearTransformationMatrix", 2, 2, {m[0], m[1], m[2], m[3]}));
+    out.push_back(scalarProperty(P + "ProjectionSystem", "String", projection));
+    out.push_back(vectorProperty(P + "ReferenceCelestialCoordinates", {crval1, crval2}));
+    out.push_back(vectorProperty(P + "ReferenceImageCoordinates", {x0, y0}));
+    out.push_back(vectorProperty(P + "ReferenceNativeCoordinates", {0.0, 90.0}));
+
+    size_t nPoints = 0;
+    if (sipOrder >= 2) {
+        // Sample the distortion model on a regular grid that includes the image borders. PixInsight
+        // rebuilds its thin plate splines from these control points when it loads the file.
+        const double longSide = std::max(W, H);
+        const size_t nx = std::max<size_t>(4, static_cast<size_t>(std::lround(23 * W / longSide)) + 1);
+        const size_t ny = std::max<size_t>(4, static_cast<size_t>(std::lround(23 * H / longSide)) + 1);
+        std::vector<double> image, world;
+        image.reserve(2 * nx * ny);
+        world.reserve(2 * nx * ny);
+        for (size_t r = 0; r < ny; ++r) {
+            for (size_t c = 0; c < nx; ++c) {
+                const double x = W * static_cast<double>(c) / static_cast<double>(nx - 1);
+                const double y = H * static_cast<double>(r) / static_cast<double>(ny - 1);
+                const double dx = (x + 0.5) - crpix1, dy = (H + 0.5 - y) - crpix2;
+                const double u = dx + evalPoly(terms, A, dx, dy), v = dy + evalPoly(terms, B, dx, dy);
+                image.push_back(x);
+                image.push_back(y);
+                world.push_back(cd[0] * u + cd[1] * v);
+                world.push_back(cd[2] * u + cd[3] * v);
+            }
+        }
+        nPoints = nx * ny;
+        const std::string S = P + "SplineWorldTransformation:";
+        out.push_back(vectorProperty(S + "ControlPoints:Image", std::move(image)));
+        out.push_back(vectorProperty(S + "ControlPoints:World", std::move(world)));
+        out.push_back(matrixProperty(S + "LinearApproximation", 2, 3,
+                                     {m[0], m[1], -(m[0] * x0 + m[1] * y0), m[2], m[3], -(m[2] * x0 + m[3] * y0)}));
+        // Generation parameters. The control points are exact samples of a smooth model, not
+        // measured star positions, so the splines must interpolate them: no smoothing and no
+        // surface simplification. (With ImageSolver's defaults for noisy data, smoothing 0.005
+        // and simplifiers on, PixInsight 1.9.3 missed the corner points by about 1.4 arcsec.)
+        out.push_back(scalarProperty(S + "MaxSplinePoints", "Int32", "4000"));
+        out.push_back(scalarProperty(S + "RBFType", "String", "DDMThinPlateSpline"));
+        out.push_back(scalarProperty(S + "SimplifierRejectFraction", "Float32", "0.1"));
+        out.push_back(scalarProperty(S + "SplineOrder", "Int32", "2"));
+        out.push_back(scalarProperty(S + "SplineSmoothness", "Float32", "0"));
+        out.push_back(scalarProperty(S + "Truncated", "Boolean", "false"));
+        out.push_back(scalarProperty(S + "UseSimplifiers", "Boolean", "false"));
+        out.push_back(scalarProperty(S + "Version", "String", "2.0"));
+    }
+
+    char buf[200];
+    const double scale = std::sqrt(std::fabs(det)) * 3600;
+    if (nPoints) {
+        std::snprintf(buf, sizeof buf, "PixInsight solution properties: %s, %.3f\"/px, spline with %zu control points "
+                      "from SIP order %d", projection.c_str(), scale, nPoints, sipOrder);
+    } else {
+        std::snprintf(buf, sizeof buf, "PixInsight solution properties: %s, %.3f\"/px, linear", projection.c_str(), scale);
+    }
+    summary = buf;
+    return true;
+}
+
 bool astrometricSolutionToWcs(XisfFile& file, size_t index, bool bottomUp, int sipOrder, WcsResult& out) {
     const XisfImage& img = file.images().at(index);
     const XisfProperty* proj = file.findProperty(index, kPrefix + "ProjectionSystem");

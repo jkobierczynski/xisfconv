@@ -8,6 +8,7 @@
 
 #include "common.hpp"
 #include "xisf.hpp"
+#include "xisfwrite.hpp"
 
 namespace xisfconv {
 
@@ -25,5 +26,13 @@ bool astrometricSolutionToWcs(XisfFile& file, size_t index, bool bottomUp, int s
 // reversed, i.e. converts between the bottom-up and top-down pixel conventions. Applying it twice
 // restores the original values. Returns true if WCS keywords were found.
 bool flipWcsRowOrder(std::vector<FitsKeyword>& keywords, uint64_t height);
+
+// Builds PixInsight's native astrometric solution properties (PCL:AstrometricSolution:*) from
+// FITS WCS keywords, which must be in the bottom-up convention. A SIP distortion model becomes a
+// spline world transformation described by control points sampled from the SIP polynomials, from
+// which PixInsight rebuilds its surface splines. Returns false (and says why in `summary`) when
+// the keywords hold no solution that can be expressed this way.
+bool wcsToAstrometricSolution(const std::vector<FitsKeyword>& keywords, uint64_t width, uint64_t height,
+                              std::vector<XisfOutProperty>& properties, std::string& summary);
 
 }  // namespace xisfconv

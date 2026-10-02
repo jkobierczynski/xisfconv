@@ -10,6 +10,7 @@
 namespace xisfconv {
 
 std::vector<uint8_t> base64Decode(const std::string& text);  // ignores whitespace
+std::string base64Encode(const uint8_t* data, size_t size);
 std::vector<uint8_t> hexDecode(const std::string& text);     // ignores whitespace
 
 // Each function decompresses exactly `expectedSize` bytes or throws.

@@ -46,6 +46,21 @@ std::vector<uint8_t> base64Decode(const std::string& text) {
     return out;
 }
 
+std::string base64Encode(const uint8_t* data, size_t size) {
+    static const char* alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve((size + 2) / 3 * 4);
+    for (size_t i = 0; i < size; i += 3) {
+        const uint32_t b0 = data[i], b1 = i + 1 < size ? data[i + 1] : 0, b2 = i + 2 < size ? data[i + 2] : 0;
+        const uint32_t v = b0 << 16 | b1 << 8 | b2;
+        out += alphabet[v >> 18];
+        out += alphabet[(v >> 12) & 63];
+        out += i + 1 < size ? alphabet[(v >> 6) & 63] : '=';
+        out += i + 2 < size ? alphabet[v & 63] : '=';
+    }
+    return out;
+}
+
 std::vector<uint8_t> hexDecode(const std::string& text) {
     std::vector<uint8_t> out;
     out.reserve(text.size() / 2);

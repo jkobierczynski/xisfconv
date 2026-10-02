@@ -6,7 +6,9 @@
 #include <cctype>
 #include <cerrno>
 #include <clocale>
+#include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <iostream>
 #include <limits>
 #include <sstream>
@@ -158,6 +160,29 @@ bool parseDouble(const std::string& str, double& out) {
     if (!is.eof()) return false;
     out = v;
     return true;
+}
+
+std::string formatDouble(double v) {
+    char buf[40] = "0";
+    for (int precision : {15, 16, 17}) {
+        std::snprintf(buf, sizeof buf, "%.*g", precision, v);
+        double back;
+        if (parseDouble(buf, back) && back == v) break;
+    }
+    return buf;
+}
+
+std::string utcTimestamp() {
+    const std::time_t t = std::time(nullptr);
+    std::tm tm{};
+#ifdef _WIN32
+    gmtime_s(&tm, &t);
+#else
+    gmtime_r(&t, &tm);
+#endif
+    char buf[32];
+    std::strftime(buf, sizeof buf, "%Y-%m-%dT%H:%M:%SZ", &tm);
+    return buf;
 }
 
 }  // namespace xisfconv

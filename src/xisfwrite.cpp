@@ -35,17 +35,6 @@ std::string xmlEscape(const std::string& s) {
     return out;
 }
 
-// Shortest decimal text that reads back as the same double.
-std::string formatDouble(double v) {
-    char buf[40];
-    for (int precision : {15, 16, 17}) {
-        std::snprintf(buf, sizeof buf, "%.*g", precision, v);
-        double back;
-        if (parseDouble(buf, back) && back == v) break;
-    }
-    return buf;
-}
-
 // XISF image ids must be identifiers: [A-Za-z_][A-Za-z0-9_]*
 std::string makeIdentifier(const std::string& text, size_t index, std::set<std::string>& used) {
     std::string id;
@@ -62,17 +51,18 @@ std::string makeIdentifier(const std::string& text, size_t index, std::set<std::
     return unique;
 }
 
-std::string utcNow() {
-    const std::time_t t = std::time(nullptr);
-    std::tm tm{};
-#ifdef _WIN32
-    gmtime_s(&tm, &t);
-#else
-    gmtime_r(&t, &tm);
-#endif
-    char buf[32];
-    std::strftime(buf, sizeof buf, "%Y-%m-%dT%H:%M:%SZ", &tm);
-    return buf;
+std::string propertyXml(const XisfOutProperty& p) {
+    std::string x = "<Property id=\"" + xmlEscape(p.id) + "\" type=\"" + p.type + "\"";
+    if (p.type == "String") return x + ">" + xmlEscape(p.value) + "</Property>\n";
+    if (p.type == "F64Vector" || p.type == "F64Matrix") {
+        std::vector<uint8_t> bytes(p.data.size() * 8);
+        if (!p.data.empty()) std::memcpy(bytes.data(), p.data.data(), bytes.size());
+        if (!hostIsLittleEndian()) byteSwapInPlace(bytes.data(), p.data.size(), 8);
+        if (p.type == "F64Vector") x += " length=\"" + std::to_string(p.data.size()) + "\"";
+        else x += " rows=\"" + std::to_string(p.rows) + "\" columns=\"" + std::to_string(p.columns) + "\"";
+        return x + " location=\"inline:base64\">" + base64Encode(bytes.data(), bytes.size()) + "</Property>\n";
+    }
+    return x + " value=\"" + xmlEscape(p.value) + "\"/>\n";
 }
 
 // The bytes stored for one image plus the attributes that describe them.
@@ -151,7 +141,7 @@ void writeXisf(const std::string& path, const std::vector<XisfOutImage>& images,
         ids.push_back(makeIdentifier(images[i].id, i, usedIds));
     }
 
-    const std::string created = utcNow();
+    const std::string created = utcTimestamp();
     auto buildHeader = [&](const std::vector<uint64_t>& positions) {
         std::string x;
         x += "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
@@ -181,6 +171,7 @@ void writeXisf(const std::string& path, const std::vector<XisfOutImage>& images,
                 x += "<ColorFilterArray pattern=\"" + xmlEscape(img.cfaPattern) + "\" width=\"" +
                      std::to_string(img.cfaWidth) + "\" height=\"" + std::to_string(img.cfaHeight) + "\"/>\n";
             }
+            for (const auto& p : img.properties) x += propertyXml(p);
             x += "</Image>\n";
         }
         x += "<Metadata>\n";

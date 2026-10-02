@@ -10,6 +10,16 @@
 
 namespace xisfconv {
 
+// An XISF image property. Scalars carry `value`; String properties carry it as element text;
+// F64Vector / F64Matrix properties carry `data` (row-major), written as an inline base64 block.
+struct XisfOutProperty {
+    std::string id;
+    std::string type;   // String, TimePoint, Boolean, Int32, Float32, Float64, F64Vector, F64Matrix
+    std::string value;
+    std::vector<double> data;
+    size_t rows = 0, columns = 0;  // F64Matrix only
+};
+
 struct XisfOutImage {
     const PixelBuffer* pixels = nullptr;  // host byte order, planar, rows top-down
     std::string id;                       // image identifier (made a valid, unique identifier on write)
@@ -18,6 +28,7 @@ struct XisfOutImage {
     std::vector<FitsKeyword> keywords;    // written as FITSKeyword elements, in order
     std::string cfaPattern;               // e.g. "RGGB" (empty = none)
     int cfaWidth = 0, cfaHeight = 0;
+    std::vector<XisfOutProperty> properties;
 };
 
 struct XisfWriteOptions {

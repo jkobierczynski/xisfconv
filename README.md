@@ -66,6 +66,12 @@ xisfconv --info light_0001.xisf               # geometry, codecs, FITS keywords,
   COMMENT, HIERARCH names and long strings split over CONTINUE cards.
 - Astrometry travels as WCS keywords in the FITS bottom-up convention, which is what PixInsight
   expects in XISF files; keywords of top-down FITS files are converted (CRPIX2, CD/PC, SIP terms).
+- The solution is also written as PixInsight's native `PCL:AstrometricSolution` properties, because
+  PixInsight reads only the linear part of WCS keywords. A SIP distortion model becomes a spline
+  world transformation: the SIP polynomials are sampled on a grid of control points covering the
+  image, from which PixInsight rebuilds its thin plate splines. Supported for RA/Dec axes with a
+  zenithal projection (TAN, STG, ZEA, SIN, ARC) given as a CD matrix, PC + CDELT or CDELT + CROTA2.
+  `--no-wcs` leaves the properties out.
 - Output is a monolithic XISF 1.0 file. `-c` compresses with Zstandard + byte shuffling (the same
   settings PixInsight uses; `--codec zlib` for zlib), blocks over 1 GiB are written as subblocks, and
   `--checksum sha1|sha256|sha512` adds an integrity checksum.
@@ -140,7 +146,8 @@ xisfconv [options] <file>...      # XISF -> FITS/TIFF/PNG, FITS -> XISF
                               from FITS: the rows are stored top-down (don't flip them)
       --bottom-up             from FITS: the rows are stored bottom-up, whatever ROWORDER says
       --no-property-keywords  FITS: don't derive missing keywords from XISF properties
-      --no-wcs                FITS: don't write WCS from a PixInsight astrometric solution
+      --no-wcs                to FITS: don't write WCS from a PixInsight astrometric solution
+                              to XISF: don't write PixInsight solution properties from WCS
       --sip-order <n>         FITS: SIP distortion order (2-7, default 3; 0 = linear only)
       --no-verify             don't verify data block checksums
       --codec <zlib|zstd>     XISF output: compression codec (implies -c)
@@ -186,8 +193,11 @@ trips XISF → FITS → XISF and FITS → XISF → FITS must return identical pi
 - WCS keywords in an XISF header are taken to follow the FITS bottom-up convention (PixInsight's);
   they are converted when writing top-down FITS. Distortion models other than SIP (TPV, TNX) are
   copied without that conversion.
-- FITS → XISF writes astrometry as WCS keywords, not as PixInsight's `PCL:AstrometricSolution`
-  properties, and doesn't create other XISF properties (PixInsight derives those from the keywords).
+- FITS → XISF writes the solution properties in the layout PixInsight 1.9.3 uses. Other XISF
+  properties (observation time, instrument) are not created; PixInsight derives those from the
+  keywords. Distortion other than SIP (TPV, TNX) and non-zenithal projections stay keyword-only.
+- A PixInsight spline solution that goes XISF → FITS → XISF comes back as a spline rebuilt from the
+  SIP approximation, not as the original: on the test frame the two agree to 0.5 arcsec rms.
 - FITS input: tile-compressed images (fpack) and tables are not read; BLANK pixels of integer images
   are kept as ordinary values; FITS can only be converted to XISF, not directly to TIFF or PNG.
 - XISF output is not compressed with LZ4 (zlib and Zstandard only).
@@ -199,7 +209,7 @@ trips XISF → FITS → XISF and FITS → XISF → FITS must return identical pi
 Bump the version in `src/common.hpp` and `CMakeLists.txt`, commit, then push a matching tag:
 
 ```
-git tag v0.4.0 && git push origin v0.4.0
+git tag v0.5.0 && git push origin v0.5.0
 ```
 
 CI builds and tests all three platforms and, only if every one passes, publishes a GitHub release with
@@ -215,9 +225,21 @@ exactly (row order aside), and the WCS generated from a plate solution was confi
 annotation of the converted image.
 
 In the other direction, PixInsight's FITS export converts back to an XISF whose pixels are identical
-to PixInsight's own XISF of the same image, and with `-c` the compressed data block is byte-for-byte
-the one PixInsight writes (same size, same SHA-256). Opening xisfconv's XISF files in PixInsight
-itself has not been verified yet.
+to PixInsight's own XISF of the same image. PixInsight 1.9.3 opens xisfconv's XISF files, including
+Zstandard-compressed ones with byte shuffling, and loads the astrometric solution from the WCS
+keywords with the orientation and reference pixel xisfconv intends.
+
+PixInsight reads only the linear part of WCS keywords (it reports "WCS transformation: Linear") and
+ignores the SIP distortion terms: on the 4656 x 3520 test frame that leaves the image center exact
+and the corners off by about 15 arcseconds. For that reason xisfconv also writes the solution as
+PixInsight's native properties. The control points it generates agree with PixInsight's own
+distortion model of the same image to 0.5 arcseconds rms. PixInsight 1.9.3 accepts the properties
+and rebuilds its splines from the control points, which are written for exact interpolation (no
+smoothing, no surface simplification). The image bounds PixInsight then reports agree with the SIP
+model to under 0.01 arcseconds, once one behaviour of PixInsight itself is taken into account: at
+the very border of the image its 8-pixel point grid returns the value belonging to a point
+1.33 pixels inside, so the printed corner coordinates sit about 1.4 arcseconds inside the true
+corners, with `ex`/`ey` round-trip errors of 1 to 2 pixels there.
 
 ## License
 

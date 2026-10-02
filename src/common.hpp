@@ -12,7 +12,7 @@
 
 namespace xisfconv {
 
-constexpr const char* kVersion = "0.4.0";
+constexpr const char* kVersion = "0.5.0";
 
 struct Error : std::runtime_error {
     using std::runtime_error::runtime_error;
@@ -63,5 +63,10 @@ std::string toUpper(std::string s);
 bool startsWith(const std::string& s, const std::string& prefix);
 bool parseUInt64(const std::string& s, uint64_t& out);
 bool parseDouble(const std::string& s, double& out);
+
+// Shortest decimal text that reads back as the same double.
+std::string formatDouble(double v);
+// Current UTC time as an ISO 8601 time point, e.g. 2026-10-02T02:04:05Z.
+std::string utcTimestamp();
 
 }  // namespace xisfconv
