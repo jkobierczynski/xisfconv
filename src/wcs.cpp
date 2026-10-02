@@ -81,6 +81,87 @@ std::string projectionCode(const std::string& name) {
 
 }  // namespace
 
+namespace {
+
+bool numericValue(const std::string& text, double& out) {
+    std::string v = trim(text);
+    if (v.empty() || v[0] == '\'') return false;
+    for (auto& c : v)
+        if (c == 'D' || c == 'd') c = 'E';
+    return parseDouble(v, out);
+}
+
+// Negates a numeric keyword value by editing its sign, so no digits are lost.
+void negateValue(FitsKeyword& k) {
+    double v;
+    if (!numericValue(k.value, v) || v == 0) return;
+    std::string t = trim(k.value);
+    if (t[0] == '-') t.erase(0, 1);
+    else if (t[0] == '+') t[0] = '-';
+    else t.insert(0, "-");
+    k.value = t;
+}
+
+// Parses SIP coefficient names: A_p_q, B_p_q, AP_p_q, BP_p_q. Returns false for *_ORDER etc.
+bool sipIndices(const std::string& name, bool& isB, int& q) {
+    size_t prefix;
+    if (name.compare(0, 3, "AP_") == 0) { isB = false; prefix = 3; }
+    else if (name.compare(0, 3, "BP_") == 0) { isB = true; prefix = 3; }
+    else if (name.compare(0, 2, "A_") == 0) { isB = false; prefix = 2; }
+    else if (name.compare(0, 2, "B_") == 0) { isB = true; prefix = 2; }
+    else return false;
+    const auto parts = split(name.substr(prefix), '_');
+    uint64_t p = 0, qq = 0;
+    if (parts.size() != 2 || !parseUInt64(parts[0], p) || !parseUInt64(parts[1], qq)) return false;
+    q = static_cast<int>(qq);
+    return true;
+}
+
+}  // namespace
+
+bool flipWcsRowOrder(std::vector<FitsKeyword>& keywords, uint64_t height) {
+    bool hasWcs = false, hasCd = false, hasPc = false;
+    for (const auto& k : keywords) {
+        const std::string n = toUpper(trim(k.name));
+        if (n == "CRPIX2" || n == "CTYPE1") hasWcs = true;
+        if (n.compare(0, 2, "CD") == 0 && n.size() == 5 && n[3] == '_') hasCd = true;
+        if (n.compare(0, 2, "PC") == 0 && n.size() == 5 && n[3] == '_') hasPc = true;
+        if (n == "CTYPE1") {
+            const std::string t = toUpper(k.value);
+            if (t.find("TPV") != std::string::npos || t.find("TNX") != std::string::npos ||
+                t.find("ZPX") != std::string::npos) {
+                warn("WCS uses a distortion model other than SIP; its coefficients are not adjusted for the "
+                     "changed row order");
+            }
+        }
+    }
+    if (!hasWcs) return false;
+    for (auto& k : keywords) {
+        const std::string n = toUpper(trim(k.name));
+        double v;
+        bool isB = false;
+        int q = 0;
+        if (n == "CRPIX2") {
+            if (numericValue(k.value, v)) {
+                char buf[40];
+                std::snprintf(buf, sizeof buf, "%.15G", static_cast<double>(height) + 1.0 - v);
+                std::string s = buf;
+                if (s.find_first_of(".E") == std::string::npos) s += ".0";
+                k.value = s;
+            }
+        } else if (n == "CD1_2" || n == "CD2_2" || n == "PC1_2" || n == "PC2_2" || n == "PC001002" ||
+                   n == "PC002002") {
+            negateValue(k);
+        } else if (n == "CDELT2" && !hasCd && !hasPc) {
+            negateValue(k);
+        } else if (sipIndices(n, isB, q)) {
+            // v -> -v: x-distortion terms change sign for odd powers of v, y-distortion terms for even ones.
+            if ((q % 2 == 1) != isB) negateValue(k);
+        }
+    }
+    return true;
+}
+
 bool astrometricSolutionToWcs(XisfFile& file, size_t index, bool bottomUp, int sipOrder, WcsResult& out) {
     const XisfImage& img = file.images().at(index);
     const XisfProperty* proj = file.findProperty(index, kPrefix + "ProjectionSystem");

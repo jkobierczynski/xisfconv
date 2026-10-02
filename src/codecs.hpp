@@ -18,6 +18,14 @@ std::vector<uint8_t> lz4BlockDecompress(const uint8_t* src, size_t srcSize, size
 std::vector<uint8_t> zstdDecompress(const uint8_t* src, size_t srcSize, size_t expectedSize);
 bool zstdAvailable();
 
+// Compressors used when writing XISF. zstdCompress throws if the build has no Zstandard support.
+std::vector<uint8_t> zlibCompress(const uint8_t* src, size_t srcSize, int level = 6);
+std::vector<uint8_t> zstdCompress(const uint8_t* src, size_t srcSize, int level = 3);
+
+// XISF byte shuffling: all first bytes of each item, then all second bytes, ...
+// Trailing bytes that do not form a full item are left in place.
+std::vector<uint8_t> shuffled(const uint8_t* data, size_t size, size_t itemSize);
+
 // Reverses XISF byte shuffling. Trailing bytes that do not form a full item are left in place.
 void unshuffle(std::vector<uint8_t>& data, size_t itemSize);
 

@@ -207,7 +207,52 @@ std::vector<uint8_t> zstdDecompress(const uint8_t* src, size_t srcSize, size_t e
 #endif
 }
 
+// ---------------------------------------------------------------- compression
+
+std::vector<uint8_t> zlibCompress(const uint8_t* src, size_t srcSize, int level) {
+    if (srcSize > 0x7FFFFFFFu) throw Error("zlib: block too large (compress in subblocks)");
+    uLongf destLen = compressBound(static_cast<uLong>(srcSize));
+    std::vector<uint8_t> out(destLen);
+    if (compress2(out.data(), &destLen, src, static_cast<uLong>(srcSize), level) != Z_OK) {
+        throw Error("zlib: compression failed");
+    }
+    out.resize(destLen);
+    return out;
+}
+
+std::vector<uint8_t> zstdCompress(const uint8_t* src, size_t srcSize, int level) {
+#ifdef XISFCONV_HAVE_ZSTD
+    std::vector<uint8_t> out(ZSTD_compressBound(srcSize));
+    const size_t r = ZSTD_compress(out.data(), out.size(), src, srcSize, level);
+    if (ZSTD_isError(r)) throw Error(std::string("zstd: ") + ZSTD_getErrorName(r));
+    out.resize(r);
+    return out;
+#else
+    (void)src;
+    (void)srcSize;
+    (void)level;
+    throw Error("this build has no Zstandard support (use --codec zlib, or rebuild with libzstd)");
+#endif
+}
+
 // ---------------------------------------------------------------- byte shuffling
+
+std::vector<uint8_t> shuffled(const uint8_t* data, size_t size, size_t itemSize) {
+    std::vector<uint8_t> out(size);
+    if (itemSize <= 1 || size < itemSize) {
+        std::copy(data, data + size, out.begin());
+        return out;
+    }
+    const size_t n = size / itemSize;
+    for (size_t b = 0; b < itemSize; ++b) {
+        uint8_t* d = out.data() + b * n;
+        const uint8_t* s = data + b;
+        for (size_t i = 0; i < n; ++i, s += itemSize) d[i] = *s;
+    }
+    const size_t tail = n * itemSize;
+    std::copy(data + tail, data + size, out.begin() + static_cast<std::ptrdiff_t>(tail));
+    return out;
+}
 
 void unshuffle(std::vector<uint8_t>& data, size_t itemSize) {
     if (itemSize <= 1 || data.size() < itemSize) return;

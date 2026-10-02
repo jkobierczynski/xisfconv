@@ -21,4 +21,9 @@ struct WcsResult {
 // Returns false if the image carries no usable astrometric solution.
 bool astrometricSolutionToWcs(XisfFile& file, size_t index, bool bottomUp, int sipOrder, WcsResult& out);
 
+// Rewrites WCS keywords (CRPIX2, CD/PC/CDELT, SIP coefficients) for an image whose row order is
+// reversed, i.e. converts between the bottom-up and top-down pixel conventions. Applying it twice
+// restores the original values. Returns true if WCS keywords were found.
+bool flipWcsRowOrder(std::vector<FitsKeyword>& keywords, uint64_t height);
+
 }  // namespace xisfconv

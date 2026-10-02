@@ -120,6 +120,30 @@ void keywordCards(const FitsKeyword& k, std::vector<std::string>& cards) {
             warn("value of keyword '" + rawName + "' does not fit in a FITS card; skipped");
             return;
         }
+        if (!hierarch) {
+            // Long-string convention: split the value over CONTINUE cards, each piece but the
+            // last ending in '&'. A quote counts double because it is written as ''.
+            std::vector<std::string> pieces(1);
+            size_t used = 0;
+            for (char c : stringContent) {
+                const size_t w = c == '\'' ? 2 : 1;
+                if (used + w > 66) {  // leave room for the '&'
+                    pieces.emplace_back();
+                    used = 0;
+                }
+                pieces.back() += c;
+                if (c == '\'') pieces.back() += '\'';
+                used += w;
+            }
+            for (size_t i = 0; i < pieces.size(); ++i) {
+                const bool last = i + 1 == pieces.size();
+                std::string card = (i == 0 ? prefix : std::string("CONTINUE  ")) + "'" + pieces[i] +
+                                   (last ? "" : "&") + "'";
+                if (last && !comment.empty() && card.size() + 3 < 80) card += " / " + comment;
+                cards.push_back(finishCard(card));
+            }
+            return;
+        }
         // Shorten the string, keeping doubled quotes intact.
         std::string s = stringContent;
         while (!s.empty() && fitsString(s).size() > room) s.pop_back();
@@ -278,12 +302,25 @@ void writeFits(const std::string& path, const std::vector<FitsHdu>& hdus) {
         if (!hdu.extname.empty()) cards.push_back(valueCard("EXTNAME", fitsString(sanitize(hdu.extname)), "image identifier"));
         cards.push_back(valueCard("ROWORDER", fitsString(hdu.bottomUp ? "BOTTOM-UP" : "TOP-DOWN"), "order of image rows"));
 
+        std::vector<std::string> userCards;
+        bool hasLongStrn = false;
         for (const auto& k : hdu.keywords) {
             if (isReservedFitsKeyword(k.name)) continue;
             if (!hdu.extname.empty() && toUpper(trim(k.name)) == "EXTNAME") continue;
             if (h == 0 && toUpper(trim(k.name)) == "PROGRAM") continue;
-            keywordCards(k, cards);
+            if (toUpper(trim(k.name)) == "LONGSTRN") hasLongStrn = true;
+            keywordCards(k, userCards);
         }
+        if (!hasLongStrn) {
+            // Announce the long-string convention when CONTINUE cards are present.
+            for (const auto& c : userCards) {
+                if (c.compare(0, 10, "CONTINUE  ") == 0) {
+                    cards.push_back(valueCard("LONGSTRN", fitsString("OGIP 1.0"), "The OGIP long string convention may be used"));
+                    break;
+                }
+            }
+        }
+        cards.insert(cards.end(), userCards.begin(), userCards.end());
         cards.push_back(finishCard("END"));
 
         std::string header;

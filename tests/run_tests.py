@@ -393,7 +393,7 @@ def test_keywords_and_properties():
     write_xisf(path, [entry])
     out = os.path.join(TMP, "keywords.fits")
     r = run(path, "-o", out, "-f")
-    check("truncated" in r.stderr, "long string keyword should warn about truncation")
+    check("truncated" not in r.stderr, "long strings are written with CONTINUE, not truncated")
     _, hdr = fits_planes(out)
     check(hdr["OBJECT"] == "M 31 & friends", f"OBJECT={hdr.get('OBJECT')!r}")
     check(hdr["OBSERVER"] == "O'Brien", f"OBSERVER={hdr.get('OBSERVER')!r}")
@@ -413,7 +413,7 @@ def test_keywords_and_properties():
     check(hdr["EXTNAME"] == "integration", "EXTNAME from image id")
     check(hdr["ROWORDER"] == "BOTTOM-UP", "ROWORDER default")
     check(hdr["PSFFLX00"] == 17870.0, "lower-case exponent value")
-    check(len(hdr["NOTES"]) < 90 and hdr["NOTES"].startswith("yyy"), "long string truncated")
+    check(hdr["NOTES"] == "y" * 90, f"long string written with CONTINUE cards ({len(hdr['NOTES'])} chars)")
 
     # --no-property-keywords
     run(path, "-o", out, "-f", "-q", "--no-property-keywords")
@@ -699,6 +699,20 @@ def test_wcs():
     run(p, "-o", out, "-f", "-q", "--no-wcs")
     check("CTYPE1" not in fits.getheader(out), "--no-wcs")
 
+    # FITS -> XISF -> FITS keeps the astrometry (including SIP) in every row-order combination
+    for first in ([], ["--top-down"]):
+        f1 = os.path.join(TMP, "wcs_rt1.fits")
+        x2 = os.path.join(TMP, "wcs_rt.xisf")
+        run(p, "-o", f1, "-f", "-q", *first)
+        run(f1, "-o", x2, "-f", "-q")
+        compare(f"WCS round trip pixels ({first or 'bottom-up'})", XISF.read(x2), a)
+        for second, bottom in (([], True), (["--top-down"], False)):
+            f2 = os.path.join(TMP, "wcs_rt2.fits")
+            run(x2, "-o", f2, "-f", "-q", *second)
+            err, hdr = star_error(f2, uv, bottom)
+            check(err < 0.02 and hdr["CTYPE1"] == "RA---TAN-SIP",
+                  f"WCS after FITS{first}->XISF->FITS{second}: max error {err:.4f} arcsec")
+
 
 # ---------------------------------------------------------------- PNG output
 
@@ -827,6 +841,311 @@ def test_png():
     check("only" in r.stderr, "PNG multi-image warning")
 
 
+# ---------------------------------------------------------------- FITS -> XISF
+
+def fits_expected(path, hdu=0, flip=True):
+    """What the XISF pixels should be, using astropy as the independent FITS reader: HxWxC, top-down."""
+    d = np.array(fits.getdata(path, hdu))
+    if d.ndim == 2:
+        d = d[None]
+    d = np.transpose(d, (1, 2, 0))
+    d = d[::-1] if flip else d
+    return np.ascontiguousarray(d.astype(d.dtype.newbyteorder("=")))
+
+
+def read_xisf_any(path, n=0):
+    """Reads image n as HxWxC. Uses the `xisf` package when it can, otherwise a small independent
+    decoder (the package implements neither subblocks nor UInt64). Checksums are verified here."""
+    import re
+    raw = open(path, "rb").read()
+    hlen = int.from_bytes(raw[8:12], "little")
+    tag = re.findall(r"<Image [^>]*>", raw[16:16 + hlen].decode())[n]
+    attr = dict(re.findall(r'(\w+)="([^"]*)"', tag))
+    _, pos, size = attr["location"].split(":")
+    stored = raw[int(pos):int(pos) + int(size)]
+    if "checksum" in attr:
+        algo, digest = attr["checksum"].split(":")
+        assert hashlib.new(algo.replace("-", ""), stored).hexdigest() == digest, "checksum mismatch in " + path
+    if "subblocks" not in attr and attr["sampleFormat"] != "UInt64":
+        return XISF(path).read_image(n)
+    w, h, c = [int(v) for v in attr["geometry"].split(":")]
+    dtype = np.dtype({v: k for k, v in SF.items()}[attr["sampleFormat"]])
+    data = stored
+    if "compression" in attr:
+        parts = attr["compression"].split(":")
+        codec = parts[0].split("+")[0]
+        dec = (lambda b, u: zlib.decompress(b)) if codec == "zlib" else \
+              (lambda b, u: zstandard.decompress(b, max_output_size=u))
+        if "subblocks" in attr:
+            out, off = b"", 0
+            for pair in attr["subblocks"].split(":"):
+                cs, us = [int(v) for v in pair.split(",")]
+                out += dec(stored[off:off + cs], us)
+                off += cs
+            assert off == len(stored)
+            data = out
+        else:
+            data = dec(stored, int(parts[1]))
+        assert len(data) == int(parts[1])
+        if parts[0].endswith("+sh"):
+            item = int(parts[2])
+            cnt = len(data) // item
+            data = np.frombuffer(data[:cnt * item], np.uint8).reshape(item, cnt).T.tobytes() + data[cnt * item:]
+    return np.transpose(np.frombuffer(data, dtype.newbyteorder("<")).reshape(c, h, w), (1, 2, 0)).astype(dtype)
+
+
+def unq(value):
+    """FITS string value without its enclosing quotes (the xisf package strips them, the spec keeps them)."""
+    v = value.strip()
+    return v[1:-1] if len(v) >= 2 and v[0] == "'" and v[-1] == "'" else v
+
+
+def xisf_keywords(path, n=0):
+    return XISF(path).get_images_metadata()[n]["FITSKeywords"]
+
+
+def test_fits_to_xisf_formats():
+    rng = np.random.default_rng(11)
+    H, W = 21, 34
+    ramp = (np.mgrid[0:H, 0:W][0] * 97 + np.mgrid[0:H, 0:W][1] * 13)
+    cases = {
+        # name: (data written by astropy, expected XISF dtype)
+        "u8": (test_image(np.uint8, H, W, 1, 1)[..., 0], np.uint8),
+        "i16_nonneg": ((ramp % 30000).astype(np.int16), np.uint16),
+        "i16_negative": ((ramp % 30000 - 15000).astype(np.int16), np.float32),
+        "u16": (test_image(np.uint16, H, W, 1, 2)[..., 0], np.uint16),
+        "i32_negative": ((ramp * 100000 - 7).astype(np.int32), np.float64),
+        "u32": (test_image(np.uint32, H, W, 1, 3)[..., 0], np.uint32),
+        "i64_nonneg": ((ramp.astype(np.int64) * 10**12), np.uint64),
+        "f32": (test_image(np.float32, H, W, 1, 4)[..., 0], np.float32),
+        "f64": (test_image(np.float64, H, W, 1, 5)[..., 0], np.float64),
+        "rgb_u16": (as_planes(test_image(np.uint16, H, W, 3, 6)), np.uint16),
+        "rgb_f32": (as_planes(test_image(np.float32, H, W, 3, 7)), np.float32),
+    }
+    variants = [[], ["-c"], ["--codec", "zlib"], ["-c", "--checksum", "sha1"], ["--checksum", "sha512"],
+                ["--codec", "zlib", "--checksum", "sha256", "--xisf-subblock-size", "700"],
+                ["-c", "--xisf-subblock-size", "1000"]]
+    for k, (name, (data, want)) in enumerate(cases.items()):
+        src = os.path.join(TMP, f"f2x_{name}.fits")
+        fits.PrimaryHDU(data).writeto(src, overwrite=True)
+        exp = fits_expected(src)
+        for j, flags in enumerate([variants[k % len(variants)], variants[(k + 3) % len(variants)]]):
+            out = os.path.join(TMP, f"f2x_{name}_{j}.xisf")
+            run(src, "-o", out, "-f", "-q", *flags)
+            got = read_xisf_any(out)
+            label = f"FITS {name} -> XISF {' '.join(flags) or 'plain'}"
+            check(got.dtype == np.dtype(want), f"{label}: dtype {got.dtype}, expected {np.dtype(want)}")
+            compare(label, got, exp.astype(want))
+            # and back: xisfconv must read its own XISF and reproduce the FITS values
+            back = out + ".fits"
+            run(out, "-o", back, "-f", "-q")
+            got2, _ = fits_planes(back)
+            compare(f"{label} -> FITS", got2, as_planes(exp.astype(want)))
+        if name in ("u16", "rgb_f32"):
+            m = XISF(out).get_images_metadata()[0]
+            check(m["geometry"] == (W, H, exp.shape[2]) and m["colorSpace"] == ("RGB" if exp.shape[2] == 3 else "Gray"),
+                  f"{name}: geometry/colorSpace {m['geometry']} {m['colorSpace']}")
+
+    # arbitrary BSCALE/BZERO are applied (astropy is the oracle)
+    src = os.path.join(TMP, "f2x_scaled.fits")
+    hdu = fits.PrimaryHDU((ramp % 2000).astype(np.int16))
+    hdu.scale("int16", bscale=0.5, bzero=10)
+    hdu.writeto(src, overwrite=True)
+    hdr = fits.getheader(src)
+    check(hdr.get("BSCALE") == 0.5 and hdr.get("BZERO") == 10, "test FITS really has BSCALE/BZERO")
+    out = os.path.join(TMP, "f2x_scaled.xisf")
+    run(src, "-o", out, "-f", "-q")
+    got = XISF.read(out)
+    check(got.dtype == np.float32 and np.allclose(got, fits_expected(src), rtol=0, atol=1e-4), "BSCALE/BZERO applied")
+
+    # subblocks really are written, and compression attributes are what PixInsight uses
+    src = os.path.join(TMP, "f2x_u16.fits")
+    out = os.path.join(TMP, "f2x_sub.xisf")
+    run(src, "-o", out, "-f", "-q", "-c", "--xisf-subblock-size", "500", "--checksum", "sha256")
+    info = run(out, "--info").stdout
+    check("subblocks:" in info and "zstd+sh:" in info and "checksum:    sha256:" in info, "subblocks/codec/checksum attributes")
+    compare("subblocked XISF read by the independent decoder", read_xisf_any(out), fits_expected(src))
+    check(open(out, "rb").read(8) == b"XISF0100", "XISF signature")
+
+
+def test_fits_to_xisf_metadata():
+    H, W = 20, 30
+    a = test_image(np.uint16, H, W, 1, 31)[..., 0]
+    long_text = "A long description " + "x" * 90 + " end"
+    hdu = fits.PrimaryHDU(a)
+    h = hdu.header
+    h["OBJECT"] = ("M 31 & friends", "target <name>")
+    h["OBSERVER"] = "O'Brien"
+    h["EXPTIME"] = (300.5, "seconds")
+    h["GAIN"] = 120
+    h["FLAG"] = True
+    h["LONGSTR"] = long_text
+    h["HIERARCH ESO DET CHIP TEMP"] = (-10.5, "deg C")
+    h["BAYERPAT"] = "RGGB"
+    h["HISTORY"] = "calibrated with master dark"
+    h["COMMENT"] = "a comment line"
+    src = os.path.join(TMP, "f2x_meta.fits")
+    hdu.writeto(src, overwrite=True)
+    check("CONTINUE" in open(src, "rb").read(5760).decode("ascii", "replace"), "test FITS uses CONTINUE cards")
+
+    out = os.path.join(TMP, "f2x_meta.xisf")
+    r = run(src, "-o", out, "-f")
+    check("flipped" in r.stderr, "reports the row flip")
+    kw = xisf_keywords(out)
+    v = lambda k: kw[k][0]["value"]
+    check(unq(v("OBJECT")) == "M 31 & friends" and kw["OBJECT"][0]["comment"] == "target <name>", f"OBJECT {kw.get('OBJECT')}")
+    check(unq(v("OBSERVER")) == "O''Brien", f"OBSERVER {v('OBSERVER')}")
+    header_xml = open(out, "rb").read(6000).decode("ascii", "replace")
+    check("value=\"'M 31 &amp; friends'\"" in header_xml and "value=\"'O''Brien'\"" in header_xml,
+          "string keyword values keep their FITS quotes in the XML, as PixInsight writes them")
+    check(float(v("EXPTIME")) == 300.5 and v("GAIN") == "120" and v("FLAG") == "T", "numeric/logical keywords")
+    check(unq(v("LONGSTR")) == long_text, f"CONTINUE joined: {v('LONGSTR')[:40]}...")
+    check(float(v("ESO DET CHIP TEMP")) == -10.5, "HIERARCH keyword")
+    check(any("calibrated with master dark" in e["comment"] for e in kw["HISTORY"]), "HISTORY kept")
+    check(any("Converted from FITS by xisfconv" in e["comment"] for e in kw["HISTORY"]), "provenance HISTORY")
+    check(any("a comment line" in e["comment"] for e in kw["COMMENT"]), "COMMENT kept")
+    for structural in ("SIMPLE", "BITPIX", "NAXIS", "NAXIS1", "BZERO", "BSCALE", "EXTEND", "ROWORDER"):
+        check(structural not in kw, f"{structural} must not be copied")
+    # even image height: flipping the rows turns RGGB into GBRG, in the keyword and the CFA element
+    check(unq(v("BAYERPAT")) == "GBRG", f"BAYERPAT flipped with the rows: {v('BAYERPAT')}")
+    info = run(out, "--info").stdout
+    check("CFA:         GBRG (2x2)" in info, "ColorFilterArray element written")
+    check('Image 0 "f2x_meta"' in info, "image id from the file name")
+
+    # back to FITS: keywords survive the round trip
+    back = os.path.join(TMP, "f2x_meta_back.fits")
+    run(out, "-o", back, "-f", "-q")
+    hb = fits.getheader(back)
+    check(hb["LONGSTR"] == long_text, "long string survives FITS -> XISF -> FITS")
+    check(hb["OBJECT"] == "M 31 & friends" and hb["OBSERVER"] == "O'Brien" and hb["EXPTIME"] == 300.5 and
+          hb["GAIN"] == 120 and hb["FLAG"] is True and hb["BAYERPAT"] == "RGGB" and
+          hb["ESO DET CHIP TEMP"] == -10.5, "keywords after FITS -> XISF -> FITS")
+    compare("pixels after FITS -> XISF -> FITS", np.array(fits.getdata(back)), a)
+
+    # row order: ROWORDER keyword and the command-line overrides
+    exp_flip, exp_keep = fits_expected(src), fits_expected(src, flip=False)
+    top = os.path.join(TMP, "f2x_top.fits")
+    hdu.header["ROWORDER"] = "TOP-DOWN"
+    hdu.writeto(top, overwrite=True)
+    for path, flags, exp, pattern, what in (
+            (top, [], exp_keep, "RGGB", "ROWORDER=TOP-DOWN is honoured"),
+            (top, ["--bottom-up"], exp_flip, "GBRG", "--bottom-up overrides ROWORDER"),
+            (src, ["--top-down"], exp_keep, "RGGB", "--top-down without ROWORDER"),
+            (src, [], exp_flip, "GBRG", "no ROWORDER means bottom-up")):
+        run(path, "-o", out, "-f", "-q", *flags)
+        compare(what, XISF.read(out), exp)
+        check(unq(xisf_keywords(out)["BAYERPAT"][0]["value"]) == pattern, f"{what}: BAYERPAT {pattern}")
+
+    # --info on a FITS file
+    info = run(top, "--info").stdout
+    check("BITPIX 16" in info and "top-down (ROWORDER)" in info and "OBSERVER" in info, "--info for FITS input")
+
+
+def test_fits_to_xisf_bounds_bits_hdus():
+    H, W = 12, 16
+    base = test_image(np.float32, H, W, 1, 41)[..., 0]
+    out = os.path.join(TMP, "f2x_b.xisf")
+
+    def bounds_of(data, *flags):
+        src = os.path.join(TMP, "f2x_b.fits")
+        fits.PrimaryHDU(data).writeto(src, overwrite=True)
+        r = run(src, "-o", out, "-f", *flags)
+        line = [l for l in run(out, "--info").stdout.splitlines() if "bounds:" in l][0]
+        lo, hi = [float(x) for x in line.split("bounds:")[1].split(":")]
+        compare(f"float data unchanged ({flags})", XISF.read(out), fits_expected(src))
+        return lo, hi, r.stderr
+
+    lo, hi, err = bounds_of(base)
+    check((lo, hi) == (0, 1) and "bounds" not in err, f"data in [0,1] -> bounds 0:1 ({lo}:{hi})")
+    lo, hi, err = bounds_of((base * 40000).astype(np.float32))
+    check((lo, hi) == (0, 65535) and "0:65535" in err, f"ADU-range floats -> bounds 0:65535 ({lo}:{hi})")
+    neg = (base * 10 - 3).astype(np.float32)
+    lo, hi, err = bounds_of(neg)
+    attr = open(out, "rb").read(3000).decode("ascii", "replace").split('bounds="')[1].split('"')[0]
+    lo, hi = [float(x) for x in attr.split(":")]
+    check(lo == float(neg.min()) and hi == float(neg.max()), f"other floats -> min:max ({lo}:{hi})")
+    lo, hi, err = bounds_of(neg, "--bounds", "-5:20")
+    check((lo, hi) == (-5, 20), "--bounds override")
+
+    # --bits
+    u16 = test_image(np.uint16, H, W, 1, 42)[..., 0]
+    src = os.path.join(TMP, "f2x_bits.fits")
+    fits.PrimaryHDU(u16).writeto(src, overwrite=True)
+    run(src, "-o", out, "-f", "-q", "-b", "f32")
+    compare("FITS u16 -> XISF f32", XISF.read(out), (fits_expected(src) / 65535.0).astype(np.float32))
+    fits.PrimaryHDU(base).writeto(src, overwrite=True)
+    run(src, "-o", out, "-f", "-q", "-b", "u16")
+    exp = np.floor(np.clip(fits_expected(src).astype(np.float64), 0, 1) * 65535 + 0.5).astype(np.uint16)
+    compare("FITS f32 -> XISF u16", XISF.read(out), exp)
+
+    # several HDUs: image extensions become XISF images, tables are skipped
+    a = test_image(np.uint16, H, W, 3, 43)
+    b = test_image(np.float32, 9, 7, 1, 44)[..., 0]
+    table = fits.BinTableHDU.from_columns([fits.Column(name="x", format="E", array=np.arange(5.0))])
+    src = os.path.join(TMP, "f2x_multi.fits")
+    fits.HDUList([fits.PrimaryHDU(as_planes(a)), table, fits.ImageHDU(b, name="MASK 1")]).writeto(src, overwrite=True)
+    r = run(src, "-o", out, "-f")
+    check("BINTABLE" in r.stderr and "not an image" in r.stderr, "table HDU reported as skipped")
+    x = XISF(out)
+    meta = x.get_images_metadata()
+    check(len(meta) == 2, f"two images written ({len(meta)})")
+    compare("multi-HDU image 0", x.read_image(0), fits_expected(src, 0))
+    compare("multi-HDU image 1", x.read_image(1), fits_expected(src, 2))
+    info = run(out, "--info").stdout
+    check('Image 1 "MASK_1"' in info, "EXTNAME becomes a valid image id")
+    run(src, "-o", out, "-f", "-q", "-i", "1")
+    compare("--image 1 on FITS", XISF.read(out), fits_expected(src, 2))
+
+    # empty primary HDU followed by an image extension
+    src = os.path.join(TMP, "f2x_emptyprimary.fits")
+    fits.HDUList([fits.PrimaryHDU(), fits.ImageHDU(b)]).writeto(src, overwrite=True)
+    run(src, "-o", out, "-f", "-q")
+    compare("empty primary + extension", XISF.read(out), fits_expected(src, 1))
+
+    # default output name and format, batch of mixed inputs
+    d = os.path.join(TMP, "f2x_batch")
+    os.makedirs(d, exist_ok=True)
+    fpath, xpath = os.path.join(d, "one.fits"), os.path.join(d, "two.xisf")
+    fits.PrimaryHDU(u16).writeto(fpath, overwrite=True)
+    XISF.write(xpath, u16[..., None])
+    run(fpath, xpath, "-f", "-q")
+    check(os.path.exists(os.path.join(d, "one.xisf")) and os.path.exists(os.path.join(d, "two.fits")),
+          "mixed batch: each input converted to the other format")
+
+    # errors
+    r = run(fpath, "-t", "tiff", "-f", expect_ok=False)
+    check(r.returncode == 1 and "only be converted to XISF" in r.stderr, "FITS -> TIFF is refused clearly")
+    r = run(fpath, "-s", "-f", expect_ok=False)
+    check(r.returncode == 1 and "--stretch" in r.stderr, "--stretch refused for XISF output")
+    r = run(xpath, "-t", "xisf", "-f", expect_ok=False)
+    check(r.returncode == 1 and "already an XISF" in r.stderr, "XISF -> XISF is refused clearly")
+    r = run(fpath, expect_ok=False)
+    check(r.returncode == 1 and "already exists" in r.stderr, "refuses to overwrite an XISF without --force")
+    data = open(fpath, "rb").read()
+    trunc = os.path.join(d, "trunc.fits")
+    open(trunc, "wb").write(data[:2880 + 100])
+    r = run(trunc, "-f", expect_ok=False)
+    check(r.returncode == 1 and "beyond the end" in r.stderr, "truncated FITS reported")
+    check(not os.path.exists(os.path.join(d, "trunc.xisf.part")), "no partial XISF left behind")
+
+
+def test_xisf_fits_xisf_roundtrip():
+    """XISF -> FITS -> XISF returns the original pixels for every format and both row orders."""
+    for dtype in (np.uint8, np.uint16, np.uint32, np.uint64, np.float32, np.float64):
+        for c in (1, 3):
+            a = test_image(dtype, 15, 22, c, 51)
+            p = os.path.join(TMP, f"rt_{np.dtype(dtype).name}_{c}.xisf")
+            write_xisf(p, [image_entry(a, codec="zlib", shuffle_item=np.dtype(dtype).itemsize)])
+            for flags in ([], ["--top-down"]):
+                f = p + ".fits"
+                back = p + ".back.xisf"
+                run(p, "-o", f, "-f", "-q", *flags)
+                run(f, "-o", back, "-f", "-q", "-c")
+                got = read_xisf_any(back)
+                check(got.dtype == np.dtype(dtype), f"round trip {np.dtype(dtype).name}: dtype {got.dtype}")
+                compare(f"XISF -> FITS{flags} -> XISF {np.dtype(dtype).name} {c}ch", got, a)
+
+
 if __name__ == "__main__":
     print("xisfconv:", EXE)
     print(subprocess.run([EXE, "--version"], capture_output=True, text=True).stdout.strip())
@@ -837,7 +1156,9 @@ if __name__ == "__main__":
            else "no -- compressed float TIFF checks will be SKIPPED (pip install imagecodecs)"))
     for t in (test_python_xisf_codecs, test_hand_written, test_checksum_mismatch, test_truncated_and_garbage,
               test_keywords_and_properties, test_multi_image_icc_resolution, test_bits_conversion,
-              test_batch_and_outdir, test_stretch, test_wcs, test_tiff_predictors, test_png):
+              test_batch_and_outdir, test_stretch, test_wcs, test_tiff_predictors, test_png,
+              test_fits_to_xisf_formats, test_fits_to_xisf_metadata, test_fits_to_xisf_bounds_bits_hdus,
+              test_xisf_fits_xisf_roundtrip):
         try:
             t()
         except Exception as e:  # noqa: BLE001
