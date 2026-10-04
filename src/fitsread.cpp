@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Jurgen Kobierczynski
 #include "fitsread.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <fstream>
 #include <limits>
@@ -311,6 +312,138 @@ bool looksLikeFits(const std::string& path) {
     char buf[9] = {};
     in.read(buf, 9);
     return in.gcount() == 9 && std::string(buf, 9) == "SIMPLE  =";
+}
+
+namespace {
+
+// 32-bit ones' complement sum of big-endian words (the FITS checksum convention) over `size`
+// bytes at `pos`. A last incomplete word counts as if it were padded with zeros, as do the
+// missing bytes of a data unit that was left unpadded.
+uint32_t onesComplementSum(std::ifstream& in, uint64_t pos, uint64_t size) {
+    std::vector<uint8_t> buf(static_cast<size_t>(std::min<uint64_t>(size + 4, 1u << 20)));
+    uint64_t sum = 0;
+    in.clear();
+    in.seekg(static_cast<std::streamoff>(pos));
+    while (size > 0) {
+        const size_t n = static_cast<size_t>(std::min<uint64_t>(size, 1u << 20));
+        if (!in.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(n))) throw Error("read error");
+        size_t words = n;
+        while (words % 4 != 0) buf[words++] = 0;  // only at the very end (the chunk size is a multiple of 4)
+        for (size_t i = 0; i < words; i += 4) {
+            sum += (static_cast<uint32_t>(buf[i]) << 24) | (static_cast<uint32_t>(buf[i + 1]) << 16) |
+                   (static_cast<uint32_t>(buf[i + 2]) << 8) | buf[i + 3];
+        }
+        sum = (sum & 0xFFFFFFFFull) + (sum >> 32);  // fold per chunk, so the accumulator cannot overflow
+        size -= n;
+    }
+    while (sum >> 32) sum = (sum & 0xFFFFFFFFull) + (sum >> 32);
+    return static_cast<uint32_t>(sum);
+}
+
+uint32_t onesComplementAdd(uint32_t a, uint32_t b) {
+    uint64_t sum = static_cast<uint64_t>(a) + b;
+    while (sum >> 32) sum = (sum & 0xFFFFFFFFull) + (sum >> 32);
+    return static_cast<uint32_t>(sum);
+}
+
+}  // namespace
+
+VerifyReport verifyFits(const std::string& path) {
+    VerifyReport report;
+    std::ifstream in(path, std::ios::binary);
+    if (!in) throw Error("cannot open file");
+    in.seekg(0, std::ios::end);
+    const uint64_t fileSize = static_cast<uint64_t>(in.tellg());
+
+    uint64_t pos = 0;
+    size_t hdus = 0;
+    for (size_t hduIndex = 0;; ++hduIndex) {
+        Header hdr;
+        const uint64_t headerPos = pos;
+        if (!readHeader(in, fileSize, pos, hdr, hduIndex == 0)) {
+            // Whatever follows the last HDU must be padding. Anything else is the remains of an
+            // HDU: a cut-off header, or one whose first card is damaged.
+            pos = headerPos;
+            uint64_t stray = 0;
+            in.clear();
+            in.seekg(static_cast<std::streamoff>(pos));
+            std::vector<char> buf(65536);
+            for (uint64_t left = fileSize - pos; left > 0;) {
+                const size_t n = static_cast<size_t>(std::min<uint64_t>(left, buf.size()));
+                if (!in.read(buf.data(), static_cast<std::streamsize>(n))) throw Error("read error");
+                for (size_t i = 0; i < n; ++i)
+                    if (buf[i] != 0 && buf[i] != ' ') ++stray;
+                left -= n;
+            }
+            if (stray) {
+                report.problems.push_back(std::to_string(fileSize - pos) + " bytes after HDU " + std::to_string(hduIndex - 1) +
+                                          " are not padding: a truncated or damaged extension");
+            }
+            break;
+        }
+        const std::string label = "HDU " + std::to_string(hduIndex);
+        long long bitpix = 0, naxis = 0, pcount = 0, gcount = 1;
+        if (!hdr.getInt("BITPIX", bitpix) || !hdr.getInt("NAXIS", naxis) || naxis < 0 || naxis > 999 ||
+            (bitpix != 8 && bitpix != 16 && bitpix != 32 && bitpix != 64 && bitpix != -32 && bitpix != -64)) {
+            throw Error(label + ": missing or invalid BITPIX/NAXIS");
+        }
+        std::vector<uint64_t> dims;
+        for (long long k = 1; k <= naxis; ++k) {
+            long long d = 0;
+            if (!hdr.getInt("NAXIS" + std::to_string(k), d) || d < 0) throw Error(label + ": missing or invalid NAXIS" + std::to_string(k));
+            dims.push_back(static_cast<uint64_t>(d));
+        }
+        // Random groups (primary HDU, NAXIS1 = 0, GROUPS = T): the data are GCOUNT groups of
+        // PCOUNT parameters plus an array of NAXIS2 x ... elements.
+        const Card* groups = hdr.find("GROUPS");
+        const bool randomGroups = hduIndex == 0 && dims.size() > 1 && dims[0] == 0 && groups && trim(groups->value) == "T";
+        uint64_t elements = dims.empty() ? 0 : 1;
+        for (size_t k = randomGroups ? 1 : 0; k < dims.size(); ++k) elements = checkedMul(elements, dims[k], "FITS data size");
+        if (hduIndex > 0 || randomGroups) {
+            hdr.getInt("PCOUNT", pcount);
+            hdr.getInt("GCOUNT", gcount);
+            if (pcount < 0 || gcount < 0) throw Error(label + ": invalid PCOUNT/GCOUNT");
+        }
+        const uint64_t sb = static_cast<uint64_t>(bitpix < 0 ? -bitpix : bitpix) / 8;
+        const uint64_t dataBytes = checkedMul(checkedMul(sb, static_cast<uint64_t>(gcount), "FITS data size"),
+                                              static_cast<uint64_t>(pcount) + elements, "FITS data size");
+        const uint64_t dataPos = pos;
+        if (dataBytes > fileSize || dataPos > fileSize - dataBytes) {
+            throw Error(label + ": data extends beyond the end of the file (truncated?)");
+        }
+        // The last data unit of a file is sometimes left unpadded.
+        const uint64_t stored = std::min<uint64_t>(padded(dataBytes), fileSize - dataPos);
+        pos = dataPos + stored;
+        ++hdus;
+
+        const Card* checksum = hdr.find("CHECKSUM");
+        const Card* datasum = hdr.find("DATASUM");
+        if (!checksum && !datasum) {
+            ++report.unchecked;
+            continue;
+        }
+        const uint32_t dataSum = onesComplementSum(in, dataPos, stored);
+        bool good = true;
+        if (datasum) {
+            uint64_t expected = 0;
+            if (!parseUInt64(fitsUnquote(datasum->value), expected) || expected != dataSum) {
+                report.problems.push_back(label + ": DATASUM mismatch: the data unit is damaged (keyword " +
+                                          fitsUnquote(datasum->value) + ", data " + std::to_string(dataSum) + ")");
+                good = false;
+            }
+        }
+        if (checksum) {
+            // With a correct CHECKSUM card the sum over the whole HDU is all ones (or zero).
+            const uint32_t total = onesComplementAdd(onesComplementSum(in, headerPos, dataPos - headerPos), dataSum);
+            if (total != 0xFFFFFFFFu && total != 0) {
+                report.problems.push_back(label + ": CHECKSUM mismatch: " + (datasum && good ? "the header was changed" : "the HDU is damaged"));
+                good = false;
+            }
+        }
+        if (good) ++report.verified;
+    }
+    report.summary = std::to_string(hdus) + (hdus == 1 ? " HDU" : " HDUs");
+    return report;
 }
 
 FitsFile readFits(const std::string& path, bool headersOnly) {

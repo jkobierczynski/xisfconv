@@ -9,6 +9,7 @@
 #include <set>
 
 #include "codecs.hpp"
+#include "xisf.hpp"
 
 namespace xisfconv {
 
@@ -115,10 +116,7 @@ void prepareBlock(const PixelBuffer& px, const XisfWriteOptions& opt, Block& blo
         // The checksum covers the block as stored (i.e. the compressed bytes).
         const size_t n = static_cast<size_t>(block.size);
         std::string digest;
-        if (opt.checksum == "sha1") digest = sha1Hex(block.data, n);
-        else if (opt.checksum == "sha256") digest = sha256Hex(block.data, n);
-        else if (opt.checksum == "sha512") digest = sha512Hex(block.data, n);
-        else throw Error("unsupported checksum algorithm '" + opt.checksum + "'");
+        if (!xisfDigest(opt.checksum, block.data, n, digest)) throw Error("unsupported checksum algorithm '" + opt.checksum + "'");
         block.attributes += " checksum=\"" + opt.checksum + ":" + digest + "\"";
     }
 }

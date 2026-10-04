@@ -36,6 +36,7 @@ void unshuffle(std::vector<uint8_t>& data, size_t itemSize);
 std::string sha1Hex(const uint8_t* data, size_t size);
 std::string sha256Hex(const uint8_t* data, size_t size);
 std::string sha512Hex(const uint8_t* data, size_t size);
+std::string sha3Hex(const uint8_t* data, size_t size, int bits);  // SHA3-256 or SHA3-512
 
 // MD5 digest (16 raw bytes), used for ASDF block checksums.
 void md5(const uint8_t* data, size_t size, uint8_t digest[16]);

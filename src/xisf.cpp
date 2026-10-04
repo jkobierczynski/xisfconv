@@ -22,14 +22,32 @@ std::string attrOr(const xml::Node& n, const char* key, const std::string& dflt 
     return v ? *v : dflt;
 }
 
-struct Compression {
-    std::string codec;  // zlib, lz4, lz4hc, zstd
-    bool shuffled = false;
-    uint64_t uncompressedSize = 0;
-    uint64_t itemSize = 1;
-};
+using Compression = XisfCompression;
 
-Compression parseCompression(const std::string& text) {
+std::vector<uint8_t> decompressOne(const Compression& c, const uint8_t* src, size_t size, size_t expected) {
+    if (c.codec == "zlib") return zlibDecompress(src, size, expected);
+    if (c.codec == "lz4" || c.codec == "lz4hc") return lz4BlockDecompress(src, size, expected);
+    return zstdDecompress(src, size, expected);
+}
+
+// Converts interleaved ("Normal") samples to planar layout.
+void deinterleave(std::vector<uint8_t>& data, uint64_t pixels, uint64_t channels, size_t sb) {
+    if (channels <= 1) return;
+    std::vector<uint8_t> out(data.size());
+    for (uint64_t ch = 0; ch < channels; ++ch) {
+        uint8_t* dst = out.data() + ch * pixels * sb;
+        const uint8_t* src = data.data() + ch * sb;
+        const size_t stride = static_cast<size_t>(channels) * sb;
+        for (uint64_t i = 0; i < pixels; ++i) {
+            std::memcpy(dst + i * sb, src + i * stride, sb);
+        }
+    }
+    data.swap(out);
+}
+
+}  // namespace
+
+XisfCompression parseXisfCompression(const std::string& text) {
     const auto parts = split(text, ':');
     if (parts.size() < 2) throw Error("malformed compression attribute '" + text + "'");
     Compression c;
@@ -53,50 +71,37 @@ Compression parseCompression(const std::string& text) {
     return c;
 }
 
-std::vector<uint8_t> decompressOne(const Compression& c, const uint8_t* src, size_t size, size_t expected) {
-    if (c.codec == "zlib") return zlibDecompress(src, size, expected);
-    if (c.codec == "lz4" || c.codec == "lz4hc") return lz4BlockDecompress(src, size, expected);
-    return zstdDecompress(src, size, expected);
+bool xisfDigest(const std::string& algorithm, const uint8_t* data, size_t size, std::string& hex) {
+    const std::string algo = toLower(trim(algorithm));
+    if (algo == "sha-1" || algo == "sha1") hex = sha1Hex(data, size);
+    else if (algo == "sha-256" || algo == "sha256") hex = sha256Hex(data, size);
+    else if (algo == "sha-512" || algo == "sha512") hex = sha512Hex(data, size);
+    else if (algo == "sha3-256") hex = sha3Hex(data, size, 256);
+    else if (algo == "sha3-512") hex = sha3Hex(data, size, 512);
+    else return false;
+    return true;
 }
 
-void verifyChecksum(const std::string& spec, const std::vector<uint8_t>& data, const std::string& what) {
-    const size_t colon = spec.find(':');
+XisfChecksumState XisfFile::verifyBlockChecksum(const XisfStoredBlock& block, const std::string& what) {
+    if (block.checksum.empty()) return XisfChecksumState::None;
+    const size_t colon = block.checksum.find(':');
     if (colon == std::string::npos) {
         warn("malformed checksum attribute on " + what + "; not verified");
-        return;
+        return XisfChecksumState::Unsupported;
     }
-    const std::string algo = toLower(trim(spec.substr(0, colon)));
-    const std::string expected = toLower(trim(spec.substr(colon + 1)));
+    const std::string algo = toLower(trim(block.checksum.substr(0, colon)));
+    const std::string expected = toLower(trim(block.checksum.substr(colon + 1)));
     std::string actual;
-    if (algo == "sha-1" || algo == "sha1") actual = sha1Hex(data.data(), data.size());
-    else if (algo == "sha-256" || algo == "sha256") actual = sha256Hex(data.data(), data.size());
-    else if (algo == "sha-512" || algo == "sha512") actual = sha512Hex(data.data(), data.size());
-    else {
+    if (!xisfDigest(algo, block.bytes.data(), block.bytes.size(), actual)) {
         warn("checksum algorithm '" + algo + "' on " + what + " is not supported; not verified");
-        return;
+        return XisfChecksumState::Unsupported;
     }
     if (actual != expected) {
         throw Error("checksum mismatch on " + what + " (" + algo + "): file is corrupt "
                     "(use --no-verify to convert anyway)");
     }
+    return XisfChecksumState::Verified;
 }
-
-// Converts interleaved ("Normal") samples to planar layout.
-void deinterleave(std::vector<uint8_t>& data, uint64_t pixels, uint64_t channels, size_t sb) {
-    if (channels <= 1) return;
-    std::vector<uint8_t> out(data.size());
-    for (uint64_t ch = 0; ch < channels; ++ch) {
-        uint8_t* dst = out.data() + ch * pixels * sb;
-        const uint8_t* src = data.data() + ch * sb;
-        const size_t stride = static_cast<size_t>(channels) * sb;
-        for (uint64_t i = 0; i < pixels; ++i) {
-            std::memcpy(dst + i * sb, src + i * stride, sb);
-        }
-    }
-    data.swap(out);
-}
-
-}  // namespace
 
 XisfFile::XisfFile(const std::string& path) : path_(path) {
     file_.open(path, std::ios::binary);
@@ -305,11 +310,10 @@ std::vector<uint8_t> XisfFile::readAttachment(uint64_t position, uint64_t size) 
     return buf;
 }
 
-std::vector<uint8_t> XisfFile::readBlock(const xml::Node& element, bool verify, const std::string& what,
-                                         uint64_t expectedSize) {
+XisfStoredBlock XisfFile::readStoredBlock(const xml::Node& element, const std::string& what) {
     const std::string location = attrOr(element, "location");
     const xml::Node* attrSource = &element;
-    std::vector<uint8_t> stored;
+    XisfStoredBlock block;
 
     auto decodeText = [&](const std::string& encoding, const std::string& text) {
         if (encoding == "base64") return base64Decode(text);
@@ -323,13 +327,15 @@ std::vector<uint8_t> XisfFile::readBlock(const xml::Node& element, bool verify, 
         if (parts.size() != 3 || !parseUInt64(parts[1], pos) || !parseUInt64(parts[2], size)) {
             throw Error("malformed location '" + location + "' in " + what);
         }
-        stored = readAttachment(pos, size);
+        block.bytes = readAttachment(pos, size);
+        block.attachment = true;
+        block.position = pos;
     } else if (startsWith(location, "inline:")) {
-        stored = decodeText(location.substr(7), element.text);
+        block.bytes = decodeText(location.substr(7), element.text);
     } else if (location == "embedded") {
         const xml::Node* data = element.child("Data");
         if (!data) throw Error("embedded " + what + " has no <Data> element");
-        stored = decodeText(attrOr(*data, "encoding"), data->text);
+        block.bytes = decodeText(attrOr(*data, "encoding"), data->text);
         attrSource = data;
     } else if (startsWith(location, "url(") || startsWith(location, "path(")) {
         throw Error(what + " is stored in an external file (distributed XISF), which is not supported");
@@ -341,14 +347,17 @@ std::vector<uint8_t> XisfFile::readBlock(const xml::Node& element, bool verify, 
         if (const std::string* v = attrSource->attr(key)) return *v;
         return attrOr(element, key);
     };
+    block.checksum = attr("checksum");
+    block.compression = attr("compression");
+    block.subblocks = attr("subblocks");
+    return block;
+}
 
-    const std::string checksum = attr("checksum");
-    if (verify && !checksum.empty()) verifyChecksum(checksum, stored, what);
+std::vector<uint8_t> XisfFile::decodeBlock(const XisfStoredBlock& block, const std::string& what, uint64_t expectedSize) {
+    if (block.compression.empty()) return block.bytes;
+    const std::vector<uint8_t>& stored = block.bytes;
 
-    const std::string compression = attr("compression");
-    if (compression.empty()) return stored;
-
-    const Compression c = parseCompression(compression);
+    const Compression c = parseXisfCompression(block.compression);
     if (expectedSize != 0 && c.uncompressedSize != expectedSize) {
         throw Error(what + ": compressed block declares " + std::to_string(c.uncompressedSize) +
                     " bytes, geometry requires " + std::to_string(expectedSize));
@@ -359,13 +368,12 @@ std::vector<uint8_t> XisfFile::readBlock(const xml::Node& element, bool verify, 
     }
     if (c.uncompressedSize > std::numeric_limits<size_t>::max()) throw Error("data block too large for this platform");
     std::vector<uint8_t> out;
-    const std::string subblocks = attr("subblocks");
-    if (subblocks.empty()) {
+    if (block.subblocks.empty()) {
         out = decompressOne(c, stored.data(), stored.size(), static_cast<size_t>(c.uncompressedSize));
     } else {
         out.reserve(static_cast<size_t>(c.uncompressedSize));
         uint64_t offset = 0;
-        for (const auto& pair : split(subblocks, ':')) {
+        for (const auto& pair : split(block.subblocks, ':')) {
             const auto cu = split(pair, ',');
             uint64_t cs = 0, us = 0;
             if (cu.size() != 2 || !parseUInt64(cu[0], cs) || !parseUInt64(cu[1], us)) {
@@ -382,6 +390,14 @@ std::vector<uint8_t> XisfFile::readBlock(const xml::Node& element, bool verify, 
     }
     if (c.shuffled) unshuffle(out, static_cast<size_t>(c.itemSize));
     return out;
+}
+
+std::vector<uint8_t> XisfFile::readBlock(const xml::Node& element, bool verify, const std::string& what,
+                                         uint64_t expectedSize) {
+    XisfStoredBlock block = readStoredBlock(element, what);
+    if (verify) verifyBlockChecksum(block, what);
+    if (block.compression.empty()) return std::move(block.bytes);
+    return decodeBlock(block, what, expectedSize);
 }
 
 bool DisplayFunction::isIdentity() const {

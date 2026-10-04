@@ -312,6 +312,46 @@ public:
 
     std::string treeText() { return readTree(); }
 
+    VerifyReport verifyAll() {
+        VerifyReport report;
+        const YamlPtr root = parseYaml(readTree());
+        scanBlocks();
+        for (size_t i = 0; i < blocks_.size(); ++i) {
+            const Block& b = blocks_[i];
+            try {
+                blockData(i, 0, b.compression.empty() ? b.used : b.dataSize, "block " + std::to_string(i));
+                if (b.hasChecksum) ++report.verified;
+                else ++report.unchecked;
+            } catch (const Unsupported& e) {
+                report.notChecked.push_back(e.what());
+            } catch (const Error& e) {
+                report.problems.push_back(e.what());
+            }
+        }
+        // Every block the tree refers to must be there, and nothing but the block index may
+        // follow the last block: a block whose header is cut off or damaged is not found above.
+        uint64_t highest = 0;
+        bool any = false;
+        highestSource(root, highest, any);
+        if (any && highest >= blocks_.size()) {
+            report.problems.push_back("the tree refers to block " + std::to_string(highest) + ", but the file has " +
+                                      std::to_string(blocks_.size()) + " block(s): truncated or damaged");
+        }
+        if (scanEnd_ < file_.fileSize) {
+            const auto tail = readAt(scanEnd_, std::min<uint64_t>(file_.fileSize - scanEnd_, 4096));
+            size_t i = 0;
+            while (i < tail.size() && (tail[i] == 0 || tail[i] == '\n' || tail[i] == '\r' || tail[i] == ' ')) ++i;
+            const std::string index = "#ASDF BLOCK INDEX";
+            if (i < tail.size() && std::string(tail.begin() + static_cast<std::ptrdiff_t>(i), tail.end()).compare(0, index.size(), index) != 0) {
+                report.problems.push_back(std::to_string(file_.fileSize - scanEnd_) + " bytes after block " +
+                                          (blocks_.empty() ? std::string("area start") : std::to_string(blocks_.size() - 1)) +
+                                          " are neither a block nor the block index: a damaged block header");
+            }
+        }
+        report.summary = std::to_string(blocks_.size()) + (blocks_.size() == 1 ? " binary block" : " binary blocks");
+        return report;
+    }
+
     FitsFile run() {
         const YamlPtr root = parseYaml(readTree());
         if (!root || !root->isMapping()) throw Error("the ASDF tree is not a mapping");
@@ -330,6 +370,7 @@ private:
     FitsFile file_;
     bool headersOnly_, verify_;
     uint64_t treeEnd_ = 0;
+    uint64_t scanEnd_ = 0;  // where the block scan stopped
     std::vector<Block> blocks_;
     std::set<const YamlNode*> visited_;
 
@@ -413,6 +454,7 @@ private:
             pos += i;
             if (i < buf.size()) break;
         }
+        scanEnd_ = pos;
         while (file_.fileSize - pos >= 6 + kBlockHeaderSize) {
             const auto start = readAt(pos, 6);
             if (std::memcmp(start.data(), kBlockMagic, 4) != 0) break;  // block index or end of file
@@ -438,6 +480,7 @@ private:
                 b.hasChecksum = false;
                 b.streamed = true;
                 blocks_.push_back(b);
+                scanEnd_ = file_.fileSize;
                 break;
             }
             if (b.used > b.allocated) throw Error(label + ": used size exceeds allocated size");
@@ -447,6 +490,22 @@ private:
             blocks_.push_back(b);
             if (blocks_.size() > 1000000) throw Error("too many binary blocks");
             pos = b.dataPos + b.allocated;
+            scanEnd_ = pos;
+        }
+    }
+
+    // Highest block index that an array in the tree refers to.
+    void highestSource(const YamlPtr& node, uint64_t& highest, bool& any) {
+        if (!node || !visited_.insert(node.get()).second) return;
+        if (node->isMapping()) {
+            uint64_t index = 0;
+            if (tagContains(*node, "/core/ndarray-") && scalarUInt(node->get("source"), index)) {
+                highest = any ? std::max(highest, index) : index;
+                any = true;
+            }
+            for (const auto& pair : node->pairs) highestSource(pair.second, highest, any);
+        } else if (node->isSequence()) {
+            for (const auto& item : node->items) highestSource(item, highest, any);
         }
     }
 
@@ -477,13 +536,13 @@ private:
             if (!checksumMatches(b, data)) checksumError(index);
         } else {
             if (b.compression == "bzp2") {
-                throw Error(where + ": bzip2 compression is not supported; rewrite the file with zlib or no compression");
+                throw Unsupported(where + ": bzip2 compression is not supported; rewrite the file with zlib or no compression");
             }
             if (b.compression == "zstd" && !zstdAvailable()) {
-                throw Error(where + ": zstd compression, but this build of xisfconv has no Zstandard support");
+                throw Unsupported(where + ": zstd compression, but this build of xisfconv has no Zstandard support");
             }
             if (b.compression != "zlib" && b.compression != "zstd" && b.compression != "lz4") {
-                throw Error(where + ": compression '" + b.compression + "' is not supported");
+                throw Unsupported(where + ": compression '" + b.compression + "' is not supported");
             }
             const auto stored = readAt(b.dataPos, b.used);
             // The checksum of a compressed block covers the stored bytes (the standard, and the
@@ -903,6 +962,11 @@ void writeAsdf(const std::string& path, const std::vector<FitsHdu>& hdus, const 
 FitsFile readAsdf(const std::string& path, bool headersOnly, bool verifyChecksums) {
     Reader reader(path, headersOnly, verifyChecksums);
     return reader.run();
+}
+
+VerifyReport verifyAsdf(const std::string& path) {
+    Reader reader(path, false, true);
+    return reader.verifyAll();
 }
 
 std::string readAsdfTree(const std::string& path) {

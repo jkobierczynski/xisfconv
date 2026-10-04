@@ -44,6 +44,9 @@ FitsFile readFits(const std::string& path, bool headersOnly = false);
 // Sets dataMin, dataMax and hasNaN from floating point pixels (no-op for integer data).
 void updateFloatRange(FitsImage& img);
 
+// Checks the structure of every HDU and its CHECKSUM / DATASUM keywords where present.
+VerifyReport verifyFits(const std::string& path);
+
 // True if the file starts with a FITS primary header.
 bool looksLikeFits(const std::string& path);
 

@@ -218,7 +218,7 @@ std::vector<uint8_t> zstdDecompress(const uint8_t* src, size_t srcSize, size_t e
     (void)src;
     (void)srcSize;
     (void)expectedSize;
-    throw Error("this build has no Zstandard support (rebuild with libzstd)");
+    throw Unsupported("this build has no Zstandard support (rebuild with libzstd)");
 #endif
 }
 
@@ -473,6 +473,69 @@ std::string sha512Hex(const uint8_t* data, size_t size) {
     for (int i = 0; i < 8; ++i)
         for (int j = 0; j < 8; ++j) out[8 * i + j] = static_cast<uint8_t>(h[i] >> (56 - 8 * j));
     return toHex(out, 64);
+}
+
+// ---------------------------------------------------------------- SHA-3 (FIPS 202)
+
+namespace {
+
+void keccakF1600(uint64_t s[25]) {
+    static const uint64_t roundConstants[24] = {
+        0x0000000000000001ull, 0x0000000000008082ull, 0x800000000000808aull, 0x8000000080008000ull,
+        0x000000000000808bull, 0x0000000080000001ull, 0x8000000080008081ull, 0x8000000000008009ull,
+        0x000000000000008aull, 0x0000000000000088ull, 0x0000000080008009ull, 0x000000008000000aull,
+        0x000000008000808bull, 0x800000000000008bull, 0x8000000000008089ull, 0x8000000000008003ull,
+        0x8000000000008002ull, 0x8000000000000080ull, 0x000000000000800aull, 0x800000008000000aull,
+        0x8000000080008081ull, 0x8000000000008080ull, 0x0000000080000001ull, 0x8000000080008008ull};
+    static const int rotation[24] = {1, 3, 6, 10, 15, 21, 28, 36, 45, 55, 2, 14, 27, 41, 56, 8, 25, 43, 62, 18, 39, 61, 20, 44};
+    static const int lane[24] = {10, 7, 11, 17, 18, 3, 5, 16, 8, 21, 24, 4, 15, 23, 19, 13, 12, 2, 20, 14, 22, 9, 6, 1};
+    auto rotl = [](uint64_t x, int n) { return (x << n) | (x >> (64 - n)); };
+    for (int round = 0; round < 24; ++round) {
+        uint64_t c[5];
+        for (int i = 0; i < 5; ++i) c[i] = s[i] ^ s[i + 5] ^ s[i + 10] ^ s[i + 15] ^ s[i + 20];
+        for (int i = 0; i < 5; ++i) {
+            const uint64_t t = c[(i + 4) % 5] ^ rotl(c[(i + 1) % 5], 1);
+            for (int j = 0; j < 25; j += 5) s[j + i] ^= t;
+        }
+        uint64_t t = s[1];
+        for (int i = 0; i < 24; ++i) {
+            const uint64_t next = s[lane[i]];
+            s[lane[i]] = rotl(t, rotation[i]);
+            t = next;
+        }
+        for (int j = 0; j < 25; j += 5) {
+            for (int i = 0; i < 5; ++i) c[i] = s[j + i];
+            for (int i = 0; i < 5; ++i) s[j + i] ^= ~c[(i + 1) % 5] & c[(i + 2) % 5];
+        }
+        s[0] ^= roundConstants[round];
+    }
+}
+
+}  // namespace
+
+std::string sha3Hex(const uint8_t* data, size_t size, int bits) {
+    if (bits != 256 && bits != 512) throw Error("unsupported SHA-3 digest size");
+    const size_t digestBytes = static_cast<size_t>(bits) / 8;
+    const size_t rate = 200 - 2 * digestBytes;  // bytes absorbed per permutation
+    uint64_t s[25] = {};
+    auto absorb = [&](const uint8_t* block) {
+        for (size_t i = 0; i < rate / 8; ++i) {
+            uint64_t w = 0;
+            for (int k = 7; k >= 0; --k) w = (w << 8) | block[i * 8 + static_cast<size_t>(k)];  // little-endian lanes
+            s[i] ^= w;
+        }
+        keccakF1600(s);
+    };
+    size_t offset = 0;
+    for (; size - offset >= rate; offset += rate) absorb(data + offset);
+    uint8_t last[144] = {};  // the largest rate (SHA3-256: 136)
+    if (size > offset) std::memcpy(last, data + offset, size - offset);
+    last[size - offset] ^= 0x06;
+    last[rate - 1] ^= 0x80;
+    absorb(last);
+    uint8_t digest[64];
+    for (size_t i = 0; i < digestBytes; ++i) digest[i] = static_cast<uint8_t>(s[i / 8] >> (8 * (i % 8)));
+    return toHex(digest, digestBytes);
 }
 
 // ---------------------------------------------------------------- MD5

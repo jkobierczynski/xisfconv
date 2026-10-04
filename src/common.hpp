@@ -12,10 +12,16 @@
 
 namespace xisfconv {
 
-constexpr const char* kVersion = "0.7.0";
+constexpr const char* kVersion = "0.8.0";
 
 struct Error : std::runtime_error {
     using std::runtime_error::runtime_error;
+};
+
+// A feature of the file that this program (or this build of it) does not implement. The file
+// itself may be perfectly fine.
+struct Unsupported : Error {
+    using Error::Error;
 };
 
 // Emits a warning on stderr, prefixed with the file currently being processed.
@@ -54,6 +60,15 @@ struct PixelBuffer {
 
     uint64_t samples() const { return width * height * channels; }
     uint64_t planeSamples() const { return width * height; }
+};
+
+// Outcome of checking one file's integrity (--verify).
+struct VerifyReport {
+    std::string summary;                 // what was examined, e.g. "3 data blocks"
+    size_t verified = 0;                 // checksums that were present and matched
+    size_t unchecked = 0;                // blocks (or HDUs) that carry no checksum this build can verify
+    std::vector<std::string> problems;   // empty = the file is intact as far as can be told
+    std::vector<std::string> notChecked; // parts that could not be checked (unsupported codec or checksum)
 };
 
 std::string trim(const std::string& s);

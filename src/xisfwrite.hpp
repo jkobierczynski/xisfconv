@@ -34,7 +34,7 @@ struct XisfOutImage {
 struct XisfWriteOptions {
     std::string codec;              // "" (uncompressed), "zlib" or "zstd"
     bool shuffle = true;            // byte shuffling before compression
-    std::string checksum;           // "", "sha1", "sha256" or "sha512" (PixInsight's spelling)
+    std::string checksum;           // "", "sha1", "sha256", "sha512" (PixInsight's spelling), "sha3-256" or "sha3-512"
     uint64_t subblockSize = 1u << 30;  // blocks larger than this are compressed in subblocks
 };
 

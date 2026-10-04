@@ -174,8 +174,9 @@ private:
 
     std::unique_ptr<Node> parseElement(int depth) {
         if (depth > kMaxDepth) fail("elements nested too deeply");
-        ++p_;  // '<'
         auto node = std::make_unique<Node>();
+        node->start = p_;
+        ++p_;  // '<'
         const std::string qname = parseName();
         node->name = localName(qname);
 
@@ -185,10 +186,18 @@ private:
             if (p_ >= s_.size()) fail("unterminated start tag");
             if (s_[p_] == '/') {
                 if (!at("/>")) fail("expected '/>'");
+                node->tagClose = p_;
+                node->selfClosing = true;
                 p_ += 2;
+                node->contentEnd = node->end = p_;
                 return node;
             }
-            if (s_[p_] == '>') { ++p_; break; }
+            if (s_[p_] == '>') {
+                node->tagClose = p_;
+                ++p_;
+                break;
+            }
+            const size_t attributeStart = p_;
             const std::string aname = parseName();
             skipSpace();
             if (p_ >= s_.size() || s_[p_] != '=') fail("expected '=' after attribute " + aname);
@@ -200,18 +209,21 @@ private:
             if (end == std::string::npos) fail("unterminated attribute value");
             node->attributes.emplace_back(aname, decodeEntities(p_, end));
             p_ = end + 1;
+            node->attributeSpans.emplace_back(attributeStart, p_);
         }
 
         // Content
         for (;;) {
             if (p_ >= s_.size()) fail("unterminated element <" + qname + ">");
             if (at("</")) {
+                node->contentEnd = p_;
                 p_ += 2;
                 const std::string closing = parseName();
                 if (closing != qname) fail("mismatched closing tag </" + closing + "> for <" + qname + ">");
                 skipSpace();
                 if (p_ >= s_.size() || s_[p_] != '>') fail("expected '>'");
                 ++p_;
+                node->end = p_;
                 return node;
             }
             if (at("<!--")) { skipPast("-->"); continue; }

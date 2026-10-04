@@ -28,6 +28,10 @@ void writeAsdf(const std::string& path, const std::vector<FitsHdu>& hdus, const 
 // Throws xisfconv::Error on malformed files.
 FitsFile readAsdf(const std::string& path, bool headersOnly = false, bool verifyChecksums = true);
 
+// Parses the tree and reads every binary block: MD5 checksums are verified, compressed blocks
+// are decompressed.
+VerifyReport verifyAsdf(const std::string& path);
+
 // Returns the YAML tree of an ASDF file as text (from the %YAML directive to the closing "...").
 std::string readAsdfTree(const std::string& path);
 

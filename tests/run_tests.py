@@ -1268,7 +1268,7 @@ def test_fits_to_xisf_bounds_bits_hdus():
     r = run(fpath, "-s", "-f", expect_ok=False)
     check(r.returncode == 1 and "--stretch" in r.stderr, "--stretch refused for XISF output")
     r = run(xpath, "-t", "xisf", "-f", expect_ok=False)
-    check(r.returncode == 1 and "already an XISF" in r.stderr, "XISF -> XISF is refused clearly")
+    check(r.returncode == 1 and "add --in-place" in r.stderr, "XISF -> XISF onto itself needs --in-place")
     r = run(fpath, expect_ok=False)
     check(r.returncode == 1 and "already exists" in r.stderr, "refuses to overwrite an XISF without --force")
     data = open(fpath, "rb").read()
@@ -2267,6 +2267,572 @@ def test_export_from_fits_and_asdf():
     check(r.returncode == 1 and "ASDF files carry no saved STF" in r.stderr, "ASDF input with --stretch=stf")
 
 
+# ---------------------------------------------------------------- XISF -> XISF, --verify
+
+def xisf_header(path):
+    raw = open(path, "rb").read()
+    return raw, raw[16:16 + int.from_bytes(raw[8:12], "little")].decode()
+
+
+def xisf_blocks(path):
+    """Every data block of an XISF file, read without xisfconv: a list of dicts with the element name,
+    its id, the location kind, the storage attributes, the stored bytes and the decoded bytes."""
+    import xml.etree.ElementTree as ET
+    raw, hdr = xisf_header(path)
+    out = []
+    for el in ET.fromstring(hdr).iter():
+        loc = el.get("location")
+        if loc is None:
+            continue
+        src = el
+        if loc.startswith("attachment:"):
+            _, pos, size = loc.split(":")
+            stored = raw[int(pos):int(pos) + int(size)]
+            assert len(stored) == int(size), "attachment beyond the end of " + path
+        else:
+            if loc == "embedded":
+                src = [c for c in el if c.tag.endswith("}Data") or c.tag == "Data"][0]
+                encoding = src.get("encoding")
+            else:
+                encoding = loc.split(":")[1]
+            text = "".join((src.text or "").split())
+            stored = base64.b64decode(text) if encoding == "base64" else bytes.fromhex(text)
+        attr = {k: src.get(k, el.get(k)) for k in ("compression", "subblocks", "checksum")}
+        if attr["checksum"] and not attr["checksum"].startswith("sha3"):
+            algo, digest = attr["checksum"].split(":")
+            assert hashlib.new(algo.replace("-", ""), stored).hexdigest() == digest, "checksum mismatch in " + path
+        data = stored
+        if attr["compression"]:
+            parts = attr["compression"].split(":")
+            codec = parts[0].split("+")[0]
+            dec = {"zlib": lambda b, u: zlib.decompress(b), "zstd": lambda b, u: zstandard.decompress(b, max_output_size=u),
+                   "lz4": lambda b, u: lz4.block.decompress(b, uncompressed_size=u),
+                   "lz4hc": lambda b, u: lz4.block.decompress(b, uncompressed_size=u)}[codec]
+            if attr["subblocks"]:
+                data, off = b"", 0
+                for pair in attr["subblocks"].split(":"):
+                    cs, us = [int(v) for v in pair.split(",")]
+                    data += dec(stored[off:off + cs], us)
+                    off += cs
+                assert off == len(stored)
+            else:
+                data = dec(stored, int(parts[1]))
+            assert len(data) == int(parts[1])
+            if parts[0].endswith("+sh"):
+                item = int(parts[2])
+                cnt = len(data) // item
+                data = np.frombuffer(data[:cnt * item], np.uint8).reshape(item, cnt).T.tobytes() + data[cnt * item:]
+        out.append({"tag": el.tag.split("}")[-1], "id": el.get("id"), "kind": loc.split(":")[0], "attr": attr,
+                    "stored": stored, "data": data, "location": loc})
+    return out
+
+
+def header_without_storage(hdr):
+    """The header with everything xisfconv may change when rewriting removed: the storage attributes of
+    attached blocks and the file properties that describe the block storage."""
+    import re
+    def strip(m):
+        return re.sub(r'\s+(location|compression|subblocks|checksum)="[^"]*"', "", m.group(0))
+    hdr = re.sub(r'<[^<>]*\slocation="attachment:[^<>]*>', strip, hdr)
+    return re.sub(r'<Property id="XISF:(CompressionCodecs|CompressionLevel|BlockAlignmentSize)"[^>]*?(/>|>[^<]*</Property>)\s*',
+                  "", hdr)
+
+
+def write_xisf_blocks(path, template, blocks, align=1):
+    """template: the header, with {0}, {1}, ... where the attributes of attached block n belong."""
+    positions = [0] * len(blocks)
+    for _ in range(5):
+        attrs = []
+        for b, pos in zip(blocks, positions):
+            a = {"location": f"attachment:{pos}:{len(b.payload)}", **b.attrs}
+            attrs.append(" ".join(f'{k}="{v}"' for k, v in a.items()))
+        hdr = template.format(*attrs).encode()
+        p, positions = 16 + len(hdr), []
+        for b in blocks:
+            p = -(-p // align) * align
+            positions.append(p)
+            p += len(b.payload)
+    with open(path, "wb") as f:
+        f.write(b"XISF0100" + len(hdr).to_bytes(4, "little") + b"\0\0\0\0" + hdr)
+        for b, pos in zip(blocks, positions):
+            f.write(b"\0" * (pos - f.tell()))
+            f.write(b.payload)
+
+
+def rich_xisf(path, storage, align=1, extra_metadata=""):
+    """A file with everything a rewrite must carry over: three images (attached, embedded, attached),
+    attached and inline properties, an ICC profile, a thumbnail, comments, CDATA, entities, an
+    element xisfconv does not know. `storage` gives the Block options of the attached blocks."""
+    rng = np.random.default_rng(5)
+    rgb = test_image(np.uint16, 23, 31, 3, 41)
+    mask = test_image(np.float32, 9, 12, 1, 42)
+    small = test_image(np.uint8, 7, 8, 1, 43)
+    vec = (np.arange(400) * 0.25).astype("<f8").tobytes()
+    icc = bytes(rng.integers(0, 255, 600, dtype=np.uint8)) + b"\0" * 300
+    thumb = bytes(range(12))
+    noise = bytes(rng.integers(0, 255, 3000, dtype=np.uint8))        # does not compress
+    def blk(raw, item):
+        kw = dict(storage)
+        if kw.get("shuffle_item"):
+            kw["shuffle_item"] = item if item > 1 else None
+        return Block(raw, **kw)
+    blocks = [blk(as_planes(rgb).astype("<u2").tobytes(), 2), blk(vec, 8), blk(icc, 1), blk(thumb, 1), blk(noise, 1),
+              blk(as_planes(small).tobytes(), 1)]
+    emb = Block(as_planes(mask).astype("<f4").tobytes(), codec="zlib", shuffle_item=4, checksum="sha1", location="embedded")
+    emb_attrs = " ".join(f'{k}="{v}"' for k, v in emb.attrs.items())
+    template = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n<!--\nExtensible Image Serialization Format - XISF version 1.0\n'
+        'Created with the test suite\n-->\n'
+        '<xisf version="1.0" xmlns="http://www.pixinsight.com/xisf" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
+        'xsi:schemaLocation="http://www.pixinsight.com/xisf http://pixinsight.com/xisf/xisf-1.0.xsd">\n'
+        '<Image id="main" geometry="31:23:3" sampleFormat="UInt16" colorSpace="RGB" {0} imageType="Light" >\n'
+        '  <FITSKeyword name="OBJECT" value="\'M 31 &amp; &lt;friends&gt;\'" comment=\'single "quoted" attribute\'/>\n'
+        '  <FITSKeyword name="HISTORY" value="" comment="caf&#233; &#x3BC;m"/>\n'
+        '  <!-- a comment inside the image -->\n'
+        '  <Property id="Note" type="String">text with &lt;entities&gt; &amp; "quotes" and <![CDATA[<raw> & data]]></Property>\n'
+        '  <Property id="Exposure" type="Float32" value="300"/>\n'
+        '  <Property id="Vec" type="F64Vector" length="400" {1}/>\n'
+        '  <Property id="Inline" type="UI8Vector" length="5" location="inline:hex">0102030405</Property>\n'
+        '  <ICCProfile {2}/>\n'
+        '  <Thumbnail geometry="4:3:1" sampleFormat="UInt8" colorSpace="Gray" {3}/>\n'
+        '  <Property id="Noise" type="UI8Vector" length="3000" {4}/>\n'
+        '  <Resolution horizontal="300" vertical="300" unit="inch"/>\n'
+        '  <Weird foo="bar"><Child a="1"/>some text</Weird>\n'
+        '</Image>\n'
+        f'<Image id="mask" geometry="12:9:1" sampleFormat="Float32" bounds="0:1" colorSpace="Gray" location="embedded">'
+        f'<Data encoding="base64" {emb_attrs}>{emb.text}</Data><FITSKeyword name="GAIN" value="120" comment=""/></Image>\n'
+        '<Image id="small" geometry="8:7:1" sampleFormat="UInt8" colorSpace="Gray" {5}/>\n'
+        '<Metadata>\n<Property id="XISF:CreationTime" type="TimePoint" value="2026-01-02T03:04:05Z"/>\n'
+        '<Property id="XISF:CreatorApplication" type="String">PixInsight 1.9.3</Property>\n'
+        '<Property id="XISF:BlockAlignmentSize" type="UInt16" value="' + str(align) + '"/>\n' + extra_metadata +
+        '</Metadata>\n</xisf>\n')
+    write_xisf_blocks(path, template, blocks, align)
+    return {"main": rgb, "mask": mask, "small": small}
+
+
+def test_xisf_rewrite():
+    """XISF -> XISF: every block decodes to the same bytes, the header is the same text apart from
+    the storage attributes, and the blocks are stored the way the options say."""
+    import re
+    d = os.path.join(TMP, "rewrite")
+    os.makedirs(d, exist_ok=True)
+    zstd_ok = zstandard is not None and ZSTD_BUILD
+    sources = {
+        "plain": (dict(), 4096, ""),
+        "zlib+sh, sha1": (dict(codec="zlib", shuffle_item=1, checksum="sha1"), 1,
+                          '<Property id="XISF:CompressionCodecs" type="String">zlib+sh</Property>\n'
+                          '<Property id="XISF:CompressionLevel" type="Int32" value="0"/>\n'),
+        "lz4hc": (dict(codec="lz4hc"), 16, '<Property id="XISF:CompressionCodecs" type="String" value="lz4hc"/>\n'),
+        "sha-512 only": (dict(checksum="sha-512"), 1, ""),
+    }
+    if zstd_ok:
+        sources["zstd+sh in subblocks, sha-256"] = (dict(codec="zstd", shuffle_item=1, subblocks=3, checksum="sha-256"), 1, "")
+    default_codec = "zstd" if ZSTD_BUILD else "zlib"
+    option_sets = [[], ["-c"], ["--codec", "zlib"], ["--codec", "none"], ["--checksum", "sha512"], ["--checksum", "none"],
+                   ["-c", "--checksum", "sha1"], ["--codec", "zlib", "--xisf-subblock-size", "500"]]
+    for name, (storage, align, meta) in sources.items():
+        src = os.path.join(d, "src.xisf")
+        images = rich_xisf(src, storage, align, meta)
+        before = xisf_blocks(src)
+        _, hdr0 = xisf_header(src)
+        ref_fits = os.path.join(d, "src.fits")
+        run(src, "-o", ref_fits, "-f", "-q")
+        for flags in option_sets:
+            label = f"rewrite {name} {flags}"
+            out = os.path.join(d, "out.xisf")
+            r = run(src, "-o", out, "-f", *flags)
+            check("read back and compared" in r.stdout, f"{label}: the output is read back")
+            try:
+                after = xisf_blocks(out)   # also checks every checksum in the output
+            except Exception as e:  # noqa: BLE001
+                check(False, f"{label}: output unreadable: {type(e).__name__}: {e}")
+                continue
+            _, hdr1 = xisf_header(out)
+            check(len(after) == len(before) and all(a["data"] == b["data"] for a, b in zip(after, before)),
+                  f"{label}: all {len(before)} blocks decode to the same bytes")
+            check(header_without_storage(hdr1) == header_without_storage(hdr0),
+                  f"{label}: the header is unchanged apart from the storage attributes")
+            codec = default_codec if "-c" in flags else flags[flags.index("--codec") + 1] if "--codec" in flags else None
+            want_sum = flags[flags.index("--checksum") + 1] if "--checksum" in flags else None
+            for a, b in zip(after, before):
+                if a["kind"] != "attachment":
+                    check(a["stored"] == b["stored"] and a["attr"] == b["attr"], f"{label}: {a['kind']} block untouched")
+                    continue
+                comp = a["attr"]["compression"]
+                if codec is None:
+                    check(a["stored"] == b["stored"] and comp == b["attr"]["compression"], f"{label}: block {a['id']} copied as stored")
+                elif codec == "none":
+                    check(comp is None and a["stored"] == b["data"], f"{label}: block {a['id']} decompressed")
+                else:
+                    compressible = a["id"] != "Noise" and len(a["data"]) > 300
+                    check((comp or "").startswith(codec) if compressible else True, f"{label}: block {a['id']} compressed with {codec}: {comp}")
+                    check(comp is None or comp.startswith(codec), f"{label}: block {a['id']} is in no other codec: {comp}")
+                    check(comp is None or a["stored"] == b["stored"] or len(a["stored"]) < len(a["data"]),
+                          f"{label}: block {a['id']} is not larger than its data")
+                    if comp and a["stored"] != b["stored"] and "500" in flags and len(a["data"]) > 500:
+                        check(a["attr"]["subblocks"] and len(a["attr"]["subblocks"].split(":")) == -(-len(a["data"]) // 500),
+                              f"{label}: block {a['id']} written in subblocks")
+                had = (b["attr"]["checksum"] or "").split(":")[0].replace("-", "")
+                has = (a["attr"]["checksum"] or "").split(":")[0].replace("-", "")
+                check(has == ("" if want_sum == "none" else want_sum or had), f"{label}: block {a['id']} checksum {has!r}")
+                if not comp:
+                    check(int(a["location"].split(":")[1]) % 4096 == 0, f"{label}: uncompressed block {a['id']} is aligned")
+            # metadata that describes the storage follows the change
+            changed = codec is not None and any(a["attr"]["compression"] != b["attr"]["compression"] for a, b in zip(after, before))
+            codecs = re.findall(r'<Property id="XISF:CompressionCodecs"[^>]*?(?:value="([^"]*)"/>|>([^<]*)</Property>)', hdr1)
+            codecs = [x or y for x, y in codecs]
+            if changed and codec == "none":
+                check(not codecs and "XISF:CompressionLevel" not in hdr1, f"{label}: compression metadata removed")
+            elif changed:
+                check(codecs == [codec + "+sh"] and "XISF:CompressionLevel" not in hdr1, f"{label}: compression metadata {codecs}")
+            else:
+                check(re.findall(r'XISF:Compression\w+"[^>]*>[^<]*', hdr1) == re.findall(r'XISF:Compression\w+"[^>]*>[^<]*', hdr0),
+                      f"{label}: compression metadata untouched")
+            aligned = all(int(a["location"].split(":")[1]) % 4096 == 0 for a in after if a["kind"] == "attachment")
+            check(('id="XISF:BlockAlignmentSize" type="UInt16" value="4096"' in hdr1) if aligned
+                  else "XISF:BlockAlignmentSize" not in hdr1, f"{label}: block alignment stated only if it holds")
+            # xisfconv reads its own output the same way
+            v = run(out, "--verify", expect_ok=False)
+            check(v.returncode == 0 and ": OK (XISF, 3 images, 8 data blocks" in v.stdout, f"{label}: --verify: {v.stdout.strip()}")
+            fo = os.path.join(d, "out.fits")
+            run(out, "-o", fo, "-f", "-q")
+            check(open(fo, "rb").read() == open(ref_fits, "rb").read(), f"{label}: converts to the same FITS file as the input")
+
+    # one image out of several
+    src = os.path.join(d, "src.xisf")
+    images = rich_xisf(src, dict(codec="zlib", shuffle_item=1, checksum="sha1"), 1)
+    before = xisf_blocks(src)
+    for index, (ident, count) in enumerate([("main", 6), ("mask", 1), ("small", 1)]):
+        out = os.path.join(d, f"one_{index}.xisf")
+        run(src, "-o", out, "-f", "-q", "-i", str(index))
+        after = xisf_blocks(out)
+        _, hdr1 = xisf_header(out)
+        check(re.findall(r'<Image id="(\w+)"', hdr1) == [ident] and len(after) == count,
+              f"--image {index}: only image {ident} and its {count} blocks remain")
+        want = [b for b in before if b["id"] == ident or (index == 0 and b["id"] not in ("mask", "small"))]
+        check([a["data"] for a in after] == [b["data"] for b in want], f"--image {index}: its blocks are intact")
+        check("XISF:CreatorApplication" in hdr1 and "</Metadata>" in hdr1, f"--image {index}: file metadata kept")
+        pixels = [a for a in after if a["tag"] == "Image"][0]["data"]
+        check(pixels == as_planes(images[ident]).astype(images[ident].dtype.newbyteorder("<")).tobytes(), f"--image {index}: pixels")
+    check(os.path.getsize(os.path.join(d, "one_2.xisf")) < os.path.getsize(os.path.join(d, "one_0.xisf")) - 2000,
+          "the blocks of the other images are left out of the file")
+    r = run(src, "-o", out, "-f", "-i", "5", expect_ok=False)
+    check(r.returncode == 1 and "out of range" in r.stderr, "XISF -> XISF image index out of range")
+
+    # replacing the input
+    src = os.path.join(d, "inplace.xisf")
+    rich_xisf(src, dict(), 4096)
+    before = xisf_blocks(src)
+    size0 = os.path.getsize(src)
+    r = run(src, expect_ok=False, *["-t", "xisf"])
+    check(r.returncode == 1 and "add --in-place" in r.stderr and os.path.getsize(src) == size0, "no silent overwrite of the input")
+    r = run(src, "--in-place", "-c", "--checksum", "sha1")
+    after = xisf_blocks(src)
+    check(os.path.getsize(src) < size0 and [a["data"] for a in after] == [b["data"] for b in before] and
+          not os.path.exists(src + ".part") and "read back and compared" in r.stdout, "--in-place replaces the file with the compressed one")
+    stamp, content = os.path.getmtime(src), open(src, "rb").read()
+    r = run(src, "--in-place", "-c", "--checksum", "sha1")
+    check("left unchanged" in r.stdout and open(src, "rb").read() == content and os.path.getmtime(src) == stamp,
+          "--in-place leaves a file alone that is already stored as requested")
+    r = run(src, "--in-place", "--no-verify", "--codec", "none")
+    check("read back and compared" in r.stdout and os.path.getsize(src) > len(content), "--in-place always reads the new file back")
+    for args, msg in [(["--in-place", "-o", os.path.join(d, "x.xisf")], "cannot be combined"), (["--in-place", "-t", "fits"], "--in-place is for"),
+                      (["-t", "xisf", "-b", "u8", "-o", os.path.join(d, "x.xisf")], "do not apply"),
+                      (["-t", "xisf", "-s", "-o", os.path.join(d, "x.xisf")], "do not apply")]:
+        r = run(src, *args, expect_ok=False)
+        check(r.returncode != 0 and msg in r.stderr, f"XISF -> XISF with {args[:3]}: {r.stderr.strip()[:120]}")
+    f = os.path.join(d, "some.fits")
+    fits.PrimaryHDU(np.zeros((40, 40), np.uint16)).writeto(f, overwrite=True)
+    r = run(f, "--in-place", expect_ok=False)
+    check(r.returncode == 1 and "--in-place is for" in r.stderr, "--in-place on a FITS file is refused")
+    # "none" is also accepted where a file is created from another format
+    x = os.path.join(d, "some.xisf")
+    run(f, "-o", x, "-f", "-q", "--codec", "none", "--checksum", "none")
+    blk = xisf_blocks(x)[0]
+    check(blk["attr"]["compression"] is None and blk["attr"]["checksum"] is None, "--codec none --checksum none for FITS -> XISF")
+    run(f, "-o", x, "-f", "-q", "-c", "--checksum", "sha1")
+    blk = xisf_blocks(x)[0]
+    check(blk["attr"]["compression"] and blk["attr"]["checksum"].startswith("sha1:"), "-c --checksum sha1 for FITS -> XISF")
+
+    # a damaged input is never turned into an output, and never replaced
+    src = os.path.join(d, "damaged.xisf")
+    rich_xisf(src, dict(codec="zlib", shuffle_item=1, checksum="sha1"), 1)
+    raw = bytearray(open(src, "rb").read())
+    pos = int(xisf_blocks(src)[0]["location"].split(":")[1])
+    raw[pos + 40] ^= 0xFF
+    open(src, "wb").write(raw)
+    for flags in (["--codec", "none"], ["--codec", "zlib", "--checksum", "none"], ["--checksum", "sha256"]):
+        r = run(src, "--in-place", *flags, expect_ok=False)
+        check(r.returncode == 1 and "checksum mismatch" in r.stderr and open(src, "rb").read() == bytes(raw) and
+              not os.path.exists(src + ".part"), f"damaged file with {flags}: refused, original untouched")
+    plain = os.path.join(d, "damaged_plain.xisf")
+    rich_xisf(plain, dict(codec="zlib", shuffle_item=1), 1)     # no checksum: the damage shows when decompressing
+    raw = bytearray(open(plain, "rb").read())
+    raw[int(xisf_blocks(plain)[0]["location"].split(":")[1]) + 40] ^= 0xFF
+    open(plain, "wb").write(raw)
+    r = run(plain, "--in-place", "--checksum", "sha1", expect_ok=False)
+    check(r.returncode == 1 and open(plain, "rb").read() == bytes(raw), "damaged compressed block without checksum: no checksum is added")
+
+    # SHA-3 checksums are verified and computed like the others
+    src = os.path.join(d, "sha3.xisf")
+    a = test_image(np.uint16, 12, 14, 1, 44)
+    out = os.path.join(d, "sha3_out.xisf")
+    for algo in ("sha3-256", "sha3-512"):
+        e = image_entry(a)
+        e["block"].attrs["checksum"] = algo + ":" + hashlib.new(algo.replace("-", "_"), e["block"].payload).hexdigest()
+        write_xisf(src, [e])
+        run(src, "-o", out, "-f", "-q", "-c")
+        blk = xisf_blocks(out)[0]
+        check(blk["attr"]["checksum"] == algo + ":" + hashlib.new(algo.replace("-", "_"), blk["stored"]).hexdigest() and
+              blk["attr"]["compression"], f"{algo} checksum is computed again for the compressed block")
+        raw = bytearray(open(src, "rb").read())
+        raw[-20] ^= 1
+        open(src, "wb").write(raw)
+        r = run(src, "-o", out, "-f", "-c", expect_ok=False)
+        check(r.returncode == 1 and "checksum mismatch" in r.stderr, f"a damaged block under a {algo} checksum is refused")
+    write_xisf(src, [image_entry(a)])
+    run(src, "-o", out, "-f", "-q", "--checksum", "sha3-512")
+    blk = xisf_blocks(out)[0]
+    check(blk["attr"]["checksum"] == "sha3-512:" + hashlib.sha3_512(blk["stored"]).hexdigest(), "--checksum sha3-512")
+    # a checksum of an unknown kind: kept on a copied block, never silently dropped from one stored differently
+    e = image_entry(a)
+    e["block"].attrs["checksum"] = "whirlpool:" + "ab" * 64
+    write_xisf(src, [e])
+    run(src, "-o", out, "-f", "-q")
+    check(xisf_header(out)[1].count('checksum="whirlpool:') == 1, "a checksum of an unknown kind is kept when the block is copied")
+    r = run(src, "-o", out, "-f", "-c", expect_ok=False)
+    check(r.returncode == 1 and "cannot verify" in r.stderr, f"...and the block is not stored differently: {r.stderr.strip()[:160]}")
+    r = run(src, "-o", out, "-f", "-c", "--no-verify")
+    check("checksum" not in xisf_header(out)[1] and "cannot be recomputed" in r.stderr, "...unless --no-verify is given (checksum dropped, with a warning)")
+    r = run(src, "--verify", expect_ok=False)
+    check(r.returncode == 0 and "NOT FULLY CHECKED" in r.stdout and "whirlpool" in r.stdout, f"--verify says what it could not check: {r.stdout.strip()[:200]}")
+
+    # blocks in other files; elements that use a location attribute for something else
+    hdr = ('<xisf version="1.0" xmlns="http://www.pixinsight.com/xisf"><Image geometry="4:4:1" sampleFormat="UInt8" '
+           'colorSpace="Gray" location="url(file:///data.xisb):16:16"/></xisf>').encode()
+    open(src, "wb").write(b"XISF0100" + len(hdr).to_bytes(4, "little") + b"\0\0\0\0" + hdr)
+    r = run(src, "-o", out, "-f", expect_ok=False)
+    check(r.returncode == 1 and "external file" in r.stderr, "distributed XISF is refused when rewriting")
+    e = image_entry(a, children='<Observatory location="La Palma"/><Property id="Site" type="String" location="Roque"/>')
+    write_xisf(src, [e])
+    r = run(src, "-o", out, "-f", "-c")
+    check(r.returncode == 0 and '<Observatory location="La Palma"/>' in xisf_header(out)[1] and
+          run(out, "--verify", expect_ok=False).returncode == 0, "a location attribute that is no block reference is left alone")
+    emb = Block(as_planes(a).astype("<u2").tobytes(), location="embedded", encoding="hex")
+    hdr = ('<xisf version="1.0" xmlns="http://www.pixinsight.com/xisf"><Image geometry="14:12:1" sampleFormat="UInt16" '
+           f'colorSpace="Gray" location="embedded"><Data encoding="hex" location="attachment:9999:5">{emb.text}</Data></Image>'
+           '</xisf>').encode()
+    open(src, "wb").write(b"XISF0100" + len(hdr).to_bytes(4, "little") + b"\0\0\0\0" + hdr)
+    run(src, "-o", out, "-f", "-q", "-c", "--checksum", "sha1")
+    fo = os.path.join(d, "emb.fits")
+    run(out, "-o", fo, "-f", "-q", "--top-down")
+    check(np.array_equal(fits.getdata(fo), a[:, :, 0]) and run(out, "--verify", expect_ok=False).returncode == 0,
+          "the <Data> element of an embedded block is not taken for a block of its own")
+
+    # temporary files: never the input, never somebody else's file
+    part = os.path.join(d, "img.xisf.part")
+    rich_xisf(part, dict(), 4096)
+    content = open(part, "rb").read()
+    for flags in (["-c"], ["-t", "fits"]):
+        target = os.path.join(d, "img.xisf") if flags == ["-c"] else os.path.join(d, "img.xisf")
+        r = run(part, "-o", os.path.join(d, "img.xisf"), *flags, expect_ok=False)
+        check(r.returncode == 1 and "is the input file" in r.stderr and open(part, "rb").read() == content,
+              f"an input named like the temporary file is not destroyed ({flags})")
+    f = os.path.join(d, "t.fits")
+    fits.PrimaryHDU(np.zeros((40, 40), np.uint16)).writeto(f, overwrite=True)
+    r = run(f, "-o", os.path.join(d, "img.xisf"), expect_ok=False)
+    check(r.returncode == 1 and open(part, "rb").read() == content, "a file named like the temporary file is not overwritten (FITS -> XISF)")
+    src = os.path.join(d, "keep.xisf")
+    rich_xisf(src, dict(), 4096)
+    open(src + ".part", "w").write("my notes")
+    open(src[:-5] + ".fits.part", "w").write("my notes")
+    for flags, part in ((["--in-place", "-c"], src + ".part"), (["--in-place", "-i", "9"], src + ".part"),
+                        (["-t", "fits"], src[:-5] + ".fits.part")):
+        r = run(src, *flags, expect_ok=False)
+        check(r.returncode == 1 and open(part).read() == "my notes" and ("exists" in r.stderr or "out of range" in r.stderr),
+              f"a foreign .part file is left alone ({flags}): {r.stderr.strip()[:100]}")
+    run(src, "--in-place", "-c", "--force", "-q")
+    check(not os.path.exists(src + ".part") and xisf_blocks(src)[0]["attr"]["compression"], "--force lets a leftover .part be overwritten")
+    r = run(src, "--in-place", "-c", "-i", "7", expect_ok=False)
+    check(r.returncode == 1 and "out of range" in r.stderr, "--in-place with an image index out of range is an error")
+
+    # replacing through a link, and file permissions (POSIX)
+    if os.name == "posix":
+        real = os.path.join(d, "real.xisf")
+        link = os.path.join(d, "link.xisf")
+        rich_xisf(real, dict(), 4096)
+        if os.path.lexists(link):
+            os.remove(link)
+        os.symlink(real, link)
+        size0 = os.path.getsize(real)
+        os.chmod(real, 0o640)
+        run(link, "--in-place", "-c", "-q")
+        check(os.path.islink(link) and os.path.getsize(real) < size0, "--in-place through a symbolic link rewrites the file, not the link")
+        check((os.stat(real).st_mode & 0o777) == 0o640, f"--in-place keeps the file's permissions ({oct(os.stat(real).st_mode & 0o777)})")
+        os.chmod(real, 0o440)
+        content = open(real, "rb").read()
+        r = run(real, "--in-place", "--codec", "none", expect_ok=False)
+        check(r.returncode == 1 and "read-only" in r.stderr and open(real, "rb").read() == content, "--in-place does not replace a read-only file")
+        os.chmod(real, 0o640)
+
+
+def test_verify():
+    """--verify on intact and damaged XISF, FITS and ASDF files, and on a directory."""
+    import warnings
+    d = os.path.join(TMP, "verify")
+    os.makedirs(os.path.join(d, "sub", "deeper"), exist_ok=True)
+    def verify(*args):
+        return run("--verify", *args, expect_ok=False)
+    def damaged(path, offset, name):
+        raw = bytearray(open(path, "rb").read())
+        raw[offset] ^= 0xFF
+        out = os.path.join(d, name)
+        open(out, "wb").write(raw)
+        return out
+
+    good = os.path.join(d, "good.xisf")
+    rich_xisf(good, dict(codec="zlib", shuffle_item=1, checksum="sha1"), 1)
+    r = verify(good)
+    check(r.returncode == 0 and r.stdout.strip().endswith(": OK (XISF, 3 images, 8 data blocks; 7 checksums verified, 1 without checksum)"),
+          f"--verify on an intact XISF file: {r.stdout.strip()}")
+    pos = int(xisf_blocks(good)[0]["location"].split(":")[1])
+    r = verify(damaged(good, pos + 40, "bad_sum.xisf"))
+    check(r.returncode == 1 and "FAILED" in r.stdout and "checksum mismatch on image 0" in r.stdout and "--no-verify" not in r.stdout,
+          f"--verify finds a flipped byte under a checksum: {r.stdout.strip()}")
+    nosum = os.path.join(d, "nosum.xisf")
+    rich_xisf(nosum, dict(codec="zlib", shuffle_item=1), 1)
+    r = verify(nosum)
+    check(r.returncode == 0 and "1 checksum verified, 7 without checksum" in r.stdout, f"--verify without checksums: {r.stdout.strip()}")
+    pos = int(xisf_blocks(nosum)[1]["location"].split(":")[1])
+    r = verify(damaged(nosum, pos + 20, "bad_zlib.xisf"))
+    check(r.returncode == 1 and "FAILED" in r.stdout and "Vec" in r.stdout, f"--verify finds damaged compressed data: {r.stdout.strip()}")
+    trunc = os.path.join(d, "trunc.xisf")
+    open(trunc, "wb").write(open(good, "rb").read()[:-200])
+    r = verify(trunc)
+    check(r.returncode == 1 and "beyond the end of the file" in r.stdout, "--verify finds a truncated file")
+    a = test_image(np.uint16, 12, 14, 1, 45)
+    e = image_entry(a)
+    e["attrs"]["geometry"] = "14:13:1"
+    wrong = os.path.join(d, "geometry.xisf")
+    write_xisf(wrong, [e])
+    r = verify(wrong)
+    check(r.returncode == 1 and "geometry requires" in r.stdout, "--verify compares the pixel data with the geometry")
+
+    # FITS: CHECKSUM / DATASUM as astropy writes them
+    rng = np.random.default_rng(46)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        f = os.path.join(d, "sums.fits")
+        fits.HDUList([fits.PrimaryHDU(rng.integers(0, 65535, (30, 40), dtype=np.uint16)),
+                      fits.ImageHDU(rng.random((3, 20, 25)).astype(np.float32), name="B"), fits.ImageHDU()]).writeto(
+                          f, overwrite=True, checksum=True)
+        plain = os.path.join(d, "plain.fits")
+        fits.PrimaryHDU(rng.integers(0, 255, (9, 9), dtype=np.uint8)).writeto(plain, overwrite=True)
+        with fits.open(f, checksum=True) as h:   # astropy agrees that the sums are right
+            w = []
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                [x.data for x in h]
+            check(not w, "astropy accepts the checksums of the test file")
+    r = verify(f)
+    check(r.returncode == 0 and ": OK (FITS, 3 HDUs; 3 checksums verified)" in r.stdout, f"--verify on FITS with checksums: {r.stdout.strip()}")
+    r = verify(plain)
+    check(r.returncode == 0 and "1 HDU; no checksums in the file" in r.stdout, f"--verify on FITS without checksums: {r.stdout.strip()}")
+    r = verify(damaged(f, 2880 + 500, "bad_data.fits"))
+    check(r.returncode == 1 and "HDU 0: DATASUM mismatch" in r.stdout and "HDU 0: CHECKSUM mismatch" in r.stdout and
+          "HDU 1" not in r.stdout, f"--verify finds a damaged FITS data unit: {r.stdout.strip()}")
+    header = open(f, "rb").read()[:2880]
+    r = verify(damaged(f, header.index(b"BITPIX") + 40, "bad_header.fits"))
+    check(r.returncode == 1 and "HDU 0: CHECKSUM mismatch: the header was changed" in r.stdout and "DATASUM" not in r.stdout,
+          f"--verify finds a changed FITS header: {r.stdout.strip()}")
+    open(os.path.join(d, "short.fits"), "wb").write(open(plain, "rb").read()[:2880 + 10])
+    r = verify(os.path.join(d, "short.fits"))
+    check(r.returncode == 1 and "beyond the end" in r.stdout, "--verify finds a truncated FITS file")
+    whole = open(f, "rb").read()
+    second = whole.index(b"XTENSION")
+    open(os.path.join(d, "cut_header.fits"), "wb").write(whole[:second + 1000])
+    r = verify(os.path.join(d, "cut_header.fits"))
+    check(r.returncode == 1 and "after HDU 0 are not padding" in r.stdout, f"--verify finds a FITS file cut inside a header: {r.stdout.strip()}")
+    r = verify(damaged(f, second + 1, "bad_xtension.fits"))
+    check(r.returncode == 1 and "after HDU 0 are not padding" in r.stdout, "--verify finds a damaged XTENSION card")
+    third = whole.index(b"XTENSION", second + 1)
+    open(os.path.join(d, "unpadded.fits"), "wb").write(whole[:second + 2880 + 3 * 20 * 25 * 4])   # HDU 1 without its padding
+    r = verify(os.path.join(d, "unpadded.fits"))
+    check(r.returncode == 0 and "2 HDUs; 2 checksums verified" in r.stdout and third > second,
+          f"--verify accepts an intact last HDU that is not padded: {r.stdout.strip()}")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        g = os.path.join(d, "groups.fits")
+        gdata = fits.GroupData(rng.random((5, 1, 1, 4, 3)).astype(np.float32), parnames=["U", "V"], bitpix=-32,
+                               pardata=[np.arange(5.0), np.arange(5.0) * 2])
+        fits.GroupsHDU(gdata).writeto(g, overwrite=True, checksum=True)
+    r = verify(g)
+    check(r.returncode == 0 and "1 HDU; 1 checksum verified" in r.stdout, f"--verify on random groups FITS: {r.stdout.strip()}")
+    r = verify(damaged(g, os.path.getsize(g) - 2880 + 7, "bad_groups.fits"))
+    check(r.returncode == 1 and "DATASUM mismatch" in r.stdout, "--verify finds damage in random groups data")
+
+    # ASDF: MD5 of every block
+    s = os.path.join(d, "good.asdf")
+    run(f, "-o", s, "-f", "-q", "-c")
+    r = verify(s)
+    check(r.returncode == 0 and ": OK (ASDF, 2 binary blocks; 2 checksums verified)" in r.stdout, f"--verify on ASDF: {r.stdout.strip()}")
+    r = verify(damaged(s, open(s, "rb").read().index(b"\xd3BLK") + 60, "bad.asdf"))
+    check(r.returncode == 1 and "block 0: MD5 checksum mismatch" in r.stdout and "--no-verify" not in r.stdout,
+          f"--verify finds a damaged ASDF block: {r.stdout.strip()}")
+    whole = open(s, "rb").read()
+    first = whole.index(b"\xd3BLK")
+    second = whole.index(b"\xd3BLK", first + 1)
+    for name, cut in [("at the end of the tree", first), ("inside the first block header", first + 20),
+                      ("at the second block", second), ("inside the second block header", second + 30),
+                      ("inside the second block", second + 80)]:
+        open(os.path.join(d, "cut.asdf"), "wb").write(whole[:cut])
+        r = verify(os.path.join(d, "cut.asdf"))
+        check(r.returncode == 1 and "FAILED" in r.stdout, f"--verify finds an ASDF file cut {name}: {r.stdout.strip()[:160]}")
+    r = verify(damaged(s, second, "bad_magic.asdf"))
+    check(r.returncode == 1 and "damaged block header" in r.stdout, f"--verify finds a damaged ASDF block magic: {r.stdout.strip()[:200]}")
+    bz = os.path.join(d, "bz.asdf")
+    write_asdf_raw(bz, "img: !core/ndarray-1.0.0 {source: 0, datatype: uint8, byteorder: little, shape: [4, 5]}\n",
+                   [asdf_block(bytes(20), b"bzp2")])
+    r = verify(bz, plain)
+    check(r.returncode == 0 and "bz.asdf: NOT FULLY CHECKED" in r.stdout and "not checked: block 0: bzip2" in r.stdout and
+          "1 file OK, 1 not fully checked, 0 failed" in r.stdout, f"--verify: what cannot be checked is not a failure: {r.stdout.strip()}")
+
+    # other files, directories, exit status, --quiet
+    text = os.path.join(d, "notes.txt")
+    open(text, "w").write("not an image, just some notes\n" * 3)
+    r = verify(text)
+    check(r.returncode == 1 and "FAILED" in r.stdout and "not an XISF" in r.stdout, "--verify on a file of another kind")
+    r = verify(os.path.join(d, "missing.xisf"))
+    check(r.returncode == 1 and "FAILED" in r.stdout, "--verify on a missing file")
+    tree = os.path.join(d, "sub")
+    shutil.copy(good, os.path.join(tree, "a.xisf"))
+    shutil.copy(f, os.path.join(tree, "deeper", "b.fits"))
+    shutil.copy(s, os.path.join(tree, "deeper", "c.asdf"))
+    shutil.copy(text, os.path.join(tree, "deeper", "notes.txt"))
+    r = verify(tree)
+    check(r.returncode == 0 and r.stdout.count(": OK (") == 3 and "3 files OK, 0 failed" in r.stdout and "notes.txt" not in r.stdout,
+          f"--verify on a directory looks at the image files below it: {r.stdout.strip()[-200:]}")
+    shutil.copy(os.path.join(d, "bad_sum.xisf"), os.path.join(tree, "deeper", "z.xisf"))
+    r = verify(tree, plain)
+    check(r.returncode == 1 and "4 files OK, 1 failed" in r.stdout, "--verify: exit status 1 when a file fails")
+    r = verify("-q", tree, plain)
+    check(r.returncode == 1 and ": OK" not in r.stdout and "z.xisf: FAILED" in r.stdout, "--verify --quiet prints the failures only")
+    empty = os.path.join(d, "empty")
+    os.makedirs(empty, exist_ok=True)
+    r = verify(empty)
+    check(r.returncode == 0 and "no XISF, FITS or ASDF files found" in r.stderr, "--verify on a directory without image files")
+    if os.name == "posix" and os.geteuid() != 0:   # (root reads every directory)
+        locked = os.path.join(tree, "locked")
+        os.makedirs(locked, exist_ok=True)
+        os.chmod(locked, 0)
+        r = verify(tree)
+        os.chmod(locked, 0o755)
+        check(r.returncode == 1 and "locked" in r.stdout and "cannot be read" in r.stdout, "--verify reports a directory it cannot read")
+    before = {n: os.path.getmtime(os.path.join(d, n)) for n in os.listdir(d)}
+    verify(d)
+    check(before == {n: os.path.getmtime(os.path.join(d, n)) for n in os.listdir(d)}, "--verify writes nothing")
+
+
 if __name__ == "__main__":
     print("xisfconv:", EXE)
     print(subprocess.run([EXE, "--version"], capture_output=True, text=True).stdout.strip())
@@ -2282,7 +2848,8 @@ if __name__ == "__main__":
               test_batch_and_outdir, test_stretch, test_wcs, test_solution_properties_forms, test_tiff_predictors, test_png,
               test_fits_to_xisf_formats, test_fits_to_xisf_metadata, test_fits_to_xisf_bounds_bits_hdus,
               test_xisf_fits_xisf_roundtrip, test_asdf_yaml, test_asdf_hand_written, test_asdf_output,
-              test_asdf_python_files, test_asdf_roundtrips, test_export_from_fits_and_asdf):
+              test_asdf_python_files, test_asdf_roundtrips, test_export_from_fits_and_asdf, test_xisf_rewrite,
+              test_verify):
         try:
             t()
         except Exception as e:  # noqa: BLE001

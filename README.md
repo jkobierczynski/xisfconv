@@ -12,6 +12,8 @@ xisfconv -t tiff -c -b u16 *.xisf -d export/  # batch to 16-bit Deflate TIFFs
 xisfconv -t tiff -s -b u8 integration.xisf     # stretched 8-bit TIFF for GIMP
 xisfconv -t png -s -b u8 integration.xisf      # stretched 8-bit PNG for the web
 xisfconv -t png -s -b u8 light_0001.fits       # quick look at a raw FITS frame
+xisfconv -c --in-place *.xisf                 # recompress XISF files with zstd, replacing them
+xisfconv --verify ~/astro/2026                # check every XISF, FITS and ASDF file below a folder
 xisfconv --info light_0001.xisf               # geometry, codecs, FITS keywords, properties
 ```
 
@@ -23,7 +25,7 @@ xisfconv --info light_0001.xisf               # geometry, codecs, FITS keywords,
 - Compression: zlib, LZ4, LZ4HC (built-in decoder), Zstandard (via libzstd), each with or without
   byte shuffling, including compressed **subblocks**
 - Data blocks as attachments, `inline:base64`/`inline:hex`, or `embedded` `<Data>` elements
-- SHA-1 / SHA-256 / SHA-512 checksum verification (SHA3 checksums are reported but not verified)
+- Checksum verification: SHA-1, SHA-256, SHA-512, SHA3-256 and SHA3-512
 - FITS keywords, XISF properties, ColorFilterArray, Resolution, ICC profile, multiple images
 
 **FITS output**
@@ -78,6 +80,59 @@ xisfconv --info light_0001.xisf               # geometry, codecs, FITS keywords,
 - Output is a monolithic XISF 1.0 file. `-c` compresses with Zstandard + byte shuffling (the same
   settings PixInsight uses; `--codec zlib` for zlib), blocks over 1 GiB are written as subblocks, and
   `--checksum sha1|sha256|sha512` adds an integrity checksum.
+
+**XISF → XISF: another compression, checksums, one image of several** (`-t xisf`, `-o name.xisf` or `--in-place`)
+- Rewrites a file with its attached data blocks stored another way, for example to shrink an archive
+  of uncompressed files: `-c` compresses every attached block with Zstandard and byte shuffling
+  (`--codec zlib` for zlib, `--codec none` to store everything uncompressed). On the uncompressed
+  71 MiB test frame from PixInsight that gives 52 MiB, the size PixInsight's own zstd files have.
+- `--checksum sha1|sha256|sha512|sha3-256|sha3-512` adds a checksum to every attached block
+  (replacing others); `--checksum none` removes them. Without the option, checksums the file has are
+  kept, and computed again with the same algorithm for blocks whose stored bytes change.
+- `--image n` writes a file that holds only that image, with its keywords, properties and other
+  blocks, and the file metadata.
+- Nothing else changes. The XML header is carried over as text: only the `location`, `compression`,
+  `subblocks` and `checksum` attributes of the attached blocks are edited, plus the
+  `XISF:CompressionCodecs` / `XISF:CompressionLevel` / `XISF:BlockAlignmentSize` file properties that
+  describe the storage. Pixels, keywords, properties (astrometric solution, processing history), ICC
+  profile, thumbnail, comments and elements xisfconv does not know all stay as they are, and so do
+  the creation time and the creating application. Blocks stored inline or embedded in the header
+  are left where they are. Blocks already stored as requested are copied, not compressed again, and
+  a block the codec cannot shrink is stored uncompressed. Uncompressed blocks are aligned to 4096
+  bytes; compressed blocks follow each other directly, as in PixInsight's files.
+- It is careful with the data. The input's checksums are verified and every compressed block is
+  decompressed, so a damaged file is refused rather than given a fresh checksum. A block with a
+  checksum of a kind xisfconv does not know is copied with it, never stored differently. The output
+  is then read back, every block compared with the input and the whole file verified (`--no-verify`
+  skips these checks).
+- `--in-place` replaces the input file. The new file is written next to it as `name.xisf.part`, read
+  back and compared (always, even with `--no-verify`), given the permissions of the original,
+  flushed to disk, and only then renamed over the original; if anything fails the original is
+  untouched. A symbolic link is followed (the file is replaced, the link stays); a read-only file
+  is refused. Files that are already stored as requested are left alone, so
+  `xisfconv -c --in-place *.xisf` can be run again on a folder. Without `--in-place`, give `-o` or
+  `-d`: the input is never overwritten by accident.
+- All codecs PixInsight writes are read (zlib, LZ4, LZ4HC, Zstandard, with subblocks); the output
+  uses zlib or Zstandard. Tested on PixInsight 1.9.3 files in each of those codecs, Float32, Float64
+  and UInt32, with SHA-1/256/512 checksums: every block of every rewritten file decodes to the
+  original bytes.
+
+**Verifying files** (`--verify <file or directory>...`)
+- Reads every file completely without converting anything and says whether it is intact. A
+  directory stands for the `.xisf`, `.fits`/`.fit`/`.fts` and `.asdf` files in it and below it.
+- XISF: every data block (pixels, properties, ICC profile, thumbnail; attached, inline or embedded)
+  has its checksum verified where it has one, is decompressed, and for images compared with the
+  size the geometry requires.
+- FITS: the structure of every HDU is checked, and the `CHECKSUM` and `DATASUM` keywords where the
+  file has them (most capture programs do not write them; astropy and CFITSIO can).
+- ASDF: the tree is parsed, and every binary block has its MD5 checksum verified and is decompressed.
+- One line per file, `OK` with what was checked or `FAILED` with the reasons; with several files a
+  count at the end. The exit status is 1 if any file failed (or a directory could not be read), so
+  it can be used in scripts. `-q` prints the failures only. A file with a part xisfconv cannot
+  check (a bzip2-compressed ASDF block, a checksum of an unknown kind) is reported as
+  `NOT FULLY CHECKED`, with that part named; it does not count as a failure. A file without checksums can still fail (truncated, compressed data that
+  does not decompress), but a changed pixel in uncompressed data goes unnoticed: add checksums with
+  `xisfconv --checksum sha1 --in-place` to be able to tell later.
 
 **ASDF output** (`-t asdf` or `-o name.asdf`, from XISF or FITS)
 - [ASDF](https://www.asdf-format.org) is the YAML-plus-binary-blocks format of the Python astronomy
@@ -221,9 +276,11 @@ xisfconv [options] <file>...      # any of XISF, FITS, ASDF -> any other of them
   -o, --output <file>         output file name (single input only)
   -d, --outdir <dir>          directory for output files (default: next to each input)
   -f, --force                 overwrite existing output files
+      --in-place              XISF -> XISF: replace the input file (after reading the new one back)
   -b, --bits <fmt>            output sample format: u8, u16, u32, f32, f64 (default: as stored)
   -i, --image <n>             convert only image n (0-based); default: all images
   -c, --compress              TIFF: Deflate with predictor; XISF: zstd + byte shuffling; ASDF: zlib
+                              XISF -> XISF: every attached data block
   -s, --stretch[=mode]        screen stretch for viewing: auto (default), linked, unlinked, stf
       --top-down              from XISF: keep XISF's top-down row order in FITS/ASDF (default: bottom-up)
                               from FITS/ASDF: the rows are stored top-down
@@ -233,18 +290,25 @@ xisfconv [options] <file>...      # any of XISF, FITS, ASDF -> any other of them
                               to XISF: don't write PixInsight solution properties from WCS
       --sip-order <n>         from XISF: SIP distortion order (2-7, default 3; 0 = linear only)
       --no-verify             don't verify data block checksums
-      --codec <zlib|zstd>     XISF and ASDF output: compression codec (implies -c)
-      --checksum <sha1|sha256|sha512>  XISF output: checksum of the pixel data
+      --codec <zlib|zstd|none>  XISF and ASDF output: compression codec (zlib, zstd imply -c);
+                              none = uncompressed (XISF -> XISF: decompress)
+      --checksum <sha1|sha256|sha512|sha3-256|sha3-512|none>
+                              XISF output: checksum of the pixel data;
+                              XISF -> XISF: of every attached block (none removes them)
       --bounds <lo:hi>        from FITS/ASDF: range of floating point data (XISF bounds; black:white
                               for TIFF and PNG)
+      --verify                check the files, and the image files in the directories, given;
+                              converts nothing; exit status 1 if a file is damaged
   -I, --info                  print image geometry, keywords and properties; no conversion
       --dump-header           print the raw XML header (XISF), all keywords (FITS) or the YAML tree (ASDF)
   -q, --quiet                 suppress warnings
 ```
 
 Output is written to `<name>.part` and renamed when complete, so an interrupted run never leaves a
-half-written file under the final name. With several inputs, a failing file is reported and the
-rest are still converted (exit status 1).
+half-written file under the final name. A `<name>.part` that already exists (the leftover of an
+interrupted run, or another file) is not overwritten unless `--force` is given, and never when it
+is the input itself. With several inputs, a failing file is reported and the rest are still
+converted (exit status 1).
 
 ## Testing
 
@@ -272,6 +336,17 @@ was made from: for every sample format, gray and RGB, both row orders and a set 
 `--stretch` and `--compress` combinations the pixels must be identical, and separate cases cover
 ADU-scaled floats, signed data, NaN pixels, cubes and several HDUs.
 
+XISF → XISF is checked with a reader in the test script that knows nothing of xisfconv: for source
+files in every codec, with and without checksums and subblocks, and for every option set, all data
+blocks of the output must decode to the bytes of the input, the header must be the same text once
+the storage attributes are taken out, and the blocks must be stored the way the options say. The
+source holds what a rewrite could lose: attached and inline properties, an embedded image, an ICC
+profile, a thumbnail, comments, CDATA, entities and an unknown element. Damaged inputs must be
+refused with the original left byte for byte as it was, and so must an input that is named like
+the temporary file. `--verify` is tested on intact files, on files with one byte flipped in each
+kind of place and on files cut short at each kind of place; FITS checksums come from astropy
+(image HDUs and random groups), SHA-3 digests are compared with Python's hashlib.
+
 ASDF is checked against Python's `asdf` library with `asdf-astropy` (the tests are skipped if those
 are not installed). Files written by xisfconv must open without a warning, pass schema validation
 and checksum validation, and yield an astropy HDU list with the pixels and header cards of the
@@ -285,7 +360,6 @@ compared with PyYAML on random documents in all of PyYAML's output styles.
 
 - Distributed XISF units (`.xish` + `.xisb`) are not supported, only monolithic `.xisf` files.
 - Complex sample formats and images with more than two dimensions are skipped.
-- SHA3 checksums are not verified.
 - CIELab images are written as raw 3-channel data without color conversion.
 - TIFF output is classic TIFF (4 GiB limit); BigTIFF is not implemented.
 - WCS keywords in an XISF header are taken to follow the FITS bottom-up convention (PixInsight's);
@@ -305,6 +379,10 @@ compared with PyYAML on random documents in all of PyYAML's output styles.
 - ASDF output always uses the FITS HDU list layout described above; it does not write generalized WCS
   (gwcs) objects or instrument-specific data models.
 - XISF output is not compressed with LZ4 (zlib and Zstandard only).
+- XISF → XISF does not move blocks between the header (inline, embedded) and attachments. Replacing a
+  file in place gives it a new inode: other hard links to the old file keep the old content.
+- FITS output carries no CHECKSUM/DATASUM keywords yet; `--verify` checks them where a file has them.
+- On Windows the shell does not expand `*.xisf`; name the files, or use a directory with `--verify`.
 - The PixInsight spline distortion model is approximated by SIP polynomials, not carried over exactly.
 - Please report any file that fails to convert, ideally with `xisfconv --info` output.
 
@@ -313,7 +391,7 @@ compared with PyYAML on random documents in all of PyYAML's output styles.
 Bump the version in `src/common.hpp` and `CMakeLists.txt`, commit, then push a matching tag:
 
 ```
-git tag v0.7.0 && git push origin v0.7.0
+git tag v0.8.0 && git push origin v0.8.0
 ```
 
 CI builds and tests all three platforms and, only if every one passes, publishes a GitHub release with

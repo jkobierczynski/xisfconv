@@ -77,6 +77,29 @@ struct XisfImage {
     const xml::Node* iccNode = nullptr;
 };
 
+// The compression attribute of a data block: codec[+sh]:uncompressedSize[:itemSize].
+struct XisfCompression {
+    std::string codec;  // zlib, lz4, lz4hc, zstd
+    bool shuffled = false;
+    uint64_t uncompressedSize = 0;
+    uint64_t itemSize = 1;
+};
+XisfCompression parseXisfCompression(const std::string& text);
+
+// Hex digest for a checksum algorithm name (sha1 / sha-1, sha256 / sha-256, sha512 / sha-512,
+// sha3-256, sha3-512). Returns false for names that are not known.
+bool xisfDigest(const std::string& algorithm, const uint8_t* data, size_t size, std::string& hex);
+
+// A data block as it is stored in the file, with the attributes that describe it.
+struct XisfStoredBlock {
+    std::vector<uint8_t> bytes;                     // attachment bytes, or the decoded inline/embedded text
+    std::string compression, subblocks, checksum;   // attribute text (empty if absent)
+    bool attachment = false;
+    uint64_t position = 0;                          // attachments: offset in the file
+};
+
+enum class XisfChecksumState { None, Verified, Unsupported };
+
 class XisfFile {
 public:
     explicit XisfFile(const std::string& path);
@@ -93,6 +116,18 @@ public:
 
     // Reads an image's embedded ICC profile (empty if none).
     std::vector<uint8_t> readIccProfile(size_t index, bool verifyChecksum);
+
+    // Low-level access to data blocks, for rewriting and verification. `element` is any header
+    // element with a location attribute; `what` names it in error messages.
+    const xml::Node& root() const { return *root_; }
+    XisfStoredBlock readStoredBlock(const xml::Node& element, const std::string& what);
+    // Throws on a mismatch; Unsupported for algorithms that are not implemented.
+    static XisfChecksumState verifyBlockChecksum(const XisfStoredBlock& block, const std::string& what);
+    // Decompresses and unshuffles the stored bytes (a copy of them if the block is not compressed).
+    // expectedSize 0 = unknown.
+    static std::vector<uint8_t> decodeBlock(const XisfStoredBlock& block, const std::string& what, uint64_t expectedSize = 0);
+    std::vector<uint8_t> readBlock(const xml::Node& element, bool verifyChecksum, const std::string& what,
+                                   uint64_t expectedSize = 0);  // 0 = unknown
 
     // Looks up a property by id: image properties first, then file-level metadata.
     const XisfProperty* findProperty(size_t imageIndex, const std::string& id) const;
@@ -114,8 +149,6 @@ private:
 
     void parseImage(const xml::Node& node);
     XisfProperty parseProperty(const xml::Node& node);
-    std::vector<uint8_t> readBlock(const xml::Node& element, bool verifyChecksum, const std::string& what,
-                                   uint64_t expectedSize = 0);  // 0 = unknown
     std::vector<uint8_t> readAttachment(uint64_t position, uint64_t size);
 };
 
