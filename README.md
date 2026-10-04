@@ -415,12 +415,17 @@ compared with PyYAML on random documents in all of PyYAML's output styles.
 - The PixInsight spline distortion model is approximated by SIP polynomials, not carried over exactly.
 - Please report any file that fails to convert, ideally with `xisfconv --info` output.
 
+## Development
+
+[`DEVELOPMENT.md`](DEVELOPMENT.md) records the decisions behind the program (scope, conventions,
+dependencies, testing, the planned library); [`TODO.md`](TODO.md) lists what is planned.
+
 ## Releasing
 
 Bump the version in `src/common.hpp` and `CMakeLists.txt`, commit, then push a matching tag:
 
 ```
-git tag v0.9.0 && git push origin v0.9.0
+git tag v0.9.1 && git push origin v0.9.1
 ```
 
 CI builds and tests all three platforms and, only if every one passes, publishes a GitHub release with

@@ -1,6 +1,7 @@
 # To do
 
-Planned features, roughly in order. Done items move to the README.
+Planned features, roughly in order. Done items move to the README; the decisions behind them are
+in `DEVELOPMENT.md`.
 
 - [x] TIFF and PNG export from FITS and ASDF input, with `--stretch` and `--bits` (0.7.0)
 - [x] XISF -> XISF rewriting: recompress or decompress existing files, add or remove checksums,
@@ -34,30 +35,22 @@ Smaller items, each closing a limitation listed in the README:
 Brief: `LIBRARY-HANDOFF.md` with `xisfconv.h` (draft 1 of the C API) and `example.c`, written
 against 0.8.0.
 
-Decided:
-
-- The C++ code stays the engine; a plain C API in `xisfconv.h` is the only public interface, and
-  every language binds to it (C++ through a header-only wrapper).
-- The command line tool is rebuilt on the C API alone.
-- Licence of the library: LGPL-3.0; the command line tool stays GPL-3.0-or-later.
-- 0.x, no ABI promise until two bindings have used the API. Bindings: Python first, then Rust, Perl.
-
-Open:
-
-- Function prefix: `xc_` (draft) or `xisfconv_`. `xc_` is taken by libxc (`xc_version`,
-  `xc_func_init`) and by Xen's libxenctrl.
-- Whether writing images from memory (`xc_writer_*`) and the stretch on buffers are in the first
-  library release.
+The decisions (C API only, licence, prefix, scope, writer, bindings, delivery) are recorded in
+`DEVELOPMENT.md`.
 
 Steps, each ending with the whole test suite green and the console output unchanged:
 
-1. Build split: a static core library with everything but `main.cpp`; the executable links it.
-2. Move the conversion logic (`convertXisfFile`, `convertFitsOrAsdfFile`, `rewriteXisfFile`, the
-   `.part` handling) out of `main.cpp` into a module that takes an options struct and a message
-   sink. Replace the globals `g_context` / `g_quiet` and `warn()`. Also: the lazily filled table
-   in `base64Decode` (not thread-safe), an error kind in `xisfconv::Error` (I/O, format, checksum,
-   exists, argument), UTF-8 paths on Windows for every file that is opened, and reading one FITS
-   HDU or ASDF array at a time (`readFits` and `readAsdf` read all images of a file at once).
+1. [x] Build split: a static core library with everything but `main.cpp`; the executable links
+   it (0.9.1).
+2. [x] The conversion logic (`convertXisfFile`, `convertFitsOrAsdfFile`, `rewriteXisfFile`, the
+   `.part` handling) is in `src/pipeline.cpp`, takes an options struct and prints nothing. The
+   globals `g_context` / `g_quiet` are gone: `warn()` and `info()` go to a message handler that is
+   installed per thread (`MessageScope`). The table in `base64Decode` is filled thread-safely
+   (0.9.1).
+   Still to do before the C API: an error kind in `xisfconv::Error` (I/O, format, checksum, exists,
+   argument), UTF-8 paths on Windows for every file that is opened, reading one FITS HDU or ASDF
+   array at a time (`readFits` and `readAsdf` read all images of a file at once), and messages
+   that name command line options (`--force`, `--bounds`) only where the tool adds them.
 3. The C API over it, with one try/catch per entry point.
 4. The command line tool on `xisfconv.h` alone.
 5. Shared library, exported symbols only, install rules, pkg-config and CMake package files.

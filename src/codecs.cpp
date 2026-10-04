@@ -5,6 +5,7 @@
 #include <zlib.h>
 
 #include <algorithm>
+#include <array>
 #include <climits>
 
 #include "common.hpp"
@@ -18,14 +19,14 @@ namespace xisfconv {
 // ---------------------------------------------------------------- text encodings
 
 std::vector<uint8_t> base64Decode(const std::string& text) {
-    static int8_t table[256];
-    static bool init = false;
-    if (!init) {
-        for (auto& t : table) t = -1;
+    // filled once, also when several threads arrive here together
+    static const std::array<int8_t, 256> table = [] {
+        std::array<int8_t, 256> t;
+        t.fill(-1);
         const char* alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        for (int i = 0; i < 64; ++i) table[static_cast<unsigned char>(alphabet[i])] = static_cast<int8_t>(i);
-        init = true;
-    }
+        for (int i = 0; i < 64; ++i) t[static_cast<unsigned char>(alphabet[i])] = static_cast<int8_t>(i);
+        return t;
+    }();
     std::vector<uint8_t> out;
     out.reserve(text.size() * 3 / 4);
     uint32_t acc = 0;

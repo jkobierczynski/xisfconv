@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(xisfconv VERSION 0.9.0 LANGUAGES CXX)
+project(xisfconv VERSION 0.9.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -22,8 +22,8 @@ endif()
 
 find_package(ZLIB REQUIRED)
 
-add_executable(xisfconv
-  src/main.cpp
+# Everything but the command line: the formats and the conversions between them.
+add_library(xisfconv_core STATIC
   src/asdf.cpp
   src/common.cpp
   src/xml.cpp
@@ -35,19 +35,26 @@ add_executable(xisfconv
   src/fits.cpp
   src/fitsread.cpp
   src/fitstile.cpp
+  src/pipeline.cpp
   src/tiff.cpp
   src/png.cpp
   src/wcs.cpp
   src/yaml.cpp
 )
-target_link_libraries(xisfconv PRIVATE ZLIB::ZLIB)
+target_include_directories(xisfconv_core PUBLIC src)
+target_link_libraries(xisfconv_core PUBLIC ZLIB::ZLIB)
 
-if(MSVC)
-  target_compile_options(xisfconv PRIVATE /W4)
-  target_compile_definitions(xisfconv PRIVATE _CRT_SECURE_NO_WARNINGS)
-else()
-  target_compile_options(xisfconv PRIVATE -Wall -Wextra -Wpedantic)
-endif()
+add_executable(xisfconv src/main.cpp)
+target_link_libraries(xisfconv PRIVATE xisfconv_core)
+
+foreach(_target xisfconv_core xisfconv)
+  if(MSVC)
+    target_compile_options(${_target} PRIVATE /W4)
+    target_compile_definitions(${_target} PRIVATE _CRT_SECURE_NO_WARNINGS)
+  else()
+    target_compile_options(${_target} PRIVATE -Wall -Wextra -Wpedantic)
+  endif()
+endforeach()
 
 # Zstandard: try the CMake package (vcpkg, recent distros), then pkg-config, then a plain search.
 if(XISFCONV_WITH_ZSTD)
@@ -99,8 +106,8 @@ if(XISFCONV_WITH_ZSTD)
     endif()
   endif()
   if(_zstd_target)
-    target_link_libraries(xisfconv PRIVATE ${_zstd_target})
-    target_compile_definitions(xisfconv PRIVATE XISFCONV_HAVE_ZSTD)
+    target_link_libraries(xisfconv_core PUBLIC ${_zstd_target})
+    target_compile_definitions(xisfconv_core PRIVATE XISFCONV_HAVE_ZSTD)
     message(STATUS "xisfconv: Zstandard support enabled (${_zstd_target})")
   else()
     message(WARNING "libzstd not found: zstd-compressed XISF files will not be readable. "

@@ -6,13 +6,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace xisfconv {
 
-constexpr const char* kVersion = "0.9.0";
+constexpr const char* kVersion = "0.9.1";
 
 struct Error : std::runtime_error {
     using std::runtime_error::runtime_error;
@@ -24,10 +25,27 @@ struct Unsupported : Error {
     using Error::Error;
 };
 
-// Emits a warning on stderr, prefixed with the file currently being processed.
-void warn(const std::string& message);
-void setWarningContext(const std::string& context);
-void setQuiet(bool quiet);
+// Warnings and notes about the file being processed. The library prints nothing: a message
+// goes to the handler that is installed on the calling thread, or nowhere if there is none.
+enum class MessageLevel { Warning, Info };
+using MessageHandler = std::function<void(MessageLevel level, const std::string& text)>;
+
+// Installs a handler for the current thread for as long as the object lives; the handler that
+// was installed before is put back afterwards.
+class MessageScope {
+public:
+    explicit MessageScope(MessageHandler handler);
+    ~MessageScope();
+    MessageScope(const MessageScope&) = delete;
+    MessageScope& operator=(const MessageScope&) = delete;
+
+private:
+    MessageHandler handler_;
+    const MessageHandler* previous_;
+};
+
+void warn(const std::string& message);   // something the user should know about the result
+void info(const std::string& message);   // how the conversion was done (row order, value range, WCS fit)
 
 enum class SampleFormat { UInt8, UInt16, UInt32, UInt64, Float32, Float64 };
 

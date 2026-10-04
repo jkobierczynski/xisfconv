@@ -9,26 +9,35 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
-#include <iostream>
 #include <limits>
 #include <sstream>
+#include <utility>
 
 namespace xisfconv {
 
 namespace {
-std::string g_context;
-bool g_quiet = false;
+thread_local const MessageHandler* t_handler = nullptr;
+
+void emit(MessageLevel level, const std::string& message) {
+    const MessageHandler* handler = t_handler;
+    if (!handler || !*handler) return;
+    // A handler that converts another file must not receive that file's messages as its own.
+    t_handler = nullptr;
+    try {
+        (*handler)(level, message);
+    } catch (...) {
+        t_handler = handler;
+        throw;
+    }
+    t_handler = handler;
+}
 }  // namespace
 
-void setWarningContext(const std::string& context) { g_context = context; }
-void setQuiet(bool quiet) { g_quiet = quiet; }
+MessageScope::MessageScope(MessageHandler handler) : handler_(std::move(handler)), previous_(t_handler) { t_handler = &handler_; }
+MessageScope::~MessageScope() { t_handler = previous_; }
 
-void warn(const std::string& message) {
-    if (g_quiet) return;
-    std::cerr << "warning: ";
-    if (!g_context.empty()) std::cerr << g_context << ": ";
-    std::cerr << message << '\n';
-}
+void warn(const std::string& message) { emit(MessageLevel::Warning, message); }
+void info(const std::string& message) { emit(MessageLevel::Info, message); }
 
 size_t sampleBytes(SampleFormat f) {
     switch (f) {
