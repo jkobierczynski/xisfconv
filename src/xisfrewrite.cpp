@@ -306,6 +306,7 @@ XisfRewriteResult rewriteXisf(const std::string& input, const std::string& outpu
     }
     if (opt.codec == "zstd" && !zstdAvailable()) throw Error("this build has no Zstandard support; use --codec zlib");
     const bool recompress = opt.codec == "zlib" || opt.codec == "zstd";
+    warnIfChecksumUnknownToPixInsight(opt.checksum);
 
     {
         std::error_code ec;

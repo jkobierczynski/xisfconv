@@ -111,7 +111,8 @@ void usage(std::ostream& os) {
           "                              in Python. none: no compression; XISF -> XISF: decompress the blocks\n"
           "      --checksum <sha1|sha256|sha512|sha3-256|sha3-512|none>\n"
           "                              XISF: store a checksum of the pixel data block; XISF -> XISF: of every\n"
-          "                              attached block (none removes them). ASDF blocks always carry MD5\n\n"
+          "                              attached block (none removes them). ASDF blocks always carry MD5.\n"
+          "                              PixInsight opens files with sha1, sha256 and sha512 checksums only\n\n"
 
           "Inspection:\n"
           "      --verify                check the integrity of the files (and of the XISF, FITS and ASDF\n"

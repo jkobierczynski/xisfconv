@@ -81,7 +81,8 @@ xisfconv --info light_0001.xisf               # geometry, codecs, FITS keywords,
   `--no-wcs` leaves the properties out.
 - Output is a monolithic XISF 1.0 file. `-c` compresses with Zstandard + byte shuffling (the same
   settings PixInsight uses; `--codec zlib` for zlib), blocks over 1 GiB are written as subblocks, and
-  `--checksum sha1|sha256|sha512` adds an integrity checksum.
+  `--checksum sha1|sha256|sha512` adds an integrity checksum (`sha3-256` and `sha3-512` are also
+  written, but PixInsight does not open such files: see below).
 
 **XISF → XISF: another compression, checksums, one image of several** (`-t xisf`, `-o name.xisf` or `--in-place`)
 - Rewrites a file with its attached data blocks stored another way, for example to shrink an archive
@@ -91,6 +92,10 @@ xisfconv --info light_0001.xisf               # geometry, codecs, FITS keywords,
 - `--checksum sha1|sha256|sha512|sha3-256|sha3-512` adds a checksum to every attached block
   (replacing others); `--checksum none` removes them. Without the option, checksums the file has are
   kept, and computed again with the same algorithm for blocks whose stored bytes change.
+- **Use `sha1`, `sha256` or `sha512` for files PixInsight has to read.** SHA3-256 and SHA3-512 are
+  part of the XISF 1.0 specification, but PixInsight 1.9.3 does not implement them and refuses the
+  whole image ("Unknown/unsupported checksum algorithm"). xisfconv warns when it writes one. A file
+  that has one is repaired with `xisfconv --checksum sha256 --in-place file.xisf`.
 - `--image n` writes a file that holds only that image, with its keywords, properties and other
   blocks, and the file metadata.
 - Nothing else changes. The XML header is carried over as text: only the `location`, `compression`,
@@ -408,6 +413,7 @@ compared with PyYAML on random documents in all of PyYAML's output styles.
 - ASDF output always uses the FITS HDU list layout described above; it does not write generalized WCS
   (gwcs) objects or instrument-specific data models.
 - XISF output is not compressed with LZ4 (zlib and Zstandard only).
+- XISF files with SHA3-256 or SHA3-512 checksums are valid but cannot be opened by PixInsight 1.9.3.
 - XISF → XISF does not move blocks between the header (inline, embedded) and attachments. Replacing a
   file in place gives it a new inode: other hard links to the old file keep the old content.
 - FITS output carries no CHECKSUM/DATASUM keywords yet; `--verify` checks them where a file has them.
@@ -425,7 +431,7 @@ dependencies, testing, the planned library); [`TODO.md`](TODO.md) lists what is 
 Bump the version in `src/common.hpp` and `CMakeLists.txt`, commit, then push a matching tag:
 
 ```
-git tag v0.9.1 && git push origin v0.9.1
+git tag v0.9.2 && git push origin v0.9.2
 ```
 
 CI builds and tests all three platforms and, only if every one passes, publishes a GitHub release with
@@ -436,7 +442,8 @@ the packaged binaries. A tag that doesn't match the program version fails the bu
 Tested with files saved by PixInsight 1.9.3 (XISF module 1.1.3): Float32, Float64 and UInt32 images
 compressed with zlib, LZ4, LZ4HC and Zstandard (all with byte shuffling), and SHA-1/SHA-256/SHA-512
 checksums. Every variant decodes bit-identical to the original data and to an independent decoder,
-and a corrupted byte is caught by each checksum type. Pixel data matches PixInsight's own FITS export
+and a corrupted byte is caught by each checksum type. PixInsight 1.9.3 does not open images whose
+block has a SHA3-256 or SHA3-512 checksum. Pixel data matches PixInsight's own FITS export
 exactly (row order aside), and the WCS generated from a plate solution was confirmed by Siril's
 annotation of the converted image.
 

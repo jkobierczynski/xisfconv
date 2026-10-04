@@ -2,7 +2,7 @@
 
 What was decided while building xisfconv, and why. The README says what the program does and
 `TODO.md` what is planned; this file records the choices behind both, so that they are not
-reopened by accident. State: version 0.9.1, 5 October 2026.
+reopened by accident. State: version 0.9.2, 5 October 2026.
 
 ## Purpose and scope
 
@@ -80,6 +80,10 @@ These are the choices a user could otherwise be surprised by. Each has an option
   `checksum` attributes of attached blocks change, plus the metadata describing them. Everything
   else, including unknown elements, is copied byte for byte. A block whose checksum is of an
   unknown kind is copied as it is, never re-stored.
+- **Checksums.** SHA3-256 and SHA3-512 are in the XISF 1.0 specification and are read and written,
+  but PixInsight 1.9.3 implements only SHA-1, SHA-256 and SHA-512 and refuses an image that carries
+  another one. Writing a SHA-3 checksum is therefore allowed, with a warning: the file is valid,
+  and what the specification allows is not withheld because one reader lacks it.
 - **Tile-compressed FITS** is read, not written. Quantized floating point is restored exactly as
   CFITSIO restores it, including its dithering sequence; that it is lossy is stated in the README.
 - **Stretch** is for viewing: PixInsight's STF maths, the saved STF if there is one, else a linked
@@ -159,7 +163,9 @@ as follows. The steps and their state are in `TODO.md`.
 - A refactor is checked by running the old and the new binary on the same invocations and comparing
   exit status, stdout, stderr and every file written.
 - Real files matter: PixInsight 1.9.3 output in every codec and checksum, and PixInsight opening
-  what xisfconv writes. What was verified that way is listed in the README.
+  what xisfconv writes. What was verified that way is listed in the README. A feature that follows
+  the specification is not proven until PixInsight has opened its output: SHA-3 checksums passed
+  every test here and were refused by PixInsight.
 - CI builds and runs the suite on Linux, macOS and Windows.
 
 ## How changes are made

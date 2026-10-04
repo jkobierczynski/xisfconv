@@ -127,6 +127,7 @@ uint64_t alignUp(uint64_t v) { return (v + kAlignment - 1) / kAlignment * kAlign
 
 void writeXisf(const std::string& path, const std::vector<XisfOutImage>& images, const XisfWriteOptions& opt) {
     if (images.empty()) throw Error("no images to write");
+    warnIfChecksumUnknownToPixInsight(opt.checksum);
     if (!opt.codec.empty() && opt.codec != "zlib" && opt.codec != "zstd") {
         throw Error("unsupported XISF compression codec '" + opt.codec + "' (use zlib or zstd)");
     }

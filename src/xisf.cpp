@@ -71,6 +71,12 @@ XisfCompression parseXisfCompression(const std::string& text) {
     return c;
 }
 
+void warnIfChecksumUnknownToPixInsight(const std::string& algorithm) {
+    if (!startsWith(toLower(algorithm), "sha3")) return;
+    warn(algorithm + " checksums are valid XISF 1.0, but PixInsight (1.9.3) does not open images that carry them; "
+         "use sha1, sha256 or sha512 for files PixInsight has to read");
+}
+
 bool xisfDigest(const std::string& algorithm, const uint8_t* data, size_t size, std::string& hex) {
     const std::string algo = toLower(trim(algorithm));
     if (algo == "sha-1" || algo == "sha1") hex = sha1Hex(data, size);

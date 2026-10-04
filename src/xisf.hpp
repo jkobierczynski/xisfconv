@@ -90,6 +90,11 @@ XisfCompression parseXisfCompression(const std::string& text);
 // sha3-256, sha3-512). Returns false for names that are not known.
 bool xisfDigest(const std::string& algorithm, const uint8_t* data, size_t size, std::string& hex);
 
+// Warns when a checksum algorithm is about to be written that PixInsight itself cannot read:
+// SHA3-256 and SHA3-512 are named by the XISF 1.0 specification, but PixInsight (1.9.3) knows
+// only SHA-1, SHA-256 and SHA-512 and does not open an image whose block carries another one.
+void warnIfChecksumUnknownToPixInsight(const std::string& algorithm);
+
 // A data block as it is stored in the file, with the attributes that describe it.
 struct XisfStoredBlock {
     std::vector<uint8_t> bytes;                     // attachment bytes, or the decoded inline/embedded text

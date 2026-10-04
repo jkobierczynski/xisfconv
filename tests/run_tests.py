@@ -2595,6 +2595,30 @@ def test_xisf_rewrite():
     run(src, "-o", out, "-f", "-q", "--checksum", "sha3-512")
     blk = xisf_blocks(out)[0]
     check(blk["attr"]["checksum"] == "sha3-512:" + hashlib.sha3_512(blk["stored"]).hexdigest(), "--checksum sha3-512")
+    # PixInsight does not open images with SHA-3 checksums: writing one comes with a warning
+    note = "PixInsight (1.9.3) does not open images that carry them"
+    fsrc = os.path.join(d, "sha3_src.fits")
+    fits.PrimaryHDU(a).writeto(fsrc, overwrite=True)
+    for algo in ("sha3-256", "sha3-512"):
+        r = run(src, "-o", out, "-f", "--checksum", algo)
+        check(r.stderr.count(note) == 1 and r.stderr.startswith("warning: " + src + ": " + algo), f"XISF -> XISF --checksum {algo} warns about PixInsight")
+        r = run(fsrc, "-o", out, "-f", "--checksum", algo)
+        check(r.stderr.count(note) == 1 and xisf_blocks(out)[0]["attr"]["checksum"].startswith(algo + ":"),
+              f"FITS -> XISF --checksum {algo} warns about PixInsight")
+    r = run(fsrc, "-o", out, "-f", "-q", "--checksum", "sha3-256")
+    check(r.stderr == "", "-q silences the warning about SHA-3 checksums")
+    for algo in ("sha1", "sha256", "sha512"):
+        r1 = run(src, "-o", out, "-f", "--checksum", algo)
+        r2 = run(fsrc, "-o", out, "-f", "--checksum", algo)
+        check(note not in r1.stderr + r2.stderr, f"no such warning for {algo}")
+    # a file that has a SHA-3 checksum already keeps it without comment; replacing it is the way out
+    run(src, "-o", out, "-f", "-q", "--checksum", "sha3-256")
+    r = run(out, "--in-place", "--codec", "zlib")
+    check(note not in r.stderr and xisf_blocks(out)[0]["attr"]["checksum"].startswith("sha3-256:"), "an existing SHA-3 checksum is kept without a warning")
+    r = run(out, "--in-place", "--checksum", "sha256")
+    blk = xisf_blocks(out)[0]
+    check(r.returncode == 0 and blk["attr"]["checksum"] == "sha256:" + hashlib.sha256(blk["stored"]).hexdigest(),
+          "--in-place --checksum sha256 replaces a SHA-3 checksum")
     # a checksum of an unknown kind: kept on a copied block, never silently dropped from one stored differently
     e = image_entry(a)
     e["block"].attrs["checksum"] = "whirlpool:" + "ab" * 64
