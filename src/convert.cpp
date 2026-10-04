@@ -218,6 +218,19 @@ void applyStretch(PixelBuffer& px, const std::vector<StretchParams>& params, dou
     px.format = SampleFormat::Float32;
 }
 
+void normalizeFloat(PixelBuffer& px, double lower, double upper) {
+    if (!isFloat(px.format) || !(upper > lower) || (lower == 0 && upper == 1)) return;
+    const size_t n = static_cast<size_t>(px.samples());
+    const double scale = 1.0 / (upper - lower);
+    if (px.format == SampleFormat::Float32) {
+        float* p = reinterpret_cast<float*>(px.data.data());
+        for (size_t i = 0; i < n; ++i) p[i] = static_cast<float>((static_cast<double>(p[i]) - lower) * scale);
+    } else {
+        double* p = reinterpret_cast<double*>(px.data.data());
+        for (size_t i = 0; i < n; ++i) p[i] = (p[i] - lower) * scale;
+    }
+}
+
 void flipVertical(PixelBuffer& px) {
     const size_t rowBytes = static_cast<size_t>(px.width) * sampleBytes(px.format);
     std::vector<uint8_t> tmp(rowBytes);

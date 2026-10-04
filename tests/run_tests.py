@@ -1263,8 +1263,8 @@ def test_fits_to_xisf_bounds_bits_hdus():
           "mixed batch: each input converted to the other format")
 
     # errors
-    r = run(fpath, "-t", "tiff", "-f", expect_ok=False)
-    check(r.returncode == 1 and "not to TIFF or PNG" in r.stderr, "FITS -> TIFF is refused clearly")
+    r = run(fpath, "-t", "fits", "-f", expect_ok=False)
+    check(r.returncode == 1 and "already a FITS" in r.stderr, "FITS -> FITS is refused clearly")
     r = run(fpath, "-s", "-f", expect_ok=False)
     check(r.returncode == 1 and "--stretch" in r.stderr, "--stretch refused for XISF output")
     r = run(xpath, "-t", "xisf", "-f", expect_ok=False)
@@ -1708,7 +1708,7 @@ def test_asdf_hand_written():
     r = run(out, "--asdf-tree-json", "-f", expect_ok=False)
     check(r.returncode == 1 and "needs an ASDF file" in r.stderr, "--asdf-tree-json refuses other formats")
     # refusals
-    for args, msg in [(["-t", "asdf"], "already an ASDF"), (["-t", "tiff"], "not to TIFF or PNG"), (["-s"], "--stretch")]:
+    for args, msg in [(["-t", "asdf"], "already an ASDF"), (["-s"], "--stretch"), (["-t", "fits", "-s"], "--stretch")]:
         r = run(p, "-f", *args, expect_ok=False)
         check(r.returncode == 1 and msg in r.stderr, f"ASDF input with {args}: {r.stderr.strip()}")
     run(p, "-f", "-q")
@@ -2119,6 +2119,154 @@ def test_asdf_roundtrips():
               f"solution matrix after XISF -> ASDF -> XISF {row}: {m}")
 
 
+def test_export_from_fits_and_asdf():
+    """TIFF and PNG export from FITS and ASDF input. The reference is the export of the XISF file
+    the FITS/ASDF file was made from: same pixels in, same pixels out, whatever the options."""
+    d = os.path.join(TMP, "export")
+    os.makedirs(d, exist_ok=True)
+    tiff_flags = [[], ["-c", "-s"], ["-b", "u8", "--stretch=unlinked"], ["-b", "u16"], ["-b", "f32"]]
+    png_flags = [[], ["-s"], ["-b", "u8", "-s"]]
+    for dtype in (np.uint8, np.uint16, np.uint32, np.uint64, np.float32, np.float64):
+        for c in (1, 3):
+            a = test_image(dtype, 15, 22, c, 70 + c)
+            name = f"{np.dtype(dtype).name}_{c}"
+            x = os.path.join(d, name + ".xisf")
+            write_xisf(x, [image_entry(a)])
+            sources = {"FITS": x + ".fits", "top-down FITS": x + ".td.fits", "ASDF": x + ".asdf"}
+            run(x, "-o", sources["FITS"], "-f", "-q")
+            run(x, "-o", sources["top-down FITS"], "-f", "-q", "--top-down")
+            run(x, "-o", sources["ASDF"], "-f", "-q", "-c")
+            for flags in tiff_flags:
+                ref = os.path.join(d, "ref.tif")
+                run(x, "-o", ref, "-f", "-q", *flags)
+                want = tiff_array(ref)
+                for kind, src in sources.items():
+                    out = os.path.join(d, "out.tif")
+                    run(src, "-o", out, "-f", "-q", *flags)
+                    got = tiff_array(out)
+                    check(len(got) == len(want) and got[0].dtype == want[0].dtype and np.array_equal(got[0], want[0]),
+                          f"{kind} -> TIFF {flags} {name}: equals XISF -> TIFF ({got[0].dtype} vs {want[0].dtype})")
+            for flags in png_flags:
+                ref = os.path.join(d, "ref.png")
+                run(x, "-o", ref, "-f", "-q", *flags)
+                for kind, src in sources.items():
+                    out = os.path.join(d, "out.png")
+                    run(src, "-o", out, "-f", "-q", *flags)
+                    check(open(out, "rb").read() == open(ref, "rb").read(), f"{kind} -> PNG {flags} {name}: equals XISF -> PNG")
+            # one independent look at the pixels per image
+            out = os.path.join(d, "plain.tif")
+            run(sources["FITS"], "-o", out, "-f", "-q")
+            got = tiff_array(out)[0]
+            compare(f"FITS -> TIFF {name}: pixels, rows top-down", got.reshape(a.shape), a)
+
+    # floating point data in ADU (0..65535), as ASTAP and others write it
+    rng = np.random.default_rng(75)
+    adu = (rng.random((12, 16)) * 60000).astype(np.float32)
+    adu[0, 0], adu[0, 1] = 0, 60000
+    f = os.path.join(d, "adu.fits")
+    fits.PrimaryHDU(adu).writeto(f, overwrite=True)
+    top = adu[::-1]                       # FITS rows are bottom-up
+    out = os.path.join(d, "adu.tif")
+    r = run(f, "-o", out, "-f")
+    got = tiff_array(out)[0]
+    check(got.dtype == np.float32 and np.allclose(got, top / 65535.0, rtol=1e-6, atol=0),
+          "ADU float FITS -> TIFF: scaled to 0..1 through the 0:65535 range")
+    check("0:65535 taken as black:white" in r.stderr and "scaled to 0..1" in r.stderr and "bottom-up (flipped)" in r.stderr,
+          f"ADU float FITS -> TIFF: the scaling is reported: {r.stderr.strip()}")
+    run(f, "-o", out, "-f", "-q", "-b", "u16")
+    compare("ADU float FITS -> 16-bit TIFF keeps the ADU values", tiff_array(out)[0],
+            np.floor(top.astype(np.float64) + 0.5).astype(np.uint16))
+    png = os.path.join(d, "adu.png")
+    r = run(f, "-o", png, "-f")
+    arr, depth, _ = decode_png(png)
+    check(depth == 16 and np.array_equal(arr[:, :, 0], np.floor(top.astype(np.float64) + 0.5).astype(np.uint16)),
+          "ADU float FITS -> PNG: 16-bit with the ADU values")
+    check("add --stretch" in r.stderr, "PNG from linear float data suggests --stretch")
+    run(f, "-o", out, "-f", "-q", "-b", "u8", "--bounds", "0:60000")
+    compare("--bounds sets black and white for the export", tiff_array(out)[0],
+            np.floor(top.astype(np.float64) / 60000 * 255 + 0.5).astype(np.uint8))
+    # the stretch works on the same normalized values as for an XISF file with bounds 0:65535
+    e = image_entry(top[:, :, None])
+    e["attrs"]["bounds"] = "0:65535"
+    x = os.path.join(d, "adu.xisf")
+    write_xisf(x, [e])
+    ref = os.path.join(d, "adu_ref.tif")
+    run(x, "-o", ref, "-f", "-q", "-s")
+    r = run(f, "-o", out, "-f", "-s")
+    compare("stretched ADU float FITS equals the stretched XISF with bounds 0:65535", tiff_array(out)[0], tiff_array(ref)[0])
+    check("linked auto-STF" in r.stderr, "the stretch parameters are reported")
+
+    # signed data with negative values: read as float, its range becomes black:white
+    neg = rng.integers(-2000, 3000, (10, 14)).astype(np.int16)
+    f = os.path.join(d, "neg.fits")
+    fits.PrimaryHDU(neg).writeto(f, overwrite=True)
+    r = run(f, "-o", out, "-f")
+    got = tiff_array(out)[0]
+    lo, hi = float(neg.min()), float(neg.max())
+    check(np.allclose(got, (neg[::-1].astype(np.float64) - lo) / (hi - lo), rtol=0, atol=1e-6) and
+          "that range taken as black:white" in r.stderr, "signed FITS data -> TIFF: scaled from its own range")
+    nan = adu / 65535
+    nan[3, 4] = np.nan
+    f = os.path.join(d, "nan.fits")
+    fits.PrimaryHDU(nan).writeto(f, overwrite=True)
+    r = run(f, "-o", png, "-f")
+    arr, _, _ = decode_png(png)
+    check(arr[12 - 1 - 3, 4, 0] == 0 and "NaN" in r.stderr, "NaN pixels are black in PNG and reported")
+
+    # several HDUs: TIFF pages; a cube that is not RGB becomes one page per plane; PNG takes one image
+    h0 = rng.integers(0, 65535, (8, 10), dtype=np.uint16)
+    h1 = rng.random((3, 6, 7)).astype(np.float32)
+    h2 = rng.integers(0, 255, (5, 4, 6), dtype=np.uint8)
+    f = os.path.join(d, "multi.fits")
+    fits.HDUList([fits.PrimaryHDU(h0), fits.ImageHDU(h1, name="RGB"), fits.ImageHDU(h2, name="CUBE")]).writeto(f, overwrite=True)
+    run(f, "-o", out, "-f", "-q")
+    with tifffile.TiffFile(out) as t:
+        check(len(t.pages) == 7, f"multi-HDU FITS -> TIFF: 1 + 1 + 5 pages ({len(t.pages)})")
+        compare("TIFF page of the primary HDU", t.pages[0].asarray(), h0[::-1])
+        compare("TIFF page of the RGB cube", t.pages[1].asarray(), np.transpose(h1, (1, 2, 0))[::-1])
+        check(t.pages[1].photometric.name == "RGB" and t.pages[2].photometric.name == "MINISBLACK", "RGB and gray pages")
+        for k in range(5):
+            compare(f"TIFF page of cube plane {k}", t.pages[2 + k].asarray(), h2[k][::-1])
+        check(t.pages[1].description == "RGB" and t.pages[4].description == "CUBE plane 2", "TIFF pages are named")
+    r = run(f, "-o", png, "-f")
+    arr, depth, _ = decode_png(png)
+    check("PNG holds one image" in r.stderr and depth == 16 and np.array_equal(arr[:, :, 0], h0[::-1]),
+          "multi-HDU FITS -> PNG writes the first image")
+    r = run(f, "-o", png, "-f", "-i", "2")
+    arr, depth, _ = decode_png(png)
+    check("first of 5 planes" in r.stderr and depth == 8 and np.array_equal(arr[:, :, 0], h2[0][::-1]),
+          "cube -> PNG writes the first plane")
+    run(f, "-o", png, "-f", "-q", "-i", "1", "-b", "u8")
+    arr, depth, _ = decode_png(png)
+    check(arr.shape == (6, 7, 3) and np.array_equal(arr, np.floor(np.transpose(h1, (1, 2, 0))[::-1].astype(np.float64) * 255 + 0.5)),
+          "RGB cube -> 8-bit RGB PNG")
+
+    # plain ASDF arrays: bottom-up assumed, --top-down for arrays stored the other way
+    img = rng.integers(0, 4000, (9, 11), dtype=np.uint16)
+    rgb = rng.integers(0, 255, (6, 8, 3), dtype=np.uint8)
+    p = os.path.join(d, "plain.asdf")
+    write_asdf_raw(p, "img: !core/ndarray-1.0.0 {source: 0, datatype: uint16, byteorder: little, shape: [9, 11]}\n"
+                      "rgb: !core/ndarray-1.0.0 {source: 1, datatype: uint8, byteorder: little, shape: [6, 8, 3]}\n",
+                   [asdf_block(img.tobytes()), asdf_block(rgb.tobytes(), b"zlib")])
+    r = run(p, "-o", out, "-f")
+    pages = tiff_array(out)
+    check(len(pages) == 2 and np.array_equal(pages[0], img[::-1]) and np.array_equal(pages[1], rgb[::-1]) and
+          "assumed bottom-up" in r.stderr, "plain ASDF arrays -> TIFF (rows assumed bottom-up)")
+    run(p, "-o", out, "-f", "-q", "--top-down")
+    pages = tiff_array(out)
+    check(np.array_equal(pages[0], img) and np.array_equal(pages[1], rgb), "plain ASDF arrays -> TIFF with --top-down")
+
+    # naming, refusals
+    run(f, "-t", "png", "-f", "-q", "-d", d)
+    check(os.path.exists(os.path.join(d, "multi.png")), "-t png names the output .png")
+    for args, msg in [(["-t", "tiff", "--stretch=stf"], "no saved STF"), (["-t", "png", "-b", "f32"], "PNG supports only"),
+                      (["-t", "xisf", "-s"], "TIFF and PNG output"), (["-t", "asdf", "-s"], "TIFF and PNG output")]:
+        r = run(f, "-f", *args, expect_ok=False)
+        check(r.returncode == 1 and msg in r.stderr, f"FITS input with {args}: {r.stderr.strip()}")
+    r = run(p, "-f", "-t", "png", "--stretch=stf", expect_ok=False)
+    check(r.returncode == 1 and "ASDF files carry no saved STF" in r.stderr, "ASDF input with --stretch=stf")
+
+
 if __name__ == "__main__":
     print("xisfconv:", EXE)
     print(subprocess.run([EXE, "--version"], capture_output=True, text=True).stdout.strip())
@@ -2134,7 +2282,7 @@ if __name__ == "__main__":
               test_batch_and_outdir, test_stretch, test_wcs, test_solution_properties_forms, test_tiff_predictors, test_png,
               test_fits_to_xisf_formats, test_fits_to_xisf_metadata, test_fits_to_xisf_bounds_bits_hdus,
               test_xisf_fits_xisf_roundtrip, test_asdf_yaml, test_asdf_hand_written, test_asdf_output,
-              test_asdf_python_files, test_asdf_roundtrips):
+              test_asdf_python_files, test_asdf_roundtrips, test_export_from_fits_and_asdf):
         try:
             t()
         except Exception as e:  # noqa: BLE001

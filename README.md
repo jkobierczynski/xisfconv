@@ -1,7 +1,7 @@
 # xisfconv
 
 A small, dependency-light command-line converter between PixInsight **XISF**, **FITS** and **ASDF**,
-in every direction, with **TIFF** and **PNG** export from XISF.
+in every direction, with **TIFF** and **PNG** export from all three.
 
 ```
 xisfconv M31_integration.xisf                 # -> M31_integration.fits
@@ -11,6 +11,7 @@ xisfconv observation.asdf                     # -> observation.xisf
 xisfconv -t tiff -c -b u16 *.xisf -d export/  # batch to 16-bit Deflate TIFFs
 xisfconv -t tiff -s -b u8 integration.xisf     # stretched 8-bit TIFF for GIMP
 xisfconv -t png -s -b u8 integration.xisf      # stretched 8-bit PNG for the web
+xisfconv -t png -s -b u8 light_0001.fits       # quick look at a raw FITS frame
 xisfconv --info light_0001.xisf               # geometry, codecs, FITS keywords, properties
 ```
 
@@ -149,6 +150,25 @@ xisfconv --info light_0001.xisf               # geometry, codecs, FITS keywords,
 - Float data is scaled through its bounds to 16-bit; add `--stretch` for linear data.
 - PNG holds one image: multi-image files write the first one (or the one chosen with `--image`).
 
+**TIFF and PNG from FITS and ASDF input**
+- The same export as from XISF: `-t tiff` or `-t png`, with `--bits`, `--compress` and `--stretch`, so
+  `xisfconv -t png -s frame.fits` gives a viewable picture of any FITS or ASDF image without a
+  detour through XISF. Exporting a FITS or ASDF file gives the same pixels as exporting the XISF file
+  it was converted from (or to).
+- Rows are flipped to the top-down order of TIFF and PNG unless the file says `ROWORDER = 'TOP-DOWN'`
+  (`--top-down` / `--bottom-up` override, as for conversion to XISF).
+- Integer data keeps its values. Floating point data has no declared range in FITS, so one is chosen as
+  for XISF output: `0:1` when the data fits, else `0:65535` when it fits (ADU-scaled floats), else the
+  data's minimum and maximum; `--bounds lo:hi` overrides. That range is black to white: it is used
+  for conversion to integers and for the stretch, and floating point TIFF output is scaled so that it
+  becomes 0..1, which is what image programs expect. The range used is printed.
+- `--stretch` computes an auto-STF (`linked`, the default, or `unlinked`); FITS and ASDF files hold no
+  saved STF. All planes of the image take part.
+- A FITS cube with three planes is written as RGB. Any other cube becomes one grayscale TIFF page per
+  plane (PNG: the first plane). Several HDUs become several TIFF pages; PNG takes the first, or the
+  one chosen with `--image`.
+- Keywords and WCS are not carried into TIFF or PNG.
+
 **Stretch for viewing** (`-s`, `--stretch[=auto|linked|unlinked|stf]`)
 - Linear data (integrations, calibrated frames) looks black in ordinary viewers. `--stretch` applies
   PixInsight's screen-transfer-function maths: shadows clip, midtones transfer function, highlights.
@@ -194,7 +214,7 @@ Windows (vcpkg): `vcpkg install zlib zstd`, then configure with
 ## Usage
 
 ```
-xisfconv [options] <file>...      # XISF -> FITS/ASDF/TIFF/PNG, FITS -> XISF/ASDF, ASDF -> XISF/FITS
+xisfconv [options] <file>...      # any of XISF, FITS, ASDF -> any other of them, or TIFF/PNG
 
   -t, --to <fits|asdf|tiff|png|xisf>
                               output format (default: fits for XISF input, xisf for FITS and ASDF input)
@@ -215,7 +235,8 @@ xisfconv [options] <file>...      # XISF -> FITS/ASDF/TIFF/PNG, FITS -> XISF/ASD
       --no-verify             don't verify data block checksums
       --codec <zlib|zstd>     XISF and ASDF output: compression codec (implies -c)
       --checksum <sha1|sha256|sha512>  XISF output: checksum of the pixel data
-      --bounds <lo:hi>        XISF output: range of floating point data
+      --bounds <lo:hi>        from FITS/ASDF: range of floating point data (XISF bounds; black:white
+                              for TIFF and PNG)
   -I, --info                  print image geometry, keywords and properties; no conversion
       --dump-header           print the raw XML header (XISF), all keywords (FITS) or the YAML tree (ASDF)
   -q, --quiet                 suppress warnings
@@ -246,6 +267,11 @@ reference. The XISF output is read back by the `xisf` package, and by a separate
 script for what that package lacks (subblocks, UInt64); checksums are verified there as well. Round
 trips XISF → FITS → XISF and FITS → XISF → FITS must return identical pixels, keywords and WCS.
 
+TIFF and PNG export from FITS and ASDF input is checked against the export of the XISF file the input
+was made from: for every sample format, gray and RGB, both row orders and a set of `--bits`,
+`--stretch` and `--compress` combinations the pixels must be identical, and separate cases cover
+ADU-scaled floats, signed data, NaN pixels, cubes and several HDUs.
+
 ASDF is checked against Python's `asdf` library with `asdf-astropy` (the tests are skipped if those
 are not installed). Files written by xisfconv must open without a warning, pass schema validation
 and checksum validation, and yield an astropy HDU list with the pixels and header cards of the
@@ -272,7 +298,6 @@ compared with PyYAML on random documents in all of PyYAML's output styles.
   SIP approximation, not as the original: on the test frame the two agree to 0.5 arcsec rms.
 - FITS input: tile-compressed images (fpack) and tables are not read; BLANK pixels of integer images
   are kept as ordinary values.
-- FITS and ASDF inputs are converted to XISF or to each other, not directly to TIFF or PNG.
 - ASDF input: arrays stored inline in the tree or in another file, non-contiguous views, Fortran-ordered
   arrays, tables and structured or complex data types are skipped with a message; bzip2- and
   Blosc-compressed blocks are not read. Line breaks written as U+0085, U+2028 or U+2029 inside the
@@ -288,7 +313,7 @@ compared with PyYAML on random documents in all of PyYAML's output styles.
 Bump the version in `src/common.hpp` and `CMakeLists.txt`, commit, then push a matching tag:
 
 ```
-git tag v0.6.0 && git push origin v0.6.0
+git tag v0.7.0 && git push origin v0.7.0
 ```
 
 CI builds and tests all three platforms and, only if every one passes, publishes a GitHub release with

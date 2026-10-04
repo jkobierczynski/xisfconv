@@ -49,7 +49,7 @@ struct Options {
     bool rowOrderGiven = false;  // --top-down / --bottom-up given explicitly (overrides ROWORDER on FITS input)
     std::string codec;           // XISF and ASDF output: zlib or zstd
     std::string checksum;        // XISF output: sha1, sha256 or sha512
-    std::optional<std::pair<double, double>> bounds;  // XISF output: range of floating point data
+    std::optional<std::pair<double, double>> bounds;  // FITS/ASDF input: range of floating point data
     uint64_t subblockSize = 1u << 30;
     bool propertyKeywords = true;
     bool verify = true;
@@ -67,7 +67,8 @@ void usage(std::ostream& os) {
     os << "xisfconv " << kVersion << " - convert between PixInsight XISF, FITS and ASDF images; export TIFF and PNG\n\n"
           "Usage: xisfconv [options] <file>...\n"
           "       XISF inputs are converted to FITS (default), ASDF, TIFF or PNG;\n"
-          "       FITS inputs to XISF (default) or ASDF; ASDF inputs to XISF (default) or FITS.\n\n"
+          "       FITS inputs to XISF (default), ASDF, TIFF or PNG;\n"
+          "       ASDF inputs to XISF (default), FITS, TIFF or PNG.\n\n"
           "Output:\n"
           "  -t, --to <fits|asdf|tiff|png|xisf>\n"
           "                              output format (default: fits for XISF input, xisf for FITS and ASDF\n"
@@ -87,7 +88,8 @@ void usage(std::ostream& os) {
           "                                linked   auto-STF with shared statistics (keeps color balance)\n"
           "                                unlinked auto-STF per channel (neutralizes color casts)\n"
           "                                stf      only the STF saved in the file\n"
-          "                              (TIFF: stretched float data becomes 16-bit unless --bits is given)\n"
+          "                              (TIFF: stretched float data becomes 16-bit unless --bits is given;\n"
+          "                              FITS and ASDF input: for TIFF and PNG output, auto means linked)\n"
           "      --top-down              XISF input: keep XISF's top-down row order in FITS and ASDF output\n"
           "                              (ROWORDER='TOP-DOWN') instead of the FITS convention, bottom-up\n"
           "                              FITS and ASDF input: the rows are stored top-down\n"
@@ -98,14 +100,16 @@ void usage(std::ostream& os) {
           "                              to XISF: don't write PixInsight solution properties from WCS keywords\n"
           "      --sip-order <n>         from XISF: SIP distortion order fitted to the solution (2-7, default 3;\n"
           "                              0 = off)\n"
+          "      --bounds <lo:hi>        FITS and ASDF input: the range of floating point data, written as the\n"
+          "                              XISF bounds and taken as black:white for TIFF and PNG (default: 0:1\n"
+          "                              if the data fits, else 0:65535 if it fits, else minimum:maximum)\n"
           "      --no-verify             don't verify data block checksums\n\n"
           "XISF and ASDF output:\n"
           "      --codec <zlib|zstd>     compression codec (implies --compress). XISF blocks are also byte\n"
           "                              shuffled. zstd in ASDF needs the asdf-compression package in Python\n"
           "      --checksum <sha1|sha256|sha512>  XISF: store a checksum of the pixel data block\n"
-          "                              (ASDF blocks always carry an MD5 checksum)\n"
-          "      --bounds <lo:hi>        XISF: range of floating point data (default: 0:1 if the data fits,\n"
-          "                              else 0:65535 if it fits, else the data's minimum and maximum)\n\n"
+          "                              (ASDF blocks always carry an MD5 checksum)\n\n"
+
           "Inspection:\n"
           "  -I, --info                  print image geometry, keywords and properties; no conversion\n"
           "      --dump-header           print the raw XML header (XISF), all keywords (FITS) or the YAML tree\n"
@@ -297,6 +301,17 @@ std::string outputPathFor(const std::string& input, const Options& opt, Format f
     return (dir / name).string();
 }
 
+std::string stretchDescription(const std::string& how, const std::vector<StretchParams>& params) {
+    std::string desc = how + ":";
+    char buf[96];
+    for (size_t c = 0; c < params.size(); ++c) {
+        std::snprintf(buf, sizeof buf, " c%zu s=%.6f m=%.6f h=%.6f", c, params[c].shadows, params[c].midtones,
+                      params[c].highlights);
+        desc += buf;
+    }
+    return desc;
+}
+
 void convertXisfFile(const std::string& input, const Options& opt) {
     if (opt.treeJson) throw Error("--asdf-tree-json needs an ASDF file");
     XisfFile file(input);
@@ -379,13 +394,7 @@ void convertXisfFile(const std::string& input, const Options& opt) {
                                                       : img.format;
             if (opt.bits) target = *opt.bits;
             convertSampleFormat(px, target, 0, 1);
-            std::string desc = how + ":";
-            char buf[96];
-            for (size_t c = 0; c < params.size(); ++c) {
-                std::snprintf(buf, sizeof buf, " c%zu s=%.6f m=%.6f h=%.6f", c, params[c].shadows,
-                              params[c].midtones, params[c].highlights);
-                desc += buf;
-            }
+            const std::string desc = stretchDescription(how, params);
             stretchNotes.push_back("Stretched with " + desc);
             if (!opt.quiet) std::cerr << "info: image " << idx << ": " << desc << "\n";
         } else if (opt.bits) {
@@ -622,23 +631,22 @@ void printYamlJson(const YamlNode& node, int depth) {
     }
 }
 
-// Chooses the XISF bounds attribute for floating point data.
-std::pair<double, double> floatBounds(const FitsImage& img, const Options& opt, std::string& how) {
+// Chooses the range of floating point data: the XISF bounds attribute, or black and white when
+// exporting to TIFF or PNG (`display`).
+std::pair<double, double> floatBounds(const FitsImage& img, const Options& opt, std::string& how, bool display = false) {
     if (opt.bounds) {
-        how = "bounds set with --bounds";
+        how = display ? "range set with --bounds" : "bounds set with --bounds";
         return *opt.bounds;
     }
     if (img.dataMin >= 0 && img.dataMax <= 1) return {0.0, 1.0};
-    char buf[160];
+    char span[96];
+    std::snprintf(span, sizeof span, "float data spans %g..%g: ", img.dataMin, img.dataMax);
+    const char* hint = " (override with --bounds)";
     if (img.dataMin >= 0 && img.dataMax <= 65535) {
-        std::snprintf(buf, sizeof buf, "float data spans %g..%g: bounds set to 0:65535 (override with --bounds)",
-                      img.dataMin, img.dataMax);
-        how = buf;
+        how = std::string(span) + (display ? "0:65535 taken as black:white" : "bounds set to 0:65535") + hint;
         return {0.0, 65535.0};
     }
-    std::snprintf(buf, sizeof buf, "float data spans %g..%g: bounds set to that range (override with --bounds)",
-                  img.dataMin, img.dataMax);
-    how = buf;
+    how = std::string(span) + (display ? "that range taken as black:white" : "bounds set to that range") + hint;
     return {img.dataMin, img.dataMax > img.dataMin ? img.dataMax : img.dataMin + 1};
 }
 
@@ -681,15 +689,20 @@ void convertFitsOrAsdfFile(const std::string& input, InputKind kind, const Optio
     else if (!opt.output.empty()) {
         if (auto f = formatFromExtension(opt.output)) format = *f;
     }
-    if (format == Format::Tiff || format == Format::Png) {
-        throw Error(std::string(inputName) + " input can be converted to XISF or " + (asdfInput ? "FITS" : "ASDF") +
-                    ", not to TIFF or PNG (convert to XISF first)");
-    }
+    const bool exporting = format == Format::Tiff || format == Format::Png;
     if (format == (asdfInput ? Format::Asdf : Format::Fits)) {
-        throw Error(std::string("the input is already ") + (asdfInput ? "an ASDF" : "a FITS") + " file; choose xisf or " +
-                    (asdfInput ? "fits" : "asdf") + " as output");
+        throw Error(std::string("the input is already ") + (asdfInput ? "an ASDF" : "a FITS") + " file; choose xisf, " +
+                    (asdfInput ? "fits" : "asdf") + ", tiff or png as output");
     }
-    if (opt.stretch != Stretch::None) throw Error("--stretch is only available for XISF input");
+    if (opt.stretch != Stretch::None && !exporting) {
+        throw Error(std::string("--stretch is for viewing: from ") + inputName + " input it is available for TIFF and PNG output");
+    }
+    if (opt.stretch == Stretch::Stored) {
+        throw Error(std::string(inputName) + " files carry no saved STF; use --stretch, --stretch=linked or --stretch=unlinked");
+    }
+    if (format == Format::Png && opt.bits && *opt.bits != SampleFormat::UInt8 && *opt.bits != SampleFormat::UInt16) {
+        throw Error("PNG supports only --bits u8 or u16");
+    }
 
     FitsFile fits = asdfInput ? readAsdf(input, false, opt.verify) : readFits(input);
     for (const auto& s : fits.skipped) warn("skipped " + s);
@@ -705,6 +718,10 @@ void convertFitsOrAsdfFile(const std::string& input, InputKind kind, const Optio
     } else {
         for (size_t i = 0; i < fits.images.size(); ++i) indices.push_back(i);
     }
+    if (format == Format::Png && indices.size() > 1) {
+        warn("PNG holds one image; writing image " + std::to_string(indices[0]) + " only (use --image to choose)");
+        indices.resize(1);
+    }
 
     const std::string outPath = outputPathFor(input, opt, format);
     if (fs::exists(outPath) && !opt.force) throw Error(outPath + " already exists (use --force to overwrite)");
@@ -715,6 +732,117 @@ void convertFitsOrAsdfFile(const std::string& input, InputKind kind, const Optio
     };
     const std::string history = std::string("Converted from ") + inputName + " by xisfconv " + kVersion;
     const std::string tmpPath = outPath + ".part";
+
+    if (exporting) {
+        // TIFF and PNG: rows top-down, floating point data scaled so that its range is 0..1.
+        std::vector<PixelBuffer> buffers;   // one per page; planes of a cube that is not RGB become pages
+        std::vector<std::string> names;
+        for (size_t idx : indices) {
+            FitsImage& img = fits.images[idx];
+            PixelBuffer& px = img.pixels;
+            const std::string label = "image " + std::to_string(idx);
+            const bool topDown = opt.rowOrderGiven ? !opt.bottomUp : img.topDown;
+            if (!topDown) flipVertical(px);
+            const SampleFormat stored = px.format;
+            const bool wasFloat = isFloat(stored);
+            std::string rangeNote;
+            std::pair<double, double> range{0.0, 1.0};   // of floating point samples; integers use their full range
+            if (wasFloat) {
+                range = floatBounds(img, opt, rangeNote, true);
+                if (img.hasNaN) warn(label + ": the data contains NaN/Inf values (black in integer output)");
+            }
+            std::string stretchNote;
+            if (opt.stretch != Stretch::None) {
+                // Every plane is image data here (FITS has no alpha channel): all are stretched.
+                const bool linked = opt.stretch != Stretch::Unlinked;
+                const auto params = autoStretch(px, range.first, range.second, static_cast<size_t>(px.channels), linked);
+                applyStretch(px, params, range.first, range.second);   // leaves Float32 in [0,1]
+                range = {0.0, 1.0};
+                // As for XISF input: 16-bit for floating point data, the stored type for integers.
+                convertSampleFormat(px, opt.bits ? *opt.bits : wasFloat ? SampleFormat::UInt16 : stored, 0, 1);
+                stretchNote = stretchDescription(linked ? "linked auto-STF" : "unlinked auto-STF", params);
+            } else if (opt.bits) {
+                convertSampleFormat(px, *opt.bits, range.first, range.second);
+            }
+            if (format == Format::Png && px.format != SampleFormat::UInt8 && px.format != SampleFormat::UInt16) {
+                convertSampleFormat(px, SampleFormat::UInt16, range.first, range.second);
+            }
+            bool scaled = false;
+            if (isFloat(px.format) && wasFloat && (range.first != 0 || range.second != 1)) {
+                normalizeFloat(px, range.first, range.second);
+                scaled = true;
+            }
+            if (format == Format::Tiff && (px.format == SampleFormat::UInt32 || px.format == SampleFormat::UInt64 ||
+                                           px.format == SampleFormat::Float64)) {
+                warn(label + ": " + sampleFormatName(px.format) +
+                     " TIFF is not supported by many programs; consider --bits u16 or --bits f32");
+            }
+            if (!opt.quiet) {
+                std::cerr << "info: " << label << origin(img) << ": " << img.note << ", rows "
+                          << (topDown ? "top-down" : (img.generic && !img.hasRowOrder && !opt.rowOrderGiven)
+                                                         ? "assumed bottom-up (flipped; add --top-down if the image comes out "
+                                                           "upside down)"
+                                                         : "bottom-up (flipped)");
+                if (!rangeNote.empty()) std::cerr << "; " << rangeNote;
+                if (scaled) std::cerr << "; float samples scaled to 0..1";
+                std::cerr << "\n";
+                if (!stretchNote.empty()) std::cerr << "info: " << label << ": " << stretchNote << "\n";
+                if (format == Format::Png && wasFloat && opt.stretch == Stretch::None) {
+                    std::cerr << "info: linear data may look dark in PNG; add --stretch for a viewable image\n";
+                }
+            }
+            const std::string name = img.name.empty() ? fs::path(input).stem().string() : img.name;
+            if (px.channels == 1 || px.channels == 3) {
+                buffers.push_back(std::move(px));
+                names.push_back(name);
+                continue;
+            }
+            // A cube that is not an RGB image: one grayscale page per plane.
+            const uint64_t planes = format == Format::Png ? 1 : px.channels;
+            if (format == Format::Png) {
+                warn(label + ": PNG holds one image; writing the first of " + std::to_string(px.channels) + " planes");
+            }
+            const size_t planeBytes = static_cast<size_t>(px.planeSamples()) * sampleBytes(px.format);
+            for (uint64_t c = 0; c < planes; ++c) {
+                PixelBuffer plane;
+                plane.width = px.width;
+                plane.height = px.height;
+                plane.channels = 1;
+                plane.format = px.format;
+                plane.data.assign(px.data.begin() + static_cast<std::ptrdiff_t>(c * planeBytes),
+                                  px.data.begin() + static_cast<std::ptrdiff_t>((c + 1) * planeBytes));
+                buffers.push_back(std::move(plane));
+                names.push_back(name + " plane " + std::to_string(c));
+            }
+            px.data.clear();
+            px.data.shrink_to_fit();
+        }
+        try {
+            if (format == Format::Tiff) {
+                std::vector<TiffPage> pages;
+                for (size_t n = 0; n < buffers.size(); ++n) {
+                    TiffPage page;
+                    page.pixels = &buffers[n];
+                    page.rgb = buffers[n].channels == 3;
+                    page.description = names[n];
+                    pages.push_back(std::move(page));
+                }
+                writeTiff(tmpPath, pages, opt.compress);
+            } else {
+                PngImage png;
+                png.pixels = &buffers[0];
+                png.rgb = buffers[0].channels == 3;
+                writePng(tmpPath, png);
+            }
+            replaceFile(tmpPath, outPath);
+        } catch (...) {
+            std::error_code ec;
+            fs::remove(tmpPath, ec);
+            throw;
+        }
+        if (!opt.quiet) std::cout << input << " -> " << outPath << "\n";
+        return;
+    }
 
     if (format != Format::Xisf) {
         // FITS <-> ASDF: the same HDUs in another container. Rows stay in the order they are stored in.

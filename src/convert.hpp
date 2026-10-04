@@ -32,6 +32,9 @@ std::vector<StretchParams> autoStretch(const PixelBuffer& px, double lower, doub
 // normalized. The result is Float32 in [0,1].
 void applyStretch(PixelBuffer& px, const std::vector<StretchParams>& params, double lower, double upper);
 
+// Maps floating point samples from [lower,upper] to [0,1] without clipping (no-op for integers).
+void normalizeFloat(PixelBuffer& px, double lower, double upper);
+
 // Reverses the row order of every channel plane.
 void flipVertical(PixelBuffer& px);
 
