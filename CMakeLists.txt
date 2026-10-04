@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(xisfconv VERSION 0.8.0 LANGUAGES CXX)
+project(xisfconv VERSION 0.9.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -34,6 +34,7 @@ add_executable(xisfconv
   src/convert.cpp
   src/fits.cpp
   src/fitsread.cpp
+  src/fitstile.cpp
   src/tiff.cpp
   src/png.cpp
   src/wcs.cpp

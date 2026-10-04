@@ -76,7 +76,8 @@ void usage(std::ostream& os) {
           "Usage: xisfconv [options] <file>...\n"
           "       XISF inputs are converted to FITS (default), ASDF, TIFF or PNG, or rewritten as XISF\n"
           "       with another compression or checksum (-t xisf);\n"
-          "       FITS inputs to XISF (default), ASDF, TIFF or PNG;\n"
+          "       FITS inputs to XISF (default), ASDF, TIFF or PNG; tile-compressed FITS (.fits.fz)\n"
+          "       is read like any FITS file, and -t fits writes it as a plain FITS file;\n"
           "       ASDF inputs to XISF (default), FITS, TIFF or PNG.\n"
           "       xisfconv --verify <file or directory>... checks files without converting them.\n\n"
           "Output:\n"
@@ -310,6 +311,9 @@ std::string outputPathFor(const std::string& input, const Options& opt, Format f
     fs::path p(input);
     fs::path dir = opt.outdir.empty() ? p.parent_path() : fs::path(opt.outdir);
     fs::path name = p.stem();
+    // image.fits.fz is named after "image"
+    const std::string outer = lowerExt(p.string());
+    if (outer == ".fz" && formatFromExtension(name.string())) name = name.stem();
     switch (format) {
         case Format::Fits: name += ".fits"; break;
         case Format::Tiff: name += ".tif"; break;
@@ -712,6 +716,7 @@ void printFitsInfo(const FitsFile& f) {
         if (!img.name.empty()) std::cout << " \"" << img.name << "\"";
         std::cout << ": " << img.pixels.width << " x " << img.pixels.height << " x " << img.pixels.channels
                   << ", BITPIX " << img.bitpix;
+        if (!img.tileCompression.empty()) std::cout << ", tile-compressed (" << img.tileCompression << ")";
         if (img.bscale != 1 || img.bzero != 0) std::cout << ", BZERO " << img.bzero << ", BSCALE " << img.bscale;
         std::cout << ", rows " << (img.hasRowOrder ? (img.topDown ? "top-down (ROWORDER)" : "bottom-up (ROWORDER)")
                                                     : "bottom-up (FITS default, no ROWORDER)")
@@ -840,9 +845,8 @@ void convertFitsOrAsdfFile(const std::string& input, InputKind kind, const Optio
     }
     if (opt.inPlace) throw Error("--in-place is for rewriting XISF files as XISF");
     const bool exporting = format == Format::Tiff || format == Format::Png;
-    if (format == (asdfInput ? Format::Asdf : Format::Fits)) {
-        throw Error(std::string("the input is already ") + (asdfInput ? "an ASDF" : "a FITS") + " file; choose xisf, " +
-                    (asdfInput ? "fits" : "asdf") + ", tiff or png as output");
+    if (asdfInput && format == Format::Asdf) {
+        throw Error("the input is already an ASDF file; choose xisf, fits, tiff or png as output");
     }
     if (opt.stretch != Stretch::None && !exporting) {
         throw Error(std::string("--stretch is for viewing: from ") + inputName + " input it is available for TIFF and PNG output");
@@ -857,6 +861,13 @@ void convertFitsOrAsdfFile(const std::string& input, InputKind kind, const Optio
     FitsFile fits = asdfInput ? readAsdf(input, false, opt.verify) : readFits(input);
     for (const auto& s : fits.skipped) warn("skipped " + s);
     if (fits.images.empty()) throw Error(std::string("no image data found in this ") + inputName + " file");
+    if (!asdfInput && format == Format::Fits) {
+        // FITS -> FITS has one use: writing tile-compressed images as plain ones.
+        bool tiled = false;
+        for (const auto& img : fits.images)
+            if (!img.tileCompression.empty()) tiled = true;
+        if (!tiled) throw Error("the input is already a FITS file; choose xisf, asdf, tiff or png as output");
+    }
 
     std::vector<size_t> indices;
     if (opt.imageIndex) {
@@ -1273,8 +1284,10 @@ void findImageFiles(const fs::path& directory, std::vector<std::string>& found, 
             if (it->is_directory(entryError) && !it->is_symlink(entryError)) {
                 directories.push_back(it->path());
             } else if (it->is_regular_file(entryError)) {
-                const std::string name = it->path().string();
-                const auto format = formatFromExtension(name);
+                std::string name = it->path().string();
+                auto format = formatFromExtension(name);
+                // image.fits.fz: a FITS file with tile-compressed images
+                if (!format && lowerExt(name) == ".fz" && formatFromExtension(it->path().stem().string()) == Format::Fits) format = Format::Fits;
                 if (format && (*format == Format::Xisf || *format == Format::Fits || *format == Format::Asdf)) found.push_back(name);
             }
         } catch (const std::exception& e) {  // e.g. a name that has no narrow-character form

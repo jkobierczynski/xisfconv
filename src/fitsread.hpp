@@ -23,6 +23,7 @@ struct FitsImage {
     double dataMin = 0, dataMax = 0;    // finite range of floating point data (after BSCALE/BZERO)
     bool hasNaN = false;
     std::string note;                   // how the samples were mapped (for the console)
+    std::string tileCompression;        // ZCMPTYPE if the image was stored tile-compressed (RICE_1, GZIP_1, ...)
     // ASDF input only:
     std::string source;                 // location of the array in the tree, e.g. fits[0].data
     std::string storage;                // datatype, byte order, block and compression

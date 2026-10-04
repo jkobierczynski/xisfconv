@@ -8,6 +8,7 @@
 #include <limits>
 
 #include "fits.hpp"
+#include "fitstile.hpp"
 
 namespace xisfconv {
 
@@ -316,6 +317,113 @@ bool looksLikeFits(const std::string& path) {
 
 namespace {
 
+// A binary table extension that holds a tile-compressed image (written by fpack, CFITSIO, astropy).
+bool isTiledImage(const Header& hdr, const std::string& xtension) {
+    const Card* z = hdr.find("ZIMAGE");
+    return xtension == "BINTABLE" && z && trim(z->value) == "T";
+}
+
+// Gathers the compression parameters and the table layout from the header.
+TiledImage tiledImageFromHeader(const Header& hdr, const std::string& label, uint64_t rowBytes, uint64_t rows) {
+    TiledImage t;
+    t.algorithm = toUpper(hdr.getString("ZCMPTYPE"));
+    long long v = 0, n = 0;
+    if (!hdr.getInt("ZBITPIX", v) || !hdr.getInt("ZNAXIS", n) || n < 0 || n > 9) throw Error(label + ": missing or invalid ZBITPIX/ZNAXIS");
+    t.bitpix = static_cast<int>(v);
+    for (long long k = 1; k <= n; ++k) {
+        long long d = 0;
+        if (!hdr.getInt("ZNAXIS" + std::to_string(k), d) || d < 0) throw Error(label + ": missing or invalid ZNAXIS" + std::to_string(k));
+        t.naxis.push_back(static_cast<uint64_t>(d));
+        long long tile = k == 1 ? d : 1;  // the default: one row of the image per tile
+        if (hdr.getInt("ZTILE" + std::to_string(k), tile) && tile <= 0) throw Error(label + ": invalid ZTILE" + std::to_string(k));
+        t.tile.push_back(static_cast<uint64_t>(tile));
+    }
+    for (int i = 1; i < 100; ++i) {
+        const std::string name = toUpper(hdr.getString("ZNAME" + std::to_string(i)));
+        if (name.empty()) break;
+        if (!hdr.getInt("ZVAL" + std::to_string(i), v)) continue;
+        if (v < 0 || v > 1000000) throw Error(label + ": invalid " + name);
+        if (name == "BLOCKSIZE") t.riceBlockSize = static_cast<int>(v);
+        else if (name == "BYTEPIX") t.riceBytePix = static_cast<int>(v);
+    }
+    t.quantize = toUpper(hdr.getString("ZQUANTIZ"));
+    hdr.getInt("ZDITHER0", t.ditherSeed);
+    t.hasBlank = hdr.getInt("ZBLANK", t.blank);
+    const bool hasScale = hdr.getDouble("ZSCALE", t.scale), hasZero = hdr.getDouble("ZZERO", t.zero);
+    t.hasScale = hasScale || hasZero;
+
+    t.rowBytes = rowBytes;
+    t.rows = rows;
+    t.heapOffset = checkedMul(rowBytes, rows, "table size");
+    if (hdr.getInt("THEAP", v)) {
+        if (v < 0 || static_cast<uint64_t>(v) < t.heapOffset) throw Error(label + ": invalid THEAP");
+        t.heapOffset = static_cast<uint64_t>(v);
+    }
+    long long fields = 0;
+    if (!hdr.getInt("TFIELDS", fields) || fields < 1 || fields > 999) throw Error(label + ": missing or invalid TFIELDS");
+    uint64_t offset = 0;
+    for (long long i = 1; i <= fields; ++i) {
+        TileColumn c;
+        c.name = toUpper(hdr.getString("TTYPE" + std::to_string(i)));
+        const std::string form = toUpper(hdr.getString("TFORM" + std::to_string(i)));
+        size_t p = 0;
+        uint64_t repeat = 0;
+        bool hasRepeat = false;
+        while (p < form.size() && form[p] >= '0' && form[p] <= '9' && repeat < 100000000) {
+            repeat = repeat * 10 + static_cast<uint64_t>(form[p++] - '0');
+            hasRepeat = true;
+        }
+        c.repeat = hasRepeat ? repeat : 1;
+        if (p >= form.size()) throw Error(label + ": invalid TFORM" + std::to_string(i));
+        uint64_t width = 0;
+        if (form[p] == 'P' || form[p] == 'Q') {
+            c.variable = true;
+            c.wide = form[p] == 'Q';
+            if (p + 1 >= form.size()) throw Error(label + ": invalid TFORM" + std::to_string(i));
+            c.type = form[p + 1];
+            width = c.repeat * (c.wide ? 16 : 8);
+        } else {
+            c.type = form[p];
+            static const std::string known = "LXBIJKAEDCM";
+            const size_t code = known.find(c.type);
+            if (code == std::string::npos) throw Error(label + ": invalid TFORM" + std::to_string(i));
+            static const uint64_t bytes[] = {1, 0, 1, 2, 4, 8, 1, 4, 8, 8, 16};
+            width = c.type == 'X' ? (c.repeat + 7) / 8 : c.repeat * bytes[code];
+        }
+        c.offset = offset;
+        offset += width;
+        t.columns.push_back(std::move(c));
+    }
+    if (offset != rowBytes) throw Error(label + ": the columns do not add up to the row length of the table");
+    return t;
+}
+
+// Keywords that describe the table and the compression, not the image.
+bool isTileKeyword(const std::string& name) {
+    static const char* exact[] = {"TFIELDS", "THEAP", "ZIMAGE", "ZCMPTYPE", "ZBITPIX", "ZNAXIS", "ZMASKCMP", "ZQUANTIZ", "ZDITHER0",
+                                  "ZSIMPLE", "ZEXTEND", "ZBLOCKED", "ZTENSION", "ZPCOUNT", "ZGCOUNT", "ZHECKSUM", "ZDATASUM",
+                                  "ZBLANK", "ZSCALE", "ZZERO"};
+    for (const char* e : exact)
+        if (name == e) return true;
+    static const char* indexed[] = {"TTYPE", "TFORM", "TUNIT", "TDIM", "TNULL", "TSCAL", "TZERO", "TDISP", "ZNAXIS", "ZTILE", "ZNAME", "ZVAL"};
+    for (const char* prefix : indexed) {
+        uint64_t k;
+        if (startsWith(name, prefix) && parseUInt64(name.substr(std::strlen(prefix)), k)) return true;
+    }
+    return false;
+}
+
+std::vector<uint8_t> readBytes(std::ifstream& in, uint64_t pos, uint64_t size, const std::string& label) {
+    if (size > std::numeric_limits<size_t>::max() / 2) throw Error("image too large for this platform");
+    std::vector<uint8_t> raw(static_cast<size_t>(size));
+    in.clear();
+    in.seekg(static_cast<std::streamoff>(pos));
+    if (size && !in.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(size))) {
+        throw Error(label + ": read error in image data");
+    }
+    return raw;
+}
+
 // 32-bit ones' complement sum of big-endian words (the FITS checksum convention) over `size`
 // bytes at `pos`. A last incomplete word counts as if it were padded with zeros, as do the
 // missing bytes of a data unit that was left unpadded.
@@ -416,6 +524,23 @@ VerifyReport verifyFits(const std::string& path) {
         pos = dataPos + stored;
         ++hdus;
 
+        // A tile-compressed image must decompress.
+        if (isTiledImage(hdr, toUpper(hdr.getString("XTENSION")))) {
+            try {
+                if (dims.size() != 2) throw Error("invalid binary table");
+                const TiledImage tile = tiledImageFromHeader(hdr, label, dims[0], dims[1]);
+                bool empty = tile.naxis.empty();
+                for (uint64_t d : tile.naxis)
+                    if (d == 0) empty = true;
+                if (!empty) decodeTiledImage(tile, readBytes(in, dataPos, dataBytes, label));
+            } catch (const Unsupported& e) {
+                report.notChecked.push_back(label + ": " + e.what());
+            } catch (const Error& e) {
+                const std::string message = e.what();
+                report.problems.push_back(message.find(label) == std::string::npos ? label + ": " + message : message);
+            }
+        }
+
         const Card* checksum = hdr.find("CHECKSUM");
         const Card* datasum = hdr.find("DATASUM");
         if (!checksum && !datasum) {
@@ -494,13 +619,27 @@ FitsFile readFits(const std::string& path, bool headersOnly) {
         pos = dataPos + padded(dataBytes);
 
         const std::string label = "HDU " + std::to_string(hduIndex);
-        if (!isImage) {
-            const Card* z = hdr.find("ZIMAGE");
-            if (xtension == "BINTABLE" && z && trim(z->value) == "T") {
-                file.skipped.push_back(label + ": tile-compressed image (fpack); decompress it with funpack first");
-            } else {
-                file.skipped.push_back(label + ": " + (xtension.empty() ? "unknown" : xtension) + " extension (not an image)");
+        const bool tiled = isTiledImage(hdr, xtension);
+        TiledImage tile;
+        if (tiled) {
+            // The image is described by the Z keywords; the table only carries its compressed tiles.
+            if (dims.size() != 2) throw Error(label + ": invalid binary table");
+            tile = tiledImageFromHeader(hdr, label, dims[0], dims[1]);
+            if (!tileAlgorithmSupported(tile.algorithm)) {
+                file.skipped.push_back(label + ": tile-compressed image (" + (tile.algorithm.empty() ? "unknown method" : tile.algorithm) +
+                                       "), which is not supported; decompress it with funpack first");
+                continue;
             }
+            bitpix = tile.bitpix;
+            if (bitpix != 8 && bitpix != 16 && bitpix != 32 && bitpix != 64 && bitpix != -32 && bitpix != -64) {
+                throw Error(label + ": invalid ZBITPIX " + std::to_string(bitpix));
+            }
+            dims = tile.naxis;
+            naxis = static_cast<long long>(dims.size());
+            elements = dims.empty() ? 0 : 1;
+            for (uint64_t d : dims) elements = checkedMul(elements, d, "FITS data size");
+        } else if (!isImage) {
+            file.skipped.push_back(label + ": " + (xtension.empty() ? "unknown" : xtension) + " extension (not an image)");
             continue;
         }
         // Trailing axes of length 1 are ignored; leading axes are width, height[, channels].
@@ -524,7 +663,9 @@ FitsFile readFits(const std::string& path, bool headersOnly) {
         img.pixels.height = dims[1];
         img.pixels.channels = dims.size() == 3 ? dims[2] : 1;
         img.name = hdr.getString("EXTNAME");
+        if (tiled && img.name == "COMPRESSED_IMAGE") img.name.clear();  // the name fpack and astropy give the table
         if (img.name.empty()) img.name = hdr.getString("HDUNAME");
+        if (tiled) img.tileCompression = tile.algorithm;
         const std::string rowOrder = toUpper(hdr.getString("ROWORDER"));
         if (!rowOrder.empty()) {
             img.hasRowOrder = true;
@@ -537,18 +678,24 @@ FitsFile readFits(const std::string& path, bool headersOnly) {
             if (isReservedFitsKeyword(c.name) || c.name == "EXTNAME" || c.name == "HDUNAME" || c.name == "CONTINUE") {
                 continue;
             }
+            if (tiled && isTileKeyword(c.name)) continue;
             img.keywords.push_back({c.name, c.value, c.comment});
         }
 
         if (!headersOnly) {
-            if (dataBytes > std::numeric_limits<size_t>::max()) throw Error("image too large for this platform");
-            std::vector<uint8_t> raw(static_cast<size_t>(dataBytes));
-            in.clear();
-            in.seekg(static_cast<std::streamoff>(dataPos));
-            if (!in.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(dataBytes))) {
-                throw Error(label + ": read error in image data");
+            std::vector<uint8_t> raw = readBytes(in, dataPos, dataBytes, label);
+            if (tiled) {
+                try {
+                    raw = decodeTiledImage(tile, raw);
+                } catch (const Unsupported& e) {
+                    file.skipped.push_back(label + ": tile-compressed image: " + e.what());
+                    continue;
+                } catch (const Error& e) {
+                    throw Error(label + ": tile-compressed image: " + e.what());
+                }
             }
             decodeSamples(img, raw);
+            if (tiled) img.note += ", " + tile.algorithm + " tile compression";
             img.hasData = true;
         }
         file.images.push_back(std::move(img));

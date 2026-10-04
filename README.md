@@ -57,6 +57,8 @@ xisfconv --info light_0001.xisf               # geometry, codecs, FITS keywords,
 **FITS → XISF** (a FITS input is converted to XISF automatically)
 - Reads the primary HDU and IMAGE extensions: BITPIX 8/16/32/64/-32/-64, 2-D images and 3-D cubes
   (channels). Each image HDU becomes an XISF image; tables are skipped with a warning.
+- Reads **tile-compressed images** (`.fits.fz`, as written by fpack, CFITSIO and astropy) directly,
+  without funpack: see below.
 - Sample mapping: the standard unsigned conventions (BZERO = 32768, 2^31, 2^63) become UInt16/32/64
   exactly; signed integers without negative values become unsigned of the same width; signed data
   with negative values, or any other BSCALE/BZERO, becomes Float32 (8/16-bit) or Float64 (32/64-bit)
@@ -117,14 +119,34 @@ xisfconv --info light_0001.xisf               # geometry, codecs, FITS keywords,
   and UInt32, with SHA-1/256/512 checksums: every block of every rewritten file decodes to the
   original bytes.
 
+**Tile-compressed FITS** (`image.fits.fz`)
+- Images stored with the FITS tiled image compression convention are decompressed on reading and
+  then treated like any other FITS image: to XISF (default), ASDF, TIFF or PNG. `-t fits` writes
+  them as a plain FITS file, which is what funpack does; `image.fits.fz` gives `image.xisf`,
+  `image.fits` and so on.
+- Algorithms: `RICE_1` (fpack's default), `GZIP_1`, `GZIP_2`, `PLIO_1` and `NOCOMPRESS`, for all
+  BITPIX values, any tile shape, 2-D images and cubes. `HCOMPRESS_1` is not implemented: such an
+  image is skipped with a message (funpack can decompress it).
+- Integer images are lossless. Floating point images are stored either losslessly (gzip, `fpack -g
+  -q 0`) or **quantized** to integers with a scale per tile, which is fpack's default for floats and
+  is lossy: xisfconv restores exactly the values CFITSIO and astropy restore (`NO_DITHER`,
+  `SUBTRACTIVE_DITHER_1` and `_2`, with the same random sequence; undefined pixels come back as
+  NaN), but those are not the values of the image before it was packed.
+- The image's own keywords are carried over; the keywords that describe the table and the
+  compression (`ZIMAGE`, `ZCMPTYPE`, `ZTILEn`, `TFORMn`, ...) are dropped, as is the table name
+  `COMPRESSED_IMAGE`. `--info` shows the algorithm.
+- Writing tile-compressed FITS is not implemented yet.
+
 **Verifying files** (`--verify <file or directory>...`)
 - Reads every file completely without converting anything and says whether it is intact. A
-  directory stands for the `.xisf`, `.fits`/`.fit`/`.fts` and `.asdf` files in it and below it.
+  directory stands for the `.xisf`, `.fits`/`.fit`/`.fts`, `.fits.fz` and `.asdf` files in it and
+  below it.
 - XISF: every data block (pixels, properties, ICC profile, thumbnail; attached, inline or embedded)
   has its checksum verified where it has one, is decompressed, and for images compared with the
   size the geometry requires.
 - FITS: the structure of every HDU is checked, and the `CHECKSUM` and `DATASUM` keywords where the
-  file has them (most capture programs do not write them; astropy and CFITSIO can).
+  file has them (most capture programs do not write them; astropy and CFITSIO can). Every tile of
+  a tile-compressed image is decompressed.
 - ASDF: the tree is parsed, and every binary block has its MD5 checksum verified and is decompressed.
 - One line per file, `OK` with what was checked or `FAILED` with the reasons; with several files a
   count at the end. The exit status is 1 if any file failed (or a directory could not be read), so
@@ -331,6 +353,13 @@ reference. The XISF output is read back by the `xisf` package, and by a separate
 script for what that package lacks (subblocks, UInt64); checksums are verified there as well. Round
 trips XISF → FITS → XISF and FITS → XISF → FITS must return identical pixels, keywords and WCS.
 
+Tile-compressed FITS is checked against astropy and CFITSIO: files written by astropy's
+`CompImageHDU` (every algorithm, every integer and floating point type, several tile shapes, cubes,
+each quantization and dithering method, NaN pixels) must decode to what astropy reads from them,
+bit for bit, and, where `fpack` and `funpack` are installed, files packed by fpack must decode to
+what funpack writes. Damaged and truncated files, headers that contradict the table and an
+`HCOMPRESS_1` image are covered as well.
+
 TIFF and PNG export from FITS and ASDF input is checked against the export of the XISF file the input
 was made from: for every sample format, gray and RGB, both row orders and a set of `--bits`,
 `--stretch` and `--compress` combinations the pixels must be identical, and separate cases cover
@@ -370,8 +399,8 @@ compared with PyYAML on random documents in all of PyYAML's output styles.
   keywords. Distortion other than SIP (TPV, TNX) and non-zenithal projections stay keyword-only.
 - A PixInsight spline solution that goes XISF → FITS → XISF comes back as a spline rebuilt from the
   SIP approximation, not as the original: on the test frame the two agree to 0.5 arcsec rms.
-- FITS input: tile-compressed images (fpack) and tables are not read; BLANK pixels of integer images
-  are kept as ordinary values.
+- FITS input: tables are not read; BLANK pixels of integer images are kept as ordinary values.
+  Tile-compressed images: `HCOMPRESS_1` is not read, and tile-compressed FITS is not written.
 - ASDF input: arrays stored inline in the tree or in another file, non-contiguous views, Fortran-ordered
   arrays, tables and structured or complex data types are skipped with a message; bzip2- and
   Blosc-compressed blocks are not read. Line breaks written as U+0085, U+2028 or U+2029 inside the
@@ -391,7 +420,7 @@ compared with PyYAML on random documents in all of PyYAML's output styles.
 Bump the version in `src/common.hpp` and `CMakeLists.txt`, commit, then push a matching tag:
 
 ```
-git tag v0.8.0 && git push origin v0.8.0
+git tag v0.9.0 && git push origin v0.9.0
 ```
 
 CI builds and tests all three platforms and, only if every one passes, publishes a GitHub release with

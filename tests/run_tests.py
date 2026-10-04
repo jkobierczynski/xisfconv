@@ -16,7 +16,8 @@ files assembled byte by byte below.
 Requirements: pip install numpy astropy tifffile imagecodecs xisf lz4 zstandard pillow
 Optional:     pip install asdf asdf-astropy asdf-compression  (without them the ASDF checks that
               need the library are skipped; xisfconv's own reader still checks its output)
-              libtiff tools (tiffcp), fitsverify and pngcheck, used as extra independent checkers.
+              libtiff tools (tiffcp), fitsverify and pngcheck, used as extra independent checkers;
+              fpack and funpack (CFITSIO) as a second source of tile-compressed FITS files.
               Without tiffcp and imagecodecs, compressed float TIFF checks are skipped.
 Usage: python3 tests/run_tests.py path/to/xisfconv
 """
@@ -2833,11 +2834,249 @@ def test_verify():
     check(before == {n: os.path.getmtime(os.path.join(d, n)) for n in os.listdir(d)}, "--verify writes nothing")
 
 
+# ---------------------------------------------------------------- tile-compressed FITS
+
+HAVE_FPACK = shutil.which("fpack") is not None and shutil.which("funpack") is not None
+
+
+def comp_hdu(data, tile=None, **kw):
+    """astropy's tile-compressed image HDU (the tile size argument changed its name in astropy 5.3)."""
+    if tile is None:
+        return fits.CompImageHDU(data, **kw)
+    try:
+        return fits.CompImageHDU(data, tile_shape=tile, **kw)
+    except TypeError:  # pragma: no cover
+        return fits.CompImageHDU(data, tile_size=tile[::-1], **kw)
+
+
+def test_fits_tile_compressed():
+    """Tile-compressed FITS images (.fits.fz). The reference is what astropy decompresses from the same
+    file, bit for bit; for files made by fpack, what funpack writes."""
+    import warnings
+    d = os.path.join(TMP, "fz")
+    os.makedirs(d, exist_ok=True)
+    rng = np.random.default_rng(81)
+
+    def image(dtype, shape):
+        y = np.indices(shape).sum(0)
+        if np.issubdtype(dtype, np.floating):
+            return (np.sin(y / 7.0) * 1000 + rng.normal(0, 5, shape) + 2000).astype(dtype)
+        info = np.iinfo(dtype)
+        a = ((y * 37 + rng.integers(0, 50, shape)) % (int(info.max) - int(info.min) + 1) + int(info.min)).astype(dtype)
+        a.flat[0], a.flat[1] = info.max, info.min
+        return a
+
+    def same(got, ref):
+        return got.shape == ref.shape and np.array_equal(got.astype(np.float64), ref.astype(np.float64), equal_nan=True)
+
+    src = os.path.join(d, "c.fits.fz")
+    out = os.path.join(d, "out.fits")
+
+    def convert_and_compare(label, hdu=1):
+        with fits.open(src) as h:
+            ref = np.array(h[hdu].data)
+        r = run(src, "-o", out, "-f", "-q", "-t", "fits", expect_ok=False)
+        if r.returncode != 0:
+            check(False, f"{label}: {r.stderr.strip()[:200]}")
+            return
+        got = np.array(fits.getdata(out))
+        check(same(got, ref), f"{label}: pixels equal astropy's decompression ({got.dtype}, {got.shape})")
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        # integers: every algorithm, default tiles (rows), small tiles, the whole image as one tile
+        for dtype in (np.uint8, np.int16, np.uint16, np.int32, np.uint32):
+            for shape in ((37, 53), (3, 20, 31)):
+                a = image(dtype, shape)
+                for algo in ("RICE_1", "GZIP_1", "GZIP_2", "NOCOMPRESS"):
+                    for tile in (None, tuple(min(s, 16) for s in shape), shape):
+                        fits.HDUList([fits.PrimaryHDU(), comp_hdu(a, tile, compression_type=algo)]).writeto(src, overwrite=True)
+                        convert_and_compare(f"{np.dtype(dtype).name} {shape} {algo} tiles {tile}")
+        # masks: PLIO run-length coding
+        for dtype in (np.uint8, np.int16, np.int32):
+            m = (rng.random((40, 60)) > 0.8).astype(dtype) * rng.integers(1, 200, (40, 60)).astype(dtype)
+            m[5:10, :] = 7
+            m[20] = 0
+            for tile in (None, (8, 60), (40, 60)):
+                fits.HDUList([fits.PrimaryHDU(), comp_hdu(m, tile, compression_type="PLIO_1")]).writeto(src, overwrite=True)
+                convert_and_compare(f"PLIO_1 {np.dtype(dtype).name} tiles {tile}")
+        # floating point: quantized with each dithering method (seeds at both ends of the range), NaN
+        # and exact zeros, and lossless
+        for dtype in (np.float32, np.float64):
+            for shape in ((37, 53), (2, 24, 31)):
+                a = image(dtype, shape)
+                a.flat[5] = np.nan
+                a[..., 10:14, 3:9] = 0.0
+                n = 0
+                for algo in ("RICE_1", "GZIP_1", "GZIP_2"):
+                    for method in (-1, 1, 2):
+                        for level, seed in ((16.0, 1), (4.0, 777), (-0.01, 10000)):
+                            n += 1
+                            if n % 2 and shape != (37, 53):
+                                continue   # half of the combinations for the cube
+                            fits.HDUList([fits.PrimaryHDU(), comp_hdu(a, None, compression_type=algo, quantize_level=level,
+                                                                      quantize_method=method, dither_seed=seed)]).writeto(src, overwrite=True)
+                            convert_and_compare(f"{np.dtype(dtype).name} {shape} {algo} quantized, level {level}, method {method}, seed {seed}")
+                for algo in ("GZIP_1", "GZIP_2", "NOCOMPRESS"):
+                    fits.HDUList([fits.PrimaryHDU(), comp_hdu(a, None, compression_type=algo, quantize_level=0.0)]).writeto(src, overwrite=True)
+                    with fits.open(src) as h:
+                        check(same(np.array(h[1].data), a), "astropy's own lossless round trip")
+                    convert_and_compare(f"{np.dtype(dtype).name} {shape} {algo} lossless")
+
+        # the header: the image's keywords stay, the table's and the compression's go
+        a = image(np.uint16, (30, 44))
+        hd = fits.Header()
+        hd["OBJECT"] = ("M 31", "target")
+        hd["EXPTIME"] = (30.5, "seconds")
+        hd["ZEBRA"] = (7, "a keyword that merely starts with Z")
+        hd["TTYPEX"] = "not a column keyword"
+        hd["ROWORDER"] = "TOP-DOWN"
+        hd.add_history("calibrated")
+        fits.HDUList([fits.PrimaryHDU(), comp_hdu(a, None, header=hd, compression_type="RICE_1"),
+                      comp_hdu(image(np.float32, (20, 21)), None, name="SECOND", compression_type="GZIP_2", quantize_level=0.0),
+                      fits.ImageHDU(image(np.int16, (9, 11)), name="PLAIN"),
+                      fits.BinTableHDU.from_columns([fits.Column(name="x", format="E", array=np.arange(5.0))])]).writeto(src, overwrite=True)
+        r = run(src, "-o", out, "-f", "-t", "fits")
+        check("RICE_1 tile compression" in r.stderr and "skipped HDU 4: BINTABLE" in r.stderr, f"messages for a mixed file: {r.stderr.strip()[:300]}")
+        with fits.open(out) as h, fits.open(src) as ref:
+            check(len(h) == 3 and [x.header.get("EXTNAME") for x in h] == [None, "SECOND", "PLAIN"], "compressed and plain images, in order, with their names")
+            for i in range(3):
+                check(same(np.array(h[i].data), np.array(ref[i + 1].data)), f"mixed file, image {i}")
+            hdr = h[0].header
+            check(hdr["OBJECT"] == "M 31" and hdr.comments["OBJECT"] == "target" and hdr["EXPTIME"] == 30.5 and hdr["ZEBRA"] == 7 and
+                  hdr["TTYPEX"] == "not a column keyword" and "calibrated" in str(hdr["HISTORY"]), "the image's keywords are carried over")
+            left = [k for k in hdr if k.startswith(("ZIMAGE", "ZCMPTYPE", "ZBITPIX", "ZNAXIS", "ZTILE", "ZNAME", "ZVAL", "TFIELDS", "TFORM",
+                                                    "TTYPE1", "PCOUNT", "THEAP", "ZQUANTIZ", "ZDITHER"))]
+            check(not left, f"table and compression keywords are not carried over: {left}")
+            check(hdr["ROWORDER"] == "TOP-DOWN" and hdr["BZERO"] == 32768, "row order and the unsigned convention survive")
+        if HAVE_FITSVERIFY:
+            v = subprocess.run(["fitsverify", "-q", out], capture_output=True, text=True)
+            check("verification OK" in v.stdout, f"fitsverify on the decompressed file: {v.stdout.strip()}")
+        x = os.path.join(d, "c.xisf")
+        run(src, "-o", x, "-f", "-q")
+        compare(".fits.fz -> XISF, top-down image", read_xisf_any(x), a[:, :, None])
+        with fits.open(src) as ref:
+            compare(".fits.fz -> XISF, second image (rows flipped)", read_xisf_any(x, 1), np.array(ref[2].data)[::-1, :, None])
+        info = run(src, "--info").stdout
+        check("HDU 1: 44 x 30 x 1, BITPIX 16, tile-compressed (RICE_1)" in info and 'HDU 2 "SECOND": 21 x 20 x 1, BITPIX -32, tile-compressed (GZIP_2)' in info,
+              f"--info names the compression: {info[:200]}")
+        # names: image.fits.fz -> image.xisf / image.fits; plain FITS -> FITS stays refused
+        named = os.path.join(d, "image.fits.fz")
+        shutil.copy(src, named)
+        run(named, "-f", "-q")
+        run(named, "-f", "-q", "-t", "fits")
+        run(named, "-f", "-q", "-t", "png", "-s")
+        check(all(os.path.exists(os.path.join(d, n)) for n in ("image.xisf", "image.fits", "image.png")), "image.fits.fz is converted to image.xisf / .fits / .png")
+        r = run(os.path.join(d, "image.fits"), "-t", "fits", "-f", expect_ok=False)
+        check(r.returncode == 1 and "already a FITS file" in r.stderr, "FITS -> FITS is only for decompressing")
+
+        # what is not implemented is named and skipped; the rest is converted
+        b = (np.arange(64 * 64).reshape(64, 64) % 5000).astype(np.int16)
+        fits.HDUList([fits.PrimaryHDU(), comp_hdu(b, None, compression_type="HCOMPRESS_1"),
+                      comp_hdu(b, None, name="OK", compression_type="RICE_1")]).writeto(src, overwrite=True, checksum=True)
+        r = run(src, "-o", out, "-f", "-t", "fits")
+        check("skipped HDU 1: tile-compressed image (HCOMPRESS_1), which is not supported" in r.stderr and
+              same(np.array(fits.getdata(out)), b), "HCOMPRESS_1 is skipped with a message, the other image is converted")
+        r = run("--verify", src, expect_ok=False)
+        check(r.returncode == 0 and "NOT FULLY CHECKED" in r.stdout and "HDU 1: tile compression HCOMPRESS_1 is not supported" in r.stdout and
+              "3 checksums verified" in r.stdout, f"--verify on a file with HCOMPRESS_1: {r.stdout.strip()[:300]}")
+
+        # --verify and damage
+        fits.HDUList([fits.PrimaryHDU(), comp_hdu(image(np.int16, (60, 80)), None, compression_type="RICE_1")]).writeto(src, overwrite=True, checksum=True)
+        raw = bytearray(open(src, "rb").read())
+        r = run("--verify", src, expect_ok=False)
+        check(r.returncode == 0 and "OK (FITS, 2 HDUs; 2 checksums verified)" in r.stdout, f"--verify on .fits.fz: {r.stdout.strip()}")
+        table = raw.index(b"XTENSION")
+        heap = table + (raw[table:].index(b"END" + b" " * 77) // 2880 + 1) * 2880 + 60 * 8   # behind the 60 row descriptors
+        bad = bytearray(raw)
+        bad[heap + 400] ^= 0xFF
+        open(src, "wb").write(bad)
+        r = run("--verify", src, expect_ok=False)
+        check(r.returncode == 1 and "DATASUM mismatch" in r.stdout, f"--verify finds a damaged tile: {r.stdout.strip()[:200]}")
+        plain = os.path.join(d, "nosum.fits.fz")
+        fits.HDUList([fits.PrimaryHDU(), comp_hdu(image(np.int16, (60, 80)), None, compression_type="GZIP_1")]).writeto(plain, overwrite=True)
+        raw = bytearray(open(plain, "rb").read())
+        table = raw.index(b"XTENSION")
+        heap = table + (raw[table:].index(b"END" + b" " * 77) // 2880 + 1) * 2880 + 60 * 8
+        raw[heap + 400] ^= 0xFF
+        open(plain, "wb").write(raw)
+        r = run("--verify", plain, expect_ok=False)
+        check(r.returncode == 1 and "tile" in r.stdout, f"--verify finds a tile that does not decompress: {r.stdout.strip()[:200]}")
+        r = run(plain, "-o", out, "-f", "-t", "fits", expect_ok=False)
+        check(r.returncode == 1 and "tile-compressed image: tile" in r.stderr and not os.path.exists(out + ".part"), "a damaged tile stops the conversion")
+        cut = os.path.join(d, "cut.fits.fz")
+        whole = open(named, "rb").read()
+        table = whole.index(b"XTENSION")
+        data = table + (whole[table:].index(b"END" + b" " * 77) // 2880 + 1) * 2880
+        open(cut, "wb").write(whole[:data + 100])
+        r = run(cut, "-o", out, "-f", "-t", "fits", expect_ok=False)
+        check(r.returncode == 1 and "beyond the end" in r.stderr, "a truncated .fits.fz is reported")
+        # a table that does not match its header
+        fits.HDUList([fits.PrimaryHDU(), comp_hdu(image(np.int16, (60, 80)), None, compression_type="RICE_1")]).writeto(src, overwrite=True)
+        raw = open(src, "rb").read()
+        for old, new, msg in ((b"ZNAXIS2 =                   60", b"ZNAXIS2 =                   61", "the image needs 61 tiles"),
+                              (b"ZVAL2   =                    2", b"ZVAL2   =                    3", "bytes per pixel"),
+                              (b"ZBITPIX =                   16", b"ZBITPIX =                   17", "ZBITPIX")):
+            check(old in raw, "test file layout")
+            open(src, "wb").write(raw.replace(old, new))
+            r = run(src, "-o", out, "-f", "-t", "fits", expect_ok=False)
+            check(r.returncode == 1 and msg in r.stderr, f"inconsistent header ({new.decode().split()[0]}): {r.stderr.strip()[:160]}")
+
+        # a header that promises far more pixels than the table can hold must not cost the memory
+        huge = raw.replace(b"ZNAXIS1 =                   80", b"ZNAXIS1 =            800000000").replace(
+            b"ZTILE1  =                   80", b"ZTILE1  =            800000000")
+        check(huge != raw and len(huge) == len(raw), "test file layout")
+        open(src, "wb").write(huge)
+        r = run(src, "-o", out, "-f", "-t", "fits", expect_ok=False)
+        check(r.returncode == 1 and "implausible" in r.stderr, f"an implausible image size is refused: {r.stderr.strip()[:160]}")
+        # --verify finds .fits.fz files in a directory
+        sub = os.path.join(d, "dir")
+        os.makedirs(sub)
+        fits.HDUList([fits.PrimaryHDU(), comp_hdu(image(np.int16, (60, 80)), None, compression_type="GZIP_2")]).writeto(
+            os.path.join(sub, "a.fits.fz"), overwrite=True, checksum=True)
+        open(os.path.join(sub, "notes.fz"), "wb").write(b"not an image")
+        r = run("--verify", sub, expect_ok=False)
+        check(r.returncode == 0 and "a.fits.fz: OK (FITS, 2 HDUs; 2 checksums verified)" in r.stdout and "notes" not in r.stdout,
+              f"--verify on a directory with a .fits.fz: {r.stdout.strip()[:200]}")
+
+    # CFITSIO's own tools, when installed: fpack writes, funpack is the reference
+    if not HAVE_FPACK:
+        skipped.append("tile-compressed FITS written by fpack (install the CFITSIO tools fpack and funpack)")
+        return
+    n = 0
+    for dtype in (np.uint8, np.int16, np.uint16, np.int32, np.float32, np.float64):
+        shape = (41, 67) if n % 2 else (3, 30, 45)
+        n += 1
+        a = image(dtype, shape)
+        h = fits.PrimaryHDU(a)
+        h.header["OBJECT"] = "M 31"
+        base = os.path.join(d, "p.fits")
+        fits.HDUList([h, fits.ImageHDU(image(np.int16, (20, 33)), name="SECOND")]).writeto(base, overwrite=True)
+        options = [[], ["-g"], ["-g2"], ["-w"]]
+        if np.issubdtype(dtype, np.floating):
+            options += [["-q", "0", "-g"], ["-q", "4"], ["-q", "-0.5"]]
+        for o in options:
+            for f in (base + ".fz", os.path.join(d, "u.fits")):
+                if os.path.exists(f):
+                    os.remove(f)
+            p1 = subprocess.run(["fpack", *o, base], capture_output=True, text=True)
+            p2 = subprocess.run(["funpack", "-O", os.path.join(d, "u.fits"), base + ".fz"], capture_output=True, text=True)
+            if p1.returncode or p2.returncode:
+                check(False, f"fpack {o} / funpack failed: {p1.stderr.strip()[:100]} {p2.stderr.strip()[:100]}")
+                continue
+            run(base + ".fz", "-o", out, "-f", "-q", "-t", "fits")
+            with fits.open(os.path.join(d, "u.fits")) as hu, fits.open(out) as hx:
+                check(len(hx) == 2 and all(same(np.array(hx[i].data), np.array(hu[i].data)) for i in range(2)) and
+                      hx[0].header["OBJECT"] == "M 31" and hx[1].header["EXTNAME"] == "SECOND",
+                      f"fpack {' '.join(o) or '(default)'} {np.dtype(dtype).name} {shape}: equals funpack's output")
+
+
 if __name__ == "__main__":
     print("xisfconv:", EXE)
     print(subprocess.run([EXE, "--version"], capture_output=True, text=True).stdout.strip())
     print("libtiff tiffcp:", "yes" if HAVE_TIFFCP else "no (TIFF decoded by tifffile only)")
     print("NASA fitsverify:", "yes" if HAVE_FITSVERIFY else "no (FITS checked by astropy only)")
+    print("CFITSIO fpack/funpack:", "yes" if HAVE_FPACK else "no (tile-compressed FITS checked against astropy only)")
     print("asdf + asdf-astropy:", "yes" if HAVE_ASDF else "no -- ASDF files are checked by xisfconv's own reader only "
           "(pip install asdf asdf-astropy)")
     print("imagecodecs:", "yes" if HAVE_IMAGECODECS else
@@ -2849,7 +3088,7 @@ if __name__ == "__main__":
               test_fits_to_xisf_formats, test_fits_to_xisf_metadata, test_fits_to_xisf_bounds_bits_hdus,
               test_xisf_fits_xisf_roundtrip, test_asdf_yaml, test_asdf_hand_written, test_asdf_output,
               test_asdf_python_files, test_asdf_roundtrips, test_export_from_fits_and_asdf, test_xisf_rewrite,
-              test_verify):
+              test_verify, test_fits_tile_compressed):
         try:
             t()
         except Exception as e:  # noqa: BLE001
