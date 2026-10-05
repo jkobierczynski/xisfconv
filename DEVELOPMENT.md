@@ -2,7 +2,7 @@
 
 What was decided while building xisfconv, and why. The README says what the program does and
 `TODO.md` what is planned; this file records the choices behind both, so that they are not
-reopened by accident. State: version 0.10.1, 5 October 2026.
+reopened by accident. State: version 0.11.0, 5 October 2026.
 
 ## Purpose and scope
 
@@ -25,6 +25,11 @@ reopened by accident. State: version 0.10.1, 5 October 2026.
   everything in `src/` but `main.cpp`, the example and the build files are the library (LGPL);
   `main.cpp` and the tests are GPL. `COPYING.LESSER` holds the LGPL text, `LICENSE` the GPL it
   builds on.
+- The Python package (`python/xisfconv`) is part of the library: LGPL. Its tests are GPL like the
+  others. The source distribution of the package holds LGPL files only (no `main.cpp`, no tests).
+- Binaries that are handed out (the release archives, the wheels) contain Zstandard and zlib.
+  Zstandard's BSD licence asks for its notice to go with binaries: `THIRD-PARTY-NOTICES.md` is
+  packed with both since 0.11.0. (The release archives up to 0.10.0 lacked it.)
 
 ## Language, build and dependencies
 
@@ -173,12 +178,12 @@ and built in 0.10.0. What remains is in `TODO.md`.
 - Writing images from memory and the stretch on buffers are in the first release, for all five
   output formats: saving an array as XISF is what Python users cannot get elsewhere.
 - Version 0.x with no ABI promise until two bindings have used the API. The shared library version
-  changes with every 0.x release (`libxisfconv.so.0.10`), so that a binding built for another
+  changes with every 0.x release (`libxisfconv.so.0.11`), so that a binding built for another
   release fails to load.
 - Bindings: Python first (NumPy arrays; it can register `xisf` with astropy's I/O registry), then
   Rust and Perl when someone asks for them.
 - Delivered in three patches: the internal refactor (0.9.1), the C API with the tool rebuilt on it
-  (0.10.0), the Python binding.
+  (0.10.0), the Python package (0.11.0).
 
 Choices made while building the API:
 
@@ -207,7 +212,8 @@ Choices made while building the API:
   number is a stack of planes: the rule of the conversion from FITS.
 - **A damaged file is a finding of `xisfconv_verify`, not an error of it.** The call fails only when
   no report can be made.
-- **Cancelling** goes through the progress handler and leaves no partly written file.
+- **Cancelling** goes through the progress handler, or through `xisfconv_context_cancel` from
+  another thread, and leaves no partly written file.
 - **Freeing a context silences its handlers.** Handles may outlive the context; what the handlers
   point to (a Python object, say) need not.
 - **Messages keep naming the tool's options** (`--force`, `--bounds`). Making them neutral would
@@ -219,9 +225,203 @@ Choices made while building the API:
 - **Diagnostics** (`xisfconv_asdf_tree_text`, `xisfconv_asdf_tree_json`) are in the header for the
   tool and the tests, marked as not stable.
 
+## The Python package
+
+Built in 0.11.0, in `python/`. What was decided:
+
+- **ctypes, not cffi or a compiled extension.** The header was designed for it (sized structs,
+  32-bit enumerations, no macros in the interface). Nothing is compiled against Python, so one
+  wheel per platform serves every Python version, and there is no dependency besides NumPy.
+  The price is that the declarations are written twice; a test compares them with the header
+  (every function, constant and structure field) and with the layout a C compiler produces.
+- **The wheel holds the shared library** next to the modules, without a version in its file name
+  (wheels cannot hold symbolic links). The package looks for the library in this order: the
+  `XISFCONV_LIBRARY` environment variable, its own directory, the system. It refuses a library of
+  another 0.x release, since the layouts may differ.
+- **Build**: scikit-build-core, from `pyproject.toml` in the root of the repository (so that the
+  source distribution can hold the C++ sources). CMake knows this build by `SKBUILD`: shared
+  library only, no tool, no header. The version is read from `xisfconv.h` here too.
+- **Wheels** are built by cibuildwheel for Linux x86_64 and arm64 (manylinux_2_28), macOS arm64
+  and Windows x64. Zstandard is linked statically, so that a wheel needs only the C and C++
+  runtime and zlib of the system: on Linux and macOS it is built from its release archive, which
+  is checked against a SHA-256 written in `python/tools/build-zstd.sh`; on Windows it comes from
+  vcpkg, as for the release binary. On Linux the shared library exports the functions of
+  `xisfconv.h` and nothing else (a linker version script), so another copy of Zstandard or of the
+  C++ library in the same process is not disturbed. musllinux, 32-bit Windows and Intel macOS are
+  left for when someone needs them.
+- **Arrays have row 0 at the top and the channels last** by default: that is what Pillow,
+  matplotlib, tifffile and the `xisf` package give, and what a Python user expects of an image.
+  `row_order` and `channels` give the FITS conventions (bottom-up, planes first) on request, and
+  `xisfconv.astropy` uses those throughout, because astropy does. A colour image with the
+  channels last is a view of the planar buffer the library fills: no copy is made.
+- **`sample_format`, not `dtype`.** The conversion rescales (`--bits`), and an argument called
+  `dtype` would promise a cast. In `read()` and `read_image()` it is given by name, because the
+  second positional argument is the image.
+- **Only the six sample types of the library are written.** Signed integers and the like raise an
+  error that says so, instead of being converted silently. (`xisfconv.astropy` converts signed
+  integers the way the FITS reader of the library does, because FITS data is signed by nature.)
+- **Keywords are a list of cards that can be asked by name**, with typed values, made from a list,
+  a dict or an astropy `Header`. A value read from a file remembers its text and is written back
+  unchanged unless it is replaced. COMMENT and HISTORY have their text as value, as in astropy.
+- **`read_image()` gives the keywords as the file has them** and names the row order their WCS part
+  describes (`wcs_row_order`), so that `write(read_image(...))` changes nothing. BAYERPAT is the
+  exception: it is turned over when the rows are handed over in the other order than stored.
+- **XISF properties are read, not written.** Writing them needs the lossless property round trip
+  of `TODO.md` first.
+- **Errors are exceptions** derived from `xisfconv.Error` and, where one fits, from the built-in
+  one (`OSError`, `FileNotFoundError`, `FileExistsError`, `ValueError`, `IndexError`,
+  `LookupError`). Their text names the file. **Warnings are Python warnings**, raised when the
+  call is back and blamed on the caller's line; **notes go to the logger** `xisfconv`. For that
+  the library keeps its messages (`xisfconv_context_keep_messages`) until the call has returned;
+  a message handler written in Python would be a callback from C, with the trouble described
+  next.
+- **Progress is a function passed to the call**, not a setting. An exception it raises stops the
+  work and is passed on.
+- **Ctrl-C and other signals: the library calls a generator between its steps.** This took four
+  designs, and the reasons belong here so that the first three are not tried again.
+
+  A Python signal handler does not run when the signal arrives. It runs when the main thread next
+  executes Python code, at one of a few kinds of instruction: the start of a function, the jump
+  back to the top of a loop, the return from a call. While the main thread is inside the library
+  there is no such moment, so Ctrl-C waits for the end of the call. If the library calls a Python
+  function in between (a progress callback), the handler runs at that function's first
+  instruction, which is before its `try` block; what the handler raises (`KeyboardInterrupt`)
+  goes back to the C code that called the function, and ctypes can only print it. The interrupt
+  is shown and forgotten.
+
+  1. *Replacing the program's SIGINT handler during a call* by one that only takes note. Every
+     other signal that raises (an alarm that sets a time limit, a SIGTERM handler that exits) was
+     still lost.
+  2. *Wrapping the handlers of the signals that commonly raise*, and putting them back after the
+     call. Python code that swaps handlers can itself be interrupted between any two instructions;
+     an independent review kept finding moments at which a signal was dropped or a handler stayed
+     replaced.
+  3. *Doing the work in a thread of its own* while the caller waits in Python, where a handler may
+     raise. Now the caller's wait and its clean-up were the code that a handler could tear at any
+     instruction: on Python 3.11 and 3.12 an exception raised at the jump back of a loop was
+     attributed to an instruction outside the `try` and skipped the `finally` altogether, so the
+     caller got its exception while the work went on, and a second call collided with the first.
+     The thread also had to be a bare one (a `threading.Thread` is registered in a weak set whose
+     clean-up is Python code called from C), had to be stopped before Python ends, and made a
+     forked child wait for ever for a thread it did not have.
+  4. *What is there now.* The call is an ordinary call in the caller's thread. Between its steps
+     the library calls the `send` method of a **generator**. A generator comes back to life in
+     the middle of its code, inside its `try` block, so the handlers that are due run there and
+     what they raise is caught, kept, and answered with "stop"; the library stops its work,
+     removes what it had begun and returns, and the exception is raised from the call. The loop
+     of the generator is inside the `try`, not around it, because the jump back is such a moment
+     too; and once it has caught something the generator has done its work (the next call gets
+     a new one), because storing the exception and going round again would be two more.
+     Measured on Python 3.10 to 3.14: entered with a signal already due, an ordinary function
+     lost the exception every time and a generator never; with real signals 20 to 170
+     microseconds after the start of a run of reports, a generator with the `try` inside the
+     loop lost about a third of them on 3.11 and later, and this shape none of some ten thousand
+     per version.
+
+  The same generator calls the caller's progress function, so that is ordinary Python code that
+  may raise, and may use the package. For this the library has a second kind of progress handler
+  (`xisfconv_context_set_host_progress`): it takes one argument, because `send` takes one, and its
+  answers are two unlikely numbers, because a ctypes callback that fails leaves whatever was in
+  memory as its answer (on Python 3.14 that happened to be 1). Any other answer stops the call,
+  which then says that the report did not come back.
+
+  Only the calls that have steps get the generator: conversions, rewrites, verification and the
+  writing of a file. Opening a file, reading an image and reading keywords are one piece of work
+  each for the library, so nothing of Python runs inside them.
+- **What that does not cover.** In a thread other than the main one no handler runs, so a call
+  without a progress function is not asked anything there. A call is stopped only between its
+  steps: a rewrite and a verification have one per data block; a conversion has one per image
+  while it reads an XISF file, reads a FITS or ASDF file in one, and writes its output in one;
+  reading one image is one step. And an exception that a handler raises in the Python code of
+  the package, before the library is entered or after it has returned, is like one raised
+  anywhere else in a Python program: it reaches the caller, and everything is written so that
+  whatever instruction it strikes at, a handle is closed once and no more (the pointer is given
+  to what will free it in one step, and taken from it in one step). The last review sent some
+  240,000 raising signals into 29 kinds of calls on Python 3.10 to 3.14: every exception
+  reached the caller except some of the class `Exception` that astropy's own code caught
+  (`CCDData.read`; never `KeyboardInterrupt` or `SystemExit`), nothing crashed or hung, and no
+  handle stayed open in some 10,000 interrupted `open` calls on each of 3.10, 3.11 and 3.13.
+  Known limits that remain:
+  - *Two handlers that raise at the same moment*: the caller gets the later exception with the
+    earlier one as its context. On Python 3.10 the second is printed by Python and the call
+    raises `Cancelled` instead (3.10 looks for signals between almost any two instructions).
+  - *Python 3.14* (3.14.0rc2 is what was at hand): an exception from a signal handler can leave
+    a `with lock:` statement without releasing the lock, in any Python program; it did so in
+    half of 87,000 interrupted runs of a bare loop, and never on 3.10 to 3.13. Here the effect is
+    that an open `File` shared between threads can stay locked by the thread that was
+    interrupted. That thread itself can go on using and closing it.
+  - A temporary file of `xisfconv.astropy` that an interrupt keeps from being removed where it
+    was used is removed when Python ends.
+- **A file and what runs inside a call.** A signal handler can run between two calls of the
+  library, also inside a method that makes several (reading an image does); if it closes the
+  file there, the method finds the file closed and says so (every call looks once more just
+  before it enters the library). Inside a call on an open file nothing runs, as said. Should
+  that change, the library says whether a call is running in a context
+  (`xisfconv_context_running`), and using or closing the file then raises `RuntimeError`. A
+  progress function or handler that uses the package from inside a conversion gets a context of
+  its own; calls nested more than 24 deep raise `RecursionError` (a handler that uses the
+  package and is itself interrupted by its signal again and again would otherwise use up the C
+  stack).
+- **When Python ends** while a daemon thread is inside a call, the call is asked to stop
+  (`xisfconv_context_cancel`) and waited for by an `atexit` function, and from then on calls
+  report no progress: a thread that came back from the library into an interpreter being taken
+  down, to report, would crash it. (A thread that is about to enter the library is given two
+  seconds to do so; one that was torn out of a call and left its entry behind is not waited for
+  longer than that.) A daemon thread that starts another call after that is cut off where it is
+  when the process ends, as daemon threads are. A forked child forgets the calls of its
+  parent's threads.
+- **Handles are freed without running Python code**: the weak reference to their owner has the
+  library's free function as its callback, so nothing can be raised and lost there. An object
+  that the collector has taken knows by that reference that its handle is gone, and says
+  "closed" instead of using it. The references are kept in a set without a lock: a lock there was
+  taken a second time by a finalizer that closed a file, and the process hung.
+- **A call made while another is running** in the same thread (from a progress function, or from
+  a signal handler) gets a context of its own; the thread's usual one is busy.
+- Tests send real signals into loops of calls, from timers and from other threads, use the
+  package from inside handlers and progress functions, fork, and end Python in the middle of
+  calls.
+- **A file object does not keep its image objects**: they are made when asked for. Otherwise
+  file and images would form a reference cycle, and an unclosed file would stay open until the
+  cycle collector runs.
+- **The messages of the library name the tool's options**; the package rewords them to its
+  arguments (`--force` to `overwrite=True`) from a short list. A test reads the sources of the
+  library and fails when a message names an option the list does not know. File names in a
+  message are left as they are, also one that looks like an option.
+- **Threads.** The functions that take file names use one context per thread; an open file has
+  its own, with a lock, so it may be shared between threads but is used by one at a time.
+- **astropy is optional** and registered by `import xisfconv.astropy` (astropy has no entry point
+  for this). `CCDData.read` hands the image to astropy's own FITS reader as a FITS file in
+  memory: every detail of units, mask, uncertainty and WCS is then astropy's, at the price of
+  about four times the image in memory. Mask, uncertainty and PSF are stored as further images
+  named as astropy names its HDUs, and found by those names whatever the case, as astropy finds
+  HDUs. The registered writer writes XISF whatever the file is called.
+- **Additions to the C API** that came out of this: `xisfconv_fits_keywords` (the header an image
+  gets in a conversion to FITS, which before only a conversion could produce);
+  `xisfconv_keywords_fits_text` (a keyword list as FITS cards, exactly as the FITS writer formats
+  them, so that the package does not format cards a second way); the writer leaving out the
+  cards that describe how a FITS file stores its data, so that a header from astropy can be
+  passed as it is; messages kept in the context (`xisfconv_context_keep_messages`,
+  `_message_count`, `_message`, `_clear_messages`); the host progress handler described above
+  (`xisfconv_context_set_host_progress`, `xisfconv_context_host_progress_failed`);
+  `xisfconv_context_cancel`, the one function that another thread may call while a call runs; and
+  `xisfconv_context_running`, which says whether one does.
+- **What the review of the package changed in the library and the tool** (0.11.0): a keyword
+  value that is text without quotes (`Ha`) is written to FITS in quotes, where it used to make
+  an invalid card; a HIERARCH card whose string does not fit is shortened to a valid card or
+  left out, and a keyword with `=` in its name is left out, each with a warning; an output name
+  that is a directory or a device is refused instead of replaced (as root, `-f -o /dev/null`
+  replaced the device); a directory given as input is called that; a FITS or ASDF file that
+  changed between opening and reading is an error; a card without a keyword name can be put in
+  a keyword list; a text too long for one card that ends in `&` keeps it (astropy took it for
+  the mark that the text goes on, so an empty last piece is written); an output whose `.part`
+  name is taken by a link or a directory is refused.
+- **Publishing to PyPI is switched off** until the project is registered there: a version can be
+  uploaded once only, so that step is the maintainer's. It uses trusted publishing, without a
+  stored token.
+
 ## Testing
 
-- `tests/run_tests.py` drives the built program (3459 checks at 0.10.0). The Python packages it
+- `tests/run_tests.py` drives the built program (3470 checks at 0.11.0). The Python packages it
   needs are listed at its top; the `asdf` packages and the external tools (`tiffcp`, `fitsverify`,
   `pngcheck`, `fpack`/`funpack`) are used when installed and their checks skipped when not.
 - Every format is checked against an implementation that shares no code with xisfconv: astropy
@@ -243,8 +443,15 @@ Choices made while building the API:
   lifetimes, callbacks), a Python script that calls the API through ctypes and compares what the
   library writes and reads with astropy, the `xisf` package, asdf, tifffile and Pillow, and a
   program that reads all there is of any file, which is what gets fuzzed.
+- The Python package is tested with pytest (`python/tests`, 249 tests at 0.11.0): the same
+  comparisons with other software, made through the package, run from the source tree and from the
+  installed wheel on Python 3.10 to 3.14, with the oldest NumPy and astropy the package allows and
+  with the newest, and under AddressSanitizer.
+- An arm64 build of the tool is run under qemu against the suite before a release that touches
+  arithmetic (see "Arithmetic does not depend on the processor").
 - Windows code is compiled with MinGW and run under Wine before delivery, since no Windows machine
-  is at hand; CI on Windows remains the real check.
+  is at hand; CI on Windows remains the real check. The wheels for macOS and Windows have only CI
+  to prove them.
 - CI builds and runs the suite on Linux, macOS and Windows.
 
 ## How changes are made
@@ -261,6 +468,5 @@ Choices made while building the API:
 
 ## Not decided yet
 
-- Packaging of the Python binding (cffi or ctypes; wheel builds).
 - A CMake package for the static library.
 - Order of the remaining items in `TODO.md` after the library.

@@ -112,6 +112,8 @@ XisfChecksumState XisfFile::verifyBlockChecksum(const XisfStoredBlock& block, co
 XisfFile::XisfFile(const std::string& path) : path_(path) {
     file_.open(toPath(path), std::ios::binary);
     if (!file_) throw Error("cannot open file", ErrorKind::Io);
+    std::error_code directoryError;
+    if (std::filesystem::is_directory(toPath(path), directoryError)) throw Error("is a directory, not a file", ErrorKind::Io);
     file_.seekg(0, std::ios::end);
     fileSize_ = static_cast<uint64_t>(file_.tellg());
     file_.seekg(0);
@@ -443,23 +445,33 @@ std::vector<uint8_t> XisfFile::readIccProfile(size_t index, bool verify) {
     return readBlock(*img.iccNode, verify, "ICC profile of image " + std::to_string(index));
 }
 
+namespace {
+struct ElemType { const char* name; size_t size; bool isFloat; bool isSigned; };
+// The element types of vector and matrix properties that are read as numbers.
+const ElemType* numericElementType(const std::string& type) {
+    static const ElemType types[] = {{"I8", 1, false, true},   {"UI8", 1, false, false}, {"Byte", 1, false, false},
+                                     {"I16", 2, false, true},  {"UI16", 2, false, false}, {"I32", 4, false, true},
+                                     {"UI32", 4, false, false}, {"I64", 8, false, true},  {"UI64", 8, false, false},
+                                     {"F32", 4, true, true},   {"F64", 8, true, true}};
+    const bool matrix = type.size() > 6 && type.compare(type.size() - 6, 6, "Matrix") == 0;
+    const bool vector = type.size() > 6 && type.compare(type.size() - 6, 6, "Vector") == 0;
+    if (!matrix && !vector) return nullptr;
+    const std::string elem = type.substr(0, type.size() - 6);
+    for (const auto& e : types)
+        if (elem == e.name) return &e;
+    return nullptr;
+}
+}  // namespace
+
+bool isNumericPropertyType(const std::string& type) { return numericElementType(type) != nullptr; }
+
 bool XisfFile::readNumericProperty(size_t imageIndex, const std::string& id, std::vector<double>& out,
                                    size_t* rows, size_t* columns) {
     const XisfProperty* p = findProperty(imageIndex, id);
     if (!p || !p->node || p->location.empty()) return false;
     std::string t = p->type;
     const bool matrix = t.size() > 6 && t.compare(t.size() - 6, 6, "Matrix") == 0;
-    const bool vector = t.size() > 6 && t.compare(t.size() - 6, 6, "Vector") == 0;
-    if (!matrix && !vector) return false;
-    const std::string elem = t.substr(0, t.size() - 6);
-    struct ElemType { const char* name; size_t size; bool isFloat; bool isSigned; };
-    static const ElemType types[] = {{"I8", 1, false, true},   {"UI8", 1, false, false}, {"Byte", 1, false, false},
-                                     {"I16", 2, false, true},  {"UI16", 2, false, false}, {"I32", 4, false, true},
-                                     {"UI32", 4, false, false}, {"I64", 8, false, true},  {"UI64", 8, false, false},
-                                     {"F32", 4, true, true},   {"F64", 8, true, true}};
-    const ElemType* et = nullptr;
-    for (const auto& e : types)
-        if (elem == e.name) et = &e;
+    const ElemType* et = numericElementType(t);
     if (!et) return false;
     std::vector<uint8_t> bytes;
     try {

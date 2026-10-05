@@ -141,6 +141,13 @@ std::string stretchDescription(const std::string& how, const std::vector<Stretch
 std::string partPathFor(const std::string& outPath, const std::string& input, bool force) {
     const std::string tmpPath = outPath + ".part";
     std::error_code ec;
+    // Only a plain file of that name is ever written over: through a link the data would land
+    // somewhere else, and a directory or a pipe is not ours to remove.
+    const fs::file_status there = fs::symlink_status(toPath(tmpPath), ec);
+    if (!ec && fs::exists(there) && !fs::is_regular_file(there)) {
+        throw Error(tmpPath + ", the name of the temporary file for this output, is taken by something that is not a "
+                    "regular file; remove it or choose another output name", ErrorKind::Io);
+    }
     if (fs::exists(toPath(tmpPath), ec)) {
         if (!input.empty() && fs::equivalent(toPath(tmpPath), toPath(input), ec)) {
             throw Error("the temporary file for this output, " + tmpPath + ", is the input file; choose another output name",
@@ -187,8 +194,20 @@ void removeFile(const std::string& path) {
     fs::remove(toPath(path), ec);
 }
 
+// An output replaces a file of its name. A directory or a device of that name is left alone,
+// whatever the caller allows: renaming a file over /dev/null would take the device away.
+void notInPlaceOfSomethingElse(const std::string& outPath) {
+    std::error_code ec;
+    const fs::file_status status = fs::status(toPath(outPath), ec);
+    if (!ec && fs::exists(status) && !fs::is_regular_file(status)) {
+        throw Error(outPath + (fs::is_directory(status) ? " is a directory" : " is not a regular file") +
+                    "; it is not replaced by the output", ErrorKind::Io);
+    }
+}
+
 // Refuses an output that exists (unless it may be overwritten) or that is the input itself.
 void checkOutput(const std::string& outPath, const std::string& input, bool force) {
+    notInPlaceOfSomethingElse(outPath);
     if (fs::exists(toPath(outPath)) && !force) throw Error(outPath + " already exists (use --force to overwrite)", ErrorKind::Exists);
     if (!input.empty() && fs::exists(toPath(outPath)) && fs::equivalent(toPath(outPath), toPath(input))) {
         throw Error("output would overwrite the input file", ErrorKind::Argument);
@@ -240,6 +259,7 @@ XisfFileRewrite rewriteXisfFile(const std::string& input, const std::string& out
         throw Error("the output would overwrite the input file; add --in-place to replace it, or name another file "
                     "or directory with -o or -d", ErrorKind::Argument);
     }
+    if (!same) notInPlaceOfSomethingElse(outPath);
     if (!same && fs::exists(toPath(outPath)) && !force) {
         throw Error(outPath + " already exists (use --force to overwrite)", ErrorKind::Exists);
     }
@@ -283,6 +303,51 @@ XisfFileRewrite rewriteXisfFile(const std::string& input, const std::string& out
         syncToDisk(parent.empty() ? "." : fromPath(parent), true);
     }
     return done;
+}
+
+std::vector<FitsKeyword> xisfImageFitsKeywords(XisfFile& file, size_t idx, bool bottomUp, bool propertyKeywords,
+                                               bool wcs, int sipOrder, std::string* wcsSummary) {
+    const XisfImage& img = file.images()[idx];
+    std::vector<FitsKeyword> keywords = img.keywords;
+    if (propertyKeywords) addPropertyKeywords(file, idx, keywords);
+    if (bottomUp) {
+        if (FitsKeyword* bp = findKeyword(keywords, "BAYERPAT")) {
+            const std::string v = trim(bp->value);
+            std::string pattern;
+            if (v.size() >= 2 && v.front() == '\'' && v.back() == '\'') pattern = trim(v.substr(1, v.size() - 2));
+            int pw = 2, ph = 2;
+            if (img.cfa.present && img.cfa.pattern == pattern) {
+                pw = img.cfa.width;
+                ph = img.cfa.height;
+            }
+            if (!pattern.empty() && pattern.size() == static_cast<size_t>(pw * ph)) {
+                bp->value = fitsString(flipPatternRows(pattern, pw, ph, img.height));
+            } else {
+                warn("cannot adjust BAYERPAT " + v + " for the bottom-up row order; check it manually");
+            }
+        }
+    } else {
+        // WCS keywords stored in an XISF file follow the FITS bottom-up convention
+        // (as PixInsight wrote them); adapt them to the top-down rows being written.
+        flipWcsRowOrder(keywords, img.height);
+    }
+    if (wcs && !hasKeyword(keywords, "CTYPE1")) {
+        WcsResult result;
+        if (astrometricSolutionToWcs(file, idx, bottomUp, sipOrder, result)) {
+            keywords.insert(keywords.end(), result.keywords.begin(), result.keywords.end());
+            if (wcsSummary) *wcsSummary = result.summary;
+        }
+    }
+    return keywords;
+}
+
+void flipKeywordRows(std::vector<FitsKeyword>& keywords, uint64_t height) {
+    if (FitsKeyword* bp = findKeyword(keywords, "BAYERPAT")) {
+        const std::string pattern = fitsUnquote(bp->value);
+        if (pattern.size() == 4) bp->value = fitsString(flipPatternRows(pattern, 2, 2, height));
+        else warn("cannot adjust BAYERPAT " + bp->value + " for the changed row order; check it manually");
+    }
+    flipWcsRowOrder(keywords, height);
 }
 
 void convertXisfFile(const std::string& input, const std::string& outPath, Format format, const ConvertOptions& opt) {
@@ -397,36 +462,10 @@ void convertXisfFile(const std::string& input, const std::string& outPath, Forma
                 hdu.pixels = &buffers[n];
                 hdu.extname = img.id;
                 hdu.bottomUp = opt.bottomUp;
-                hdu.keywords = img.keywords;
-                if (opt.propertyKeywords) addPropertyKeywords(file, idx, hdu.keywords);
-                if (opt.bottomUp) {
-                    if (FitsKeyword* bp = findKeyword(hdu.keywords, "BAYERPAT")) {
-                        const std::string v = trim(bp->value);
-                        std::string pattern;
-                        if (v.size() >= 2 && v.front() == '\'' && v.back() == '\'') pattern = trim(v.substr(1, v.size() - 2));
-                        int pw = 2, ph = 2;
-                        if (img.cfa.present && img.cfa.pattern == pattern) {
-                            pw = img.cfa.width;
-                            ph = img.cfa.height;
-                        }
-                        if (!pattern.empty() && pattern.size() == static_cast<size_t>(pw * ph)) {
-                            bp->value = fitsString(flipPatternRows(pattern, pw, ph, img.height));
-                        } else {
-                            warn("cannot adjust BAYERPAT " + v + " for the bottom-up row order; check it manually");
-                        }
-                    }
-                } else {
-                    // WCS keywords stored in an XISF file follow the FITS bottom-up convention
-                    // (as PixInsight wrote them); adapt them to the top-down rows being written.
-                    flipWcsRowOrder(hdu.keywords, img.height);
-                }
-                if (opt.wcs && !hasKeyword(hdu.keywords, "CTYPE1")) {
-                    WcsResult wcs;
-                    if (astrometricSolutionToWcs(file, idx, opt.bottomUp, opt.sipOrder, wcs)) {
-                        hdu.keywords.insert(hdu.keywords.end(), wcs.keywords.begin(), wcs.keywords.end());
-                        info("image " + std::to_string(idx) + ": " + wcs.summary);
-                    }
-                }
+                std::string wcsSummary;
+                hdu.keywords = xisfImageFitsKeywords(file, idx, opt.bottomUp, opt.propertyKeywords, opt.wcs, opt.sipOrder,
+                                                     &wcsSummary);
+                if (!wcsSummary.empty()) info("image " + std::to_string(idx) + ": " + wcsSummary);
                 hdu.keywords.push_back({"HISTORY", "", std::string("Converted from XISF by xisfconv ") + kVersion});
                 if (n < stretchNotes.size()) hdu.keywords.push_back({"HISTORY", "", stretchNotes[n]});
                 hdus.push_back(std::move(hdu));
@@ -535,12 +574,7 @@ std::pair<double, double> automaticBounds(const FitsImage& image) {
 
 void flipImageRows(FitsImage& img) {
     flipVertical(img.pixels);
-    if (FitsKeyword* bp = findKeyword(img.keywords, "BAYERPAT")) {
-        const std::string pattern = fitsUnquote(bp->value);
-        if (pattern.size() == 4) bp->value = fitsString(flipPatternRows(pattern, 2, 2, img.pixels.height));
-        else warn("cannot adjust BAYERPAT " + bp->value + " for the changed row order; check it manually");
-    }
-    flipWcsRowOrder(img.keywords, img.pixels.height);
+    flipKeywordRows(img.keywords, img.pixels.height);
     img.topDown = !img.topDown;
     img.hasRowOrder = true;
 }

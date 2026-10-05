@@ -2,8 +2,9 @@
 
 A small, dependency-light command-line converter between PixInsight **XISF**, **FITS** and **ASDF**,
 in every direction, with **TIFF** and **PNG** export from all three. The same code is available as a
-library, **libxisfconv**, with a plain C API for C, C++, Python and other languages: see
-[Library](#library-libxisfconv).
+library, **libxisfconv**, with a plain C API for C, C++ and other languages (see
+[Library](#library-libxisfconv)), and as a **Python package** that reads and writes the images as
+NumPy arrays and works with astropy (see [Python](#python)).
 
 ```
 xisfconv M31_integration.xisf                 # -> M31_integration.fits
@@ -34,6 +35,9 @@ xisfconv --info light_0001.xisf               # geometry, codecs, FITS keywords,
 - BITPIX 8/16/32/64/-32/-64 with the standard BZERO offsets for unsigned data
 - All original FITS keywords carried over; structural keywords (SIMPLE, BITPIX, NAXISn, BZERO, ...) are
   regenerated, long names use HIERARCH, long strings are split over CONTINUE cards
+- A keyword value that is text without quotes (`Ha` for `'Ha'`) is written in quotes, so that every
+  card is valid FITS; a card that cannot be written (a `=` in a long name, no room for the value) is
+  left out with a warning
 - Missing keywords filled from XISF properties: OBJECT, EXPTIME, DATE-OBS, TELESCOP, INSTRUME, FILTER,
   CCD-TEMP, XPIXSZ/YPIXSZ, FOCALLEN, APTDIA, IMAGETYP, and BAYERPAT from the CFA element
   (disable with `--no-property-keywords`; existing keywords always win)
@@ -300,6 +304,8 @@ sudo cmake --install build        # optional
 Windows (vcpkg): `vcpkg install zlib zstd`, then configure with
 `-DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake`.
 
+`pip install .` builds the Python package instead: see [Python](#python).
+
 Options: `-DBUILD_SHARED_LIBS=ON` builds libxisfconv as a shared library (the default is a static
 library that is linked into the tool), `-DXISFCONV_BUILD_TESTS=ON` builds the C test programs of
 the library, `-DXISFCONV_WITH_ZSTD=OFF` leaves Zstandard out, `-DXISFCONV_PORTABLE=ON` makes the
@@ -346,8 +352,9 @@ xisfconv [options] <file>...      # any of XISF, FITS, ASDF -> any other of them
 Output is written to `<name>.part` and renamed when complete, so an interrupted run never leaves a
 half-written file under the final name. A `<name>.part` that already exists (the leftover of an
 interrupted run, or another file) is not overwritten unless `--force` is given, and never when it
-is the input itself. With several inputs, a failing file is reported and the rest are still
-converted (exit status 1).
+is the input itself. An output name that is a directory or a device (`/dev/null`) is refused, with
+or without `--force`: the output would take its place. With several inputs, a failing file is
+reported and the rest are still converted (exit status 1).
 
 ## Library (libxisfconv)
 
@@ -400,24 +407,32 @@ What to know:
 
 - **Errors.** Functions return a status (`XISFCONV_OK` is 0); the text of the last failure is kept
   in the context. No exception leaves the library, and it prints nothing: warnings and notes go to
-  a message handler, if one is set. A progress handler can cancel a long call.
+  a message handler, if one is set, or are kept in the context for the caller to fetch
+  (`xisfconv_context_keep_messages`). A progress handler can cancel a long call, and so can another
+  thread, with `xisfconv_context_cancel`. For a host that calls the library from an interpreter
+  there is a second kind of progress handler, with one argument and an answer that tells a
+  handler that failed from one that says "go on" (`xisfconv_context_set_host_progress`); the
+  Python package uses it to let Ctrl-C through.
 - **Pixels** are planar and in host byte order: `[channels, height, width]` for NumPy. The row
   order is always stated: XISF, TIFF and PNG are top-down, FITS is bottom-up unless `ROWORDER` says
   otherwise, and reading and writing take the order the caller wants.
 - **Keywords** come as the file has them. WCS keywords describe the rows in the order the image
   info names (`wcs_row_order`): the stored order in FITS and ASDF, always bottom-up in XISF, as
   PixInsight writes them. `xisfconv_wcs_keywords` returns them for any row order, and the writer
-  converts them when it stores the rows the other way round.
+  converts them when it stores the rows the other way round. `xisfconv_fits_keywords` gives the
+  whole header an image gets in a conversion to FITS, and `xisfconv_keywords_fits_text` any
+  keyword list as FITS cards, for handing to another FITS library. The writer leaves out the cards
+  that describe how a FITS file stores its data (SIMPLE, BITPIX, NAXIS, BZERO and the like), so a
+  header read from a FITS file can be passed as it is.
 - **Numbers** in files have a decimal point whatever locale the program has set.
 - **File names** are UTF-8 on every platform, Windows included.
 - **Threads.** There is no global state. A context and the handles made from it belong to one
   thread at a time; different contexts are independent.
 - **From other languages.** The structs start with their size and enumerations are 32-bit integers,
   so the header maps directly to Python's `ctypes` or `cffi`, Rust's bindgen and Perl's
-  FFI::Platypus. `tests/library_tests.py` drives the library through `ctypes` and shows how. A
-  Python package with NumPy arrays in and out is the next step.
+  FFI::Platypus. The Python package in `python/` is built that way, on `ctypes`.
 - **Stability.** Version 0.x: the API may still change between releases, and the shared library's
-  version changes with each of them (`libxisfconv.so.0.10`).
+  version changes with each of them (`libxisfconv.so.0.11`).
 - **Messages** are the tool's and some name its options (`--force`, `--bounds`): the option names
   say which setting is meant.
 - The CMake package (`find_package(xisfconv)`) is installed with the shared library; a static
@@ -427,6 +442,65 @@ What to know:
 
 The library is licensed under the LGPL (version 3 or later), so that programs under other licences
 can use it; the command line tool remains under the GPL.
+
+## Python
+
+The package `xisfconv` is the library with NumPy arrays in and out. [`python/README.md`](python/README.md)
+describes it; in short:
+
+```python
+import xisfconv
+
+data = xisfconv.read("m31.xisf")                    # [height, width] or [height, width, channels]
+image = xisfconv.read_image("m31.xisf")             # with keywords, name, bounds, XISF properties
+xisfconv.write("out.xisf", data, keywords={"OBJECT": "M 31"}, codec="zstd", checksum="sha256")
+xisfconv.convert("m31.xisf", "m31.fits")            # what the command line tool does
+print(xisfconv.verify("m31.xisf").verdict)
+
+import xisfconv.astropy                             # CCDData.read("m31.xisf"), ccd.write("x.xisf"),
+from astropy.nddata import CCDData                  # and astropy.io.fits HDU lists
+ccd = CCDData.read("m31.xisf", unit="adu")
+```
+
+```
+pip install .                    # from a checkout: builds the library and installs the package
+pip install ".[astropy]"         # with astropy
+```
+
+The package needs Python 3.10 or later and NumPy; astropy is optional. It holds the shared library
+and calls it through `ctypes`, so one wheel per platform serves every Python version. The wheels
+for Linux (x86_64, arm64), macOS (Apple Silicon) and Windows (x64) are built by
+`.github/workflows/wheels.yml`; Zstandard is linked into them, so they need nothing but the C and
+C++ runtime and, on Linux and macOS, the zlib of the system. The package is not on PyPI yet: see
+[Releasing](#releasing).
+
+Good to know:
+
+- Arrays have row 0 at the top and the channels last, as Pillow, matplotlib and tifffile have them;
+  `row_order="bottom-up"` and `channels="first"` give the FITS conventions, and `xisfconv.astropy`
+  uses those throughout.
+- `sample_format` rescales, as `--bits` does; it does not cast.
+- Warnings of the library are Python warnings (`xisfconv.XisfconvWarning`), its notes go to the
+  logger `xisfconv`, its errors are exceptions derived from `xisfconv.Error`.
+- Ctrl-C stops a conversion, a rewrite or a verification between its steps and leaves no partly
+  written file; during the last step it takes effect when the file is complete. (A rewrite and a
+  verification have a step per data block; a conversion has one per image while it reads an XISF
+  file, and writes its output in one.) The same holds for any signal whose handler raises, such as an alarm that sets a
+  time limit. A function given as `progress=` is called between the steps, in the caller's
+  thread, and stops the work by raising an exception.
+- XISF properties are read, not written. The astrometric solution of an XISF file is carried into
+  a new file as WCS keywords, from which the PixInsight solution properties are written again.
+  The saved screen stretch and the resolution of an XISF image are not carried by `read_image`
+  and `write`; `rewrite` copies an XISF file with everything in it.
+- An image is read and written as a whole, in memory. Reading takes about twice the size of the
+  image for a moment, three times for a compressed file. Writing takes once its size on top of
+  the array, twice for a colour image with the channels last, and about four times when the
+  file is compressed.
+- `CCDData.read` hands the image to astropy's own FITS reader as a FITS file in memory, so that
+  units, mask and uncertainty behave exactly as with FITS; that takes about four times the size
+  of the image in memory.
+- The messages of the library are those of the command line tool. In the Python package they
+  name its arguments (`overwrite=True`) where the tool's name options (`--force`).
 
 ## Testing
 
@@ -438,19 +512,41 @@ python3 tests/run_tests.py build/xisfconv
 cmake -S . -B build-shared -DBUILD_SHARED_LIBS=ON -DXISFCONV_BUILD_TESTS=ON && cmake --build build-shared -j
 mkdir /tmp/capi && build-shared/xisfconv_capi_test /tmp/capi
 python3 tests/library_tests.py build-shared/libxisfconv.so build-shared/xisfconv
+
+# the Python package: against the build above, or installed (then without the first two settings)
+pip install pytest
+XISFCONV_LIBRARY=build-shared/libxisfconv.so PYTHONPATH=python XISFCONV_TOOL=build-shared/xisfconv \
+  python3 -m pytest python/tests
 ```
 
 The library is tested on its own. `tests/capi_test.c` is plain C99 and built by a C compiler, so the
 header stays C; it writes its test files with the library, reads them back and goes through the
 error paths: missing arguments, buffers that are too small, indices out of range, options of an
-older and shorter layout, handles that outlive their context, the message and progress callbacks and
-cancellation. `tests/library_tests.py` calls the API through `ctypes`: arrays written as XISF, FITS,
+older and shorter layout, handles that outlive their context, the message and progress callbacks,
+messages kept in the context, the host's progress handler, and cancellation by a handler and
+through the context. `tests/library_tests.py` calls the API through `ctypes`: arrays written as XISF, FITS,
 ASDF, TIFF and PNG are read back by astropy, the `xisf` package, Python's `asdf`, tifffile and
 Pillow, and files written by astropy and the `xisf` package are read through the library and
 compared with what that software reads. It also checks the WCS functions through astropy, the
 stretch against the tool's `--stretch`, file names beyond ASCII, several threads with their own
 contexts at once, and that the library prints nothing. `tests/capi_readall.c` reads everything the
 API offers from any file and is the target for fuzzing.
+
+The Python package has its tests in `python/tests` (pytest). They are the same comparisons made
+through the package: what it writes is read by astropy, the `xisf` package, `asdf`, tifffile and
+Pillow, and what those write is read through it; WCS keywords are evaluated with astropy for both
+row orders and through every format; `CCDData.read` of an XISF file must give what
+`CCDData.read` gives for the FITS file the converter writes from it, and a `CCDData` with unit,
+WCS, mask and uncertainty must come back from XISF as it comes back from FITS. The stretch
+functions are compared with the formulas written out in NumPy. The declarations of the package
+are checked against `xisfconv.h`: every function, constant and structure field, and the sizes and
+offsets a C compiler gives the structures. Interrupts are tested with real signals: sent at any
+moment of a loop of library calls, from a timer or from another thread, SIGINT must end the loop
+with `KeyboardInterrupt` and an alarm with the exception its handler raises; handlers and progress
+functions use the package themselves; a process is forked and Python is ended in the middle of
+calls. With
+`XISFCONV_TOOL` set, files converted by the package and by the tool must be identical byte for
+byte.
 
 Test inputs come from two independent writers: the `xisf` PyPI package (all codecs ± shuffling,
 5 sample formats, gray and RGB) and a small encoder in the test script for the features that package
@@ -535,7 +631,7 @@ compared with PyYAML on random documents in all of PyYAML's output styles.
 ## Development
 
 [`DEVELOPMENT.md`](DEVELOPMENT.md) records the decisions behind the program (scope, conventions,
-dependencies, testing, the planned library); [`TODO.md`](TODO.md) lists what is planned.
+dependencies, testing, the library and its Python package); [`TODO.md`](TODO.md) lists what is planned.
 
 ## Releasing
 
@@ -543,11 +639,18 @@ Bump the version in `include/xisfconv.h` (CMake reads it from there), commit, th
 tag:
 
 ```
-git tag v0.10.1 && git push origin v0.10.1
+git tag v0.11.0 && git push origin v0.11.0
 ```
 
 CI builds and tests all three platforms and, only if every one passes, publishes a GitHub release with
 the packaged binaries. A tag that doesn't match the program version fails the build.
+
+The same tag starts `.github/workflows/wheels.yml`, which builds the wheels and the source
+distribution of the Python package and tests each wheel; it can also be started by hand, and the
+files are kept as artifacts of the run. Publishing to PyPI is off until it is set up: register the
+project `xisfconv` on PyPI with this repository and the workflow `wheels.yml` as a trusted
+publisher (environment `pypi`), then set the repository variable `PUBLISH_TO_PYPI` to `true`.
+From then on a tag publishes the wheels. A version can be uploaded to PyPI once only.
 
 ## Verified against PixInsight
 
@@ -589,7 +692,11 @@ the terms of the GNU Lesser General Public License, either version 3 of the Lice
 option) any later version: see [COPYING.LESSER](COPYING.LESSER), which adds its permissions to the
 terms in [LICENSE](LICENSE). A program may link the library without taking on the GPL, provided the
 conditions of the LGPL are met. Each source file says in its first lines which of the two applies;
-the build files and the example belong to the library, the tests to the tool.
+the build files, the example and the Python package (`python/xisfconv`) belong to the library, the
+tests to the tool.
+
+The release binaries and the Python wheels contain Zstandard, and some of them zlib:
+see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 
 XISF and PixInsight are products of Pleiades Astrophoto S.L.; xisfconv is an independent
 implementation of the published XISF 1.0 specification and is not affiliated with them.

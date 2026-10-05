@@ -52,8 +52,8 @@
 #include <stdint.h>
 
 #define XISFCONV_VERSION_MAJOR 0
-#define XISFCONV_VERSION_MINOR 10
-#define XISFCONV_VERSION_PATCH 1
+#define XISFCONV_VERSION_MINOR 11
+#define XISFCONV_VERSION_PATCH 0
 
 #if defined(XISFCONV_STATIC)
 #  define XISFCONV_API
@@ -102,7 +102,7 @@ XISFCONV_API const char *xisfconv_status_text(xisfconv_status status);
  * Library information
  * ---------------------------------------------------------------------------------------- */
 
-/* "0.10.0" */
+/* "0.11.0" */
 XISFCONV_API const char *xisfconv_version(void);
 /* major * 10000 + minor * 100 + patch, for comparing at run time */
 XISFCONV_API int32_t xisfconv_version_number(void);
@@ -155,6 +155,69 @@ XISFCONV_API void xisfconv_context_set_message_handler(xisfconv_context *ctx, xi
 /* handler NULL = no progress reports (the default). */
 XISFCONV_API void xisfconv_context_set_progress_handler(xisfconv_context *ctx, xisfconv_progress_fn handler,
                                                         void *user);
+
+/* Messages without a handler. With keep != 0 the context keeps the warnings and notes of the
+ * calls made in it and in the handles made from it, for the caller to fetch afterwards; keep = 0
+ * (the default) ends that and drops what was kept. This is for callers who do better without a
+ * callback from C: in Python, an exception raised by a signal handler cannot pass through one.
+ * A handler, if one is set, is called all the same. The messages add up over the calls until
+ * xisfconv_context_clear_messages: a caller that keeps them has to clear them. */
+XISFCONV_API void xisfconv_context_keep_messages(xisfconv_context *ctx, int32_t keep);
+XISFCONV_API size_t xisfconv_context_message_count(const xisfconv_context *ctx);
+/* A kept message: its level, the file it is about (NULL if none) and its text. Any out pointer
+ * may be NULL. The strings are valid until the next call in the context or
+ * xisfconv_context_clear_messages. XISFCONV_ERR_INDEX beyond the last one. */
+XISFCONV_API xisfconv_status xisfconv_context_message(const xisfconv_context *ctx, size_t index,
+                                                      xisfconv_message_level *level, const char **path,
+                                                      const char **message);
+XISFCONV_API void xisfconv_context_clear_messages(xisfconv_context *ctx);
+
+/* Asks the call that is running in this context to stop: at its next step it returns
+ * XISFCONV_ERR_CANCELLED and leaves no partly written file, as when the progress handler asks.
+ * This is the one function that may be called while another thread is inside a call in the
+ * context (and from a signal handler). A request made while no call runs is dropped. Returns 1
+ * if a call was running in the context, else 0. */
+XISFCONV_API int32_t xisfconv_context_cancel(xisfconv_context *ctx);
+/* 1 if a call is running in the context, else 0. For a host whose handlers run inside a call
+ * (a progress handler, in Python also a signal handler): the context and the handles made from
+ * it must not be used or freed by such a handler while this says 1. */
+XISFCONV_API int32_t xisfconv_context_running(const xisfconv_context *ctx);
+
+/* A second kind of progress handler, for a host that runs the library from an interpreter.
+ * It differs from xisfconv_progress_fn in two ways that such a host needs.
+ *
+ * It takes one argument, so that anything the interpreter can call with one value can be the
+ * handler. (In Python that is the `send` of a generator: a generator resumes inside its `try`
+ * block, so what a signal handler raises at that moment is caught there. In an ordinary function
+ * it would strike before the function's `try` and be lost.)
+ *
+ * Its answer tells a handler that did not finish from one that says "go on": XISFCONV_HOST_GO_ON,
+ * XISFCONV_HOST_STOP, or anything else if the handler could not be run or was left by an error,
+ * which stops the call too. xisfconv_context_host_progress_failed says whether that happened in
+ * the last call. A call that is stopped returns XISFCONV_ERR_CANCELLED.
+ *
+ * It is called wherever the progress handler is, and before it. Like the other handlers it must
+ * not call back into the same context; it may use other contexts. */
+enum {
+    XISFCONV_HOST_GO_ON = 0x676F6F6E,
+    XISFCONV_HOST_STOP  = 0x73746F70
+};
+
+typedef struct xisfconv_progress_report {
+    void *user;        /* as given to xisfconv_context_set_host_progress */
+    const char *stage; /* valid during the call only */
+    uint64_t done;
+    uint64_t total;
+} xisfconv_progress_report;
+
+typedef int32_t (*xisfconv_host_progress_fn)(const xisfconv_progress_report *report);
+
+/* handler NULL = none (the default). */
+XISFCONV_API void xisfconv_context_set_host_progress(xisfconv_context *ctx, xisfconv_host_progress_fn handler,
+                                                     void *user);
+/* 1 if the host's progress handler stopped the last call by failing (an answer that is neither
+ * XISFCONV_HOST_GO_ON nor XISFCONV_HOST_STOP). */
+XISFCONV_API int32_t xisfconv_context_host_progress_failed(const xisfconv_context *ctx);
 
 /* Text of the most recent failure in this context, or in a handle made from it; "" if there was
  * none. Valid until the next failing call or until the context is freed. */
@@ -246,7 +309,8 @@ XISFCONV_API xisfconv_status xisfconv_keywords_get(const xisfconv_keywords *kw, 
 /* Index of the first card with this name (case-insensitive), or -1. */
 XISFCONV_API int64_t xisfconv_keywords_find(const xisfconv_keywords *kw, const char *name);
 /* value and comment may be NULL. Names that do not fit a standard card are written with
- * HIERARCH. Lists owned by a file cannot be changed: XISFCONV_ERR_ARGUMENT. */
+ * HIERARCH; an empty name makes a card of text only, like COMMENT. Lists owned by a file cannot
+ * be changed: XISFCONV_ERR_ARGUMENT. */
 XISFCONV_API xisfconv_status xisfconv_keywords_append(xisfconv_keywords *kw, const char *name, const char *value,
                                                       const char *comment);
 /* Convenience: quotes and escapes `text` as a FITS string value. */
@@ -261,6 +325,16 @@ XISFCONV_API xisfconv_status xisfconv_keywords_remove(xisfconv_keywords *kw, siz
 /* The unquoted content of a FITS string value ("M 31" for 'M 31    '); other values are returned
  * trimmed. *out is valid until the next call on the same list. */
 XISFCONV_API xisfconv_status xisfconv_keywords_get_text(const xisfconv_keywords *kw, size_t index, const char **out);
+
+/* The list as the cards of a FITS header: 80 characters each, one after the other without a
+ * separator and without the END card. This is what the FITS writer makes of the keywords of an
+ * image: a string that does not fit continues on CONTINUE cards (a LONGSTRN card then comes
+ * first), a name that does not fit a standard card is written with HIERARCH, text is reduced to
+ * printable ASCII, the cards that describe how a FITS file stores its data are left out (see
+ * xisfconv_image), and a card that cannot be written is left out with a warning. *text is valid
+ * until the next call on the same list; length may be NULL. */
+XISFCONV_API xisfconv_status xisfconv_keywords_fits_text(const xisfconv_keywords *kw, const char **text,
+                                                         size_t *length);
 
 /* ------------------------------------------------------------------------------------------
  * Reading files
@@ -400,7 +474,8 @@ XISFCONV_API int64_t xisfconv_property_find(const xisfconv_file *file, size_t im
  * image's properties are searched first, then the file-level metadata. Call with values = NULL
  * to learn the size: *rows and *columns are set (a vector has rows = 1). capacity is the number
  * of doubles `values` can hold; XISFCONV_ERR_BUFFER if it is too small, XISFCONV_ERR_NOT_FOUND
- * if there is no such numeric property. */
+ * if there is no vector or matrix property of that id, XISFCONV_ERR_UNSUPPORTED if its elements
+ * are of a type that is not read as numbers (complex ones). */
 XISFCONV_API xisfconv_status xisfconv_property_read_f64(xisfconv_file *file, size_t image, const char *id,
                                                         double *values, size_t capacity, size_t *rows,
                                                         size_t *columns);
@@ -504,6 +579,21 @@ XISFCONV_API xisfconv_status xisfconv_apply_stretch(xisfconv_context *ctx, const
 XISFCONV_API xisfconv_status xisfconv_wcs_keywords(xisfconv_file *file, size_t image, xisfconv_row_order row_order,
                                                    int32_t sip_order, xisfconv_keywords **out,
                                                    const char **fit_summary);
+
+/* The cards an image has as a FITS header, for pixel rows in `row_order` (XISFCONV_ROWS_DEFAULT =
+ * bottom-up): what xisfconv_convert writes to a FITS or ASDF file, without its HISTORY lines.
+ *   XISF: the FITS keywords of the image; where the file has none, keywords derived from its
+ *     properties and attributes if property_keywords is not 0 (OBJECT, EXPTIME, TELESCOP, INSTRUME,
+ *     FILTER, CCD-TEMP, XPIXSZ, YPIXSZ, FOCALLEN, APTDIA, DATE-OBS, BAYERPAT, IMAGETYP); BAYERPAT
+ *     and WCS keywords for `row_order`; and, if wcs is not 0 and the image has no WCS keywords,
+ *     those built from a PixInsight solution as by xisfconv_wcs_keywords (sip_order: 2..7,
+ *     0 = linear only).
+ *   FITS and ASDF: the cards of the image, with BAYERPAT and WCS keywords converted if `row_order`
+ *     is not the order the rows are stored in.
+ * fit_summary as for xisfconv_wcs_keywords; it may be NULL. Caller frees *out. */
+XISFCONV_API xisfconv_status xisfconv_fits_keywords(xisfconv_file *file, size_t image, xisfconv_row_order row_order,
+                                                    int32_t property_keywords, int32_t wcs, int32_t sip_order,
+                                                    xisfconv_keywords **out, const char **fit_summary);
 
 /* Converts WCS keywords in place between the bottom-up and top-down pixel conventions
  * (CRPIX2, CD/PC/CDELT, SIP coefficients). Applying it twice restores the original values. */
@@ -664,7 +754,10 @@ typedef struct xisfconv_image {
     /* May be NULL; not written to TIFF and PNG. The cards describe the buffer as it is given:
      * BAYERPAT counts rows from its first row, and so do WCS keywords unless wcs_row_order says
      * otherwise. They are converted when the rows are stored in the other order. A 2x2 BAYERPAT
-     * of R, G and B also becomes the XISF ColorFilterArray. */
+     * of R, G and B also becomes the XISF ColorFilterArray. Cards that describe how a FITS file
+     * stores its data are left out, so that a header taken from a FITS file can be passed as it
+     * is: SIMPLE, BITPIX, NAXIS, NAXISn, EXTEND, XTENSION, PCOUNT, GCOUNT, BZERO, BSCALE, BLANK,
+     * ROWORDER, CHECKSUM, DATASUM and END. */
     const xisfconv_keywords *keywords;
     const void *icc_profile;              /* may be NULL; written to XISF, TIFF and PNG */
     size_t icc_profile_size;

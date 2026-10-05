@@ -157,4 +157,8 @@ private:
     std::vector<uint8_t> readAttachment(uint64_t position, uint64_t size);
 };
 
+// True for the types of vector and matrix properties whose values XisfFile::readNumericProperty
+// reads as numbers (F64Vector, I32Matrix, ...); false for the others (complex elements, for one).
+bool isNumericPropertyType(const std::string& type);
+
 }  // namespace xisfconv

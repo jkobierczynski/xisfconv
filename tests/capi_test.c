@@ -11,6 +11,7 @@
  * Copyright (C) 2026 Jurgen Kobierczynski
  */
 #include <math.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -637,6 +638,207 @@ static void test_callbacks(xisfconv_context *ctx) {
     CHECK(xisfconv_convert(ctx, path_of("gray.xisf"), path_of("cancelled.fits"), NULL) == XISFCONV_OK, "without the handler it goes through");
 }
 
+/* A progress handler that asks through the context for the call to stop, as another thread or a
+ * signal handler would, and itself says "go on". */
+typedef struct {
+    xisfconv_context *ctx;
+    int calls, cancel_at, told;
+} canceller;
+
+static int32_t on_progress_cancel_told(void *user, const char *stage, uint64_t done, uint64_t total) {
+    canceller *c = (canceller *)user;
+    (void)stage, (void)done, (void)total;
+    if (++c->calls == c->cancel_at) c->told = xisfconv_context_running(c->ctx) + 2 * xisfconv_context_cancel(c->ctx);
+    return 0;
+}
+
+static int32_t on_progress_cancel(void *user, const char *stage, uint64_t done, uint64_t total) {
+    canceller *c = (canceller *)user;
+    (void)stage, (void)done, (void)total;
+    if (++c->calls == c->cancel_at) xisfconv_context_cancel(c->ctx);
+    return 0;
+}
+
+static void test_kept_messages_and_cancel(xisfconv_context *ctx) {
+    messages seen;
+    canceller stop;
+    xisfconv_write_options wo;
+    xisfconv_convert_options co;
+    xisfconv_report *report = NULL;
+    xisfconv_message_level level = 0;
+    const char *path = "x", *text = "x";
+    size_t n, i;
+    int infos = 0, warnings = 0;
+
+    /* messages kept in the context instead of handed to a handler */
+    CHECK(xisfconv_context_message_count(ctx) == 0, "nothing is kept unless asked for");
+    xisfconv_write_options_init(&wo, sizeof wo);
+    wo.checksum = XISFCONV_CHECKSUM_SHA3_256;
+    CHECK(write_gray(ctx, path_of("kept0.xisf"), &wo, NULL, NULL, 0) == XISFCONV_OK && xisfconv_context_message_count(ctx) == 0,
+          "a warning without a handler is dropped");
+    xisfconv_context_keep_messages(ctx, 1);
+    CHECK(write_gray(ctx, path_of("kept1.xisf"), &wo, NULL, NULL, 0) == XISFCONV_OK, "write with a SHA-3 checksum, keeping messages");
+    CHECK(xisfconv_context_message_count(ctx) == 1, "its warning is kept (it came from the writer, a handle of the context)");
+    CHECK(xisfconv_context_message(ctx, 0, &level, &path, &text) == XISFCONV_OK && level == XISFCONV_MESSAGE_WARNING && path &&
+              strcmp(path, path_of("kept1.xisf")) == 0 && strstr(text, "PixInsight") != NULL,
+          "with its level, its file and its text");
+    CHECK(xisfconv_context_message(ctx, 0, NULL, NULL, NULL) == XISFCONV_OK, "which need not all be asked for");
+    CHECK(xisfconv_context_message(ctx, 1, &level, &path, &text) == XISFCONV_ERR_INDEX && level == XISFCONV_MESSAGE_INFO && path == NULL &&
+              text && *text == 0,
+          "there is no second one");
+    CHECK(xisfconv_context_message(NULL, 0, &level, &path, &text) == XISFCONV_ERR_ARGUMENT && path == NULL && text && *text == 0 &&
+              xisfconv_context_message_count(NULL) == 0,
+          "and none without a context");
+
+    /* they add up over the calls until they are cleared; a handler is called as well */
+    memset(&seen, 0, sizeof seen);
+    xisfconv_context_set_message_handler(ctx, on_message, &seen);
+    xisfconv_convert_options_init(&co, sizeof co);
+    co.overwrite = 1;
+    CHECK(xisfconv_convert(ctx, path_of("gray.fits"), path_of("kept2.xisf"), &co) == XISFCONV_OK, "a conversion, keeping messages");
+    n = xisfconv_context_message_count(ctx);
+    CHECK(n >= 2 && (int)n - 1 == seen.infos + seen.warnings, "its notes are kept after the warning, and the handler heard them too");
+    for (i = 0; i < n; ++i) {
+        CHECK(xisfconv_context_message(ctx, i, &level, &path, &text) == XISFCONV_OK && text && *text, "a kept message");
+        if (level == XISFCONV_MESSAGE_WARNING) ++warnings;
+        else if (level == XISFCONV_MESSAGE_INFO) ++infos;
+        if (i > 0) CHECK(path && strcmp(path, path_of("gray.fits")) == 0, "names the file that was converted");
+    }
+    CHECK(warnings == 1 + seen.warnings && infos == seen.infos && infos >= 1, "warnings and notes, in order");
+    xisfconv_context_set_message_handler(ctx, NULL, NULL);
+    CHECK(xisfconv_convert(ctx, path_of("missing.fits"), path_of("kept3.xisf"), &co) != XISFCONV_OK &&
+              xisfconv_context_message_count(ctx) == n,
+          "a failing call leaves what was kept");
+    xisfconv_context_clear_messages(ctx);
+    CHECK(xisfconv_context_message_count(ctx) == 0 && xisfconv_context_message(ctx, 0, NULL, NULL, NULL) == XISFCONV_ERR_INDEX,
+          "cleared");
+
+    /* keeping ends: what was kept is dropped, and nothing more is kept */
+    CHECK(write_gray(ctx, path_of("kept4.xisf"), &wo, NULL, NULL, 0) == XISFCONV_OK && xisfconv_context_message_count(ctx) == 1,
+          "one more warning");
+    xisfconv_context_keep_messages(ctx, 0);
+    CHECK(xisfconv_context_message_count(ctx) == 0, "keeping ended: nothing is left");
+    CHECK(write_gray(ctx, path_of("kept5.xisf"), &wo, NULL, NULL, 0) == XISFCONV_OK && xisfconv_context_message_count(ctx) == 0,
+          "and nothing is kept any more");
+    xisfconv_context_keep_messages(NULL, 1);
+    xisfconv_context_clear_messages(NULL);
+    xisfconv_context_cancel(NULL);
+
+    /* a request to stop, made through the context */
+    xisfconv_context_cancel(ctx);
+    CHECK(xisfconv_convert(ctx, path_of("gray.xisf"), path_of("stopped.fits"), NULL) == XISFCONV_OK,
+          "a request made while no call runs is dropped");
+    remove(path_of("stopped.fits"));
+    memset(&stop, 0, sizeof stop);
+    stop.ctx = ctx;
+    stop.cancel_at = 1;
+    xisfconv_context_set_progress_handler(ctx, on_progress_cancel, &stop);
+    CHECK(xisfconv_convert(ctx, path_of("gray.xisf"), path_of("stopped.fits"), NULL) == XISFCONV_ERR_CANCELLED && stop.calls == 1,
+          "a request made during a call stops it at its next step");
+    CHECK(!file_exists(path_of("stopped.fits")) && !file_exists(path_of("stopped.fits.part")), "and nothing is left behind");
+    CHECK(strstr(xisfconv_error_message(ctx), "cancel") != NULL, "the error says so");
+    stop.calls = 0;
+    CHECK(xisfconv_rewrite(ctx, path_of("gray.xisf"), path_of("stopped.xisf"), NULL, NULL) == XISFCONV_ERR_CANCELLED &&
+              !file_exists(path_of("stopped.xisf")) && !file_exists(path_of("stopped.xisf.part")),
+          "a rewrite is stopped the same way");
+    stop.calls = 0;
+    CHECK(xisfconv_verify(ctx, path_of("gray.xisf"), &report) == XISFCONV_ERR_CANCELLED && report == NULL, "and verifying");
+    stop.calls = 0;
+    stop.cancel_at = 0;
+    CHECK(xisfconv_convert(ctx, path_of("gray.xisf"), path_of("stopped.fits"), NULL) == XISFCONV_OK && stop.calls >= 2,
+          "the request was for that call only: the next one goes through");
+    xisfconv_context_set_progress_handler(ctx, NULL, NULL);
+    stop.calls = 0;
+    xisfconv_context_cancel(ctx);
+    CHECK(xisfconv_verify(ctx, path_of("gray.xisf"), &report) == XISFCONV_OK && report, "also without a handler");
+    xisfconv_report_free(report);
+}
+
+/* A host's progress handler, as an interpreter would give it. */
+typedef struct {
+    int reports, answer_at;
+    int32_t answer; /* given at report `answer_at`; "go on" otherwise */
+    int stage_ok;
+} host;
+
+static int32_t host_progress(const xisfconv_progress_report *report) {
+    host *h = (host *)report->user;
+    if (!report->stage || !*report->stage || (report->total && report->done > report->total)) h->stage_ok = 0;
+    return ++h->reports == h->answer_at ? h->answer : XISFCONV_HOST_GO_ON;
+}
+
+static void test_host_progress(xisfconv_context *ctx) {
+    host h;
+    progress steps;
+    xisfconv_report *report = NULL;
+
+    memset(&h, 0, sizeof h);
+    h.stage_ok = 1;
+    memset(&steps, 0, sizeof steps);
+    xisfconv_context_set_host_progress(ctx, host_progress, &h);
+    xisfconv_context_set_progress_handler(ctx, on_progress, &steps);
+    CHECK(xisfconv_convert(ctx, path_of("gray.xisf"), path_of("host.fits"), NULL) == XISFCONV_OK && h.reports >= 2 && h.stage_ok,
+          "a conversion reports to the host's progress handler");
+    CHECK(steps.calls == h.reports && xisfconv_context_host_progress_failed(ctx) == 0, "and to the ordinary handler, as often");
+    remove(path_of("host.fits"));
+
+    /* "stop" stops the call, and the ordinary handler is not asked any more */
+    h.reports = steps.calls = 0;
+    h.answer_at = 2;
+    h.answer = XISFCONV_HOST_STOP;
+    CHECK(xisfconv_convert(ctx, path_of("gray.xisf"), path_of("host.fits"), NULL) == XISFCONV_ERR_CANCELLED && h.reports == 2 &&
+              steps.calls == 1,
+          "the answer \"stop\" stops the call");
+    CHECK(xisfconv_context_host_progress_failed(ctx) == 0 && !file_exists(path_of("host.fits")) &&
+              !file_exists(path_of("host.fits.part")),
+          "which is not a failure of the handler, and leaves nothing behind");
+
+    /* any other answer stops the call too and is remembered until the next call */
+    {
+        static const int32_t odd[] = {0, 1, 2, -1, 0x676F6F6F};
+        size_t i;
+        for (i = 0; i < sizeof odd / sizeof odd[0]; ++i) {
+            h.reports = 0;
+            h.answer_at = 1;
+            h.answer = odd[i];
+            CHECK(xisfconv_verify(ctx, path_of("gray.xisf"), &report) == XISFCONV_ERR_CANCELLED && report == NULL && h.reports == 1 &&
+                      xisfconv_context_host_progress_failed(ctx) == 1,
+                  "an answer that is neither stops the call and counts as a failure of the handler");
+        }
+    }
+    h.reports = 0;
+    h.answer_at = 0;
+    CHECK(xisfconv_verify(ctx, path_of("gray.xisf"), &report) == XISFCONV_OK && xisfconv_context_host_progress_failed(ctx) == 0,
+          "until the next call");
+    xisfconv_report_free(report);
+    report = NULL;
+
+    /* without it; without a context */
+    xisfconv_context_set_host_progress(ctx, NULL, NULL);
+    h.reports = steps.calls = 0;
+    CHECK(xisfconv_convert(ctx, path_of("gray.xisf"), path_of("host.fits"), NULL) == XISFCONV_OK && h.reports == 0 && steps.calls >= 2,
+          "without it only the ordinary handler is called");
+    xisfconv_context_set_progress_handler(ctx, NULL, NULL);
+    xisfconv_context_set_host_progress(NULL, host_progress, &h);
+    CHECK(xisfconv_context_host_progress_failed(NULL) == 0, "and nothing without a context");
+
+    /* cancel tells whether a call was running */
+    CHECK(xisfconv_context_cancel(ctx) == 0 && xisfconv_context_cancel(NULL) == 0 && xisfconv_context_running(ctx) == 0 &&
+              xisfconv_context_running(NULL) == 0,
+          "no call is running");
+    {
+        canceller stop;
+        memset(&stop, 0, sizeof stop);
+        stop.ctx = ctx;
+        stop.cancel_at = 1;
+        xisfconv_context_set_progress_handler(ctx, on_progress_cancel_told, &stop);
+        CHECK(xisfconv_verify(ctx, path_of("gray.xisf"), &report) == XISFCONV_ERR_CANCELLED && stop.told == 3,
+              "during a call the context says that one is running, and so does the request to stop it");
+        CHECK(xisfconv_context_running(ctx) == 0, "and afterwards no more");
+        xisfconv_context_set_progress_handler(ctx, NULL, NULL);
+    }
+}
+
 static void test_stretch_and_wcs(xisfconv_context *ctx) {
     xisfconv_stretch_params params[3];
     float out[3 * W * H];
@@ -767,6 +969,156 @@ static void test_stretch_and_wcs(xisfconv_context *ctx) {
 }
 
 /* Handles keep their context alive: the order of freeing does not matter. */
+/* The header of an image for FITS, cards as text, and the cards the writer does not take. */
+static void test_fits_header(xisfconv_context *ctx) {
+    xisfconv_keywords *kw = NULL, *out = NULL;
+    const xisfconv_keywords *stored = NULL;
+    xisfconv_file *f = (xisfconv_file *)1;
+    xisfconv_writer *w = NULL;
+    xisfconv_image img;
+    const char *text = NULL, *summary = NULL, *value = NULL;
+    size_t length = 99;
+    char long_text[151];
+    char xisf[1024], fits[1024];
+    strcpy(xisf, path_of("header.xisf"));
+    strcpy(fits, path_of("header.fits"));
+    memset(long_text, 'x', sizeof long_text - 1);
+    long_text[sizeof long_text - 1] = 0;
+
+    CHECK(xisfconv_keywords_new(ctx, &kw) == XISFCONV_OK && kw, "a list for the header tests");
+    if (!kw) return;
+    CHECK(xisfconv_keywords_fits_text(kw, &text, &length) == XISFCONV_OK && text && *text == 0 && length == 0,
+          "an empty list is an empty header");
+    xisfconv_keywords_append(kw, "SIMPLE", "T", NULL);
+    xisfconv_keywords_append(kw, "BITPIX", "16", NULL);
+    xisfconv_keywords_append(kw, "NAXIS", "2", NULL);
+    xisfconv_keywords_append(kw, "NAXIS1", "5", NULL);
+    xisfconv_keywords_append(kw, "EXTEND", "T", NULL);
+    xisfconv_keywords_append(kw, "BZERO", "32768", NULL);
+    xisfconv_keywords_append(kw, "BSCALE", "1", NULL);
+    xisfconv_keywords_append_string(kw, "ROWORDER", "TOP-DOWN", NULL);
+    xisfconv_keywords_append_string(kw, "BAYERPAT", "RGGB", "the filter pattern");
+    xisfconv_keywords_append_string(kw, "OBJECT", "M 1", NULL);
+    xisfconv_keywords_append_string(kw, "LONGTEXT", long_text, NULL);
+    xisfconv_keywords_append_number(kw, "Long Keyword Name", 1.5, NULL);
+    xisfconv_keywords_append(kw, "HISTORY", NULL, "made by the test");
+    CHECK(xisfconv_keywords_count(kw) == 13, "thirteen cards");
+
+    CHECK(xisfconv_keywords_fits_text(kw, &text, &length) == XISFCONV_OK && length > 0 && length % 80 == 0 &&
+              strlen(text) == length,
+          "the cards as text: 80 characters each");
+    CHECK(!strstr(text, "SIMPLE") && !strstr(text, "BITPIX") && !strstr(text, "NAXIS") && !strstr(text, "EXTEND") &&
+              !strstr(text, "BZERO") && !strstr(text, "BSCALE") && !strstr(text, "ROWORDER"),
+          "without the cards on how a FITS file stores its data");
+    CHECK(strncmp(text, "LONGSTRN= 'OGIP 1.0'", 20) == 0 && strstr(text, "CONTINUE  '"), "a long string continues, and says so first");
+    CHECK(strstr(text, "BAYERPAT= 'RGGB    ' / the filter pattern") && strstr(text, "HIERARCH Long Keyword Name = ") &&
+              strstr(text, " 1.5 ") && strstr(text, "HISTORY made by the test"),
+          "value, comment, HIERARCH and HISTORY cards");
+    CHECK(strlen(text) == length && length == 80 * 8, "eight cards: LONGSTRN, BAYERPAT, OBJECT, LONGTEXT on three, the name, HISTORY");
+    CHECK(xisfconv_keywords_fits_text(kw, NULL, &length) == XISFCONV_ERR_ARGUMENT && length == 0, "the text needs a place");
+    CHECK(xisfconv_keywords_fits_text(NULL, &text, &length) == XISFCONV_ERR_ARGUMENT, "and a list");
+    CHECK(xisfconv_keywords_fits_text(kw, &text, NULL) == XISFCONV_OK && strlen(text) == 80 * 8, "the length is optional");
+
+    /* The writer leaves the same cards out, whatever the format. */
+    /* (four rows: an even number, so that the filter pattern is another one seen from the bottom) */
+    xisfconv_image_init(&img, sizeof img);
+    img.pixels = g_gray;
+    img.width = W;
+    img.height = 4;
+    img.channels = 1;
+    img.sample_format = XISFCONV_SAMPLE_UINT16;
+    img.row_order = XISFCONV_ROWS_TOP_DOWN;
+    img.keywords = kw;
+    CHECK(xisfconv_writer_new(ctx, xisf, NULL, &w) == XISFCONV_OK && xisfconv_writer_add_image(w, &img) == XISFCONV_OK &&
+              xisfconv_writer_finish(w) == XISFCONV_OK,
+          "an XISF file from a header that came from FITS");
+    CHECK(xisfconv_open(ctx, xisf, &f) == XISFCONV_OK && f, "open it");
+    if (f) {
+        CHECK(xisfconv_image_keywords(f, 0, &stored) == XISFCONV_OK && xisfconv_keywords_count(stored) == 5 &&
+                  xisfconv_keywords_find(stored, "SIMPLE") == -1 && xisfconv_keywords_find(stored, "BZERO") == -1 &&
+                  xisfconv_keywords_find(stored, "NAXIS1") == -1 && xisfconv_keywords_find(stored, "ROWORDER") == -1 &&
+                  xisfconv_keywords_find(stored, "OBJECT") == 1,
+              "it holds the five cards that describe the image");
+
+        /* the header for FITS: BAYERPAT follows the rows */
+        summary = "x";
+        CHECK(xisfconv_fits_keywords(f, 0, XISFCONV_ROWS_BOTTOM_UP, 1, 1, 3, &out, &summary) == XISFCONV_OK && out &&
+                  summary && *summary == 0,
+              "the header for FITS, rows bottom-up");
+        CHECK(out && xisfconv_keywords_get_text(out, (size_t)xisfconv_keywords_find(out, "BAYERPAT"), &value) == XISFCONV_OK &&
+                  strcmp(value, "GBRG") == 0 && xisfconv_keywords_count(out) == 5,
+              "BAYERPAT is turned over with the rows");
+        xisfconv_keywords_free(out);
+        out = NULL;
+        CHECK(xisfconv_fits_keywords(f, 0, XISFCONV_ROWS_DEFAULT, 0, 0, 0, &out, NULL) == XISFCONV_OK && out &&
+                  xisfconv_keywords_get_text(out, (size_t)xisfconv_keywords_find(out, "BAYERPAT"), &value) == XISFCONV_OK &&
+                  strcmp(value, "GBRG") == 0,
+              "bottom-up is the default, and the summary is optional");
+        CHECK(out && xisfconv_keywords_append(out, "MINE", "1", NULL) == XISFCONV_OK, "the list is the caller's");
+        xisfconv_keywords_free(out);
+        out = NULL;
+        CHECK(xisfconv_fits_keywords(f, 0, XISFCONV_ROWS_TOP_DOWN, 1, 1, 3, &out, NULL) == XISFCONV_OK && out &&
+                  xisfconv_keywords_get_text(out, (size_t)xisfconv_keywords_find(out, "BAYERPAT"), &value) == XISFCONV_OK &&
+                  strcmp(value, "RGGB") == 0,
+              "top-down, as XISF stores them, it stays");
+        xisfconv_keywords_free(out);
+        out = (xisfconv_keywords *)1;
+        CHECK(xisfconv_fits_keywords(f, 5, XISFCONV_ROWS_DEFAULT, 1, 1, 3, &out, NULL) == XISFCONV_ERR_INDEX && out == NULL,
+              "no such image");
+        CHECK(xisfconv_fits_keywords(f, 0, XISFCONV_ROWS_DEFAULT, 1, 1, 3, NULL, NULL) == XISFCONV_ERR_ARGUMENT, "no place for the list");
+        CHECK(xisfconv_fits_keywords(f, 0, XISFCONV_ROWS_DEFAULT, 1, 1, 9, &out, NULL) == XISFCONV_ERR_ARGUMENT, "a SIP order out of range");
+        CHECK(xisfconv_fits_keywords(f, 0, 7, 1, 1, 3, &out, NULL) == XISFCONV_ERR_ARGUMENT, "a row order that does not exist");
+        CHECK(xisfconv_fits_keywords(NULL, 0, XISFCONV_ROWS_DEFAULT, 1, 1, 3, &out, NULL) == XISFCONV_ERR_ARGUMENT, "no file");
+        xisfconv_close(f);
+        f = NULL;
+    }
+
+    /* A FITS file stores the rows bottom-up: there the pattern is turned, and comes back. */
+    CHECK(xisfconv_convert(ctx, xisf, fits, NULL) == XISFCONV_OK, "the same as FITS");
+    CHECK(xisfconv_open(ctx, fits, &f) == XISFCONV_OK && f, "open it");
+    if (f) {
+        out = NULL;
+        CHECK(xisfconv_image_keywords(f, 0, &stored) == XISFCONV_OK &&
+                  xisfconv_keywords_get_text(stored, (size_t)xisfconv_keywords_find(stored, "BAYERPAT"), &value) == XISFCONV_OK &&
+                  strcmp(value, "GBRG") == 0,
+              "the FITS file holds the pattern of its bottom-up rows");
+        CHECK(xisfconv_fits_keywords(f, 0, XISFCONV_ROWS_TOP_DOWN, 1, 1, 3, &out, NULL) == XISFCONV_OK && out &&
+                  xisfconv_keywords_get_text(out, (size_t)xisfconv_keywords_find(out, "BAYERPAT"), &value) == XISFCONV_OK &&
+                  strcmp(value, "RGGB") == 0,
+              "for top-down rows it is turned back");
+        xisfconv_keywords_free(out);
+        out = NULL;
+        CHECK(xisfconv_fits_keywords(f, 0, XISFCONV_ROWS_BOTTOM_UP, 1, 1, 3, &out, NULL) == XISFCONV_OK && out &&
+                  xisfconv_keywords_get_text(out, (size_t)xisfconv_keywords_find(out, "BAYERPAT"), &value) == XISFCONV_OK &&
+                  strcmp(value, "GBRG") == 0,
+              "for bottom-up rows it is as stored");
+        xisfconv_keywords_free(out);
+        xisfconv_close(f);
+    }
+    xisfconv_keywords_free(kw);
+
+    f = (xisfconv_file *)1;
+    CHECK(xisfconv_open(ctx, g_dir, &f) == XISFCONV_ERR_IO && f == NULL && strstr(xisfconv_error_message(ctx), "directory"),
+          "a directory is not a file");
+    CHECK(xisfconv_convert(ctx, g_dir, path_of("from-directory.fits"), NULL) == XISFCONV_ERR_IO &&
+              strstr(xisfconv_error_message(ctx), "directory"),
+          "nor an input of a conversion");
+    /* an input that is not there is that, whatever the names say about the formats */
+    strcpy(xisf, path_of("missing-input.fits"));
+    CHECK(xisfconv_convert(ctx, xisf, path_of("never.xisf"), NULL) == XISFCONV_ERR_IO, "a missing input is an I/O error");
+    /* a directory of the output's name is not replaced by the output */
+    CHECK(write_gray(ctx, g_dir, NULL, NULL, NULL, 0) != XISFCONV_OK, "a directory is not an output (no format in its name)");
+
+    /* a card without a keyword name: text only */
+    kw = NULL;
+    CHECK(xisfconv_keywords_new(ctx, &kw) == XISFCONV_OK && xisfconv_keywords_append(kw, "", NULL, "text only") == XISFCONV_OK &&
+              xisfconv_keywords_append(kw, NULL, NULL, "x") == XISFCONV_ERR_ARGUMENT && xisfconv_keywords_count(kw) == 1 &&
+              xisfconv_keywords_fits_text(kw, &text, &length) == XISFCONV_OK && length == 80 &&
+              strncmp(text, "        text only", 17) == 0,
+          "a card of text only has an empty name");
+    xisfconv_keywords_free(kw);
+}
+
 static void test_lifetime(void) {
     xisfconv_context *ctx = xisfconv_context_new();
     xisfconv_file *f = NULL;
@@ -837,7 +1189,10 @@ int main(int argc, char **argv) {
     xisfconv_keywords_free(kw);
     test_convert_rewrite_verify(ctx);
     test_callbacks(ctx);
+    test_kept_messages_and_cancel(ctx);
+    test_host_progress(ctx);
     test_stretch_and_wcs(ctx);
+    test_fits_header(ctx);
     xisfconv_context_free(ctx);
     test_lifetime();
 

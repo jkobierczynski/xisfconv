@@ -9,8 +9,8 @@ in `DEVELOPMENT.md`.
       and ASDF files (and directories of them) without converting (0.8.0)
 - [x] Read tile-compressed FITS (`.fits.fz`: RICE_1, GZIP_1, GZIP_2, PLIO_1, NOCOMPRESS, quantized
       and lossless floating point) instead of asking for funpack; `-t fits` unpacks (0.9.0)
-- [x] **libxisfconv**: the converter as a library with a plain C API (0.10.0); its Python package
-      is next (see "Library" below)
+- [x] **libxisfconv**: the converter as a library with a plain C API (0.10.0), and its Python
+      package: NumPy arrays, astropy `CCDData` and HDU lists (0.11.0); see "Library" below
 - [ ] Lossless property round trip: carry all XISF properties through FITS (HIERARCH keywords) and
       ASDF (tree entries) and restore them on the way back
 - [ ] Downsampling (`--resize` / `--bin`) for TIFF and PNG export, and a `.thumbnailer` entry so Linux
@@ -43,10 +43,21 @@ The decisions are recorded in `DEVELOPMENT.md`; the API is `include/xisfconv.h`.
    (0.10.0).
 6. [x] Tests of the library: a C test program built by a C compiler, error paths, ASan/UBSan,
    fuzzing through the API, a check that nothing is written to stdout or stderr (0.10.0).
-7. [ ] Python package: NumPy arrays in and out, wheels, `CCDData.read("image.xisf")` through
-   astropy's I/O registry; then the existing oracles run through it.
+7. [x] Python package: NumPy arrays in and out, wheels, `CCDData.read("image.xisf")` through
+   astropy's I/O registry; the existing oracles run through it (0.11.0).
+
+Open checks of the Python package:
+
+- [ ] Run the `wheels` workflow once (it can be started by hand): the wheels for macOS and Windows
+      have never been built, and the Linux ones only outside the manylinux container.
+- [ ] Register the project on PyPI and switch publishing on (see "Releasing" in the README).
 
 Later, each when it is needed:
+
+- [ ] Python: write XISF properties (needs the lossless property round trip above); read and
+      write an image in pieces instead of as a whole (which would also let Ctrl-C stop the reading
+      or writing of one large image: it is one step now); wheels for musllinux and Intel macOS;
+      type stubs.
 
 - [ ] A CMake package for the static library (the dependencies have to be described to the consumer).
 - [ ] Library messages without the tool's option names.

@@ -1,0 +1,84 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
+# The Python package of libxisfconv: the modules of python/xisfconv with the shared library
+# next to them. `pip install .` builds it; the wheels for PyPI are built by
+# .github/workflows/wheels.yml.
+
+[build-system]
+requires = ["scikit-build-core>=0.11"]   # 0.11 reads the licence as an SPDX expression
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "xisfconv"
+dynamic = ["version"]   # stated in one place: include/xisfconv.h
+description = "PixInsight XISF images as NumPy arrays, and conversion between XISF, FITS and ASDF"
+readme = "python/README.md"
+requires-python = ">=3.10"
+license = "LGPL-3.0-or-later"
+license-files = ["LICENSE", "COPYING.LESSER", "THIRD-PARTY-NOTICES.md"]
+authors = [{ name = "Jurgen Kobierczynski" }]
+keywords = ["astronomy", "astrophotography", "XISF", "PixInsight", "FITS", "ASDF"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: C++",
+  "Topic :: Scientific/Engineering :: Astronomy",
+  "Topic :: Scientific/Engineering :: Image Processing",
+]
+dependencies = ["numpy>=1.22"]
+
+[project.optional-dependencies]
+astropy = ["astropy>=5.3"]
+# what python/tests compares with
+test = ["pytest", "astropy>=5.3", "xisf", "lz4", "zstandard", "asdf", "asdf-astropy", "tifffile", "imagecodecs",
+        "pillow"]
+
+[project.urls]
+Homepage = "https://github.com/jkobierczynski/xisfconv"
+Issues = "https://github.com/jkobierczynski/xisfconv/issues"
+
+[tool.scikit-build]
+minimum-version = "build-system.requires"
+cmake.version = ">=3.15"
+cmake.build-type = "Release"
+build.targets = ["xisfconv_core"]      # the library; CMakeLists.txt leaves the tool out of this build
+install.components = ["python"]
+wheel.packages = ["python/xisfconv"]
+wheel.install-dir = "xisfconv"         # the library goes next to the modules
+wheel.py-api = "py3"                   # no Python C API is used: one wheel per platform serves every Python 3
+# The source distribution holds what the wheel is built from, all of it LGPL.
+sdist.exclude = [".github", "tests", "python/tests", "examples", "src/main.cpp", "TODO.md", "DEVELOPMENT.md"]
+
+[tool.scikit-build.metadata.version]
+provider = "scikit_build_core.metadata.regex"
+input = "include/xisfconv.h"
+regex = '''(?s)XISFCONV_VERSION_MAJOR\s+(?P<major>\d+).*?XISFCONV_VERSION_MINOR\s+(?P<minor>\d+).*?XISFCONV_VERSION_PATCH\s+(?P<patch>\d+)'''
+result = "{major}.{minor}.{patch}"
+
+[tool.pytest.ini_options]
+testpaths = ["python/tests"]
+
+# The wheels for PyPI. One build per platform (the wheel does not depend on the Python version),
+# with Zstandard linked statically, so that the wheel needs nothing but the C and C++ runtime
+# and, on Linux and macOS, the zlib of the system.
+[tool.cibuildwheel]
+build = "cp312-*"
+skip = "*-musllinux_*"
+archs = "auto64"          # no 32-bit builds: the libraries the Windows build links are 64-bit
+test-extras = ["test"]
+test-command = "pytest {project}/python/tests"
+
+[tool.cibuildwheel.linux]
+manylinux-x86_64-image = "manylinux_2_28"
+manylinux-aarch64-image = "manylinux_2_28"
+before-all = "yum install -y zlib-devel && sh {project}/python/tools/build-zstd.sh /opt/zstd-static"
+environment = { CMAKE_PREFIX_PATH = "/opt/zstd-static" }
+
+[tool.cibuildwheel.macos]
+before-all = "sh {project}/python/tools/build-zstd.sh /tmp/zstd-static"
+environment = { CMAKE_PREFIX_PATH = "/tmp/zstd-static", MACOSX_DEPLOYMENT_TARGET = "11.0" }
+
+[tool.cibuildwheel.windows]
+# static zlib, zstd and C runtime, as for the release binary of the tool
+before-all = "vcpkg install zlib:x64-windows-static zstd:x64-windows-static"
+environment = { CMAKE_ARGS = "-DXISFCONV_PORTABLE=ON -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=x64-windows-static" }

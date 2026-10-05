@@ -34,6 +34,12 @@ option(BUILD_SHARED_LIBS "Build libxisfconv as a shared library (default: static
 option(XISFCONV_BUILD_TESTS "Build the C test program of the library (needs a C compiler)" OFF)
 option(XISFCONV_PORTABLE "Build a self-contained binary for distribution (static zstd/zlib/C++ runtime)" OFF)
 
+# The Python wheel (pyproject.toml, built by scikit-build-core) holds the shared library and
+# nothing else of this build: no command line tool, no header.
+if(SKBUILD)
+  set(BUILD_SHARED_LIBS ON CACHE BOOL "" FORCE)
+endif()
+
 if(XISFCONV_PORTABLE)
   # MSVC: static C runtime (pair with the vcpkg x64-windows-static triplet).
   set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
@@ -75,15 +81,28 @@ if(NOT BUILD_SHARED_LIBS)
   target_compile_definitions(xisfconv_core PUBLIC XISFCONV_STATIC)
 endif()
 target_link_libraries(xisfconv_core PRIVATE ZLIB::ZLIB)
-# Only the functions of xisfconv.h are visible from outside. The version of the shared library
-# changes with every 0.x release: there is no ABI promise yet.
+# The code is compiled with hidden visibility: of its own functions, only those of xisfconv.h are
+# visible from outside. The version of the shared library changes with every 0.x release: there
+# is no ABI promise yet.
 set_target_properties(xisfconv_core PROPERTIES
   EXPORT_NAME xisfconv
   CXX_VISIBILITY_PRESET hidden
   VISIBILITY_INLINES_HIDDEN ON
-  POSITION_INDEPENDENT_CODE ON
-  VERSION ${PROJECT_VERSION}
-  SOVERSION ${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR})
+  POSITION_INDEPENDENT_CODE ON)
+if(NOT SKBUILD)
+  # (a wheel holds one file without a version in its name: wheels cannot hold symbolic links)
+  set_target_properties(xisfconv_core PROPERTIES
+    VERSION ${PROJECT_VERSION}
+    SOVERSION ${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR})
+endif()
+if(BUILD_SHARED_LIBS AND UNIX AND NOT APPLE)
+  # Only the functions of xisfconv.h are offered to the rest of the process: not the standard
+  # library templates the code uses, and not a static library linked into this one (Zstandard in
+  # the Python wheels), of which the process may hold another copy.
+  target_link_options(xisfconv_core PRIVATE
+    "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/cmake/libxisfconv.map")
+  set_property(TARGET xisfconv_core APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/cmake/libxisfconv.map")
+endif()
 if(MSVC)
   # libxisfconv.dll / libxisfconv.lib: the plain name is taken by xisfconv.exe and its .pdb
   set_target_properties(xisfconv_core PROPERTIES OUTPUT_NAME libxisfconv)
@@ -92,13 +111,17 @@ else()
 endif()
 
 # The command line tool uses the library through its C API only.
-add_executable(xisfconv src/main.cpp)
-target_link_libraries(xisfconv PRIVATE xisfconv_core)
-if(MINGW)
-  target_link_options(xisfconv PRIVATE -municode)   # wmain: the arguments arrive as UTF-16
+set(_targets xisfconv_core)
+if(NOT SKBUILD)
+  add_executable(xisfconv src/main.cpp)
+  target_link_libraries(xisfconv PRIVATE xisfconv_core)
+  if(MINGW)
+    target_link_options(xisfconv PRIVATE -municode)   # wmain: the arguments arrive as UTF-16
+  endif()
+  list(APPEND _targets xisfconv)
 endif()
 
-foreach(_target xisfconv_core xisfconv)
+foreach(_target IN LISTS _targets)
   if(MSVC)
     target_compile_options(${_target} PRIVATE /W4)
     target_compile_definitions(${_target} PRIVATE _CRT_SECURE_NO_WARNINGS)
@@ -172,9 +195,18 @@ if(XISFCONV_WITH_ZSTD)
   endif()
 endif()
 
-if(XISFCONV_PORTABLE AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND NOT APPLE)
+if(XISFCONV_PORTABLE AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND NOT APPLE AND TARGET xisfconv)
   # Avoid depending on the build machine's libstdc++ version.
   target_link_options(xisfconv PRIVATE -static-libgcc -static-libstdc++)
+endif()
+
+if(SKBUILD)
+  # The wheel: the library next to the Python modules, where python/xisfconv/_lib.py looks for it.
+  install(TARGETS xisfconv_core
+    RUNTIME DESTINATION . COMPONENT python
+    LIBRARY DESTINATION . COMPONENT python
+    ARCHIVE DESTINATION . COMPONENT python-import-library)
+  return()
 endif()
 
 # The C test program: the API seen from a C compiler.

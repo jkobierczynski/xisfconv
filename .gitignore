@@ -1,3 +1,6 @@
 build*/
 *.part
 __pycache__/
+.pytest_cache/
+dist/
+wheelhouse/

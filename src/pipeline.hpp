@@ -8,9 +8,11 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "common.hpp"
 #include "fitsread.hpp"
+#include "xisf.hpp"
 #include "xisfrewrite.hpp"
 
 namespace xisfconv {
@@ -63,6 +65,15 @@ void writeImageSet(FitsFile& images, const ImageSetOrigin& origin, const std::st
 
 // Reverses the row order of an image and of what describes it: WCS keywords and BAYERPAT.
 void flipImageRows(FitsImage& image);
+// The same for the keywords alone.
+void flipKeywordRows(std::vector<FitsKeyword>& keywords, uint64_t height);
+
+// The cards an XISF image gets when it is written to FITS or ASDF with its rows bottom-up or
+// top-down: its FITS keywords, keywords derived from properties where it has none, BAYERPAT and
+// WCS keywords in the row order asked for, and WCS keywords built from a PixInsight solution.
+// `wcsSummary`, if given, receives the line about a fitted solution.
+std::vector<FitsKeyword> xisfImageFitsKeywords(XisfFile& file, size_t index, bool bottomUp, bool propertyKeywords,
+                                               bool wcs, int sipOrder, std::string* wcsSummary);
 
 // The range given to floating point data from FITS and ASDF when nothing else is said: 0:1 if
 // the data fits, else 0:65535 if it fits, else its minimum and maximum.

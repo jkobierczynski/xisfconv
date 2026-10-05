@@ -19,6 +19,11 @@ struct FitsHdu {
 
 void writeFits(const std::string& path, const std::vector<FitsHdu>& hdus);
 
+// The cards the writer makes of the keywords of an image, 80 characters each, one after the
+// other: long strings on CONTINUE cards (announced by a LONGSTRN card), HIERARCH for names
+// that do not fit a standard card, text reduced to printable ASCII, reserved keywords left out.
+std::string fitsCards(const std::vector<FitsKeyword>& keywords);
+
 // Formats a value as a FITS string literal ('...' with doubled quotes).
 std::string fitsString(const std::string& s);
 // Formats a floating point value for a FITS card (always contains '.' or 'E').

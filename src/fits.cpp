@@ -5,7 +5,6 @@
 #include <algorithm>
 #include <cstdio>
 #include <fstream>
-#include <regex>
 
 namespace xisfconv {
 
@@ -59,6 +58,47 @@ void commentaryCards(const std::string& name, const std::string& text, std::vect
     for (size_t off = 0; off < text.size(); off += 72) cards.push_back(finishCard(key + text.substr(off, 72)));
 }
 
+// A real number as a FITS card may hold it, starting at `i`: 12, -1.5, .5, 1.5E+03, 1e-7, 2.D5.
+// Returns the place behind it, or npos.
+size_t realNumberEnd(const std::string& s, size_t i) {
+    auto digits = [&] {
+        const size_t start = i;
+        while (i < s.size() && s[i] >= '0' && s[i] <= '9') ++i;
+        return i - start;
+    };
+    if (i < s.size() && (s[i] == '+' || s[i] == '-')) ++i;
+    const size_t whole = digits();
+    size_t fraction = 0;
+    if (i < s.size() && s[i] == '.') {
+        ++i;
+        fraction = digits();
+    }
+    if (whole + fraction == 0) return std::string::npos;
+    if (i < s.size() && (s[i] == 'E' || s[i] == 'e' || s[i] == 'D' || s[i] == 'd')) {
+        ++i;
+        if (i < s.size() && (s[i] == '+' || s[i] == '-')) ++i;
+        if (digits() == 0) return std::string::npos;
+    }
+    return i;
+}
+
+// True for a real number and for a complex one, "(1.0, -2.5E3)".
+bool isFitsNumber(const std::string& s) {
+    if (realNumberEnd(s, 0) == s.size()) return true;
+    if (s.size() < 5 || s.front() != '(' || s.back() != ')') return false;
+    auto blanks = [&](size_t i) {
+        while (i < s.size() && (s[i] == ' ' || s[i] == '\t')) ++i;
+        return i;
+    };
+    size_t i = realNumberEnd(s, blanks(1));
+    if (i == std::string::npos) return false;
+    i = blanks(i);
+    if (i >= s.size() || s[i] != ',') return false;
+    i = realNumberEnd(s, blanks(i + 1));
+    if (i == std::string::npos) return false;
+    return blanks(i) == s.size() - 1;
+}
+
 // Appends the card(s) for one keyword carried over from the XISF header.
 void keywordCards(const FitsKeyword& k, std::vector<std::string>& cards) {
     const std::string rawName = sanitize(trim(k.name));
@@ -85,13 +125,28 @@ void keywordCards(const FitsKeyword& k, std::vector<std::string>& cards) {
         valueField = fitsString(stringContent);
     } else if (!value.empty()) {
         valueField = sanitize(value);
-        // FITS requires an upper-case exponent letter; PixInsight writes e.g. 1.7870e+04.
-        static const std::regex lowerExp(R"(^[+-]?(\d+\.?\d*|\.\d+)e[+-]?\d+$)");
-        if (std::regex_match(valueField, lowerExp)) valueField = toUpper(valueField);
-        if (valueField.size() <= 20) valueField = padLeft(valueField, 20);
+        // What is a number, a logical value or a complex number goes into the card as it is, with
+        // the exponent letter in upper case as FITS wants it (PixInsight writes 1.7870e+04).
+        // Anything else is text, and a FITS card holds text in quotes: an XISF keyword may say
+        // Ha  where 'Ha' is meant.
+        if (valueField == "T" || valueField == "F") {
+            valueField = padLeft(valueField, 20);
+        } else if (isFitsNumber(valueField)) {
+            valueField = toUpper(valueField);
+            if (valueField.size() <= 20) valueField = padLeft(valueField, 20);
+        } else {
+            isString = true;
+            stringContent = trim(valueField);
+            valueField = fitsString(stringContent);
+        }
     }
 
     const bool hierarch = !isValidFitsName(name);
+    if (hierarch && rawName.find('=') != std::string::npos) {
+        // the first '=' of a HIERARCH card ends the name
+        warn("keyword '" + rawName + "' has a '=' in its name, which a FITS card cannot hold; skipped");
+        return;
+    }
     const std::string prefix = hierarch ? "HIERARCH " + rawName + " = " : padRight(name, 8) + "= ";
     if (prefix.size() >= 80) {
         warn("keyword '" + rawName + "' is too long for a FITS card; skipped");
@@ -118,6 +173,9 @@ void keywordCards(const FitsKeyword& k, std::vector<std::string>& cards) {
                 if (c == '\'') pieces.back() += '\'';
                 used += w;
             }
+            // A text that itself ends in '&' would lose it to readers that take the '&' of the
+            // last piece for the mark too (astropy does): an empty piece ends the value then.
+            if (!pieces.back().empty() && pieces.back().back() == '&') pieces.emplace_back();
             for (size_t i = 0; i < pieces.size(); ++i) {
                 const bool last = i + 1 == pieces.size();
                 std::string card = (i == 0 ? prefix : std::string("CONTINUE  ")) + "'" + pieces[i] +
@@ -127,11 +185,24 @@ void keywordCards(const FitsKeyword& k, std::vector<std::string>& cards) {
             }
             return;
         }
-        // Shorten the string, keeping doubled quotes intact.
+        // A HIERARCH card has no long-string form: the string is shortened, keeping doubled
+        // quotes intact. (It is in free format, so it need not be padded to eight characters.)
+        auto quoted = [](const std::string& text) {
+            std::string out = "'";
+            for (char c : text) {
+                out += c;
+                if (c == '\'') out += '\'';
+            }
+            return out + "'";
+        };
         std::string s = stringContent;
-        while (!s.empty() && fitsString(s).size() > room) s.pop_back();
-        warn("value of keyword '" + rawName + "' truncated to fit an 80-column FITS card");
-        valueField = fitsString(s);
+        while (!s.empty() && quoted(s).size() > room) s.pop_back();
+        if (quoted(s).size() > room) {
+            warn("value of keyword '" + rawName + "' does not fit in a FITS card; skipped");
+            return;
+        }
+        if (s != stringContent) warn("value of keyword '" + rawName + "' truncated to fit an 80-column FITS card");
+        valueField = quoted(s);
     }
     std::string card = prefix + valueField;
     if (!comment.empty() && card.size() + 3 < 80) card += " / " + comment;
@@ -264,6 +335,40 @@ bool isReservedFitsKeyword(const std::string& rawName) {
     return false;
 }
 
+namespace {
+
+// The cards of the keywords an image brings along, after those the writer sets itself.
+std::vector<std::string> userKeywordCards(const std::vector<FitsKeyword>& keywords, bool skipExtname, bool skipProgram) {
+    std::vector<std::string> userCards;
+    bool hasLongStrn = false;
+    for (const auto& k : keywords) {
+        if (isReservedFitsKeyword(k.name)) continue;
+        if (skipExtname && toUpper(trim(k.name)) == "EXTNAME") continue;
+        if (skipProgram && toUpper(trim(k.name)) == "PROGRAM") continue;
+        if (toUpper(trim(k.name)) == "LONGSTRN") hasLongStrn = true;
+        keywordCards(k, userCards);
+    }
+    if (!hasLongStrn) {
+        // Announce the long-string convention when CONTINUE cards are present.
+        for (const auto& c : userCards) {
+            if (c.compare(0, 10, "CONTINUE  ") == 0) {
+                userCards.insert(userCards.begin(),
+                                 valueCard("LONGSTRN", fitsString("OGIP 1.0"), "The OGIP long string convention may be used"));
+                break;
+            }
+        }
+    }
+    return userCards;
+}
+
+}  // namespace
+
+std::string fitsCards(const std::vector<FitsKeyword>& keywords) {
+    std::string text;
+    for (const auto& card : userKeywordCards(keywords, false, false)) text += card;
+    return text;
+}
+
 void writeFits(const std::string& path, const std::vector<FitsHdu>& hdus) {
     std::ofstream out(toPath(path), std::ios::binary | std::ios::trunc);
     if (!out) throw Error("cannot create " + path, ErrorKind::Io);
@@ -307,24 +412,7 @@ void writeFits(const std::string& path, const std::vector<FitsHdu>& hdus) {
         if (!hdu.extname.empty()) cards.push_back(valueCard("EXTNAME", fitsString(sanitize(hdu.extname)), "image identifier"));
         cards.push_back(valueCard("ROWORDER", fitsString(hdu.bottomUp ? "BOTTOM-UP" : "TOP-DOWN"), "order of image rows"));
 
-        std::vector<std::string> userCards;
-        bool hasLongStrn = false;
-        for (const auto& k : hdu.keywords) {
-            if (isReservedFitsKeyword(k.name)) continue;
-            if (!hdu.extname.empty() && toUpper(trim(k.name)) == "EXTNAME") continue;
-            if (h == 0 && toUpper(trim(k.name)) == "PROGRAM") continue;
-            if (toUpper(trim(k.name)) == "LONGSTRN") hasLongStrn = true;
-            keywordCards(k, userCards);
-        }
-        if (!hasLongStrn) {
-            // Announce the long-string convention when CONTINUE cards are present.
-            for (const auto& c : userCards) {
-                if (c.compare(0, 10, "CONTINUE  ") == 0) {
-                    cards.push_back(valueCard("LONGSTRN", fitsString("OGIP 1.0"), "The OGIP long string convention may be used"));
-                    break;
-                }
-            }
-        }
+        const std::vector<std::string> userCards = userKeywordCards(hdu.keywords, !hdu.extname.empty(), h == 0);
         cards.insert(cards.end(), userCards.begin(), userCards.end());
         cards.push_back(finishCard("END"));
 

@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 
 import numpy as np
 import tifffile
@@ -128,6 +129,11 @@ context_new = declare("context_new", ptr)
 context_free = declare("context_free", None, ptr)
 set_message_handler = declare("context_set_message_handler", None, ptr, MESSAGE_FN, ptr)
 set_progress_handler = declare("context_set_progress_handler", None, ptr, PROGRESS_FN, ptr)
+keep_messages = declare("context_keep_messages", None, ptr, i32)
+message_count = declare("context_message_count", size_t, ptr)
+message_get = declare("context_message", i32, ptr, size_t, C.POINTER(i32), C.POINTER(text), C.POINTER(text))
+clear_messages = declare("context_clear_messages", None, ptr)
+context_cancel = declare("context_cancel", None, ptr)
 error_message = declare("error_message", text, ptr)
 keywords_new = declare("keywords_new", i32, ptr, C.POINTER(ptr))
 keywords_free = declare("keywords_free", None, ptr)
@@ -761,6 +767,87 @@ def test_progress_and_cancel():
     report_free(report)
 
 
+def test_kept_messages_and_cancel_from_another_thread():
+    """What a caller needs who cannot be called back in the thread that works (Python and its
+    signal handlers): the messages afterwards, and a way to stop the work from outside."""
+    context = context_new()
+    keep_messages(context, 1)
+    src, out = os.path.join(TMP, "kept.xisf"), os.path.join(TMP, "kept.fits")
+    check(write_images(src, [image(np.float32, (1, 40, 50))], context=context, checksum=SHA3_256) == OK, "write, keeping messages")
+    level, path, message = i32(), text(), text()
+    check(message_count(context) == 1 and message_get(context, 0, C.byref(level), C.byref(path), C.byref(message)) == OK and
+          level.value == 1 and path.value == enc(src) and b"PixInsight" in message.value, "the warning is kept with its file")
+    co = ConvertOptions()
+    convert_options_init(C.byref(co), C.sizeof(co))
+    co.overwrite = 1
+    back = os.path.join(TMP, "kept-back.xisf")
+    check(convert(context, enc(src), enc(out), C.byref(co)) == OK and convert(context, enc(out), enc(back), C.byref(co)) == OK and
+          message_count(context) >= 2, "notes of conversions are added")
+    kinds = []
+    for index in range(message_count(context)):
+        message_get(context, index, C.byref(level), C.byref(path), C.byref(message))
+        kinds.append(level.value)
+    check(kinds[0] == 1 and set(kinds[1:]) == {2}, f"in order, warnings and notes told apart: {kinds}")
+    clear_messages(context)
+    check(message_count(context) == 0 and message_get(context, 0, None, None, None) == ERR_INDEX, "cleared")
+
+    # a file with many data blocks, so that the work has many steps
+    many = os.path.join(TMP, "many.xisf")
+    arrays = [image(np.uint16, (1, 300, 400), k) for k in range(40)]
+    check(write_images(many, arrays, context=context, codec=CODEC_ZLIB, checksum=SHA1) == OK, "a file with 40 images")
+    clear_messages(context)
+    reports = []
+    slow = PROGRESS_FN(lambda user, stage, done, total: reports.append(done) or time.sleep(0.005) or 0)
+    set_progress_handler(context, slow, None)
+    for name, call in (("verify", lambda: verify(context, enc(many), C.byref(report))),
+                       ("rewrite", lambda: rewrite(context, enc(many), enc(target), None, None)),
+                       ("convert", lambda: convert(context, enc(many), enc(target_fits), C.byref(co)))):
+        report, target, target_fits = ptr(), os.path.join(TMP, "many-out.xisf"), os.path.join(TMP, "many-out.fits")
+        for leftover in (target, target_fits):
+            if os.path.exists(leftover):
+                os.remove(leftover)
+        del reports[:]
+        status = []
+        worker = threading.Thread(target=lambda: status.append(call()))
+        worker.start()
+        while len(reports) < 3 and worker.is_alive():
+            time.sleep(0.001)
+        context_cancel(context)                       # from this thread, while the other is inside the call
+        worker.join()
+        check(status == [ERR_CANCELLED] and 3 <= len(reports) < 40 and err(context) == "cancelled",
+              f"{name}: stopped from another thread after {len(reports)} steps: {status}")
+        check(not report.value and not any(os.path.exists(f) or os.path.exists(f + ".part") for f in (target, target_fits)),
+              f"{name}: nothing is left behind")
+    # the request was for those calls: the next one runs through, also after a request made between calls
+    context_cancel(context)
+    set_progress_handler(context, PROGRESS_FN(0), None)
+    report = ptr()
+    check(verify(context, enc(many), C.byref(report)) == OK and report_verdict(report) == 0, "the next call is not stopped")
+    report_free(report)
+    # requests from several threads at once while a call runs: harmless
+    stop = threading.Event()
+
+    def pester():
+        while not stop.is_set():
+            context_cancel(context)
+
+    pests = [threading.Thread(target=pester) for _ in range(3)]
+    for t in pests:
+        t.start()
+    outcomes = set()
+    for _ in range(20):
+        report = ptr()
+        outcomes.add(verify(context, enc(many), C.byref(report)))
+        if report.value:
+            report_free(report)
+    stop.set()
+    for t in pests:
+        t.join()
+    check(outcomes <= {OK, ERR_CANCELLED} and ERR_CANCELLED in outcomes, f"cancel requests from three threads during 20 calls: {outcomes}")
+    keep_messages(context, 0)
+    context_free(context)
+
+
 def test_threads():
     """Several threads, each with its own context, at the same time: results and messages stay apart."""
     n = 6
@@ -1024,7 +1111,7 @@ if __name__ == "__main__":
     print("asdf + asdf-astropy:", "yes" if HAVE_ASDF else "no")
     for t in (test_write_fits, test_write_xisf, test_write_asdf, test_write_tiff_png, test_writer_arguments, test_read_fits,
               test_read_xisf, test_wcs, test_wcs_forms, test_stretch, test_odd_files, test_locale, test_progress_and_cancel,
-              test_threads, test_silence):
+              test_kept_messages_and_cancel_from_another_thread, test_threads, test_silence):
         try:
             t()
         except Exception as e:  # noqa: BLE001

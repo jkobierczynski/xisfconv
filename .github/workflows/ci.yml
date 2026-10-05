@@ -128,6 +128,19 @@ jobs:
           esac
           python tests/library_tests.py "$lib" "$exe"
 
+      # The Python package, on that shared library: python/tests compares what it reads and
+      # writes with the same other software, and its declarations with the header.
+      - name: Test the Python package
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            Windows) lib=build-shared/Release/libxisfconv.dll; exe=build-shared/Release/xisfconv.exe ;;
+            macOS)   lib=build-shared/libxisfconv.dylib; exe=build-shared/xisfconv ;;
+            *)       lib=build-shared/libxisfconv.so; exe=build-shared/xisfconv ;;
+          esac
+          pip install pytest
+          XISFCONV_LIBRARY="$lib" XISFCONV_TOOL="$exe" PYTHONPATH=python python -m pytest python/tests
+
       - name: Check tag matches program version
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
@@ -146,7 +159,7 @@ jobs:
         run: |
           pkg="xisfconv-${GITHUB_REF_NAME#v}-${{ matrix.name }}"
           mkdir -p "dist/$pkg"
-          cp "${{ steps.bin.outputs.path }}" README.md LICENSE COPYING.LESSER "dist/$pkg/"
+          cp "${{ steps.bin.outputs.path }}" README.md LICENSE COPYING.LESSER THIRD-PARTY-NOTICES.md "dist/$pkg/"
           cd dist
           if [ "$RUNNER_OS" = "Windows" ]; then 7z a -tzip "$pkg.zip" "$pkg" > /dev/null
           else tar czf "$pkg.tar.gz" "$pkg"; fi

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <atomic>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -37,13 +38,47 @@ using namespace xisfconv;
 
 namespace {
 
+struct KeptMessage {
+    xisfconv_message_level level;
+    bool named;         // it is about a file
+    std::string path;
+    std::string text;
+};
+
 struct ContextState {
     std::string error;
     xisfconv_message_fn message = nullptr;
     void* messageUser = nullptr;
     xisfconv_progress_fn progress = nullptr;
     void* progressUser = nullptr;
+    bool keepMessages = false;        // xisfconv_context_keep_messages
+    std::vector<KeptMessage> kept;
+    std::atomic<bool> cancel{false};  // xisfconv_context_cancel: the one thing another thread may set
+    std::atomic<int> running{0};      // calls in progress in this context (nested ones included)
+    xisfconv_host_progress_fn hostProgress = nullptr;  // xisfconv_context_set_host_progress
+    void* hostProgressUser = nullptr;
+    bool hostProgressFailed = false;
 };
+
+// Counts a call in a context for as long as it runs.
+struct Running {
+    explicit Running(ContextState* s) : state(s) { state->running.fetch_add(1); }
+    ~Running() { state->running.fetch_sub(1); }
+    Running(const Running&) = delete;
+    Running& operator=(const Running&) = delete;
+    ContextState* state;
+};
+
+// Between two steps of a call: does the host's progress handler let it go on?
+bool hostAllows(ContextState* s, const char* stage, uint64_t done, uint64_t total) {
+    if (!s->hostProgress) return true;
+    const xisfconv_progress_report report{s->hostProgressUser, stage, done, total};
+    const int32_t answer = s->hostProgress(&report);
+    if (answer == XISFCONV_HOST_GO_ON) return true;
+    if (answer != XISFCONV_HOST_STOP) s->hostProgressFailed = true;
+    return false;
+}
+
 using StatePtr = std::shared_ptr<ContextState>;
 
 // What is known about a FITS or ASDF image once its pixels have been read.
@@ -70,7 +105,9 @@ struct xisfconv_keywords {
 
 struct xisfconv_file {
     StatePtr state;
-    std::string path;
+    std::string path;                 // as the caller named it: for messages
+    std::string readPath;             // absolute: FITS and ASDF pixels are read from the file again later,
+                                      //   when the working directory may be another one
     xisfconv_format format = XISFCONV_FORMAT_XISF;
     std::unique_ptr<XisfFile> xisf;   // XISF
     FitsFile fits;                    // FITS and ASDF: the headers
@@ -144,11 +181,21 @@ xisfconv_status guarded(const StatePtr& state, const char* path, Body&& body) no
         ContextState* s = state.get();
         const bool named = path != nullptr;
         const MessageScope messages([s, file, named](MessageLevel level, const std::string& text) {
-            if (!s->message) return;
-            s->message(s->messageUser, level == MessageLevel::Warning ? XISFCONV_MESSAGE_WARNING : XISFCONV_MESSAGE_INFO,
-                       named ? file.c_str() : nullptr, text.c_str());
+            const xisfconv_message_level kind = level == MessageLevel::Warning ? XISFCONV_MESSAGE_WARNING : XISFCONV_MESSAGE_INFO;
+            if (s->keepMessages) s->kept.push_back({kind, named, file, text});
+            if (s->message) s->message(s->messageUser, kind, named ? file.c_str() : nullptr, text.c_str());
         });
+        // A request to stop is for the call it is made during: one that came between calls is
+        // dropped. (A call made from inside another, by a handler of the host, leaves the outer
+        // one's request alone.)
+        if (s->running.load() == 0) {
+            s->cancel.store(false);
+            s->hostProgressFailed = false;
+        }
+        const Running running(s);
         const ProgressScope reports([s](const char* stage, uint64_t done, uint64_t total) {
+            if (s->cancel.exchange(false)) return false;
+            if (!hostAllows(s, stage, done, total)) return false;
             return !s->progress || s->progress(s->progressUser, stage, done, total) == 0;
         });
         body();
@@ -382,9 +429,17 @@ void loadPixels(xisfconv_file* f, size_t image, bool verify) {
     if (isXisf(f) || (f->loaded && *f->loaded == image && (f->loadedVerified || !verify))) return;
     f->loaded.reset();
     f->loadedImage = FitsImage();
-    FitsFile all = f->format == XISFCONV_FORMAT_ASDF ? readAsdf(f->path, false, verify, image) : readFits(f->path, false, image);
+    FitsFile all = f->format == XISFCONV_FORMAT_ASDF ? readAsdf(f->readPath, false, verify, image)
+                                                     : readFits(f->readPath, false, image);
     if (image >= all.images.size() || !all.images[image].hasData) {
         fail(XISFCONV_ERR_FORMAT, "image " + std::to_string(image) + " cannot be read (has the file changed since it was opened?)");
+    }
+    // The caller sized its buffer by what the headers said when the file was opened.
+    const PixelBuffer& then = f->fits.images[image].pixels;
+    const PixelBuffer& now = all.images[image].pixels;
+    if (now.width != then.width || now.height != then.height || now.channels != then.channels) {
+        fail(XISFCONV_ERR_FORMAT, "image " + std::to_string(image) + " is not the image it was when the file was opened: "
+                                  "the file has changed");
     }
     f->loadedImage = std::move(all.images[image]);
     f->loaded = image;
@@ -405,11 +460,10 @@ void loadPixels(xisfconv_file* f, size_t image, bool verify) {
 // A path that cannot be opened and read is an I/O error, whatever the question about it was.
 void mustBeReadable(const char* path) {
     std::error_code ec;
+    if (std::filesystem::is_directory(toPath(path), ec)) throw Error("is a directory, not a file", ErrorKind::Io);
     std::ifstream in(toPath(path), std::ios::binary);
     char first = 0;
-    if (!in || std::filesystem::is_directory(toPath(path), ec) || (!in.read(&first, 1) && !in.eof())) {
-        throw Error("cannot open file", ErrorKind::Io);
-    }
+    if (!in || (!in.read(&first, 1) && !in.eof())) throw Error("cannot open file", ErrorKind::Io);
 }
 
 void copyText(char* dest, size_t size, const std::string& text) {
@@ -584,7 +638,54 @@ void xisfconv_context_free(xisfconv_context* ctx) {
     // Handles may outlive the context, but what the handlers point to need not: they are not called any more.
     ctx->state->message = nullptr;
     ctx->state->progress = nullptr;
+    ctx->state->hostProgress = nullptr;
+    ctx->state->keepMessages = false;
+    ctx->state->kept.clear();
     delete ctx;
+}
+
+void xisfconv_context_keep_messages(xisfconv_context* ctx, int32_t keep) {
+    if (!ctx) return;
+    ctx->state->keepMessages = keep != 0;
+    if (!keep) ctx->state->kept.clear();
+}
+
+size_t xisfconv_context_message_count(const xisfconv_context* ctx) { return ctx ? ctx->state->kept.size() : 0; }
+
+xisfconv_status xisfconv_context_message(const xisfconv_context* ctx, size_t index, xisfconv_message_level* level,
+                                         const char** path, const char** message) {
+    if (level) *level = XISFCONV_MESSAGE_INFO;
+    if (path) *path = nullptr;
+    if (message) *message = "";
+    if (!ctx) return XISFCONV_ERR_ARGUMENT;
+    if (index >= ctx->state->kept.size()) return XISFCONV_ERR_INDEX;
+    const KeptMessage& m = ctx->state->kept[index];
+    if (level) *level = m.level;
+    if (path) *path = m.named ? m.path.c_str() : nullptr;
+    if (message) *message = m.text.c_str();
+    return XISFCONV_OK;
+}
+
+void xisfconv_context_clear_messages(xisfconv_context* ctx) {
+    if (ctx) ctx->state->kept.clear();
+}
+
+int32_t xisfconv_context_cancel(xisfconv_context* ctx) {
+    if (!ctx) return 0;
+    ctx->state->cancel.store(true);
+    return ctx->state->running.load() > 0 ? 1 : 0;
+}
+
+int32_t xisfconv_context_running(const xisfconv_context* ctx) { return ctx && ctx->state->running.load() > 0 ? 1 : 0; }
+
+void xisfconv_context_set_host_progress(xisfconv_context* ctx, xisfconv_host_progress_fn handler, void* user) {
+    if (!ctx) return;
+    ctx->state->hostProgress = handler;
+    ctx->state->hostProgressUser = user;
+}
+
+int32_t xisfconv_context_host_progress_failed(const xisfconv_context* ctx) {
+    return ctx && ctx->state->hostProgressFailed ? 1 : 0;
 }
 
 void xisfconv_context_set_message_handler(xisfconv_context* ctx, xisfconv_message_fn handler, void* user) {
@@ -649,7 +750,7 @@ xisfconv_status xisfconv_keywords_append(xisfconv_keywords* kw, const char* name
     if (!kw) return XISFCONV_ERR_ARGUMENT;
     return guarded(kw->state, nullptr, [&] {
         if (kw->readOnly) fail(XISFCONV_ERR_ARGUMENT, "the keyword list belongs to a file and cannot be changed");
-        if (!name || !*name) fail(XISFCONV_ERR_ARGUMENT, "a keyword needs a name");
+        if (!name) fail(XISFCONV_ERR_ARGUMENT, "a keyword needs a name (an empty one makes a card of text only)");
         kw->cards.push_back({name, value ? value : "", comment ? comment : ""});
     });
 }
@@ -696,6 +797,18 @@ xisfconv_status xisfconv_keywords_get_text(const xisfconv_keywords* kw, size_t i
     });
 }
 
+xisfconv_status xisfconv_keywords_fits_text(const xisfconv_keywords* kw, const char** text, size_t* length) {
+    if (!kw) return XISFCONV_ERR_ARGUMENT;
+    if (text) *text = "";
+    if (length) *length = 0;
+    return guarded(kw->state, nullptr, [&] {
+        if (!text) fail(XISFCONV_ERR_ARGUMENT, "xisfconv_keywords_fits_text: text is NULL");
+        kw->text = fitsCards(kw->cards);
+        *text = kw->text.c_str();
+        if (length) *length = kw->text.size();
+    });
+}
+
 // ------------------------------------------------------------------------------------------
 // Opening files
 // ------------------------------------------------------------------------------------------
@@ -729,6 +842,9 @@ xisfconv_status xisfconv_open(xisfconv_context* ctx, const char* path, xisfconv_
         auto f = std::make_unique<xisfconv_file>();
         f->state = ctx->state;
         f->path = path;
+        std::error_code absoluteError;
+        const std::filesystem::path absolute = std::filesystem::absolute(toPath(path), absoluteError);
+        f->readPath = absoluteError ? std::string(path) : fromPath(absolute);
         const InputFormat kind = detectInputFormat(path);
         if (kind == InputFormat::Fits) {
             f->format = XISFCONV_FORMAT_FITS;
@@ -786,7 +902,7 @@ xisfconv_status xisfconv_header_text(xisfconv_file* file, const char** text, siz
             if (isXisf(file)) {
                 file->headerText = file->xisf->headerXml();
             } else if (file->format == XISFCONV_FORMAT_ASDF) {
-                file->headerText = readAsdfTree(file->path);
+                file->headerText = readAsdfTree(file->readPath);
             } else {
                 std::string all;
                 for (const auto& img : file->fits.images) {
@@ -1020,6 +1136,10 @@ xisfconv_status xisfconv_property_read_f64(xisfconv_file* file, size_t image, co
                              (property->type.compare(property->type.size() - 6, 6, "Vector") == 0 ||
                               property->type.compare(property->type.size() - 6, 6, "Matrix") == 0);
         if (!numeric) fail(XISFCONV_ERR_NOT_FOUND, std::string("no numeric vector or matrix property '") + id + "'");
+        if (!isNumericPropertyType(property->type)) {
+            fail(XISFCONV_ERR_UNSUPPORTED, std::string("property '") + id + "' is of type " + property->type +
+                                           ", which is not read as numbers");
+        }
         if (!file->xisf->readNumericProperty(image, id, data, &r, &c)) {
             fail(XISFCONV_ERR_FORMAT, std::string("the data of property '") + id + "' cannot be read");
         }
@@ -1282,6 +1402,33 @@ xisfconv_status xisfconv_wcs_keywords(xisfconv_file* file, size_t image, xisfcon
     });
 }
 
+xisfconv_status xisfconv_fits_keywords(xisfconv_file* file, size_t image, xisfconv_row_order row_order,
+                                       int32_t property_keywords, int32_t wcs, int32_t sip_order, xisfconv_keywords** out,
+                                       const char** fit_summary) {
+    if (!file) return XISFCONV_ERR_ARGUMENT;
+    if (out) *out = nullptr;
+    if (fit_summary) *fit_summary = "";
+    return guarded(file->state, file->path.c_str(), [&] {
+        if (!out) fail(XISFCONV_ERR_ARGUMENT, "xisfconv_fits_keywords: out is NULL");
+        checkImage(file, image);
+        checkRowOrder(row_order);
+        if (sip_order != 0 && (sip_order < 2 || sip_order > 7)) fail(XISFCONV_ERR_ARGUMENT, "--sip-order must be 0 (off) or 2..7");
+        const bool wantTopDown = row_order == XISFCONV_ROWS_TOP_DOWN;
+        auto kw = std::make_unique<xisfconv_keywords>();
+        kw->state = file->state;
+        if (isXisf(file)) {
+            kw->cards = xisfImageFitsKeywords(*file->xisf, image, !wantTopDown, property_keywords != 0, wcs != 0, sip_order,
+                                              &kw->summary);
+        } else {
+            const FitsImage& img = file->fits.images[image];
+            kw->cards = img.keywords;
+            if (img.topDown != wantTopDown) flipKeywordRows(kw->cards, img.pixels.height);
+        }
+        if (fit_summary) *fit_summary = kw->summary.c_str();
+        *out = kw.release();
+    });
+}
+
 xisfconv_status xisfconv_wcs_flip_rows(xisfconv_keywords* kw, uint64_t image_height) {
     if (!kw) return XISFCONV_ERR_ARGUMENT;
     return guarded(kw->state, nullptr, [&] {
@@ -1342,6 +1489,7 @@ xisfconv_status xisfconv_convert(xisfconv_context* ctx, const char* input, const
         c.sipOrder = o.sip_order;
         c.force = o.overwrite != 0;
         const Format format = outputFormat(o.output_format, output);
+        mustBeReadable(input);
         const InputFormat kind = detectInputFormat(input);
         if (kind == InputFormat::Xisf) convertXisfFile(input, output, format, c);
         else convertFitsOrAsdfFile(input, kind, output, format, c);
@@ -1518,7 +1666,12 @@ xisfconv_status xisfconv_writer_add_image(xisfconv_writer* writer, const xisfcon
         img.hasRowOrder = true;
         img.topDown = in.row_order != XISFCONV_ROWS_BOTTOM_UP;
         if (in.name) img.name = in.name;
-        if (in.keywords) img.keywords = in.keywords->cards;
+        if (in.keywords) {
+            // The cards that describe how a FITS file stores its data say nothing about a buffer
+            // (a header taken over from a FITS file brings them along): the writer sets its own.
+            for (const auto& card : in.keywords->cards)
+                if (!isReservedFitsKeyword(card.name)) img.keywords.push_back(card);
+        }
         checkRowOrder(in.wcs_row_order);
         if (in.wcs_row_order != XISFCONV_ROWS_DEFAULT && (in.wcs_row_order == XISFCONV_ROWS_TOP_DOWN) != img.topDown) {
             // the WCS keywords count rows from the other end than the buffer does

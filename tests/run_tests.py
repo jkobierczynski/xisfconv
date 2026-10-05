@@ -401,6 +401,10 @@ def test_keywords_and_properties():
         '<FITSKeyword name="COMMENT" value="" comment="' + "x" * 150 + '"/>',
         '<FITSKeyword name="LONGNAMEKEY" value="1.5" comment="needs HIERARCH"/>',
         '<FITSKeyword name="NOTES" value="\'' + "y" * 90 + '\'" comment="too long"/>',
+        '<FITSKeyword name="AMPEND" value="\'' + "a" * 70 + '&amp;\'" comment="ends in an ampersand"/>',
+        '<FITSKeyword name="AMPSPLIT" value="\'' + "b" * 65 + '&amp;&amp;c\'" comment="one where the text is split"/>',
+        '<FITSKeyword name="AMPONLY" value="\'' + "c" * 66 + '&amp;\'" comment=""/>',
+        '<FITSKeyword name="AMPSHORT" value="\'short&amp;\'" comment="fits in one card"/>',
     ])
     props = "".join([
         '<Property id="Instrument:ExposureTime" type="Float32" value="300"/>',
@@ -439,6 +443,18 @@ def test_keywords_and_properties():
     check(hdr["ROWORDER"] == "BOTTOM-UP", "ROWORDER default")
     check(hdr["PSFFLX00"] == 17870.0, "lower-case exponent value")
     check(hdr["NOTES"] == "y" * 90, f"long string written with CONTINUE cards ({len(hdr['NOTES'])} chars)")
+    # a long text that ends in '&', which is also the mark that the text goes on
+    amps = {"AMPEND": "a" * 70 + "&", "AMPSPLIT": "b" * 65 + "&&c", "AMPONLY": "c" * 66 + "&", "AMPSHORT": "short&"}
+    for name, text in amps.items():
+        check(hdr[name] == text, f"{name}: a text with '&' at its end or where it is split is read back by astropy: {hdr[name][-8:]!r}")
+    check(hdr.comments["AMPEND"] == "ends in an ampersand", "and keeps its comment")
+    back = os.path.join(TMP, "keywords-back.xisf")
+    again = os.path.join(TMP, "keywords-again.fits")
+    run(out, "-o", back, "-f", "-q")
+    run(back, "-o", again, "-f", "-q")
+    _, hdr2 = fits_planes(again)
+    check(all(hdr2[name] == text for name, text in amps.items()) and hdr2["NOTES"] == "y" * 90,
+          "and comes back the same through FITS -> XISF -> FITS")
 
     # --no-property-keywords
     run(path, "-o", out, "-f", "-q", "--no-property-keywords")
@@ -2844,6 +2860,19 @@ def test_verify():
     check(r.returncode == 1 and "FAILED" in r.stdout and "not an XISF" in r.stdout, "--verify on a file of another kind")
     r = verify(os.path.join(d, "missing.xisf"))
     check(r.returncode == 1 and "FAILED" in r.stdout, "--verify on a missing file")
+    # a directory where a file is meant (--verify takes directories; --info and conversion do not)
+    for arguments in (["--info", d], [d, "-o", os.path.join(d, "from-directory.fits")]):
+        r = subprocess.run([EXE] + arguments, capture_output=True, text=True)
+        check(r.returncode == 1 and "is a directory, not a file" in r.stderr and not os.path.exists(os.path.join(d, "from-directory.fits")),
+              f"a directory given as a file is called a directory: {r.stderr.strip()}")
+    # an output name that is a directory is not replaced by the output, with or without --force
+    taken = os.path.join(d, "taken.fits")
+    os.mkdir(taken)
+    for force in ([], ["-f"]):
+        r = subprocess.run([EXE, good, "-o", taken] + force, capture_output=True, text=True)
+        check(r.returncode == 1 and "is a directory; it is not replaced" in r.stderr and os.path.isdir(taken) and
+              not os.path.exists(taken + ".part"), f"an output that is a directory is refused {force}: {r.stderr.strip()}")
+    os.rmdir(taken)
     tree = os.path.join(d, "sub")
     shutil.copy(good, os.path.join(tree, "a.xisf"))
     shutil.copy(f, os.path.join(tree, "deeper", "b.fits"))

@@ -1,0 +1,10 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later
+   What the shared library offers to the rest of a process: the functions of xisfconv.h and
+   nothing else. Without this list the C++ standard library templates the code uses, and a
+   static Zstandard linked into it, would be offered as well. (GNU ld and compatible linkers.) */
+{
+  global:
+    xisfconv_*;
+  local:
+    *;
+};
