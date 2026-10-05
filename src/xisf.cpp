@@ -111,7 +111,7 @@ XisfChecksumState XisfFile::verifyBlockChecksum(const XisfStoredBlock& block, co
 
 XisfFile::XisfFile(const std::string& path) : path_(path) {
     file_.open(toPath(path), std::ios::binary);
-    if (!file_) throw Error("cannot open file", ErrorKind::Io);
+    if (!file_) failToOpen(path);
     std::error_code directoryError;
     if (std::filesystem::is_directory(toPath(path), directoryError)) throw Error("is a directory, not a file", ErrorKind::Io);
     file_.seekg(0, std::ios::end);

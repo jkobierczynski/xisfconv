@@ -463,7 +463,7 @@ void mustBeReadable(const char* path) {
     if (std::filesystem::is_directory(toPath(path), ec)) throw Error("is a directory, not a file", ErrorKind::Io);
     std::ifstream in(toPath(path), std::ios::binary);
     char first = 0;
-    if (!in || (!in.read(&first, 1) && !in.eof())) throw Error("cannot open file", ErrorKind::Io);
+    if (!in || (!in.read(&first, 1) && !in.eof())) failToOpen(path);
 }
 
 void copyText(char* dest, size_t size, const std::string& text) {

@@ -205,8 +205,14 @@ def test_no_exception_escapes_the_reporter():
     class Stop(Exception):
         pass
 
+    armed = []
+
     def handler(signum, frame):
-        raise Stop()
+        # (only while a run is on: a signal that is delivered late, after its timer was stopped,
+        # would strike the test itself; macOS does that)
+        if armed:
+            armed.clear()
+            raise Stop()
 
     report = _lib.ProgressReport(None, b"testing", 1, 2)
     argument = ctypes.pointer(report)
@@ -217,12 +223,14 @@ def test_no_exception_escapes_the_reporter():
         steps = [partial(send, argument) for _ in range(300)]
         sends = iter(steps)
         try:
+            armed.append(True)
             signal.setitimer(signal.ITIMER_REAL, delay)
             try:
                 # in C, nothing of Python between the steps; up to the first answer that is not "go on"
                 answers = list(itertools.takewhile(_lib.HOST_GO_ON.__eq__, map(call, sends)))
                 answers.append(_lib.HOST_STOP if raised[1] is not None else None)
             finally:
+                armed.clear()
                 signal.setitimer(signal.ITIMER_REAL, 0)
         except Stop as e:
             traceback = e.__traceback__

@@ -2,7 +2,7 @@
 
 What was decided while building xisfconv, and why. The README says what the program does and
 `TODO.md` what is planned; this file records the choices behind both, so that they are not
-reopened by accident. State: version 0.11.0, 5 October 2026.
+reopened by accident. State: version 0.11.1, 5 October 2026.
 
 ## Purpose and scope
 
@@ -450,7 +450,11 @@ Built in 0.11.0, in `python/`. What was decided:
 - An arm64 build of the tool is run under qemu against the suite before a release that touches
   arithmetic (see "Arithmetic does not depend on the processor").
 - Windows code is compiled with MinGW and run under Wine before delivery, since no Windows machine
-  is at hand; CI on Windows remains the real check. The wheels for macOS and Windows have only CI
+  is at hand; CI on Windows remains the real check. Since 0.11.1 that includes the Python package:
+  its tests run with a Windows build of Python under Wine against the MinGW build of the library.
+  (The first CI runs of 0.11.0 failed on what this would have shown: a directory given as input
+  was not called one on Windows, where a directory cannot be opened at all, and a test replaced a
+  file that astropy still had mapped into memory.) The wheels for macOS and Windows have only CI
   to prove them.
 - CI builds and runs the suite on Linux, macOS and Windows.
 

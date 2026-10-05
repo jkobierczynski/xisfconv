@@ -60,6 +60,12 @@ std::filesystem::path toPath(const std::string& utf8) {
 #endif
 }
 
+void failToOpen(const std::string& utf8) {
+    std::error_code ec;
+    if (std::filesystem::is_directory(toPath(utf8), ec)) throw Error("is a directory, not a file", ErrorKind::Io);
+    throw Error("cannot open file", ErrorKind::Io);
+}
+
 std::string fromPath(const std::filesystem::path& path) {
     const auto text = path.u8string();
     return std::string(text.begin(), text.end());

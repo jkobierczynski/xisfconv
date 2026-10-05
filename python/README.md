@@ -150,6 +150,9 @@ that a signal handler raises there (an alarm's time limit) can be lost. `Keyboar
   `xisfconv.Cancelled` in that thread, and no partly written file is left. A daemon thread that
   goes on to start another call is cut off where it is, as daemon threads are, and may leave a
   `.part` file.
+- On Windows a file cannot be replaced while it is open somewhere, and that includes a FITS file
+  that astropy has mapped into memory in the same program (as long as an array read from it is
+  alive): `write(..., overwrite=True)` then fails with `xisfconv.FileError`.
 - The wheels hold the shared library `libxisfconv`. Another build of it is used when the
   environment variable `XISFCONV_LIBRARY` names it.
 

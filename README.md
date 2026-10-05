@@ -639,7 +639,7 @@ Bump the version in `include/xisfconv.h` (CMake reads it from there), commit, th
 tag:
 
 ```
-git tag v0.11.0 && git push origin v0.11.0
+git tag v0.11.1 && git push origin v0.11.1
 ```
 
 CI builds and tests all three platforms and, only if every one passes, publishes a GitHub release with

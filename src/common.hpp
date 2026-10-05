@@ -49,6 +49,9 @@ struct Unsupported : Error {
 // File names are UTF-8 everywhere. On Windows a std::string handed to the standard library
 // would be taken in the ANSI code page, so every file is opened through these.
 std::filesystem::path toPath(const std::string& utf8);
+// Throws the error for an input that could not be opened: it says so if the path is a directory
+// (which opens on some systems and not on others), "cannot open file" otherwise.
+[[noreturn]] void failToOpen(const std::string& utf8);
 std::string fromPath(const std::filesystem::path& path);
 
 // Warnings and notes about the file being processed. The library prints nothing: a message

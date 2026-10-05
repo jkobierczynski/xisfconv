@@ -101,7 +101,10 @@ def test_fits_read_by_astropy(tmp_path, dtype, channels):
         assert same(read, expect)
         assert header["ROWORDER"] == "BOTTOM-UP" and header["EXTNAME"] == "LIGHT"
         assert header["OBJECT"] == "M 31" and header["EXPTIME"] == 12.5 and header.comments["EXPTIME"] == "seconds"
-    xisfconv.write(path, data, stored_row_order="top-down", overwrite=True)
+    # (into another file: astropy still has the first one mapped into memory through `read`, and
+    # Windows does not let a file be replaced while that is so)
+    path = tmp_path / "w2.fits"
+    xisfconv.write(path, data, stored_row_order="top-down")
     with fits.open(path) as hdus:
         assert same(hdus[0].data, data if channels == 1 else np.moveaxis(data, -1, 0))
         assert hdus[0].header["ROWORDER"] == "TOP-DOWN"
@@ -188,6 +191,8 @@ def test_tiff_read_by_tifffile(tmp_path, dtype, channels):
     tifffile = pytest.importorskip("tifffile")
     data = sample(dtype, shape_for(channels))
     for codec in (None, "zlib"):
+        if codec and dtype == "float32":
+            pytest.importorskip("imagecodecs")   # tifffile needs it for compressed floating point
         path = tmp_path / ("w-%s.tif" % codec)
         xisfconv.write(path, data, codec=codec)
         assert same(tifffile.imread(path), data)

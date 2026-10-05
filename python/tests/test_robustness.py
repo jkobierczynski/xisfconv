@@ -469,8 +469,15 @@ def test_messages_name_arguments_not_options(tmp_path):
             with pytest.warns(xisfconv.XisfconvWarning) as caught:
                 xisfconv.convert(name, name + ".tif", sample_format="uint64")
             assert 'sample_format="uint16"' in str(caught[0].message) and "--bits u16" not in str(caught[0].message)
-        if sys.platform != "win32":
-            name = b"a\xff --force b.xisf"                   # not UTF-8: found in the message all the same
+        name = b"a\xff --force b.xisf"                       # not UTF-8: found in the message all the same
+        try:
+            with open(name, "wb"):
+                pass
+            os.remove(name)
+            such_names = sys.platform != "win32"
+        except (OSError, ValueError):
+            such_names = False                               # (the file system of macOS has no such names)
+        if such_names:
             xisfconv.write(name, data)
             with pytest.raises(FileExistsError) as caught:
                 xisfconv.write(name, data)

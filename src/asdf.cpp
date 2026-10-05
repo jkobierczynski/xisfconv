@@ -305,7 +305,7 @@ public:
     Reader(const std::string& path, bool headersOnly, bool verify, std::optional<size_t> onlyImage = std::nullopt)
         : in_(toPath(path), std::ios::binary), headersOnly_(headersOnly), verify_(verify), onlyImage_(onlyImage) {
         file_.path = path;
-        if (!in_) throw Error("cannot open file", ErrorKind::Io);
+        if (!in_) failToOpen(path);
         in_.seekg(0, std::ios::end);
         file_.fileSize = static_cast<uint64_t>(in_.tellg());
     }

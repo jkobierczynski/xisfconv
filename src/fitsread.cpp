@@ -461,7 +461,7 @@ uint32_t onesComplementAdd(uint32_t a, uint32_t b) {
 VerifyReport verifyFits(const std::string& path) {
     VerifyReport report;
     std::ifstream in(toPath(path), std::ios::binary);
-    if (!in) throw Error("cannot open file", ErrorKind::Io);
+    if (!in) failToOpen(path);
     in.seekg(0, std::ios::end);
     const uint64_t fileSize = static_cast<uint64_t>(in.tellg());
 
@@ -578,7 +578,7 @@ FitsFile readFits(const std::string& path, bool headersOnly, std::optional<size_
     FitsFile file;
     file.path = path;
     std::ifstream in(toPath(path), std::ios::binary);
-    if (!in) throw Error("cannot open file", ErrorKind::Io);
+    if (!in) failToOpen(path);
     in.seekg(0, std::ios::end);
     file.fileSize = static_cast<uint64_t>(in.tellg());
 
