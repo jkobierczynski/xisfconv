@@ -71,6 +71,8 @@ except ImportError:
 # Deflate-compressed float TIFFs use predictor 3, which needs libtiff's tiffcp or imagecodecs.
 CAN_DECODE_FLOAT_PREDICTOR = HAVE_TIFFCP or HAVE_IMAGECODECS
 skipped = []
+LAST_BIT = []   # tile-compressed FITS: comparisons that were equal but for a rounding (see rounding_slack)
+
 failures = []
 passed = 0
 
@@ -2903,8 +2905,48 @@ def test_fits_tile_compressed():
         a.flat[0], a.flat[1] = info.max, info.min
         return a
 
-    def same(got, ref):
-        return got.shape == ref.shape and np.array_equal(got.astype(np.float64), ref.astype(np.float64), equal_nan=True)
+    def same(got, ref, slack=None, label=""):
+        """Equal bit for bit. For quantized floating point (`slack` given, see rounding_slack) a
+        difference from rounding is accepted and counted."""
+        if got.shape != ref.shape:
+            return False
+        if np.array_equal(got.astype(np.float64), ref.astype(np.float64), equal_nan=True):
+            return True
+        if slack is None or got.dtype.kind != "f" or ref.dtype.kind != "f":
+            return False
+        a, b = got.astype(np.float64), ref.astype(np.float64)
+        if not np.array_equal(np.isnan(a), np.isnan(b)):
+            return False
+        ok = ~np.isnan(a)
+        if got.dtype.itemsize == 4 and ref.dtype.itemsize == 4:
+            # rounded to single precision afterwards: the neighbouring value at most
+            near = np.abs(a[ok] - b[ok]) <= np.spacing(np.maximum(np.abs(got[ok]), np.abs(ref[ok])).astype(np.float32))
+        else:
+            near = np.abs(a[ok] - b[ok]) <= slack
+        if not np.all(near):
+            return False
+        last_bit.append(label)
+        return True
+
+    def rounding_slack(path, hdu=1):
+        """How far the values restored from a quantized image may differ between two correct
+        programs, or None if the image is not quantized (then they must be equal).
+
+        A value is restored as integer * scale + zero. Whether the product is rounded before
+        the addition depends on how a program was compiled: on arm64, C compilers fuse the two
+        into one instruction with one rounding, NumPy never does, and xisfconv is built not to.
+        The results differ by at most the rounding of the product, which is about as large as
+        the zero point (astropy's and CFITSIO's second dithering method uses zero points of
+        several 1e8 for data around 1e3, so that is more than the last bit of the result)."""
+        with fits.open(path, disable_image_compression=True) as h:
+            table = h[hdu]
+            if "ZZERO" not in (table.columns.names or []):
+                return None
+            zero = float(np.max(np.abs(table.data["ZZERO"]))) if len(table.data) else 0.0
+            scale = float(np.max(np.abs(table.data["ZSCALE"]))) if len(table.data) else 0.0
+        return 2 * float(np.spacing(2 * zero + 2.0 ** 31 * scale))
+
+    last_bit = LAST_BIT
 
     src = os.path.join(d, "c.fits.fz")
     out = os.path.join(d, "out.fits")
@@ -2917,7 +2959,7 @@ def test_fits_tile_compressed():
             check(False, f"{label}: {r.stderr.strip()[:200]}")
             return
         got = np.array(fits.getdata(out))
-        check(same(got, ref), f"{label}: pixels equal astropy's decompression ({got.dtype}, {got.shape})")
+        check(same(got, ref, rounding_slack(src, hdu), label), f"{label}: pixels equal astropy's decompression ({got.dtype}, {got.shape})")
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -3102,8 +3144,9 @@ def test_fits_tile_compressed():
                 check(False, f"fpack {o} / funpack failed: {p1.stderr.strip()[:100]} {p2.stderr.strip()[:100]}")
                 continue
             run(base + ".fz", "-o", out, "-f", "-q", "-t", "fits")
+            slack = [rounding_slack(base + ".fz", i + 1) for i in range(2)]
             with fits.open(os.path.join(d, "u.fits")) as hu, fits.open(out) as hx:
-                check(len(hx) == 2 and all(same(np.array(hx[i].data), np.array(hu[i].data)) for i in range(2)) and
+                check(len(hx) == 2 and all(same(np.array(hx[i].data), np.array(hu[i].data), slack[i], "fpack") for i in range(2)) and
                       hx[0].header["OBJECT"] == "M 31" and hx[1].header["EXTNAME"] == "SECOND",
                       f"fpack {' '.join(o) or '(default)'} {np.dtype(dtype).name} {shape}: equals funpack's output")
 
@@ -3131,6 +3174,9 @@ if __name__ == "__main__":
         except Exception as e:  # noqa: BLE001
             failures.append(f"{t.__name__}: {type(e).__name__}: {e}")
             print("ERROR in", t.__name__, ":", e)
+    if LAST_BIT:
+        print(f"\n{len(LAST_BIT)} comparisons of quantized floating point were equal but for the rounding of one multiplication:\n"
+              "  the other software fuses multiplication and addition on this machine, xisfconv does not (see README)")
     if skipped:
         print(f"\nskipped {len(skipped)} checks that need optional tools:")
         for what in sorted(set(skipped))[:8]:

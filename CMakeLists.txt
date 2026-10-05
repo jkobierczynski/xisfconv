@@ -104,6 +104,11 @@ foreach(_target xisfconv_core xisfconv)
     target_compile_definitions(${_target} PRIVATE _CRT_SECURE_NO_WARNINGS)
   else()
     target_compile_options(${_target} PRIVATE -Wall -Wextra -Wpedantic)
+    # Every multiplication and addition is rounded by itself, on every processor. Left to
+    # themselves, GCC and Clang fuse a*b + c into one instruction where the processor has one
+    # (arm64 always has): the last bit of a result then depends on the machine, and a file would
+    # not convert to the same bytes everywhere.
+    target_compile_options(${_target} PRIVATE -ffp-contract=off)
   endif()
 endforeach()
 

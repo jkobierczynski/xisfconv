@@ -136,9 +136,14 @@ xisfconv --info light_0001.xisf               # geometry, codecs, FITS keywords,
   image is skipped with a message (funpack can decompress it).
 - Integer images are lossless. Floating point images are stored either losslessly (gzip, `fpack -g
   -q 0`) or **quantized** to integers with a scale per tile, which is fpack's default for floats and
-  is lossy: xisfconv restores exactly the values CFITSIO and astropy restore (`NO_DITHER`,
+  is lossy: xisfconv restores the values CFITSIO and astropy restore (`NO_DITHER`,
   `SUBTRACTIVE_DITHER_1` and `_2`, with the same random sequence; undefined pixels come back as
-  NaN), but those are not the values of the image before it was packed.
+  NaN), but those are not the values of the image before it was packed. "The same values" holds
+  bit for bit on x86-64. On arm64 (Apple Silicon) the last digits of some values can differ from
+  what CFITSIO or astropy give there, by far less than the quantization step: a value is
+  restored as integer × scale + zero, and C compilers for arm64 fuse the multiplication and the
+  addition into one instruction with a single rounding, unless told not to. xisfconv is built to
+  round each step, so that it gives the same values on every machine.
 - The image's own keywords are carried over; the keywords that describe the table and the
   compression (`ZIMAGE`, `ZCMPTYPE`, `ZTILEn`, `TFORMn`, ...) are dropped, as is the table name
   `COMPRESSED_IMAGE`. `--info` shows the algorithm.
@@ -465,7 +470,9 @@ Tile-compressed FITS is checked against astropy and CFITSIO: files written by as
 `CompImageHDU` (every algorithm, every integer and floating point type, several tile shapes, cubes,
 each quantization and dithering method, NaN pixels) must decode to what astropy reads from them,
 bit for bit, and, where `fpack` and `funpack` are installed, files packed by fpack must decode to
-what funpack writes. Damaged and truncated files, headers that contradict the table and an
+what funpack writes. For quantized floating point a difference no larger than the rounding of
+one multiplication is accepted and counted in the summary: there the other software's result
+depends on how it was compiled (see "Tile-compressed FITS" above). Damaged and truncated files, headers that contradict the table and an
 `HCOMPRESS_1` image are covered as well.
 
 TIFF and PNG export from FITS and ASDF input is checked against the export of the XISF file the input
@@ -536,7 +543,7 @@ Bump the version in `include/xisfconv.h` (CMake reads it from there), commit, th
 tag:
 
 ```
-git tag v0.10.0 && git push origin v0.10.0
+git tag v0.10.1 && git push origin v0.10.1
 ```
 
 CI builds and tests all three platforms and, only if every one passes, publishes a GitHub release with

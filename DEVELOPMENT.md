@@ -2,7 +2,7 @@
 
 What was decided while building xisfconv, and why. The README says what the program does and
 `TODO.md` what is planned; this file records the choices behind both, so that they are not
-reopened by accident. State: version 0.10.0, 5 October 2026.
+reopened by accident. State: version 0.10.1, 5 October 2026.
 
 ## Purpose and scope
 
@@ -86,8 +86,20 @@ These are the choices a user could otherwise be surprised by. Each has an option
   but PixInsight 1.9.3 implements only SHA-1, SHA-256 and SHA-512 and refuses an image that carries
   another one. Writing a SHA-3 checksum is therefore allowed, with a warning: the file is valid,
   and what the specification allows is not withheld because one reader lacks it.
-- **Tile-compressed FITS** is read, not written. Quantized floating point is restored exactly as
+- **Tile-compressed FITS** is read, not written. Quantized floating point is restored as
   CFITSIO restores it, including its dithering sequence; that it is lossy is stated in the README.
+- **Arithmetic does not depend on the processor.** The code is compiled with
+  `-ffp-contract=off`: every multiplication and addition is rounded by itself. GCC and Clang
+  otherwise fuse `a*b + c` into one instruction on arm64, which changes the last bit of some
+  results, and more than that where the product and `c` nearly cancel. That showed in 0.10.0 on Apple Silicon, in the values restored from quantized
+  tile-compressed FITS: astropy restores undithered values with NumPy (never fused) and dithered
+  ones with C code (fused there), so no build could agree with it on both. Since the reference
+  itself is not of one mind about that rounding, the tests accept a difference of that size for
+  quantized floating point (computed from the zero points in the file) and report how often it
+  was needed (never on x86-64). With the option, the Linux builds for x86-64
+  and arm64 convert the same file to the same bytes (FITS with a fitted WCS, a stretched PNG, XISF
+  with solution properties, an unpacked `.fits.fz`); without it each of those differed. What the
+  C library computes (sine, logarithm) may still differ between systems.
 - **Stretch** is for viewing: PixInsight's STF maths, the saved STF if there is one, else a linked
   auto-STF. It is available for TIFF, PNG and, from XISF, FITS and ASDF output, and is recorded in
   a HISTORY card.
