@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 Jurgen Kobierczynski
 #include "yaml.hpp"
 
@@ -763,10 +763,9 @@ private:
 // Decimal text to double with strtod's handling of the extremes: overflow gives infinity (as in
 // Python), subnormal results are kept. The text has been validated by the caller.
 bool toDouble(const std::string& text, double& out) {
-    if (text.empty()) return false;
-    char* end = nullptr;
-    out = std::strtod(text.c_str(), &end);
-    return end == text.c_str() + text.size();
+    bool complete = false;
+    out = strtodC(text, &complete);
+    return complete;
 }
 
 std::string stripUnderscores(const std::string& t) {

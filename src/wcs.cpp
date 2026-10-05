@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 Jurgen Kobierczynski
 #include "wcs.hpp"
 
@@ -117,16 +117,57 @@ bool sipIndices(const std::string& name, bool& isB, int& q) {
     return true;
 }
 
+// Splits the name of a WCS keyword into its base and the letter of an alternate description
+// (CRPIX2A -> CRPIX2, 'A'); ' ' for the primary one. Only the keywords that depend on the
+// direction of the second axis are recognized.
+bool rowKeyword(const std::string& n, std::string& base, char& alt) {
+    alt = ' ';
+    base = n;
+    auto known = [](const std::string& b) {
+        return b == "CRPIX2" || b == "CDELT2" || b == "CTYPE1" || b == "PC001002" || b == "PC002002" || b == "PC001001" ||
+               b == "PC002001" || ((b.compare(0, 2, "CD") == 0 || b.compare(0, 2, "PC") == 0) && b.size() == 5 && b[3] == '_' &&
+                                   b[2] >= '1' && b[2] <= '9' && b[4] >= '1' && b[4] <= '9');
+    };
+    if (known(base)) return true;
+    if (n.size() > 1 && n.back() >= 'A' && n.back() <= 'Z') {
+        base = n.substr(0, n.size() - 1);
+        alt = n.back();
+        // the old PCiiijjj form has no alternates
+        if (base.compare(0, 4, "PC00") != 0 && known(base)) return true;
+    }
+    return false;
+}
+
+std::string rowNumber(double v) {
+    char buf[40];
+    std::snprintf(buf, sizeof buf, "%.15G", v);
+    std::string s = cNumber(buf);
+    if (s.find_first_of(".E") == std::string::npos) s += ".0";
+    return s;
+}
+
 }  // namespace
 
 bool flipWcsRowOrder(std::vector<FitsKeyword>& keywords, uint64_t height) {
-    bool hasWcs = false, hasCd = false, hasPc = false;
-    for (const auto& k : keywords) {
+    // What each description (the primary one and the alternates A to Z) consists of.
+    struct Description {
+        bool present = false, hasCd = false, hasPc = false, hasCrpix2 = false;
+        size_t ctypeAt = 0;
+    };
+    Description descriptions[27];
+    auto of = [&](char alt) -> Description& { return descriptions[alt == ' ' ? 0 : 1 + (alt - 'A')]; };
+    bool hasWcs = false;
+    for (size_t i = 0; i < keywords.size(); ++i) {
+        const FitsKeyword& k = keywords[i];
         const std::string n = toUpper(trim(k.name));
-        if (n == "CRPIX2" || n == "CTYPE1") hasWcs = true;
-        if (n.compare(0, 2, "CD") == 0 && n.size() == 5 && n[3] == '_') hasCd = true;
-        if (n.compare(0, 2, "PC") == 0 && n.size() == 5 && n[3] == '_') hasPc = true;
-        if (n == "CTYPE1") {
+        std::string base;
+        char alt;
+        if (!rowKeyword(n, base, alt)) continue;
+        Description& d = of(alt);
+        if (base == "CRPIX2") d.present = d.hasCrpix2 = true;
+        if (base == "CTYPE1") {
+            d.present = true;
+            d.ctypeAt = i;
             const std::string t = toUpper(k.value);
             if (t.find("TPV") != std::string::npos || t.find("TNX") != std::string::npos ||
                 t.find("ZPX") != std::string::npos) {
@@ -134,6 +175,9 @@ bool flipWcsRowOrder(std::vector<FitsKeyword>& keywords, uint64_t height) {
                      "changed row order");
             }
         }
+        if (base.compare(0, 2, "CD") == 0 && base.size() == 5) d.hasCd = true;
+        if (base.compare(0, 2, "PC") == 0) d.hasPc = true;
+        if (d.present) hasWcs = true;
     }
     if (!hasWcs) return false;
     for (auto& k : keywords) {
@@ -141,23 +185,31 @@ bool flipWcsRowOrder(std::vector<FitsKeyword>& keywords, uint64_t height) {
         double v;
         bool isB = false;
         int q = 0;
-        if (n == "CRPIX2") {
-            if (numericValue(k.value, v)) {
-                char buf[40];
-                std::snprintf(buf, sizeof buf, "%.15G", static_cast<double>(height) + 1.0 - v);
-                std::string s = buf;
-                if (s.find_first_of(".E") == std::string::npos) s += ".0";
-                k.value = s;
+        std::string base;
+        char alt;
+        if (rowKeyword(n, base, alt)) {
+            const Description& d = of(alt);
+            if (base == "CRPIX2") {
+                if (numericValue(k.value, v)) k.value = rowNumber(static_cast<double>(height) + 1.0 - v);
+            } else if (base == "CD1_2" || base == "CD2_2" || base == "PC1_2" || base == "PC2_2" || base == "PC001002" ||
+                       base == "PC002002") {
+                negateValue(k);
+            } else if (base == "CDELT2" && !d.hasCd && !d.hasPc) {
+                negateValue(k);
             }
-        } else if (n == "CD1_2" || n == "CD2_2" || n == "PC1_2" || n == "PC2_2" || n == "PC001002" ||
-                   n == "PC002002") {
-            negateValue(k);
-        } else if (n == "CDELT2" && !hasCd && !hasPc) {
-            negateValue(k);
         } else if (sipIndices(n, isB, q)) {
             // v -> -v: x-distortion terms change sign for odd powers of v, y-distortion terms for even ones.
             if ((q % 2 == 1) != isB) negateValue(k);
         }
+    }
+    // A description without CRPIX2 has its reference point at row 0, which is row height + 1
+    // counted from the other end. Inserted from the back, so that the positions noted stay valid.
+    for (int a = 26; a >= 0; --a) {
+        const Description& d = descriptions[a];
+        if (!d.present || d.hasCrpix2) continue;
+        const std::string name = a == 0 ? std::string("CRPIX2") : std::string("CRPIX2") + static_cast<char>('A' + a - 1);
+        keywords.insert(keywords.begin() + static_cast<std::ptrdiff_t>(d.ctypeAt + 1),
+                        {name, rowNumber(static_cast<double>(height) + 1.0), "reference pixel (row order changed)"});
     }
     return true;
 }

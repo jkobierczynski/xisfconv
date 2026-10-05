@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 Jurgen Kobierczynski
 #include "png.hpp"
 
@@ -18,8 +18,8 @@ void put32be(std::vector<uint8_t>& v, uint32_t x) {
 
 class ChunkWriter {
 public:
-    explicit ChunkWriter(const std::string& path) : path_(path), out_(path, std::ios::binary | std::ios::trunc) {
-        if (!out_) throw Error("cannot create " + path);
+    explicit ChunkWriter(const std::string& path) : path_(path), out_(toPath(path), std::ios::binary | std::ios::trunc) {
+        if (!out_) throw Error("cannot create " + path, ErrorKind::Io);
         static const uint8_t sig[8] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'};
         out_.write(reinterpret_cast<const char*>(sig), 8);
     }
@@ -35,12 +35,12 @@ public:
         out_.write(reinterpret_cast<const char*>(head.data()), 8);
         if (size) out_.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(size));
         out_.write(reinterpret_cast<const char*>(tail.data()), 4);
-        if (!out_) throw Error("write error on " + path_);
+        if (!out_) throw Error("write error on " + path_, ErrorKind::Io);
     }
     void chunk(const char type[4], const std::vector<uint8_t>& d) { chunk(type, d.data(), d.size()); }
     void close() {
         out_.close();
-        if (!out_) throw Error("write error on " + path_);
+        if (!out_) throw Error("write error on " + path_, ErrorKind::Io);
     }
 
 private:

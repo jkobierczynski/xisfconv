@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 Jurgen Kobierczynski
 #include "common.hpp"
 
@@ -38,6 +38,32 @@ MessageScope::~MessageScope() { t_handler = previous_; }
 
 void warn(const std::string& message) { emit(MessageLevel::Warning, message); }
 void info(const std::string& message) { emit(MessageLevel::Info, message); }
+
+namespace {
+thread_local const ProgressHandler* t_progress = nullptr;
+}  // namespace
+
+ProgressScope::ProgressScope(ProgressHandler handler) : handler_(std::move(handler)), previous_(t_progress) { t_progress = &handler_; }
+ProgressScope::~ProgressScope() { t_progress = previous_; }
+
+void progress(const char* stage, uint64_t done, uint64_t total) {
+    const ProgressHandler* handler = t_progress;
+    if (!handler || !*handler) return;
+    if (!(*handler)(stage, done, total)) throw Error("cancelled", ErrorKind::Cancelled);
+}
+
+std::filesystem::path toPath(const std::string& utf8) {
+#if defined(__cpp_lib_char8_t)
+    return std::filesystem::path(std::u8string(utf8.begin(), utf8.end()));
+#else
+    return std::filesystem::u8path(utf8);
+#endif
+}
+
+std::string fromPath(const std::filesystem::path& path) {
+    const auto text = path.u8string();
+    return std::string(text.begin(), text.end());
+}
 
 size_t sampleBytes(SampleFormat f) {
     switch (f) {
@@ -175,10 +201,43 @@ std::string formatDouble(double v) {
     char buf[40] = "0";
     for (int precision : {15, 16, 17}) {
         std::snprintf(buf, sizeof buf, "%.*g", precision, v);
+        const std::string text = cNumber(buf);
+        std::snprintf(buf, sizeof buf, "%s", text.c_str());
         double back;
         if (parseDouble(buf, back) && back == v) break;
     }
     return buf;
+}
+
+namespace {
+// The decimal point of the locale the host program has set ("." unless it set one).
+std::string localeDecimalPoint() {
+    const std::lconv* conventions = std::localeconv();
+    return conventions && conventions->decimal_point && *conventions->decimal_point ? conventions->decimal_point : ".";
+}
+}  // namespace
+
+std::string cNumber(const char* printed) {
+    std::string text = printed;
+    const std::string point = localeDecimalPoint();
+    if (point != ".") {
+        const size_t at = text.find(point);
+        if (at != std::string::npos) text.replace(at, point.size(), ".");
+    }
+    return text;
+}
+
+double strtodC(const std::string& text, bool* complete) {
+    std::string local = text;
+    const std::string point = localeDecimalPoint();
+    if (point != ".") {
+        const size_t at = local.find('.');
+        if (at != std::string::npos) local.replace(at, 1, point);
+    }
+    char* end = nullptr;
+    const double value = std::strtod(local.c_str(), &end);
+    if (complete) *complete = !local.empty() && end == local.c_str() + local.size();
+    return value;
 }
 
 std::string utcTimestamp() {

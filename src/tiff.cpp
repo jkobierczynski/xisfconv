@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 Jurgen Kobierczynski
 #include "tiff.hpp"
 
@@ -66,8 +66,8 @@ Entry undefinedBytes(uint16_t tag, const std::vector<uint8_t>& bytes) {
 
 class Output {
 public:
-    explicit Output(const std::string& path) : path_(path), out_(path, std::ios::binary | std::ios::trunc) {
-        if (!out_) throw Error("cannot create " + path);
+    explicit Output(const std::string& path) : path_(path), out_(toPath(path), std::ios::binary | std::ios::trunc) {
+        if (!out_) throw Error("cannot create " + path, ErrorKind::Io);
     }
     uint64_t pos() const { return pos_; }
     void write(const void* data, size_t size) {
@@ -76,7 +76,7 @@ public:
         }
         out_.write(static_cast<const char*>(data), static_cast<std::streamsize>(size));
         pos_ += size;
-        if (!out_) throw Error("write error on " + path_);
+        if (!out_) throw Error("write error on " + path_, ErrorKind::Io);
     }
     void align2() {
         if (pos_ & 1) {
@@ -90,11 +90,11 @@ public:
         out_.seekp(static_cast<std::streamoff>(at));
         out_.write(reinterpret_cast<const char*>(b), 4);
         out_.seekp(0, std::ios::end);
-        if (!out_) throw Error("write error on " + path_);
+        if (!out_) throw Error("write error on " + path_, ErrorKind::Io);
     }
     void close() {
         out_.close();
-        if (!out_) throw Error("write error on " + path_);
+        if (!out_) throw Error("write error on " + path_, ErrorKind::Io);
     }
 
 private:

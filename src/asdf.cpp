@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 Jurgen Kobierczynski
 #include "asdf.hpp"
 
@@ -302,22 +302,31 @@ bool scalarUInt(const YamlNode* node, uint64_t& out) {
 
 class Reader {
 public:
-    Reader(const std::string& path, bool headersOnly, bool verify)
-        : in_(path, std::ios::binary), headersOnly_(headersOnly), verify_(verify) {
+    Reader(const std::string& path, bool headersOnly, bool verify, std::optional<size_t> onlyImage = std::nullopt)
+        : in_(toPath(path), std::ios::binary), headersOnly_(headersOnly), verify_(verify), onlyImage_(onlyImage) {
         file_.path = path;
-        if (!in_) throw Error("cannot open file");
+        if (!in_) throw Error("cannot open file", ErrorKind::Io);
         in_.seekg(0, std::ios::end);
         file_.fileSize = static_cast<uint64_t>(in_.tellg());
     }
 
     std::string treeText() { return readTree(); }
 
+    // The tree as it is parsed: a NUL byte, which no valid tree holds, becomes a space, so that
+    // names and values taken from it are whole for C callers.
+    std::string treeWithoutNul() {
+        std::string tree = readTree();
+        std::replace(tree.begin(), tree.end(), '\0', ' ');
+        return tree;
+    }
+
     VerifyReport verifyAll() {
         VerifyReport report;
-        const YamlPtr root = parseYaml(readTree());
+        const YamlPtr root = parseYaml(treeWithoutNul());
         scanBlocks();
         for (size_t i = 0; i < blocks_.size(); ++i) {
             const Block& b = blocks_[i];
+            progress("verifying", i, blocks_.size());
             try {
                 blockData(i, 0, b.compression.empty() ? b.used : b.dataSize, "block " + std::to_string(i));
                 if (b.hasChecksum) ++report.verified;
@@ -353,7 +362,7 @@ public:
     }
 
     FitsFile run() {
-        const YamlPtr root = parseYaml(readTree());
+        const YamlPtr root = parseYaml(treeWithoutNul());
         if (!root || !root->isMapping()) throw Error("the ASDF tree is not a mapping");
         scanBlocks();
         file_.formatNote += ", " + std::to_string(blocks_.size()) + " binary block(s)";
@@ -369,6 +378,7 @@ private:
     std::ifstream in_;
     FitsFile file_;
     bool headersOnly_, verify_;
+    std::optional<size_t> onlyImage_;
     uint64_t treeEnd_ = 0;
     uint64_t scanEnd_ = 0;  // where the block scan stopped
     std::vector<Block> blocks_;
@@ -380,7 +390,7 @@ private:
         std::vector<uint8_t> buf(static_cast<size_t>(n));
         in_.clear();
         in_.seekg(static_cast<std::streamoff>(pos));
-        if (n && !in_.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(n))) throw Error("read error");
+        if (n && !in_.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(n))) throw Error("read error", ErrorKind::Io);
         return buf;
     }
 
@@ -517,7 +527,7 @@ private:
 
     [[noreturn]] static void checksumError(size_t index) {
         throw Error("block " + std::to_string(index) + ": MD5 checksum mismatch (the file is damaged; "
-                    "--no-verify skips this check)");
+                    "--no-verify skips this check)", ErrorKind::Checksum);
     }
 
     // Returns `count` bytes at `offset` of the (decompressed) data of a block.
@@ -569,7 +579,7 @@ private:
                 else data = lz4Chunks(stored, size);
             } catch (const Error& e) {
                 if (check && !storedOk) checksumError(index);  // damaged data rarely decompresses
-                throw Error(where + ": " + e.what());
+                throw Error(where + ": " + e.what(), e.kind);
             }
             if (check && !storedOk && !checksumMatches(b, data)) checksumError(index);
         }
@@ -821,7 +831,7 @@ private:
                       ", block " + std::to_string(blockIndex) +
                       (block.compression.empty() ? "" : ", " + block.compression + " compressed");
         img.note = dt->name;
-        if (!headersOnly_) {
+        if (!headersOnly_ && (!onlyImage_ || *onlyImage_ == file_.images.size())) {
             auto raw = blockData(static_cast<size_t>(blockIndex), offset, checkedMul(elements, dt->size, "array size"), path);
             decodeSamples(img, raw, *dt, bigEndian, interleaved);
             img.hasData = true;
@@ -876,8 +886,8 @@ private:
 }  // namespace
 
 void writeAsdf(const std::string& path, const std::vector<FitsHdu>& hdus, const AsdfWriteOptions& options) {
-    std::ofstream out(path, std::ios::binary | std::ios::trunc);
-    if (!out) throw Error("cannot create " + path);
+    std::ofstream out(toPath(path), std::ios::binary | std::ios::trunc);
+    if (!out) throw Error("cannot create " + path, ErrorKind::Io);
 
     std::string tree = "#ASDF 1.0.0\n"
                        "#ASDF_STANDARD 1.5.0\n"
@@ -947,7 +957,7 @@ void writeAsdf(const std::string& path, const std::vector<FitsHdu>& hdus, const 
         offsets.push_back(pos);
         out.write(header.data(), static_cast<std::streamsize>(header.size()));
         out.write(reinterpret_cast<const char*>(stored), static_cast<std::streamsize>(storedSize));
-        if (!out) throw Error("write error on " + path);
+        if (!out) throw Error("write error on " + path, ErrorKind::Io);
         pos += header.size() + storedSize;
     }
 
@@ -956,11 +966,11 @@ void writeAsdf(const std::string& path, const std::vector<FitsHdu>& hdus, const 
     index += "...\n";
     out.write(index.data(), static_cast<std::streamsize>(index.size()));
     out.close();
-    if (!out) throw Error("write error on " + path);
+    if (!out) throw Error("write error on " + path, ErrorKind::Io);
 }
 
-FitsFile readAsdf(const std::string& path, bool headersOnly, bool verifyChecksums) {
-    Reader reader(path, headersOnly, verifyChecksums);
+FitsFile readAsdf(const std::string& path, bool headersOnly, bool verifyChecksums, std::optional<size_t> onlyImage) {
+    Reader reader(path, headersOnly, verifyChecksums, onlyImage);
     return reader.run();
 }
 
@@ -975,7 +985,7 @@ std::string readAsdfTree(const std::string& path) {
 }
 
 bool looksLikeAsdf(const std::string& path) {
-    std::ifstream in(path, std::ios::binary);
+    std::ifstream in(toPath(path), std::ios::binary);
     char buf[5] = {};
     in.read(buf, 5);
     return in.gcount() == 5 && std::string(buf, 5) == "#ASDF";

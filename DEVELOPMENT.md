@@ -2,7 +2,7 @@
 
 What was decided while building xisfconv, and why. The README says what the program does and
 `TODO.md` what is planned; this file records the choices behind both, so that they are not
-reopened by accident. State: version 0.9.2, 5 October 2026.
+reopened by accident. State: version 0.10.0, 5 October 2026.
 
 ## Purpose and scope
 
@@ -18,11 +18,13 @@ reopened by accident. State: version 0.9.2, 5 October 2026.
 ## Licence
 
 - The command line tool is GPL-3.0-or-later (since commit `de1a3a3`).
-- The library (libxisfconv, see below) will be LGPL-3.0-or-later, so that programs under other
-  licences can link it. The tool stays GPL-3.0-or-later. "Or later" was chosen for both, to keep
-  them consistent.
-- The licence headers of the library sources change, and the LGPL text is added, with the patch
-  that introduces the C API. Until then every file carries the GPL tag.
+- The library (libxisfconv, see below) is LGPL-3.0-or-later, so that programs under other licences
+  can link it. The tool stays GPL-3.0-or-later. "Or later" was chosen for both, to keep them
+  consistent.
+- Since 0.10.0 the first lines of each source file say which applies: `include/xisfconv.h`,
+  everything in `src/` but `main.cpp`, the example and the build files are the library (LGPL);
+  `main.cpp` and the tests are GPL. `COPYING.LESSER` holds the LGPL text, `LICENSE` the GPL it
+  builds on.
 
 ## Language, build and dependencies
 
@@ -112,23 +114,46 @@ These are the choices a user could otherwise be surprised by. Each has an option
   `fitsread`, `fitstile`, `asdf`, `yaml`, `xml`, `tiff`, `png`, `wcs`, `convert` (sample formats,
   stretch), `codecs` (compression, digests), `common`.
 - `pipeline` holds the conversion of whole files. It takes an options struct and prints nothing.
-- `main.cpp` is the command line only: arguments, output names, `--info`, `--verify`, printing.
-- CMake builds a static core library from everything but `main.cpp`; the executable links it.
-- The modules do not print. Warnings and notes go to a message handler installed per thread
-  (`MessageScope`); the tool's handler prints them. There is no other global mutable state.
-- Errors are exceptions: `xisfconv::Error`, and `Unsupported` for a feature this build lacks while
-  the file may be fine. `Unsupported` becomes NOT FULLY CHECKED in `--verify`.
+  Its second half, `writeImageSet`, writes images that are in memory to any format: FITS and ASDF
+  input and the API's writer both end there, so an array handed to the library is treated exactly
+  like an image read from a FITS file.
+- `capi` is the C API: a thin layer that turns handles and structs into calls of the modules and
+  every exception into a status code.
+- `main.cpp` is the command line only: arguments, output names, `--info`, `--verify`, printing. It
+  includes `xisfconv.h` and no internal header.
+- CMake builds the library from everything but `main.cpp`, static by default and linked into the
+  tool, shared with `-DBUILD_SHARED_LIBS=ON`.
+- The modules do not print. Warnings and notes go to a message handler, progress reports to a
+  progress handler; both are installed per thread for the duration of a call (`MessageScope`,
+  `ProgressScope`). There is no other global mutable state.
+- Errors are exceptions inside the library: `xisfconv::Error` with a kind (format, I/O, checksum,
+  argument, index, exists, not found, cancelled), and `Unsupported` for a feature this build lacks
+  while the file may be fine. `Unsupported` becomes NOT FULLY CHECKED in `--verify`. No exception
+  crosses the C API.
+- File names are UTF-8 inside the library and the tool; every file is opened through `toPath`, so
+  that Windows gets wide-character names. The tool takes its arguments as UTF-16 there (`wmain`).
 - FITS and ASDF input share one in-memory form (`FitsFile`), so every conversion from them is
   written once.
+- The version is stated in one place, `include/xisfconv.h`; CMake reads it from there.
+- Numbers are formatted and parsed independently of the locale of the program the library lives
+  in (`cNumber`, `strtodC`): a host that has set a decimal comma must not change a file.
+- A NUL byte in header text (which no valid file has) is read as a space, in all three readers:
+  C callers' strings would end there.
 
 ## The library (libxisfconv)
 
-Planned in a separate brief (`LIBRARY-HANDOFF.md`, with a draft header `xisfconv.h`) and decided
-as follows. The steps and their state are in `TODO.md`.
+Planned in a separate brief with a draft header (not part of the repository), decided as follows
+and built in 0.10.0. What remains is in `TODO.md`.
 
 - The C++ code stays the engine. A plain C API in `xisfconv.h` is the only public interface;
-  every language binds to it, C++ included (a header-only wrapper), so no C++ ABI is exposed.
-- The command line tool is rebuilt on the C API alone. That is the proof that the API is complete.
+  every language binds to it, C++ included, so no C++ ABI is exposed.
+- The command line tool is rebuilt on the C API alone. That is the proof that the API is complete:
+  for the 2060 invocations of the test suite, and some 8000 more of an independent review, exit
+  status, output and files are what 0.9.2 produced. The differences are deliberate and few:
+  an IMAGE extension with PCOUNT or GCOUNT other than 0 and 1 is refused (it crashed before); a
+  tile-compressed image with an unsupported Rice setting is skipped in `--info` too; NUL bytes in
+  headers print as spaces; `-i` with the largest 64-bit number is an invalid index; on Windows,
+  file names are Unicode.
 - Function prefix `xisfconv_`, macros and enumerators `XISFCONV_`. The draft's `xc_` is taken by
   libxc (which has its own `xc_version`) and by Xen's libxenctrl.
 - Presented as "XISF, and conversion between XISF, FITS and ASDF", not as a general FITS or ASDF
@@ -136,19 +161,55 @@ as follows. The steps and their state are in `TODO.md`.
 - Writing images from memory and the stretch on buffers are in the first release, for all five
   output formats: saving an array as XISF is what Python users cannot get elsewhere.
 - Version 0.x with no ABI promise until two bindings have used the API. The shared library version
-  changes with every 0.x release, so that a binding built for another release fails to load.
+  changes with every 0.x release (`libxisfconv.so.0.10`), so that a binding built for another
+  release fails to load.
 - Bindings: Python first (NumPy arrays; it can register `xisf` with astropy's I/O registry), then
   Rust and Perl when someone asks for them.
-- Delivered in three patches: the internal refactor (0.9.1, done), the C API with the tool rebuilt
-  on it, the Python binding.
-- Changes to the draft header: enumerations inside structs as `int32_t`; a file handle keeps its
-  context alive; one type for image indices; FITS to FITS is a conversion; the ASDF tree JSON test
-  hook stays out of the documented API; a progress and cancel callback before the first binding
-  is published.
+- Delivered in three patches: the internal refactor (0.9.1), the C API with the tool rebuilt on it
+  (0.10.0), the Python binding.
+
+Choices made while building the API:
+
+- **Enumerations are `int32_t`** with named constants, flags are `int32_t`, structs start with
+  `struct_size` and only grow at the end. That is what makes the header safe for ctypes, cffi,
+  bindgen and FFI::Platypus, and lets a program built against an older header run with a newer
+  library. For that to hold the `_init` functions take the size the caller compiled with: an
+  init that filled the library's idea of the struct would write behind an older program's.
+- **One context, reference-counted.** Error text, message handler and progress handler live in a
+  context. Files, reports, keyword lists and writers keep it alive, so a garbage collector may free
+  them in any order.
+- **One image model for three formats.** What all formats share is in `xisfconv_image_info`; what
+  only one has is reached by name (`xisfconv_image_detail(file, image, "compression")`), so the
+  struct does not grow with every format detail.
+- **FITS and ASDF sample formats are known only after reading.** Whether signed integers become
+  unsigned or floating point depends on the data. The info says so (`data_known`), and
+  `xisfconv_load_pixels` reads an image into the handle; the next read takes it from there.
+- **Keywords describe the buffer as it is handed over.** WCS keywords and BAYERPAT count rows from
+  the first row of the array, whichever end of the image that is; the library converts them when
+  it stores the rows the other way round. That is the rule a FITS file follows, too. XISF is the
+  exception on the reading side: its WCS keywords are bottom-up although its rows are top-down,
+  because PixInsight writes and reads them so. The image info names the row order the WCS
+  keywords describe (`wcs_row_order`), and the writer accepts the same field, so that pixels and
+  keywords read from any file can be handed back unchanged.
+- **The writer has no colour space argument.** Three channels are RGB, one is grayscale, any other
+  number is a stack of planes: the rule of the conversion from FITS.
+- **A damaged file is a finding of `xisfconv_verify`, not an error of it.** The call fails only when
+  no report can be made.
+- **Cancelling** goes through the progress handler and leaves no partly written file.
+- **Freeing a context silences its handlers.** Handles may outlive the context; what the handlers
+  point to (a Python object, say) need not.
+- **Messages keep naming the tool's options** (`--force`, `--bounds`). Making them neutral would
+  have meant rewriting them in two places to keep the tool's output unchanged; the option names
+  double as the names of the settings.
+- **The CMake package comes with the shared library only.** A static library needs its dependencies
+  (zlib, zstd) described to the consumer, which depends on how they were found; pkg-config's
+  `Libs.private` covers that case.
+- **Diagnostics** (`xisfconv_asdf_tree_text`, `xisfconv_asdf_tree_json`) are in the header for the
+  tool and the tests, marked as not stable.
 
 ## Testing
 
-- `tests/run_tests.py` drives the built program (3447 checks at 0.9.1). The Python packages it
+- `tests/run_tests.py` drives the built program (3459 checks at 0.10.0). The Python packages it
   needs are listed at its top; the `asdf` packages and the external tools (`tiffcp`, `fitsverify`,
   `pngcheck`, `fpack`/`funpack`) are used when installed and their checks skipped when not.
 - Every format is checked against an implementation that shares no code with xisfconv: astropy
@@ -166,11 +227,17 @@ as follows. The steps and their state are in `TODO.md`.
   what xisfconv writes. What was verified that way is listed in the README. A feature that follows
   the specification is not proven until PixInsight has opened its output: SHA-3 checksums passed
   every test here and were refused by PixInsight.
+- The library has tests of its own: a C99 program for the mechanics of the API (arguments, buffers,
+  lifetimes, callbacks), a Python script that calls the API through ctypes and compares what the
+  library writes and reads with astropy, the `xisf` package, asdf, tifffile and Pillow, and a
+  program that reads all there is of any file, which is what gets fuzzed.
+- Windows code is compiled with MinGW and run under Wine before delivery, since no Windows machine
+  is at hand; CI on Windows remains the real check.
 - CI builds and runs the suite on Linux, macOS and Windows.
 
 ## How changes are made
 
-- One commit per feature, with the version bumped in `src/common.hpp` and `CMakeLists.txt` and the
+- One commit per feature, with the version bumped in `include/xisfconv.h` and the
   README and `TODO.md` updated in the same commit.
 - The work is done together with Claude (Anthropic), credited as co-author in the commit messages.
   Each change is delivered as a `git format-patch` file to apply with `git am`, plus a source
@@ -182,7 +249,6 @@ as follows. The steps and their state are in `TODO.md`.
 
 ## Not decided yet
 
-- Whether error messages that name command line options (`--force`, `--bounds`) stay in the library
-  or are added by the tool.
 - Packaging of the Python binding (cffi or ctypes; wheel builds).
+- A CMake package for the static library.
 - Order of the remaining items in `TODO.md` after the library.

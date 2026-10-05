@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
+prefix=@XISFCONV_PC_PREFIX@
+exec_prefix=${prefix}
+libdir=@XISFCONV_PC_LIBDIR@
+includedir=@XISFCONV_PC_INCLUDEDIR@
+
+Name: libxisfconv
+Description: Reads and writes PixInsight XISF images and converts between XISF, FITS and ASDF
+URL: https://github.com/jkobierczynski/xisfconv
+Version: @PROJECT_VERSION@
+Libs: -L${libdir} -lxisfconv
+Libs.private: @XISFCONV_PC_LIBS_PRIVATE@
+Cflags: -I${includedir}@XISFCONV_PC_CFLAGS@

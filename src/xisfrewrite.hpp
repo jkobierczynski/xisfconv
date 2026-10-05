@@ -1,5 +1,5 @@
 // Rewrites an XISF file with another block storage (compression, checksums), and verifies files.
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 Jurgen Kobierczynski
 #pragma once
 

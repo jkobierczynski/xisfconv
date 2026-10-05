@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 Jurgen Kobierczynski
 #include "fitsread.hpp"
 
@@ -129,7 +129,8 @@ bool readHeader(std::ifstream& in, uint64_t fileSize, uint64_t& pos, Header& hdr
             throw Error("FITS header is truncated (no END card)");
         }
         in.seekg(static_cast<std::streamoff>(pos));
-        if (!in.read(&block[0], static_cast<std::streamsize>(kBlock))) throw Error("read error in FITS header");
+        if (!in.read(&block[0], static_cast<std::streamsize>(kBlock))) throw Error("read error in FITS header", ErrorKind::Io);
+        std::replace(block.begin(), block.end(), '\0', ' ');   // not valid in a header; C callers' text would end there
         pos += kBlock;
         if (first) {
             const std::string start = block.substr(0, 8);
@@ -208,6 +209,7 @@ void decodeSamples(FitsImage& img, std::vector<uint8_t>& raw) {
     PixelBuffer& px = img.pixels;
     const size_t n = static_cast<size_t>(px.samples());
     const size_t sb = static_cast<size_t>(std::abs(img.bitpix)) / 8;
+    if (raw.size() != n * sb) throw Error("the image data does not have the size the header gives it");
     if (hostIsLittleEndian()) byteSwapInPlace(raw.data(), n, sb);
     px.data.swap(raw);
 
@@ -309,7 +311,7 @@ std::string fitsUnquote(const std::string& value) {
 }
 
 bool looksLikeFits(const std::string& path) {
-    std::ifstream in(path, std::ios::binary);
+    std::ifstream in(toPath(path), std::ios::binary);
     char buf[9] = {};
     in.read(buf, 9);
     return in.gcount() == 9 && std::string(buf, 9) == "SIMPLE  =";
@@ -419,7 +421,7 @@ std::vector<uint8_t> readBytes(std::ifstream& in, uint64_t pos, uint64_t size, c
     in.clear();
     in.seekg(static_cast<std::streamoff>(pos));
     if (size && !in.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(size))) {
-        throw Error(label + ": read error in image data");
+        throw Error(label + ": read error in image data", ErrorKind::Io);
     }
     return raw;
 }
@@ -434,7 +436,7 @@ uint32_t onesComplementSum(std::ifstream& in, uint64_t pos, uint64_t size) {
     in.seekg(static_cast<std::streamoff>(pos));
     while (size > 0) {
         const size_t n = static_cast<size_t>(std::min<uint64_t>(size, 1u << 20));
-        if (!in.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(n))) throw Error("read error");
+        if (!in.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(n))) throw Error("read error", ErrorKind::Io);
         size_t words = n;
         while (words % 4 != 0) buf[words++] = 0;  // only at the very end (the chunk size is a multiple of 4)
         for (size_t i = 0; i < words; i += 4) {
@@ -458,14 +460,15 @@ uint32_t onesComplementAdd(uint32_t a, uint32_t b) {
 
 VerifyReport verifyFits(const std::string& path) {
     VerifyReport report;
-    std::ifstream in(path, std::ios::binary);
-    if (!in) throw Error("cannot open file");
+    std::ifstream in(toPath(path), std::ios::binary);
+    if (!in) throw Error("cannot open file", ErrorKind::Io);
     in.seekg(0, std::ios::end);
     const uint64_t fileSize = static_cast<uint64_t>(in.tellg());
 
     uint64_t pos = 0;
     size_t hdus = 0;
     for (size_t hduIndex = 0;; ++hduIndex) {
+        progress("verifying", pos, fileSize);
         Header hdr;
         const uint64_t headerPos = pos;
         if (!readHeader(in, fileSize, pos, hdr, hduIndex == 0)) {
@@ -478,7 +481,7 @@ VerifyReport verifyFits(const std::string& path) {
             std::vector<char> buf(65536);
             for (uint64_t left = fileSize - pos; left > 0;) {
                 const size_t n = static_cast<size_t>(std::min<uint64_t>(left, buf.size()));
-                if (!in.read(buf.data(), static_cast<std::streamsize>(n))) throw Error("read error");
+                if (!in.read(buf.data(), static_cast<std::streamsize>(n))) throw Error("read error", ErrorKind::Io);
                 for (size_t i = 0; i < n; ++i)
                     if (buf[i] != 0 && buf[i] != ' ') ++stray;
                 left -= n;
@@ -571,11 +574,11 @@ VerifyReport verifyFits(const std::string& path) {
     return report;
 }
 
-FitsFile readFits(const std::string& path, bool headersOnly) {
+FitsFile readFits(const std::string& path, bool headersOnly, std::optional<size_t> onlyImage) {
     FitsFile file;
     file.path = path;
-    std::ifstream in(path, std::ios::binary);
-    if (!in) throw Error("cannot open file");
+    std::ifstream in(toPath(path), std::ios::binary);
+    if (!in) throw Error("cannot open file", ErrorKind::Io);
     in.seekg(0, std::ios::end);
     file.fileSize = static_cast<uint64_t>(in.tellg());
 
@@ -605,6 +608,10 @@ FitsFile readFits(const std::string& path, bool headersOnly) {
             hdr.getInt("PCOUNT", pcount);
             hdr.getInt("GCOUNT", gcount);
             if (pcount < 0 || gcount < 0) throw Error("HDU " + std::to_string(hduIndex) + ": invalid PCOUNT/GCOUNT");
+            // An image is its pixels and nothing else; other values would shift or drop them.
+            if (xtension == "IMAGE" && (pcount != 0 || gcount != 1)) {
+                throw Error("HDU " + std::to_string(hduIndex) + ": an IMAGE extension must have PCOUNT = 0 and GCOUNT = 1");
+            }
         }
         uint64_t elements = dims.empty() ? 0 : 1;
         for (uint64_t d : dims) elements = checkedMul(elements, d, "FITS data size");
@@ -628,6 +635,14 @@ FitsFile readFits(const std::string& path, bool headersOnly) {
             if (!tileAlgorithmSupported(tile.algorithm)) {
                 file.skipped.push_back(label + ": tile-compressed image (" + (tile.algorithm.empty() ? "unknown method" : tile.algorithm) +
                                        "), which is not supported; decompress it with funpack first");
+                continue;
+            }
+            // Known from the header alone, so that the image is left out of every kind of read
+            // and the numbering of the others does not depend on whether pixels are read.
+            if ((tile.algorithm == "RICE_1" || tile.algorithm == "RICE_ONE") && tile.riceBytePix != 1 && tile.riceBytePix != 2 &&
+                tile.riceBytePix != 4) {
+                file.skipped.push_back(label + ": tile-compressed image: Rice compression with " + std::to_string(tile.riceBytePix) +
+                                       " bytes per pixel is not supported");
                 continue;
             }
             bitpix = tile.bitpix;
@@ -671,7 +686,7 @@ FitsFile readFits(const std::string& path, bool headersOnly) {
             img.hasRowOrder = true;
             img.topDown = rowOrder == "TOP-DOWN";
         }
-        if (hdr.find("BLANK") && bitpix > 0) {
+        if (hdr.find("BLANK") && bitpix > 0 && (!onlyImage || *onlyImage == file.images.size())) {
             warn(label + ": BLANK (undefined) pixels are kept as ordinary sample values");
         }
         for (const auto& c : hdr.cards) {
@@ -682,16 +697,17 @@ FitsFile readFits(const std::string& path, bool headersOnly) {
             img.keywords.push_back({c.name, c.value, c.comment});
         }
 
-        if (!headersOnly) {
+        if (!headersOnly && (!onlyImage || *onlyImage == file.images.size())) {
             std::vector<uint8_t> raw = readBytes(in, dataPos, dataBytes, label);
             if (tiled) {
                 try {
                     raw = decodeTiledImage(tile, raw);
                 } catch (const Unsupported& e) {
+                    if (onlyImage) throw Unsupported(label + ": tile-compressed image: " + e.what());
                     file.skipped.push_back(label + ": tile-compressed image: " + e.what());
                     continue;
                 } catch (const Error& e) {
-                    throw Error(label + ": tile-compressed image: " + e.what());
+                    throw Error(label + ": tile-compressed image: " + e.what(), e.kind);
                 }
             }
             decodeSamples(img, raw);
@@ -699,6 +715,7 @@ FitsFile readFits(const std::string& path, bool headersOnly) {
             img.hasData = true;
         }
         file.images.push_back(std::move(img));
+        if (onlyImage && file.images.size() > *onlyImage) break;   // the one image that was asked for is read
     }
     return file;
 }

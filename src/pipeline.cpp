@@ -1,6 +1,6 @@
 // Converting whole files: XISF to FITS, ASDF, TIFF or PNG; FITS and ASDF to XISF, to each other,
 // or to TIFF or PNG; and rewriting an XISF file, also in place.
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 Jurgen Kobierczynski
 #include "pipeline.hpp"
 
@@ -124,9 +124,14 @@ std::string stretchDescription(const std::string& how, const std::vector<Stretch
     std::string desc = how + ":";
     char buf[96];
     for (size_t c = 0; c < params.size(); ++c) {
-        std::snprintf(buf, sizeof buf, " c%zu s=%.6f m=%.6f h=%.6f", c, params[c].shadows, params[c].midtones,
-                      params[c].highlights);
+        std::snprintf(buf, sizeof buf, " c%zu s=", c);
         desc += buf;
+        std::snprintf(buf, sizeof buf, "%.6f", params[c].shadows);
+        desc += cNumber(buf) + " m=";
+        std::snprintf(buf, sizeof buf, "%.6f", params[c].midtones);
+        desc += cNumber(buf) + " h=";
+        std::snprintf(buf, sizeof buf, "%.6f", params[c].highlights);
+        desc += cNumber(buf);
     }
     return desc;
 }
@@ -136,12 +141,14 @@ std::string stretchDescription(const std::string& how, const std::vector<Stretch
 std::string partPathFor(const std::string& outPath, const std::string& input, bool force) {
     const std::string tmpPath = outPath + ".part";
     std::error_code ec;
-    if (fs::exists(tmpPath, ec)) {
-        if (fs::equivalent(tmpPath, input, ec)) {
-            throw Error("the temporary file for this output, " + tmpPath + ", is the input file; choose another output name");
+    if (fs::exists(toPath(tmpPath), ec)) {
+        if (!input.empty() && fs::equivalent(toPath(tmpPath), toPath(input), ec)) {
+            throw Error("the temporary file for this output, " + tmpPath + ", is the input file; choose another output name",
+                        ErrorKind::Argument);
         }
         if (!force) {
-            throw Error(tmpPath + " exists (left by an interrupted run?); delete it, or use --force to overwrite it");
+            throw Error(tmpPath + " exists (left by an interrupted run?); delete it, or use --force to overwrite it",
+                        ErrorKind::Exists);
         }
     }
     return tmpPath;
@@ -151,7 +158,7 @@ std::string partPathFor(const std::string& outPath, const std::string& input, bo
 void syncToDisk(const std::string& path, bool directory) {
 #ifdef _WIN32
     if (directory) return;
-    const int fd = _open(path.c_str(), _O_RDWR | _O_BINARY);
+    const int fd = _wopen(toPath(path).c_str(), _O_RDWR | _O_BINARY);
     if (fd >= 0) {
         _commit(fd);
         _close(fd);
@@ -167,23 +174,40 @@ void syncToDisk(const std::string& path, bool directory) {
 
 void replaceFile(const std::string& tmpPath, const std::string& outPath) {
     std::error_code ec;
-    fs::rename(tmpPath, outPath, ec);
+    fs::rename(toPath(tmpPath), toPath(outPath), ec);
     if (ec) {
-        fs::remove(outPath, ec);
-        fs::rename(tmpPath, outPath);
+        // where a file cannot be renamed over an existing one
+        fs::remove(toPath(outPath), ec);
+        fs::rename(toPath(tmpPath), toPath(outPath));   // throws std::filesystem::filesystem_error: an I/O error
+    }
+}
+
+void removeFile(const std::string& path) {
+    std::error_code ec;
+    fs::remove(toPath(path), ec);
+}
+
+// Refuses an output that exists (unless it may be overwritten) or that is the input itself.
+void checkOutput(const std::string& outPath, const std::string& input, bool force) {
+    if (fs::exists(toPath(outPath)) && !force) throw Error(outPath + " already exists (use --force to overwrite)", ErrorKind::Exists);
+    if (!input.empty() && fs::exists(toPath(outPath)) && fs::equivalent(toPath(outPath), toPath(input))) {
+        throw Error("output would overwrite the input file", ErrorKind::Argument);
     }
 }
 
 // Chooses the range of floating point data: the XISF bounds attribute, or black and white when
 // exporting to TIFF or PNG (`display`).
 std::pair<double, double> floatBounds(const FitsImage& img, const ConvertOptions& opt, std::string& how, bool display = false) {
+    if (img.bounds) return *img.bounds;
     if (opt.bounds) {
         how = display ? "range set with --bounds" : "bounds set with --bounds";
         return *opt.bounds;
     }
     if (img.dataMin >= 0 && img.dataMax <= 1) return {0.0, 1.0};
-    char span[96];
-    std::snprintf(span, sizeof span, "float data spans %g..%g: ", img.dataMin, img.dataMax);
+    char low[48], high[48];
+    std::snprintf(low, sizeof low, "%g", img.dataMin);
+    std::snprintf(high, sizeof high, "%g", img.dataMax);
+    const std::string span = "float data spans " + cNumber(low) + ".." + cNumber(high) + ": ";
     const char* hint = " (override with --bounds)";
     if (img.dataMin >= 0 && img.dataMax <= 65535) {
         how = std::string(span) + (display ? "0:65535 taken as black:white" : "bounds set to 0:65535") + hint;
@@ -205,21 +229,23 @@ XisfFileRewrite rewriteXisfFile(const std::string& input, const std::string& out
                                 XisfRewriteOptions ropt) {
     XisfFileRewrite done;
     std::error_code sizeError;
-    done.inputSize = static_cast<uint64_t>(fs::file_size(input, sizeError));
+    done.inputSize = static_cast<uint64_t>(fs::file_size(toPath(input), sizeError));
     // In place, the file itself is replaced, not a link that leads to it.
     std::error_code pathError;
-    const fs::path real = fs::canonical(input, pathError);
-    const std::string outPath = !inPlace ? output : pathError ? input : real.string();
+    const fs::path real = fs::canonical(toPath(input), pathError);
+    const std::string outPath = !inPlace ? output : pathError ? input : fromPath(real);
     done.output = outPath;
-    const bool same = fs::exists(outPath) && fs::equivalent(outPath, input);
+    const bool same = fs::exists(toPath(outPath)) && fs::equivalent(toPath(outPath), toPath(input));
     if (same && !inPlace) {
         throw Error("the output would overwrite the input file; add --in-place to replace it, or name another file "
-                    "or directory with -o or -d");
+                    "or directory with -o or -d", ErrorKind::Argument);
     }
-    if (!same && fs::exists(outPath) && !force) throw Error(outPath + " already exists (use --force to overwrite)");
-    const fs::perms permissions = fs::status(input).permissions();
+    if (!same && fs::exists(toPath(outPath)) && !force) {
+        throw Error(outPath + " already exists (use --force to overwrite)", ErrorKind::Exists);
+    }
+    const fs::perms permissions = fs::status(toPath(input)).permissions();
     if (same && (permissions & (fs::perms::owner_write | fs::perms::group_write | fs::perms::others_write)) == fs::perms::none) {
-        throw Error("the file is read-only; it is not replaced");
+        throw Error("the file is read-only; it is not replaced", ErrorKind::Io);
     }
     ropt.readBack = ropt.readBack || same;  // a file that replaces its source is always read back first
 
@@ -235,13 +261,11 @@ XisfFileRewrite rewriteXisfFile(const std::string& input, const std::string& out
         r = rewriteXisf(input, tmpPath, ropt);
         if (!same) replaceFile(tmpPath, outPath);
     } catch (...) {
-        std::error_code ec;
-        fs::remove(tmpPath, ec);
+        removeFile(tmpPath);
         throw;
     }
     if (same && !r.changed) {
-        std::error_code ec;
-        fs::remove(tmpPath, ec);
+        removeFile(tmpPath);
         done.unchanged = true;
         return done;
     }
@@ -249,24 +273,27 @@ XisfFileRewrite rewriteXisfFile(const std::string& input, const std::string& out
         // The original is only ever replaced by a rename, once the new file is on the disk with
         // the permissions of the old one; if the rename fails both files stay.
         std::error_code ec;
-        fs::permissions(tmpPath, permissions, ec);
+        fs::permissions(toPath(tmpPath), permissions, ec);
         syncToDisk(tmpPath, false);
-        fs::rename(tmpPath, outPath, ec);
-        if (ec) throw Error("could not replace the file (" + ec.message() + "); the rewritten copy is kept as " + tmpPath);
-        syncToDisk(fs::path(outPath).parent_path().empty() ? "." : fs::path(outPath).parent_path().string(), true);
+        fs::rename(toPath(tmpPath), toPath(outPath), ec);
+        if (ec) {
+            throw Error("could not replace the file (" + ec.message() + "); the rewritten copy is kept as " + tmpPath, ErrorKind::Io);
+        }
+        const fs::path parent = toPath(outPath).parent_path();
+        syncToDisk(parent.empty() ? "." : fromPath(parent), true);
     }
     return done;
 }
 
 void convertXisfFile(const std::string& input, const std::string& outPath, Format format, const ConvertOptions& opt) {
-    if (format == Format::Xisf) throw Error("XISF to XISF is a rewrite, not a conversion");
+    if (format == Format::Xisf) throw Error("XISF to XISF is a rewrite, not a conversion", ErrorKind::Argument);
     XisfFile file(input);
 
     std::vector<size_t> indices;
     if (opt.imageIndex) {
         if (*opt.imageIndex >= file.images().size()) {
             throw Error("image index " + std::to_string(*opt.imageIndex) + " out of range (file has " +
-                        std::to_string(file.images().size()) + ")");
+                        std::to_string(file.images().size()) + ")", ErrorKind::Index);
         }
         indices.push_back(*opt.imageIndex);
     } else {
@@ -284,17 +311,17 @@ void convertXisfFile(const std::string& input, const std::string& outPath, Forma
             indices.resize(1);
         }
         if (opt.bits && *opt.bits != SampleFormat::UInt8 && *opt.bits != SampleFormat::UInt16) {
-            throw Error("PNG supports only --bits u8 or u16");
+            throw Error("PNG supports only --bits u8 or u16", ErrorKind::Argument);
         }
     }
 
-    if (fs::exists(outPath) && !opt.force) throw Error(outPath + " already exists (use --force to overwrite)");
-    if (fs::exists(outPath) && fs::equivalent(outPath, input)) throw Error("output would overwrite the input file");
+    checkOutput(outPath, input, opt.force);
 
     std::vector<PixelBuffer> buffers;
     std::vector<std::string> stretchNotes;  // HISTORY text per converted image
     buffers.reserve(indices.size());
     for (size_t idx : indices) {
+        progress("reading", buffers.size(), indices.size());
         const XisfImage& img = file.images()[idx];
         PixelBuffer px = file.readPixels(idx, opt.verify);
         if (opt.stretch != Stretch::None) {
@@ -312,7 +339,7 @@ void convertXisfFile(const std::string& input, const std::string& outPath, Forma
             } else {
                 if (opt.stretch == Stretch::Stored) {
                     throw Error("image " + std::to_string(idx) + " has no saved STF (DisplayFunction); "
-                                "use --stretch=linked or --stretch=unlinked");
+                                "use --stretch=linked or --stretch=unlinked", ErrorKind::NotFound);
                 }
                 const bool linked = opt.stretch != Stretch::Unlinked;
                 params = autoStretch(px, img.lowerBound, img.upperBound, colorChannels, linked);
@@ -359,6 +386,7 @@ void convertXisfFile(const std::string& input, const std::string& outPath, Forma
     }
 
     const std::string tmpPath = partPathFor(outPath, input, opt.force);
+    progress("writing", 0, 0);
     try {
         if (fitsLike) {
             std::vector<FitsHdu> hdus;
@@ -452,38 +480,35 @@ void convertXisfFile(const std::string& input, const std::string& outPath, Forma
             }
             writePng(tmpPath, png);
         }
-        std::error_code ec;
-        fs::rename(tmpPath, outPath, ec);
-        if (ec) {
-            fs::remove(outPath, ec);
-            fs::rename(tmpPath, outPath);
-        }
+        replaceFile(tmpPath, outPath);
     } catch (...) {
-        std::error_code ec;
-        fs::remove(tmpPath, ec);
+        removeFile(tmpPath);
         throw;
     }
 }
 
 void convertFitsOrAsdfFile(const std::string& input, InputFormat kind, const std::string& outPath, Format format,
                            const ConvertOptions& opt) {
-    if (kind == InputFormat::Xisf) throw Error("not a FITS or ASDF file");
+    if (kind == InputFormat::Xisf) throw Error("not a FITS or ASDF file", ErrorKind::Argument);
     const bool asdfInput = kind == InputFormat::Asdf;
     const char* inputName = asdfInput ? "ASDF" : "FITS";
     const bool exporting = format == Format::Tiff || format == Format::Png;
     if (asdfInput && format == Format::Asdf) {
-        throw Error("the input is already an ASDF file; choose xisf, fits, tiff or png as output");
+        throw Error("the input is already an ASDF file; choose xisf, fits, tiff or png as output", ErrorKind::Argument);
     }
     if (opt.stretch != Stretch::None && !exporting) {
-        throw Error(std::string("--stretch is for viewing: from ") + inputName + " input it is available for TIFF and PNG output");
+        throw Error(std::string("--stretch is for viewing: from ") + inputName + " input it is available for TIFF and PNG output",
+                    ErrorKind::Argument);
     }
     if (opt.stretch == Stretch::Stored) {
-        throw Error(std::string(inputName) + " files carry no saved STF; use --stretch, --stretch=linked or --stretch=unlinked");
+        throw Error(std::string(inputName) + " files carry no saved STF; use --stretch, --stretch=linked or --stretch=unlinked",
+                    ErrorKind::NotFound);
     }
     if (format == Format::Png && opt.bits && *opt.bits != SampleFormat::UInt8 && *opt.bits != SampleFormat::UInt16) {
-        throw Error("PNG supports only --bits u8 or u16");
+        throw Error("PNG supports only --bits u8 or u16", ErrorKind::Argument);
     }
 
+    progress("reading", 0, 0);
     FitsFile fits = asdfInput ? readAsdf(input, false, opt.verify) : readFits(input);
     for (const auto& s : fits.skipped) warn("skipped " + s);
     if (fits.images.empty()) throw Error(std::string("no image data found in this ") + inputName + " file");
@@ -492,14 +517,46 @@ void convertFitsOrAsdfFile(const std::string& input, InputFormat kind, const std
         bool tiled = false;
         for (const auto& img : fits.images)
             if (!img.tileCompression.empty()) tiled = true;
-        if (!tiled) throw Error("the input is already a FITS file; choose xisf, asdf, tiff or png as output");
+        if (!tiled) {
+            throw Error("the input is already a FITS file; choose xisf, asdf, tiff or png as output", ErrorKind::Argument);
+        }
     }
+    ImageSetOrigin origin;
+    origin.format = inputName;
+    origin.input = input;
+    origin.defaultName = fromPath(toPath(input).stem());
+    writeImageSet(fits, origin, outPath, format, opt);
+}
+
+std::pair<double, double> automaticBounds(const FitsImage& image) {
+    std::string how;
+    return floatBounds(image, ConvertOptions(), how);
+}
+
+void flipImageRows(FitsImage& img) {
+    flipVertical(img.pixels);
+    if (FitsKeyword* bp = findKeyword(img.keywords, "BAYERPAT")) {
+        const std::string pattern = fitsUnquote(bp->value);
+        if (pattern.size() == 4) bp->value = fitsString(flipPatternRows(pattern, 2, 2, img.pixels.height));
+        else warn("cannot adjust BAYERPAT " + bp->value + " for the changed row order; check it manually");
+    }
+    flipWcsRowOrder(img.keywords, img.pixels.height);
+    img.topDown = !img.topDown;
+    img.hasRowOrder = true;
+}
+
+void writeImageSet(FitsFile& fits, const ImageSetOrigin& source, const std::string& outPath, Format format,
+                   const ConvertOptions& opt) {
+    const bool asdfInput = source.format == "ASDF";
+    const bool exporting = format == Format::Tiff || format == Format::Png;
+    const std::string& input = source.input;
+    if (fits.images.empty()) throw Error("no images to write", ErrorKind::Argument);
 
     std::vector<size_t> indices;
     if (opt.imageIndex) {
         if (*opt.imageIndex >= fits.images.size()) {
             throw Error("image index " + std::to_string(*opt.imageIndex) + " out of range (file has " +
-                        std::to_string(fits.images.size()) + " image(s))");
+                        std::to_string(fits.images.size()) + " image(s))", ErrorKind::Index);
         }
         indices.push_back(*opt.imageIndex);
     } else {
@@ -510,19 +567,21 @@ void convertFitsOrAsdfFile(const std::string& input, InputFormat kind, const std
         indices.resize(1);
     }
 
-    if (fs::exists(outPath) && !opt.force) throw Error(outPath + " already exists (use --force to overwrite)");
-    if (fs::exists(outPath) && fs::equivalent(outPath, input)) throw Error("output would overwrite the input file");
+    checkOutput(outPath, input, opt.force);
 
     auto origin = [&](const FitsImage& img) {
         return asdfInput ? " (" + img.source + ")" : " (HDU " + std::to_string(img.hduIndex) + ")";
     };
-    const std::string history = std::string("Converted from ") + inputName + " by xisfconv " + kVersion;
+    // Images that come from a file say so in their header; images handed over in memory do not.
+    const std::string history = source.format.empty() ? std::string() : "Converted from " + source.format + " by xisfconv " + kVersion;
     const std::string tmpPath = partPathFor(outPath, input, opt.force);
+    progress("writing", 0, 0);
 
     if (exporting) {
         // TIFF and PNG: rows top-down, floating point data scaled so that its range is 0..1.
         std::vector<PixelBuffer> buffers;   // one per page; planes of a cube that is not RGB become pages
         std::vector<std::string> names;
+        std::vector<std::vector<uint8_t>> profiles;   // ICC profiles, only for images handed over in memory
         for (size_t idx : indices) {
             FitsImage& img = fits.images[idx];
             PixelBuffer& px = img.pixels;
@@ -563,7 +622,7 @@ void convertFitsOrAsdfFile(const std::string& input, InputFormat kind, const std
                 warn(label + ": " + sampleFormatName(px.format) +
                      " TIFF is not supported by many programs; consider --bits u16 or --bits f32");
             }
-            {
+            if (source.notes) {
                 std::string line = label + origin(img) + ": " + img.note + ", rows " +
                                    (topDown ? "top-down" : (img.generic && !img.hasRowOrder && !opt.rowOrderGiven)
                                                                ? "assumed bottom-up (flipped; add --top-down if the image comes out "
@@ -577,10 +636,11 @@ void convertFitsOrAsdfFile(const std::string& input, InputFormat kind, const std
                     info("linear data may look dark in PNG; add --stretch for a viewable image");
                 }
             }
-            const std::string name = img.name.empty() ? fs::path(input).stem().string() : img.name;
+            const std::string name = img.name.empty() ? source.defaultName : img.name;
             if (px.channels == 1 || px.channels == 3) {
                 buffers.push_back(std::move(px));
                 names.push_back(name);
+                profiles.push_back(img.iccProfile);
                 continue;
             }
             // A cube that is not an RGB image: one grayscale page per plane.
@@ -599,6 +659,7 @@ void convertFitsOrAsdfFile(const std::string& input, InputFormat kind, const std
                                   px.data.begin() + static_cast<std::ptrdiff_t>((c + 1) * planeBytes));
                 buffers.push_back(std::move(plane));
                 names.push_back(name + " plane " + std::to_string(c));
+                profiles.push_back(img.iccProfile);
             }
             px.data.clear();
             px.data.shrink_to_fit();
@@ -610,6 +671,7 @@ void convertFitsOrAsdfFile(const std::string& input, InputFormat kind, const std
                     TiffPage page;
                     page.pixels = &buffers[n];
                     page.rgb = buffers[n].channels == 3;
+                    page.iccProfile = profiles[n];
                     page.description = names[n];
                     pages.push_back(std::move(page));
                 }
@@ -618,12 +680,12 @@ void convertFitsOrAsdfFile(const std::string& input, InputFormat kind, const std
                 PngImage png;
                 png.pixels = &buffers[0];
                 png.rgb = buffers[0].channels == 3;
+                png.iccProfile = profiles[0];
                 writePng(tmpPath, png);
             }
             replaceFile(tmpPath, outPath);
         } catch (...) {
-            std::error_code ec;
-            fs::remove(tmpPath, ec);
+            removeFile(tmpPath);
             throw;
         }
         return;
@@ -649,8 +711,8 @@ void convertFitsOrAsdfFile(const std::string& input, InputFormat kind, const std
             hdu.keywords = img.keywords;
             hdu.extname = img.name;
             hdu.bottomUp = !topDown;
-            hdu.keywords.push_back({"HISTORY", "", history});
-            {
+            if (!history.empty()) hdu.keywords.push_back({"HISTORY", "", history});
+            if (source.notes) {
                 std::string line = label + origin(img) + ": " + img.note + ", rows " +
                                    (img.hasRowOrder || opt.rowOrderGiven || !img.generic ? "" : "assumed ") +
                                    (topDown ? "top-down" : "bottom-up") + " (kept)";
@@ -669,8 +731,7 @@ void convertFitsOrAsdfFile(const std::string& input, InputFormat kind, const std
             }
             replaceFile(tmpPath, outPath);
         } catch (...) {
-            std::error_code ec;
-            fs::remove(tmpPath, ec);
+            removeFile(tmpPath);
             throw;
         }
         return;
@@ -699,7 +760,7 @@ void convertFitsOrAsdfFile(const std::string& input, InputFormat kind, const std
 
         XisfOutImage o;
         o.pixels = &px;
-        o.id = img.name.empty() ? fs::path(input).stem().string() : img.name;
+        o.id = img.name.empty() ? source.defaultName : img.name;
         o.rgb = px.channels == 3;
         std::string boundsNote;
         if (isFloat(px.format)) {
@@ -731,6 +792,7 @@ void convertFitsOrAsdfFile(const std::string& input, InputFormat kind, const std
             }
         }
         o.keywords = img.keywords;
+        o.iccProfile = img.iccProfile;
         std::string solutionNote;
         if (opt.wcs) {
             // The keywords are now in the bottom-up convention PixInsight uses. PixInsight reads only
@@ -741,8 +803,8 @@ void convertFitsOrAsdfFile(const std::string& input, InputFormat kind, const std
                 solutionNote.clear();
             }
         }
-        o.keywords.push_back({"HISTORY", "", history});
-        {
+        if (!history.empty()) o.keywords.push_back({"HISTORY", "", history});
+        if (source.notes) {
             const bool assumed = img.generic && !img.hasRowOrder && !opt.rowOrderGiven;
             std::string line = label + origin(img) + ": " + img.note + ", rows " +
                                (topDown ? "top-down (kept)"
@@ -765,8 +827,7 @@ void convertFitsOrAsdfFile(const std::string& input, InputFormat kind, const std
         writeXisf(tmpPath, out, wopt);
         replaceFile(tmpPath, outPath);
     } catch (...) {
-        std::error_code ec;
-        fs::remove(tmpPath, ec);
+        removeFile(tmpPath);
         throw;
     }
 }

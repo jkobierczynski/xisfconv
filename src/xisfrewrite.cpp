@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 Jurgen Kobierczynski
 #include "xisfrewrite.hpp"
 
@@ -283,6 +283,7 @@ void readBack(const std::string& path, const std::vector<Fingerprint>& expected,
     }
     if (blocks.size() != expected.size()) throw Error("read-back: the output has a different number of data blocks");
     for (size_t i = 0; i < blocks.size(); ++i) {
+        progress("comparing", i, blocks.size());
         const std::string& what = expected[i].what;
         const XisfStoredBlock sb = out.readStoredBlock(*blocks[i].node, what);
         XisfFile::verifyBlockChecksum(sb, what);
@@ -302,15 +303,15 @@ void readBack(const std::string& path, const std::vector<Fingerprint>& expected,
 
 XisfRewriteResult rewriteXisf(const std::string& input, const std::string& output, const XisfRewriteOptions& opt) {
     if (!opt.codec.empty() && opt.codec != "none" && opt.codec != "zlib" && opt.codec != "zstd") {
-        throw Error("unsupported XISF compression codec '" + opt.codec + "' (use zlib, zstd or none)");
+        throw Error("unsupported XISF compression codec '" + opt.codec + "' (use zlib, zstd or none)", ErrorKind::Argument);
     }
-    if (opt.codec == "zstd" && !zstdAvailable()) throw Error("this build has no Zstandard support; use --codec zlib");
+    if (opt.codec == "zstd" && !zstdAvailable()) throw Unsupported("this build has no Zstandard support; use --codec zlib");
     const bool recompress = opt.codec == "zlib" || opt.codec == "zstd";
     warnIfChecksumUnknownToPixInsight(opt.checksum);
 
     {
         std::error_code ec;
-        if (std::filesystem::exists(output, ec) && std::filesystem::equivalent(input, output, ec)) {
+        if (std::filesystem::exists(toPath(output), ec) && std::filesystem::equivalent(toPath(input), toPath(output), ec)) {
             throw Error("internal error: the output of a rewrite is its input");
         }
     }
@@ -324,7 +325,7 @@ XisfRewriteResult rewriteXisf(const std::string& input, const std::string& outpu
     if (opt.imageIndex) {
         if (*opt.imageIndex >= in.images().size()) {
             throw Error("image index " + std::to_string(*opt.imageIndex) + " out of range (file has " +
-                        std::to_string(in.images().size()) + ")");
+                        std::to_string(in.images().size()) + ")", ErrorKind::Index);
         }
         for (size_t i = 0; i < in.images().size(); ++i) {
             if (i == *opt.imageIndex) continue;
@@ -348,19 +349,27 @@ XisfRewriteResult rewriteXisf(const std::string& input, const std::string& outpu
         const auto parts = split(location, ':');
         uint64_t size = 0;
         if (parts.size() == 3) parseUInt64(parts[2], size);
-        if (const std::string* c = b.node->attr("compression")) size = std::max(size, parseXisfCompression(*c).uncompressedSize);
+        // Sizes a damaged header declares must not decide how much is written: a block cannot be
+        // larger than the file, nor expand beyond what any codec achieves. Reading the block
+        // reports such a header further down.
+        size = std::min(size, in.fileSize());
+        if (const std::string* c = b.node->attr("compression")) {
+            size = std::max(size, std::min(parseXisfCompression(*c).uncompressedSize, (size + 1) << 20));
+        }
         reserve += 44 * (size / std::max<uint64_t>(1, opt.subblockSize) + 1);  // one subblocks entry per chunk
     }
     const uint64_t firstPosition = 16 + reserve;  // each block is aligned as needed when it is written
 
-    std::ofstream out(output, std::ios::binary | std::ios::trunc);
-    if (!out) throw Error("cannot create " + output);
+    std::ofstream out(toPath(output), std::ios::binary | std::ios::trunc);
+    if (!out) throw Error("cannot create " + output, ErrorKind::Io);
     writeZeros(out, firstPosition);
     uint64_t pos = firstPosition;
 
     std::vector<Fingerprint> fingerprints;
     bool unaligned = false;
+    size_t written = 0;
     for (const BlockRef& b : blocks) {
+        progress("rewriting", written++, blocks.size());
         const xml::Node& node = *b.node;
         if (!startsWith(*node.attr("location"), "attachment:")) {
             // Inline and embedded blocks stay in the header as they are.
@@ -432,7 +441,7 @@ XisfRewriteResult rewriteXisf(const std::string& input, const std::string& outpu
         } else if (!opt.checksum.empty()) {
             // A block that is copied and already carries this kind of checksum keeps it.
             if (!(verbatim && checksumAlgorithm(checksum) == checksumAlgorithm(opt.checksum)) && !digest(opt.checksum)) {
-                throw Error("unsupported checksum algorithm '" + opt.checksum + "'");
+                throw Error("unsupported checksum algorithm '" + opt.checksum + "'", ErrorKind::Argument);
             }
         } else if (!verbatim && !checksum.empty()) {
             // The stored bytes changed: the checksum is computed again with the algorithm the file uses.
@@ -451,7 +460,7 @@ XisfRewriteResult rewriteXisf(const std::string& input, const std::string& outpu
         if (at % kAlignment != 0) unaligned = true;
         writeZeros(out, at - pos);
         writeBytes(out, stored->data(), size);
-        if (!out) throw Error("write error on " + output);
+        if (!out) throw Error("write error on " + output, ErrorKind::Io);
         pos = at + size;
         ++result.blocks;
 
@@ -509,7 +518,7 @@ XisfRewriteResult rewriteXisf(const std::string& input, const std::string& outpu
     out.write(reinterpret_cast<const char*>(preamble), 16);
     out.write(header.data(), static_cast<std::streamsize>(header.size()));
     out.close();
-    if (!out) throw Error("write error on " + output);
+    if (!out) throw Error("write error on " + output, ErrorKind::Io);
 
     if (opt.readBack) {
         readBack(output, fingerprints, opt.imageIndex ? 1 : in.images().size());
@@ -520,7 +529,7 @@ XisfRewriteResult rewriteXisf(const std::string& input, const std::string& outpu
     }
     result.changed = result.compressed + result.decompressed + result.checksums + result.checksumsRemoved > 0 || !removed.empty();
     std::error_code ec;
-    result.outputSize = static_cast<uint64_t>(std::filesystem::file_size(output, ec));
+    result.outputSize = static_cast<uint64_t>(std::filesystem::file_size(toPath(output), ec));
     return result;
 }
 
@@ -549,7 +558,9 @@ VerifyReport verifyXisf(const std::string& path) {
     VerifyReport report;
     XisfFile file(path);
     const std::vector<BlockRef> blocks = collectBlocks(file, {});
+    size_t done = 0;
     for (const BlockRef& b : blocks) {
+        progress("verifying", done++, blocks.size());
         try {
             const XisfStoredBlock sb = file.readStoredBlock(*b.node, b.what);
             const XisfChecksumState state = XisfFile::verifyBlockChecksum(sb, b.what);

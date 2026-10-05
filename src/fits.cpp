@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 Jurgen Kobierczynski
 #include "fits.hpp"
 
@@ -244,6 +244,8 @@ std::string fitsString(const std::string& s) {
 std::string fitsReal(double v) {
     char buf[40];
     std::snprintf(buf, sizeof buf, "%.12G", v);
+    const std::string printed = cNumber(buf);
+    std::snprintf(buf, sizeof buf, "%s", printed.c_str());
     std::string s = buf;
     if (s.find_first_of(".EN") == std::string::npos) s += ".0";
     return s;
@@ -263,8 +265,8 @@ bool isReservedFitsKeyword(const std::string& rawName) {
 }
 
 void writeFits(const std::string& path, const std::vector<FitsHdu>& hdus) {
-    std::ofstream out(path, std::ios::binary | std::ios::trunc);
-    if (!out) throw Error("cannot create " + path);
+    std::ofstream out(toPath(path), std::ios::binary | std::ios::trunc);
+    if (!out) throw Error("cannot create " + path, ErrorKind::Io);
 
     for (size_t h = 0; h < hdus.size(); ++h) {
         const FitsHdu& hdu = hdus[h];
@@ -331,10 +333,10 @@ void writeFits(const std::string& path, const std::vector<FitsHdu>& hdus) {
         header.append((kBlock - header.size() % kBlock) % kBlock, ' ');
         out.write(header.data(), static_cast<std::streamsize>(header.size()));
         writeData(out, px);
-        if (!out) throw Error("write error on " + path);
+        if (!out) throw Error("write error on " + path, ErrorKind::Io);
     }
     out.close();
-    if (!out) throw Error("write error on " + path);
+    if (!out) throw Error("write error on " + path, ErrorKind::Io);
 }
 
 }  // namespace xisfconv

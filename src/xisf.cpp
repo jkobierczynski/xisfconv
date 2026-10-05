@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 Jurgen Kobierczynski
 #include "xisf.hpp"
 
@@ -104,14 +104,14 @@ XisfChecksumState XisfFile::verifyBlockChecksum(const XisfStoredBlock& block, co
     }
     if (actual != expected) {
         throw Error("checksum mismatch on " + what + " (" + algo + "): file is corrupt "
-                    "(use --no-verify to convert anyway)");
+                    "(use --no-verify to convert anyway)", ErrorKind::Checksum);
     }
     return XisfChecksumState::Verified;
 }
 
 XisfFile::XisfFile(const std::string& path) : path_(path) {
-    file_.open(path, std::ios::binary);
-    if (!file_) throw Error("cannot open file");
+    file_.open(toPath(path), std::ios::binary);
+    if (!file_) throw Error("cannot open file", ErrorKind::Io);
     file_.seekg(0, std::ios::end);
     fileSize_ = static_cast<uint64_t>(file_.tellg());
     file_.seekg(0);
@@ -311,7 +311,7 @@ std::vector<uint8_t> XisfFile::readAttachment(uint64_t position, uint64_t size) 
     file_.clear();
     file_.seekg(static_cast<std::streamoff>(position));
     if (size > 0 && !file_.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(size))) {
-        throw Error("read error in data block");
+        throw Error("read error in data block", ErrorKind::Io);
     }
     return buf;
 }
@@ -415,7 +415,7 @@ bool DisplayFunction::isIdentity() const {
 
 PixelBuffer XisfFile::readPixels(size_t index, bool verify) {
     const XisfImage& img = images_.at(index);
-    if (!img.unsupported.empty()) throw Error("image " + std::to_string(index) + ": " + img.unsupported);
+    if (!img.unsupported.empty()) throw Unsupported("image " + std::to_string(index) + ": " + img.unsupported);
 
     const size_t sb = sampleBytes(img.format);
     const uint64_t expected = checkedMul(checkedMul(checkedMul(img.width, img.height, "image size"), img.channels,

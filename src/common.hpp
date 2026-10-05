@@ -1,29 +1,55 @@
 // xisfconv - XISF <-> FITS <-> ASDF converter with TIFF/PNG export
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 Jurgen Kobierczynski
 #pragma once
 
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <functional>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
+#include "xisfconv.h"
+
 namespace xisfconv {
 
-constexpr const char* kVersion = "0.9.2";
+// The version is that of the public header: XISFCONV_VERSION_MAJOR, _MINOR and _PATCH.
+#define XISFCONV_STRINGIFY_2(x) #x
+#define XISFCONV_STRINGIFY(x) XISFCONV_STRINGIFY_2(x)
+constexpr const char* kVersion = XISFCONV_STRINGIFY(XISFCONV_VERSION_MAJOR) "." XISFCONV_STRINGIFY(XISFCONV_VERSION_MINOR) "."
+                                 XISFCONV_STRINGIFY(XISFCONV_VERSION_PATCH);
+
+// What went wrong, for callers that have to tell the cases apart (the C API's status codes).
+enum class ErrorKind {
+    Format,       // the file is malformed or truncated
+    Io,           // cannot open, read, write or rename
+    Unsupported,  // a feature this library, or this build of it, does not implement
+    Checksum,     // a stored checksum does not match the data
+    Argument,     // an option that is out of range or does not apply
+    Index,        // no image with that index
+    Exists,       // the output exists and may not be overwritten
+    NotFound,     // what was asked for is not in the file
+    Cancelled     // the progress handler asked to stop
+};
 
 struct Error : std::runtime_error {
-    using std::runtime_error::runtime_error;
+    explicit Error(const std::string& message, ErrorKind kind = ErrorKind::Format) : std::runtime_error(message), kind(kind) {}
+    ErrorKind kind;
 };
 
 // A feature of the file that this program (or this build of it) does not implement. The file
 // itself may be perfectly fine.
 struct Unsupported : Error {
-    using Error::Error;
+    explicit Unsupported(const std::string& message) : Error(message, ErrorKind::Unsupported) {}
 };
+
+// File names are UTF-8 everywhere. On Windows a std::string handed to the standard library
+// would be taken in the ANSI code page, so every file is opened through these.
+std::filesystem::path toPath(const std::string& utf8);
+std::string fromPath(const std::filesystem::path& path);
 
 // Warnings and notes about the file being processed. The library prints nothing: a message
 // goes to the handler that is installed on the calling thread, or nowhere if there is none.
@@ -46,6 +72,26 @@ private:
 
 void warn(const std::string& message);   // something the user should know about the result
 void info(const std::string& message);   // how the conversion was done (row order, value range, WCS fit)
+
+// Progress of a long operation, and the way to stop one. The handler is told what is being
+// done and how far it is (`total` is 0 when that is not known) and returns false to cancel.
+using ProgressHandler = std::function<bool(const char* stage, uint64_t done, uint64_t total)>;
+
+class ProgressScope {
+public:
+    explicit ProgressScope(ProgressHandler handler);
+    ~ProgressScope();
+    ProgressScope(const ProgressScope&) = delete;
+    ProgressScope& operator=(const ProgressScope&) = delete;
+
+private:
+    ProgressHandler handler_;
+    const ProgressHandler* previous_;
+};
+
+// Reports to the handler of the calling thread, if there is one. Throws Error (Cancelled) when
+// the handler asks to stop; files being written are removed on the way out.
+void progress(const char* stage, uint64_t done, uint64_t total);
 
 enum class SampleFormat { UInt8, UInt16, UInt32, UInt64, Float32, Float64 };
 
@@ -99,6 +145,12 @@ bool parseDouble(const std::string& s, double& out);
 
 // Shortest decimal text that reads back as the same double.
 std::string formatDouble(double v);
+
+// The library lives in programs that may have set a locale with a decimal comma, which printf
+// and strtod then follow. Numbers in files always have a decimal point:
+// cNumber turns text printf made into that form, strtodC reads such text.
+std::string cNumber(const char* printed);
+double strtodC(const std::string& text, bool* complete = nullptr);
 // Current UTC time as an ISO 8601 time point, e.g. 2026-10-02T02:04:05Z.
 std::string utcTimestamp();
 

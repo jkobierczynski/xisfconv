@@ -1,6 +1,6 @@
 // Small YAML reader for ASDF trees: block and flow collections, plain, quoted and block
 // scalars, tags (with %TAG handles), anchors and aliases. Merge keys are not supported.
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 Jurgen Kobierczynski
 #pragma once
 

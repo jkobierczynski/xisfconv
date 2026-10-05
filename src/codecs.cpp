@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 Jurgen Kobierczynski
 #include "codecs.hpp"
 
@@ -278,7 +278,7 @@ std::vector<uint8_t> zstdCompress(const uint8_t* src, size_t srcSize, int level)
     (void)src;
     (void)srcSize;
     (void)level;
-    throw Error("this build has no Zstandard support (use --codec zlib, or rebuild with libzstd)");
+    throw Unsupported("this build has no Zstandard support (use --codec zlib, or rebuild with libzstd)");
 #endif
 }
 
@@ -342,7 +342,7 @@ void mdHash(const uint8_t* data, size_t size, Compress compress) {
     for (size_t i = 0; i < full; ++i) compress(data + i * BlockSize);
     uint8_t buf[BlockSize * 2] = {};
     const size_t rem = size - full * BlockSize;
-    std::memcpy(buf, data + full * BlockSize, rem);
+    if (rem) std::memcpy(buf, data + full * BlockSize, rem);
     buf[rem] = 0x80;
     const size_t total = (rem + 1 + LenBytes <= BlockSize) ? BlockSize : 2 * BlockSize;
     const uint64_t bits = static_cast<uint64_t>(size) * 8;  // < 2^64 bits always for in-memory data

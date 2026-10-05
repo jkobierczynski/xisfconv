@@ -1,7 +1,8 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 Jurgen Kobierczynski
 #include "xml.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 
@@ -250,6 +251,27 @@ private:
 
 }  // namespace
 
-std::unique_ptr<Node> parse(const std::string& document) { return Parser(document).parseDocument(); }
+namespace {
+// Text handed on by this library ends at a NUL byte for C callers; a damaged or hostile header
+// that holds one (as a raw byte or as &#0;) gets a space in its place.
+void withoutNul(std::string& text) { std::replace(text.begin(), text.end(), '\0', ' '); }
+
+void withoutNul(Node& node, int depth) {
+    withoutNul(node.name);
+    withoutNul(node.text);
+    for (auto& a : node.attributes) {
+        withoutNul(a.first);
+        withoutNul(a.second);
+    }
+    if (depth < 100000)
+        for (auto& child : node.children) withoutNul(*child, depth + 1);
+}
+}  // namespace
+
+std::unique_ptr<Node> parse(const std::string& document) {
+    std::unique_ptr<Node> root = Parser(document).parseDocument();
+    if (document.find('\0') != std::string::npos || document.find("&#") != std::string::npos) withoutNul(*root, 0);
+    return root;
+}
 
 }  // namespace xisfconv::xml

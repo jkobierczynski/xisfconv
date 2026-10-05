@@ -1,9 +1,11 @@
 // FITS reader (primary HDU + IMAGE extensions).
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 Jurgen Kobierczynski
 #pragma once
 
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "common.hpp"
@@ -28,6 +30,9 @@ struct FitsImage {
     std::string source;                 // location of the array in the tree, e.g. fits[0].data
     std::string storage;                // datatype, byte order, block and compression
     bool generic = false;               // a plain array, not an HDU of a FITS-tagged node
+    // Images handed over in memory (the C API's writer) only:
+    std::optional<std::pair<double, double>> bounds;  // range of floating point samples, if the caller states it
+    std::vector<uint8_t> iccProfile;    // written to TIFF and PNG
 };
 
 struct FitsFile {
@@ -38,9 +43,10 @@ struct FitsFile {
     std::string formatNote;             // ASDF input: versions and block count
 };
 
-// Reads all image HDUs. With headersOnly the pixel data is skipped (for --info).
+// Reads all image HDUs. With headersOnly the pixel data is skipped (for --info); with onlyImage
+// the pixels of that one image are read and the others are left as headers.
 // Throws xisfconv::Error on malformed files.
-FitsFile readFits(const std::string& path, bool headersOnly = false);
+FitsFile readFits(const std::string& path, bool headersOnly = false, std::optional<size_t> onlyImage = std::nullopt);
 
 // Sets dataMin, dataMax and hasNaN from floating point pixels (no-op for integer data).
 void updateFloatRange(FitsImage& img);

@@ -1,7 +1,7 @@
 // Converting whole files: XISF to FITS, ASDF, TIFF or PNG; FITS and ASDF to XISF, to each other,
 // or to TIFF or PNG; and rewriting an XISF file, also in place.
 // Nothing here prints: warnings and notes go to the message handler (see common.hpp).
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 Jurgen Kobierczynski
 #pragma once
 
@@ -10,6 +10,7 @@
 #include <utility>
 
 #include "common.hpp"
+#include "fitsread.hpp"
 #include "xisfrewrite.hpp"
 
 namespace xisfconv {
@@ -46,6 +47,26 @@ struct ConvertOptions {
 void convertXisfFile(const std::string& input, const std::string& output, Format format, const ConvertOptions& options);
 void convertFitsOrAsdfFile(const std::string& input, InputFormat kind, const std::string& output, Format format,
                            const ConvertOptions& options);
+
+// Where a set of images comes from: a FITS or ASDF file, or the caller's memory.
+struct ImageSetOrigin {
+    std::string format;       // "FITS" or "ASDF"; empty for images handed over in memory
+    std::string input;        // the file they were read from (never overwritten); empty if none
+    std::string defaultName;  // for an image without a name: the name of the input file without extension
+    bool notes = true;        // report how each image was mapped (sample type, row order, bounds)
+};
+
+// Writes images that are in memory in the form the FITS and ASDF readers deliver, to any output
+// format. This is the second half of convertFitsOrAsdfFile; the images are consumed.
+void writeImageSet(FitsFile& images, const ImageSetOrigin& origin, const std::string& output, Format format,
+                   const ConvertOptions& options);
+
+// Reverses the row order of an image and of what describes it: WCS keywords and BAYERPAT.
+void flipImageRows(FitsImage& image);
+
+// The range given to floating point data from FITS and ASDF when nothing else is said: 0:1 if
+// the data fits, else 0:65535 if it fits, else its minimum and maximum.
+std::pair<double, double> automaticBounds(const FitsImage& image);
 
 struct XisfFileRewrite {
     XisfRewriteResult result;

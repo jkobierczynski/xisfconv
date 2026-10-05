@@ -1,5 +1,5 @@
 // Writer for monolithic XISF 1.0 files.
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 Jurgen Kobierczynski
 #pragma once
 
@@ -29,6 +29,7 @@ struct XisfOutImage {
     std::string cfaPattern;               // e.g. "RGGB" (empty = none)
     int cfaWidth = 0, cfaHeight = 0;
     std::vector<XisfOutProperty> properties;
+    std::vector<uint8_t> iccProfile;      // written as an ICCProfile element with an inline block (empty = none)
 };
 
 struct XisfWriteOptions {

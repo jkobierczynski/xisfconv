@@ -533,6 +533,19 @@ def test_batch_and_outdir():
     check(sorted(os.listdir(outd)) == ["frame_0.tif", "frame_1.tif", "frame_2.tif"], f"batch outputs {os.listdir(outd)}")
     r = run(paths[0], "-d", outd, "-t", "tiff", expect_ok=False)
     check(r.returncode == 1 and "already exists" in r.stderr, "refuses to overwrite without --force")
+    # the largest 64-bit number is how the library says "all images": it is not an image index
+    r = run(paths[0], "-d", outd, "-f", "-i", "18446744073709551615", expect_ok=False)
+    check(r.returncode == 2 and "invalid image index" in r.stderr, "an image index that cannot be one is refused")
+    # a NUL byte in a header (a damaged file) does not cut the listing short
+    nul = os.path.join(d, "nul.fits")
+    h = fits.PrimaryHDU(test_image(np.uint16, 8, 8, 1, 3)[:, :, 0])
+    h.header["OBJECT"] = "ab cd"
+    h.header["TELESCOP"] = "after"
+    h.writeto(nul, overwrite=True)
+    raw = open(nul, "rb").read()
+    open(nul, "wb").write(raw.replace(b"'ab cd", b"'ab\0cd"))
+    r = run("--info", nul)
+    check("'ab cd" in r.stdout and "TELESCOP= 'after" in r.stdout and "\0" not in r.stdout, "--info of a FITS header with a NUL byte")
 
 
 def ref_mtf(m, x):

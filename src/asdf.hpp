@@ -1,8 +1,9 @@
 // ASDF (Advanced Scientific Data Format) reader and writer.
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 Jurgen Kobierczynski
 #pragma once
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -26,7 +27,9 @@ void writeAsdf(const std::string& path, const std::vector<FitsHdu>& hdus, const 
 // with 2 or 3 dimensions that is stored in a binary block. The result has the same form as a
 // FITS file. With headersOnly the pixel data is not read (for --info).
 // Throws xisfconv::Error on malformed files.
-FitsFile readAsdf(const std::string& path, bool headersOnly = false, bool verifyChecksums = true);
+// With onlyImage the pixels of that one image are read and the others are left as headers.
+FitsFile readAsdf(const std::string& path, bool headersOnly = false, bool verifyChecksums = true,
+                  std::optional<size_t> onlyImage = std::nullopt);
 
 // Parses the tree and reads every binary block: MD5 checksums are verified, compressed blocks
 // are decompressed.

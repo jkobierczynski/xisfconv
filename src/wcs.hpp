@@ -1,5 +1,5 @@
 // FITS WCS keywords from a PixInsight astrometric solution (PCL:AstrometricSolution:* properties).
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 Jurgen Kobierczynski
 #pragma once
 

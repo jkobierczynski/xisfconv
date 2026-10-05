@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 Jurgen Kobierczynski
 #include "xisfwrite.hpp"
 
@@ -116,7 +116,7 @@ void prepareBlock(const PixelBuffer& px, const XisfWriteOptions& opt, Block& blo
         // The checksum covers the block as stored (i.e. the compressed bytes).
         const size_t n = static_cast<size_t>(block.size);
         std::string digest;
-        if (!xisfDigest(opt.checksum, block.data, n, digest)) throw Error("unsupported checksum algorithm '" + opt.checksum + "'");
+        if (!xisfDigest(opt.checksum, block.data, n, digest)) throw Error("unsupported checksum algorithm '" + opt.checksum + "'", ErrorKind::Argument);
         block.attributes += " checksum=\"" + opt.checksum + ":" + digest + "\"";
     }
 }
@@ -129,7 +129,7 @@ void writeXisf(const std::string& path, const std::vector<XisfOutImage>& images,
     if (images.empty()) throw Error("no images to write");
     warnIfChecksumUnknownToPixInsight(opt.checksum);
     if (!opt.codec.empty() && opt.codec != "zlib" && opt.codec != "zstd") {
-        throw Error("unsupported XISF compression codec '" + opt.codec + "' (use zlib or zstd)");
+        throw Error("unsupported XISF compression codec '" + opt.codec + "' (use zlib or zstd)", ErrorKind::Argument);
     }
 
     std::vector<Block> blocks(images.size());
@@ -171,6 +171,10 @@ void writeXisf(const std::string& path, const std::vector<XisfOutImage>& images,
                      std::to_string(img.cfaWidth) + "\" height=\"" + std::to_string(img.cfaHeight) + "\"/>\n";
             }
             for (const auto& p : img.properties) x += propertyXml(p);
+            if (!img.iccProfile.empty()) {
+                x += "<ICCProfile location=\"inline:base64\">" + base64Encode(img.iccProfile.data(), img.iccProfile.size()) +
+                     "</ICCProfile>\n";
+            }
             x += "</Image>\n";
         }
         x += "<Metadata>\n";
@@ -203,8 +207,8 @@ void writeXisf(const std::string& path, const std::vector<XisfOutImage>& images,
     }
     if (header.size() > 0xFFFFFFFFull) throw Error("XISF header too large");
 
-    std::ofstream out(path, std::ios::binary | std::ios::trunc);
-    if (!out) throw Error("cannot create " + path);
+    std::ofstream out(toPath(path), std::ios::binary | std::ios::trunc);
+    if (!out) throw Error("cannot create " + path, ErrorKind::Io);
     const uint32_t len = static_cast<uint32_t>(header.size());
     const unsigned char preamble[16] = {'X', 'I', 'S', 'F', '0', '1', '0', '0',
                                         static_cast<unsigned char>(len), static_cast<unsigned char>(len >> 8),
@@ -224,10 +228,10 @@ void writeXisf(const std::string& path, const std::vector<XisfOutImage>& images,
             done += n;
         }
         pos = positions[i] + blocks[i].size;
-        if (!out) throw Error("write error on " + path);
+        if (!out) throw Error("write error on " + path, ErrorKind::Io);
     }
     out.close();
-    if (!out) throw Error("write error on " + path);
+    if (!out) throw Error("write error on " + path, ErrorKind::Io);
 }
 
 }  // namespace xisfconv

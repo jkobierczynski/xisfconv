@@ -1,5 +1,5 @@
 // Minimal non-validating XML DOM parser, sufficient for XISF headers.
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 Jurgen Kobierczynski
 #pragma once
 

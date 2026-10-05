@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
+# CMake package of libxisfconv (shared library):
+#   find_package(xisfconv REQUIRED)
+#   target_link_libraries(app PRIVATE xisfconv::xisfconv)
+include("${CMAKE_CURRENT_LIST_DIR}/xisfconvTargets.cmake")

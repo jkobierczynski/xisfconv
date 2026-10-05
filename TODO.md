@@ -9,8 +9,8 @@ in `DEVELOPMENT.md`.
       and ASDF files (and directories of them) without converting (0.8.0)
 - [x] Read tile-compressed FITS (`.fits.fz`: RICE_1, GZIP_1, GZIP_2, PLIO_1, NOCOMPRESS, quantized
       and lossless floating point) instead of asking for funpack; `-t fits` unpacks (0.9.0)
-- [ ] **libxisfconv**: the converter as a library with a plain C API, for C, C++, Python, Perl and
-      Rust (see "Library" below)
+- [x] **libxisfconv**: the converter as a library with a plain C API (0.10.0); its Python package
+      is next (see "Library" below)
 - [ ] Lossless property round trip: carry all XISF properties through FITS (HIERARCH keywords) and
       ASDF (tree entries) and restore them on the way back
 - [ ] Downsampling (`--resize` / `--bin`) for TIFF and PNG export, and a `.thumbnailer` entry so Linux
@@ -32,46 +32,30 @@ Smaller items, each closing a limitation listed in the README:
 
 ## Library
 
-Brief: `LIBRARY-HANDOFF.md` with `xisfconv.h` (draft 1 of the C API) and `example.c`, written
-against 0.8.0.
+The decisions are recorded in `DEVELOPMENT.md`; the API is `include/xisfconv.h`.
 
-The decisions (C API only, licence, prefix, scope, writer, bindings, delivery) are recorded in
-`DEVELOPMENT.md`.
+1. [x] Build split: a core library with everything but `main.cpp` (0.9.1).
+2. [x] The conversion logic in `src/pipeline.cpp`, without printing and without globals (0.9.1).
+3. [x] The C API (`include/xisfconv.h`, `src/capi.cpp`): files, images, keywords, properties, pixels,
+   astrometry, conversion, rewriting, verification, writing arrays, stretch (0.10.0).
+4. [x] The command line tool on `xisfconv.h` alone, its output unchanged (0.10.0).
+5. [x] Shared library, exported symbols only, install rules, pkg-config and CMake package files
+   (0.10.0).
+6. [x] Tests of the library: a C test program built by a C compiler, error paths, ASan/UBSan,
+   fuzzing through the API, a check that nothing is written to stdout or stderr (0.10.0).
+7. [ ] Python package: NumPy arrays in and out, wheels, `CCDData.read("image.xisf")` through
+   astropy's I/O registry; then the existing oracles run through it.
 
-Steps, each ending with the whole test suite green and the console output unchanged:
+Later, each when it is needed:
 
-1. [x] Build split: a static core library with everything but `main.cpp`; the executable links
-   it (0.9.1).
-2. [x] The conversion logic (`convertXisfFile`, `convertFitsOrAsdfFile`, `rewriteXisfFile`, the
-   `.part` handling) is in `src/pipeline.cpp`, takes an options struct and prints nothing. The
-   globals `g_context` / `g_quiet` are gone: `warn()` and `info()` go to a message handler that is
-   installed per thread (`MessageScope`). The table in `base64Decode` is filled thread-safely
-   (0.9.1).
-   Still to do before the C API: an error kind in `xisfconv::Error` (I/O, format, checksum, exists,
-   argument), UTF-8 paths on Windows for every file that is opened, reading one FITS HDU or ASDF
-   array at a time (`readFits` and `readAsdf` read all images of a file at once), and messages
-   that name command line options (`--force`, `--bounds`) only where the tool adds them.
-3. The C API over it, with one try/catch per entry point.
-4. The command line tool on `xisfconv.h` alone.
-5. Shared library, exported symbols only, install rules, pkg-config and CMake package files.
-6. Tests of the library: a C test program built by a C compiler, error paths, ASan/UBSan, fuzzing
-   through the API, a check that nothing is written to stdout or stderr.
-7. Writer and stretch functions.
-8. Python binding (NumPy arrays in and out), then the existing oracles run through it.
-
-To change in the draft header (it predates 0.9.0):
-
-- FITS to FITS is a conversion now (unpacking tile-compressed images), and a FITS image has a
-  storage text (the tile compression).
-- Enumerations inside structs as `int32_t`: the size of a C enum is up to the compiler, which
-  matters to ctypes and FFI::Platypus.
-- A file handle keeps its context alive (reference count), so the order of `xc_close` and
-  `xc_context_free` cannot crash a binding's garbage collector.
-- The image index is `size_t` in some places and `int64_t` in others; use one.
-- A shared library version that changes with every 0.x release, so that a binding built for another
-  release fails to load instead of misreading structs.
-- `xc_asdf_tree_json` is a test hook: keep it out of the documented API.
-- A progress and cancel callback in the context before the first binding is published.
+- [ ] A CMake package for the static library (the dependencies have to be described to the consumer).
+- [ ] Library messages without the tool's option names.
+- [ ] Check in PixInsight that it accepts the inline ICC profile the writer stores in XISF.
+- [ ] Reading from and writing to memory instead of files, and input that cannot be rewound
+      (a pipe).
+- [ ] Reading one image of a FITS or ASDF file without going through the headers before it again
+      (a file with a thousand HDUs is read image by image in half a minute).
+- [ ] Rust and Perl bindings.
 
 Open check:
 

@@ -1,45 +1,140 @@
 // xisfconv - convert PixInsight XISF images to FITS, ASDF, TIFF or PNG, and FITS or ASDF images to XISF.
+// The command line tool. It uses the library through its C API (xisfconv.h) and nothing else.
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Jurgen Kobierczynski
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
+#include <iostream>
+#include <limits>
+#include <locale>
+#include <new>
+#include <optional>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
 #ifdef _WIN32
 #include <fcntl.h>
 #include <io.h>
+#ifndef NOMINMAX
+#define NOMINMAX
 #endif
-#include <iostream>
-#include <optional>
-#include <string>
-#include <vector>
+#include <windows.h>
+#endif
 
-#include "asdf.hpp"
-#include "codecs.hpp"
-#include "common.hpp"
-#include "fitsread.hpp"
-#include "pipeline.hpp"
-#include "xisf.hpp"
-#include "xisfrewrite.hpp"
-#include "yaml.hpp"
+#include "xisfconv.h"
 
 namespace fs = std::filesystem;
-using namespace xisfconv;
 
 namespace {
 
+struct Error : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
+// ---------------------------------------------------------------- small helpers
+
+std::string trim(const std::string& s) {
+    size_t b = 0, e = s.size();
+    while (b < e && std::isspace(static_cast<unsigned char>(s[b]))) ++b;
+    while (e > b && std::isspace(static_cast<unsigned char>(s[e - 1]))) --e;
+    return s.substr(b, e - b);
+}
+
+std::vector<std::string> split(const std::string& s, char sep) {
+    std::vector<std::string> out;
+    std::string cur;
+    for (char c : s) {
+        if (c == sep) { out.push_back(cur); cur.clear(); }
+        else cur += c;
+    }
+    out.push_back(cur);
+    return out;
+}
+
+std::string toLower(std::string s) {
+    for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
+bool startsWith(const std::string& s, const std::string& prefix) { return s.compare(0, prefix.size(), prefix) == 0; }
+
+bool parseUInt64(const std::string& str, uint64_t& out) {
+    const std::string s = trim(str);
+    if (s.empty()) return false;
+    uint64_t v = 0;
+    for (char c : s) {
+        if (c < '0' || c > '9') return false;
+        const uint64_t d = static_cast<uint64_t>(c - '0');
+        if (v > (std::numeric_limits<uint64_t>::max() - d) / 10) return false;
+        v = v * 10 + d;
+    }
+    out = v;
+    return true;
+}
+
+bool parseDouble(const std::string& str, double& out) {
+    // Locale-independent parse ("." decimal separator regardless of LC_NUMERIC).
+    const std::string s = trim(str);
+    if (s.empty()) return false;
+    std::istringstream is(s);
+    is.imbue(std::locale::classic());
+    double v = 0;
+    is >> v;
+    if (is.fail()) return false;
+    is >> std::ws;
+    if (!is.eof()) return false;
+    out = v;
+    return true;
+}
+
+bool parseShortSampleFormat(const std::string& s, xisfconv_sample_format& out) {
+    const std::string l = toLower(s);
+    if (l == "u8" || l == "8") out = XISFCONV_SAMPLE_UINT8;
+    else if (l == "u16" || l == "16") out = XISFCONV_SAMPLE_UINT16;
+    else if (l == "u32") out = XISFCONV_SAMPLE_UINT32;
+    else if (l == "u64") out = XISFCONV_SAMPLE_UINT64;
+    else if (l == "f32" || l == "32f" || l == "float") out = XISFCONV_SAMPLE_FLOAT32;
+    else if (l == "f64" || l == "64f" || l == "double") out = XISFCONV_SAMPLE_FLOAT64;
+    else return false;
+    return true;
+}
+
+// File names are UTF-8 in this program, as they are in the library.
+fs::path toPath(const std::string& utf8) {
+#if defined(__cpp_lib_char8_t)
+    return fs::path(std::u8string(utf8.begin(), utf8.end()));
+#else
+    return fs::u8path(utf8);
+#endif
+}
+
+std::string fromPath(const fs::path& path) {
+    const auto text = path.u8string();
+    return std::string(text.begin(), text.end());
+}
+
+bool zstdAvailable() { return xisfconv_codec_available(XISFCONV_CODEC_ZSTD, 1) != 0; }
+
+// ---------------------------------------------------------------- options
+
 struct Options {
-    Stretch stretch = Stretch::None;
-    std::optional<Format> format;
+    xisfconv_stretch stretch = XISFCONV_STRETCH_NONE;
+    std::optional<xisfconv_format> format;
     std::string output;
     std::string outdir;
-    std::optional<SampleFormat> bits;
+    std::optional<xisfconv_sample_format> bits;
     std::optional<size_t> imageIndex;
     bool compress = false;
     bool bottomUp = true;  // FITS convention: first stored row is the bottom of the image
     bool rowOrderGiven = false;  // --top-down / --bottom-up given explicitly (overrides ROWORDER on FITS input)
     std::string codec;           // XISF and ASDF output: zlib or zstd
     bool codecNone = false;      // --codec none: store uncompressed (XISF -> XISF: decompress)
-    std::string checksum;        // XISF output: sha1, sha256 or sha512
+    std::string checksum;        // XISF output: sha1, sha256, sha512, sha3-256 or sha3-512
     bool checksumNone = false;   // --checksum none (XISF -> XISF: remove checksums)
     bool inPlace = false;        // XISF -> XISF: replace the input file
     bool verifyMode = false;     // --verify: check the files, convert nothing
@@ -56,6 +151,8 @@ struct Options {
     bool quiet = false;
     std::vector<std::string> inputs;
 };
+
+const char* const kVersion = xisfconv_version();
 
 void usage(std::ostream& os) {
     os << "xisfconv " << kVersion << " - convert between PixInsight XISF, FITS and ASDF images; export TIFF and PNG\n\n"
@@ -126,101 +223,33 @@ void usage(std::ostream& os) {
           "  -V, --version               show version and enabled codecs\n";
 }
 
-std::string lowerExt(const std::string& path) { return toLower(fs::path(path).extension().string()); }
+std::string lowerExt(const std::string& path) { return toLower(fromPath(toPath(path).extension())); }
 
-std::optional<Format> formatFromExtension(const std::string& path) {
+std::optional<xisfconv_format> formatFromExtension(const std::string& path) {
     const std::string e = lowerExt(path);
-    if (e == ".fits" || e == ".fit" || e == ".fts") return Format::Fits;
-    if (e == ".tif" || e == ".tiff") return Format::Tiff;
-    if (e == ".png") return Format::Png;
-    if (e == ".xisf") return Format::Xisf;
-    if (e == ".asdf") return Format::Asdf;
+    if (e == ".fits" || e == ".fit" || e == ".fts") return XISFCONV_FORMAT_FITS;
+    if (e == ".tif" || e == ".tiff") return XISFCONV_FORMAT_TIFF;
+    if (e == ".png") return XISFCONV_FORMAT_PNG;
+    if (e == ".xisf") return XISFCONV_FORMAT_XISF;
+    if (e == ".asdf") return XISFCONV_FORMAT_ASDF;
     return std::nullopt;
 }
 
-void printInfo(const XisfFile& f) {
-    std::cout << f.path() << ": XISF " << f.version() << ", " << f.fileSize() << " bytes, header "
-              << f.headerXml().size() << " bytes, " << f.images().size() << " image(s)\n";
-    for (size_t i = 0; i < f.images().size(); ++i) {
-        const XisfImage& img = f.images()[i];
-        std::cout << "\nImage " << i;
-        if (!img.id.empty()) std::cout << " \"" << img.id << "\"";
-        std::cout << ": " << img.width << " x " << img.height << " x " << img.channels << ", "
-                  << img.sampleFormatText << ", " << img.colorSpace << ", " << (img.planar ? "Planar" : "Normal")
-                  << ", " << (img.bigEndian ? "big" : "little") << "-endian\n";
-        if (isFloat(img.format)) std::cout << "  bounds:      " << img.lowerBound << " : " << img.upperBound << "\n";
-        std::cout << "  location:    " << img.location << "\n";
-        if (!img.compression.empty()) std::cout << "  compression: " << img.compression << "\n";
-        if (!img.subblocks.empty()) std::cout << "  subblocks:   " << img.subblocks << "\n";
-        if (!img.checksum.empty()) std::cout << "  checksum:    " << img.checksum << "\n";
-        if (!img.imageType.empty()) std::cout << "  imageType:   " << img.imageType << "\n";
-        if (!img.orientation.empty()) std::cout << "  orientation: " << img.orientation << "\n";
-        if (img.cfa.present)
-            std::cout << "  CFA:         " << img.cfa.pattern << " (" << img.cfa.width << "x" << img.cfa.height << ")"
-                      << (img.cfa.name.empty() ? "" : " " + img.cfa.name) << "\n";
-        if (img.resolution.present)
-            std::cout << "  resolution:  " << img.resolution.horizontal << " x " << img.resolution.vertical << " per "
-                      << img.resolution.unit << "\n";
-        if (img.hasIccProfile) std::cout << "  ICC profile: yes\n";
-        if (img.displayFunction.present) {
-            const DisplayFunction& df = img.displayFunction;
-            std::cout << "  STF:         " << (df.isIdentity() ? "identity (no stretch)" : "");
-            if (!df.isIdentity()) {
-                for (int k = 0; k < (img.colorSpace == "Gray" ? 1 : 3); ++k)
-                    std::cout << (k ? "; " : "") << "s=" << df.s[k] << " m=" << df.m[k] << " h=" << df.h[k];
-            }
-            std::cout << "\n";
-        }
-        if (!img.unsupported.empty()) std::cout << "  NOT CONVERTIBLE: " << img.unsupported << "\n";
-        std::cout << "  FITS keywords (" << img.keywords.size() << "):\n";
-        for (const auto& k : img.keywords) {
-            std::cout << "    " << k.name;
-            if (k.name.size() < 8) std::cout << std::string(8 - k.name.size(), ' ');
-            if (!k.value.empty()) std::cout << "= " << k.value;
-            if (!k.comment.empty()) std::cout << (k.value.empty() ? " " : " / ") << k.comment;
-            std::cout << "\n";
-        }
-        std::cout << "  Properties (" << img.properties.size() << "):\n";
-        for (const auto& p : img.properties) {
-            std::cout << "    " << p.id << " (" << p.type << ")";
-            if (p.hasBlockData) std::cout << " [data block]";
-            else {
-                std::string v = p.value;
-                if (v.size() > 100) v = v.substr(0, 100) + "...";
-                for (auto& c : v)
-                    if (c == '\n' || c == '\r') c = ' ';
-                std::cout << " = " << v;
-            }
-            std::cout << "\n";
-        }
-    }
-    if (!f.fileProperties().empty()) {
-        std::cout << "\nFile metadata (" << f.fileProperties().size() << "):\n";
-        for (const auto& p : f.fileProperties()) {
-            std::cout << "  " << p.id << " (" << p.type << ")";
-            if (p.hasBlockData) std::cout << " [data block]";
-            else std::cout << " = " << p.value;
-            std::cout << "\n";
-        }
-    }
-}
-
-std::string outputPathFor(const std::string& input, const Options& opt, Format format) {
+std::string outputPathFor(const std::string& input, const Options& opt, xisfconv_format format) {
     if (!opt.output.empty()) return opt.output;
-    fs::path p(input);
-    fs::path dir = opt.outdir.empty() ? p.parent_path() : fs::path(opt.outdir);
+    const fs::path p = toPath(input);
+    const fs::path dir = opt.outdir.empty() ? p.parent_path() : toPath(opt.outdir);
     fs::path name = p.stem();
     // image.fits.fz is named after "image"
-    const std::string outer = lowerExt(p.string());
-    if (outer == ".fz" && formatFromExtension(name.string())) name = name.stem();
+    if (lowerExt(input) == ".fz" && formatFromExtension(fromPath(name))) name = name.stem();
     switch (format) {
-        case Format::Fits: name += ".fits"; break;
-        case Format::Tiff: name += ".tif"; break;
-        case Format::Png: name += ".png"; break;
-        case Format::Xisf: name += ".xisf"; break;
-        case Format::Asdf: name += ".asdf"; break;
+        case XISFCONV_FORMAT_FITS: name += ".fits"; break;
+        case XISFCONV_FORMAT_TIFF: name += ".tif"; break;
+        case XISFCONV_FORMAT_PNG: name += ".png"; break;
+        case XISFCONV_FORMAT_ASDF: name += ".asdf"; break;
+        default: name += ".xisf"; break;
     }
-    return (dir / name).string();
+    return fromPath(dir / name);
 }
 
 std::string megabytes(uint64_t bytes) {
@@ -231,207 +260,350 @@ std::string megabytes(uint64_t bytes) {
     return buf;
 }
 
-// The library's warnings and notes, as this program has always printed them.
-MessageHandler messagePrinter(const std::string& file, bool quiet) {
-    return [file, quiet](MessageLevel level, const std::string& text) {
-        if (quiet) return;
-        if (level == MessageLevel::Warning) std::cerr << "warning: " << file << ": " << text << '\n';
-        else std::cerr << "info: " << text << '\n';
-    };
+// ---------------------------------------------------------------- the library
+
+// One context for the whole run. Its message handler prints the library's warnings and notes
+// the way this program always has.
+struct Library {
+    xisfconv_context* ctx = nullptr;
+    bool quiet = false;
+
+    Library() : ctx(xisfconv_context_new()) {
+        if (!ctx) throw std::bad_alloc();
+        xisfconv_context_set_message_handler(ctx, &Library::print, this);
+    }
+    ~Library() { xisfconv_context_free(ctx); }
+    Library(const Library&) = delete;
+    Library& operator=(const Library&) = delete;
+
+    static void print(void* user, xisfconv_message_level level, const char* path, const char* message) {
+        const Library* self = static_cast<const Library*>(user);
+        if (self->quiet) return;
+        if (level == XISFCONV_MESSAGE_WARNING) {
+            std::cerr << "warning: ";
+            if (path && *path) std::cerr << path << ": ";
+            std::cerr << message << '\n';
+        } else {
+            std::cerr << "info: " << message << '\n';
+        }
+    }
+
+    // Turns a failed call into the exception that main() reports.
+    void check(xisfconv_status status) const {
+        if (status == XISFCONV_OK) return;
+        if (status == XISFCONV_ERR_MEMORY) throw std::bad_alloc();
+        throw Error(xisfconv_error_message(ctx));
+    }
+};
+
+// A file opened through the library, closed when it goes out of scope.
+struct OpenFile {
+    xisfconv_file* file = nullptr;
+    OpenFile(const Library& lib, const std::string& path) { lib.check(xisfconv_open(lib.ctx, path.c_str(), &file)); }
+    ~OpenFile() { xisfconv_close(file); }
+    OpenFile(const OpenFile&) = delete;
+    OpenFile& operator=(const OpenFile&) = delete;
+};
+
+xisfconv_checksum checksumOption(const std::string& name) {
+    if (name == "sha1") return XISFCONV_CHECKSUM_SHA1;
+    if (name == "sha256") return XISFCONV_CHECKSUM_SHA256;
+    if (name == "sha512") return XISFCONV_CHECKSUM_SHA512;
+    if (name == "sha3-256") return XISFCONV_CHECKSUM_SHA3_256;
+    if (name == "sha3-512") return XISFCONV_CHECKSUM_SHA3_512;
+    return XISFCONV_CHECKSUM_NONE;
 }
 
-ConvertOptions conversionOptions(const Options& opt) {
-    ConvertOptions c;
+xisfconv_convert_options conversionOptions(const Options& opt, xisfconv_format format) {
+    xisfconv_convert_options c;
+    xisfconv_convert_options_init(&c, sizeof c);
+    c.output_format = format;
     c.stretch = opt.stretch;
-    c.bits = opt.bits;
-    c.imageIndex = opt.imageIndex;
-    c.compress = opt.compress;
-    c.codec = opt.codec;
-    c.checksum = opt.checksum;
-    c.subblockSize = opt.subblockSize;
-    c.bottomUp = opt.bottomUp;
-    c.rowOrderGiven = opt.rowOrderGiven;
-    c.bounds = opt.bounds;
-    c.propertyKeywords = opt.propertyKeywords;
-    c.verify = opt.verify;
+    c.sample_format = opt.bits ? *opt.bits : XISFCONV_SAMPLE_AS_STORED;
+    c.image = opt.imageIndex ? *opt.imageIndex : XISFCONV_ALL_IMAGES;
+    c.codec = !opt.compress ? XISFCONV_CODEC_NONE
+                            : opt.codec == "zlib" ? XISFCONV_CODEC_ZLIB : opt.codec == "zstd" ? XISFCONV_CODEC_ZSTD : XISFCONV_CODEC_DEFAULT;
+    c.checksum = checksumOption(opt.checksum);
+    c.subblock_size = opt.subblockSize;
+    c.row_order = !opt.rowOrderGiven ? XISFCONV_ROWS_DEFAULT : opt.bottomUp ? XISFCONV_ROWS_BOTTOM_UP : XISFCONV_ROWS_TOP_DOWN;
+    if (opt.bounds) {
+        c.use_bounds = 1;
+        c.lower_bound = opt.bounds->first;
+        c.upper_bound = opt.bounds->second;
+    }
+    c.property_keywords = opt.propertyKeywords;
+    c.verify_checksums = opt.verify;
     c.wcs = opt.wcs;
-    c.sipOrder = opt.sipOrder;
-    c.force = opt.force;
+    c.sip_order = opt.sipOrder;
+    c.overwrite = opt.force;
     return c;
 }
 
+// ---------------------------------------------------------------- --info
+
+void printCards(const xisfconv_keywords* kw) {
+    for (size_t k = 0; k < xisfconv_keywords_count(kw); ++k) {
+        const char *name = "", *value = "", *comment = "";
+        xisfconv_keywords_get(kw, k, &name, &value, &comment);
+        const size_t length = std::strlen(name);
+        std::cout << "    " << name;
+        if (length < 8) std::cout << std::string(8 - length, ' ');
+        if (*value) std::cout << "= " << value;
+        if (*comment) std::cout << (*value ? " / " : " ") << comment;
+        std::cout << "\n";
+    }
+}
+
+const xisfconv_keywords* cardsOf(const Library& lib, const xisfconv_file* f, size_t image) {
+    const xisfconv_keywords* kw = nullptr;
+    lib.check(xisfconv_image_keywords(f, image, &kw));
+    return kw;
+}
+
+xisfconv_image_info infoOf(const Library& lib, const xisfconv_file* f, size_t image) {
+    xisfconv_image_info info;
+    xisfconv_image_info_init(&info, sizeof info);
+    lib.check(xisfconv_image_info_get(f, image, &info));
+    return info;
+}
+
+bool isFloat(xisfconv_sample_format f) { return f == XISFCONV_SAMPLE_FLOAT32 || f == XISFCONV_SAMPLE_FLOAT64; }
+
+void printXisfInfo(const Library& lib, const std::string& path, xisfconv_file* f) {
+    const char* header = "";
+    size_t headerSize = 0;
+    lib.check(xisfconv_header_text(f, &header, &headerSize));
+    const size_t images = xisfconv_image_count(f);
+    std::cout << path << ": XISF " << xisfconv_file_detail(f, "version") << ", " << xisfconv_file_size(f) << " bytes, header "
+              << headerSize << " bytes, " << images << " image(s)\n";
+    for (size_t i = 0; i < images; ++i) {
+        const xisfconv_image_info img = infoOf(lib, f, i);
+        auto detail = [&](const char* name) { return std::string(xisfconv_image_detail(f, i, name)); };
+        const std::string id = xisfconv_image_name(f, i);
+        std::cout << "\nImage " << i;
+        if (!id.empty()) std::cout << " \"" << id << "\"";
+        std::cout << ": " << img.width << " x " << img.height << " x " << img.channels << ", "
+                  << detail("sampleFormat") << ", " << detail("colorSpace") << ", " << detail("pixelStorage")
+                  << ", " << detail("byteOrder") << "-endian\n";
+        if (isFloat(img.sample_format)) std::cout << "  bounds:      " << img.lower_bound << " : " << img.upper_bound << "\n";
+        std::cout << "  location:    " << detail("location") << "\n";
+        if (!detail("compression").empty()) std::cout << "  compression: " << detail("compression") << "\n";
+        if (!detail("subblocks").empty()) std::cout << "  subblocks:   " << detail("subblocks") << "\n";
+        if (!detail("checksum").empty()) std::cout << "  checksum:    " << detail("checksum") << "\n";
+        if (!detail("imageType").empty()) std::cout << "  imageType:   " << detail("imageType") << "\n";
+        if (!detail("orientation").empty()) std::cout << "  orientation: " << detail("orientation") << "\n";
+        if (img.has_cfa)
+            std::cout << "  CFA:         " << detail("cfaPattern") << " (" << img.cfa_width << "x" << img.cfa_height << ")"
+                      << (detail("cfaName").empty() ? "" : " " + detail("cfaName")) << "\n";
+        if (img.resolution_unit)
+            std::cout << "  resolution:  " << img.resolution_x << " x " << img.resolution_y << " per "
+                      << detail("resolutionUnit") << "\n";
+        if (img.has_icc_profile) std::cout << "  ICC profile: yes\n";
+        if (img.has_display_function) {
+            std::cout << "  STF:         " << (img.has_stored_stretch ? "" : "identity (no stretch)");
+            if (img.has_stored_stretch) {
+                xisfconv_stretch_params stf[3];
+                size_t count = 0;
+                lib.check(xisfconv_stored_stretch(f, i, stf, 3, &count));
+                for (size_t k = 0; k < count; ++k)
+                    std::cout << (k ? "; " : "") << "s=" << stf[k].shadows << " m=" << stf[k].midtones << " h=" << stf[k].highlights;
+            }
+            std::cout << "\n";
+        }
+        if (!img.convertible) std::cout << "  NOT CONVERTIBLE: " << xisfconv_image_unsupported_reason(f, i) << "\n";
+        const xisfconv_keywords* kw = cardsOf(lib, f, i);
+        std::cout << "  FITS keywords (" << xisfconv_keywords_count(kw) << "):\n";
+        printCards(kw);
+        const size_t properties = xisfconv_property_count(f, i);
+        std::cout << "  Properties (" << properties << "):\n";
+        for (size_t p = 0; p < properties; ++p) {
+            const char *pid = "", *type = "", *value = "";
+            int32_t block = 0;
+            lib.check(xisfconv_property_get(f, i, p, &pid, &type, &value, nullptr, &block));
+            std::cout << "    " << pid << " (" << type << ")";
+            if (block) std::cout << " [data block]";
+            else {
+                std::string v = value;
+                if (v.size() > 100) v = v.substr(0, 100) + "...";
+                for (auto& c : v)
+                    if (c == '\n' || c == '\r') c = ' ';
+                std::cout << " = " << v;
+            }
+            std::cout << "\n";
+        }
+    }
+    const size_t metadata = xisfconv_property_count(f, XISFCONV_FILE_PROPERTIES);
+    if (metadata) {
+        std::cout << "\nFile metadata (" << metadata << "):\n";
+        for (size_t p = 0; p < metadata; ++p) {
+            const char *pid = "", *type = "", *value = "";
+            int32_t block = 0;
+            lib.check(xisfconv_property_get(f, XISFCONV_FILE_PROPERTIES, p, &pid, &type, &value, nullptr, &block));
+            std::cout << "  " << pid << " (" << type << ")";
+            if (block) std::cout << " [data block]";
+            else std::cout << " = " << value;
+            std::cout << "\n";
+        }
+    }
+}
+
+void printKeywords(const xisfconv_keywords* kw) {
+    std::cout << "  Keywords (" << xisfconv_keywords_count(kw) << "):\n";
+    printCards(kw);
+}
+
+const char* rowsText(const xisfconv_image_info& img, const char* undeclared) {
+    if (!img.row_order_declared) return undeclared;
+    return img.row_order == XISFCONV_ROWS_TOP_DOWN ? "top-down (ROWORDER)" : "bottom-up (ROWORDER)";
+}
+
+void printFitsInfo(const Library& lib, const std::string& path, xisfconv_file* f) {
+    const size_t images = xisfconv_image_count(f);
+    std::cout << path << ": FITS, " << xisfconv_file_size(f) << " bytes, " << images << " image HDU(s)\n";
+    for (size_t i = 0; i < images; ++i) {
+        const xisfconv_image_info img = infoOf(lib, f, i);
+        const std::string name = xisfconv_image_name(f, i);
+        const std::string tiles = xisfconv_image_detail(f, i, "tileCompression");
+        std::cout << "\nHDU " << img.source_index;
+        if (!name.empty()) std::cout << " \"" << name << "\"";
+        std::cout << ": " << img.width << " x " << img.height << " x " << img.channels << ", BITPIX " << img.bitpix;
+        if (!tiles.empty()) std::cout << ", tile-compressed (" << tiles << ")";
+        if (img.bscale != 1 || img.bzero != 0) std::cout << ", BZERO " << img.bzero << ", BSCALE " << img.bscale;
+        std::cout << ", rows " << rowsText(img, "bottom-up (FITS default, no ROWORDER)") << "\n";
+        printKeywords(cardsOf(lib, f, i));
+    }
+    for (size_t s = 0; s < xisfconv_skipped_count(f); ++s) std::cout << "\nSkipped " << xisfconv_skipped_text(f, s) << "\n";
+}
+
+void printAsdfInfo(const Library& lib, const std::string& path, xisfconv_file* f) {
+    const size_t images = xisfconv_image_count(f);
+    std::cout << path << ": " << xisfconv_file_detail(f, "format") << ", " << xisfconv_file_size(f) << " bytes, " << images
+              << " image(s)\n";
+    for (size_t i = 0; i < images; ++i) {
+        const xisfconv_image_info img = infoOf(lib, f, i);
+        const std::string name = xisfconv_image_name(f, i);
+        std::cout << "\nImage " << img.source_index << " at " << xisfconv_image_detail(f, i, "source");
+        if (!img.plain_array && !name.empty()) std::cout << " \"" << name << "\"";
+        std::cout << ": " << img.width << " x " << img.height << " x " << img.channels << ", "
+                  << xisfconv_image_detail(f, i, "storage") << "\n";
+        std::cout << "  rows:        "
+                  << rowsText(img, img.plain_array ? "assumed bottom-up (plain array)" : "bottom-up (FITS default, no ROWORDER)")
+                  << "\n";
+        if (!img.plain_array) printKeywords(cardsOf(lib, f, i));
+    }
+    for (size_t s = 0; s < xisfconv_skipped_count(f); ++s) std::cout << "\nSkipped " << xisfconv_skipped_text(f, s) << "\n";
+}
+
+// ---------------------------------------------------------------- converting
+
 // XISF -> XISF: the same file with its data blocks stored another way.
-void rewriteXisfInput(const std::string& input, const Options& opt) {
-    if (opt.bits || opt.stretch != Stretch::None) {
+void rewriteXisfInput(const Library& lib, const std::string& input, const Options& opt) {
+    if (opt.bits || opt.stretch != XISFCONV_STRETCH_NONE) {
         throw Error("XISF -> XISF changes how the data blocks are stored and leaves the pixels as they are; "
                     "--bits and --stretch do not apply (convert to FITS, TIFF or PNG for those)");
     }
-    XisfRewriteOptions ropt;
-    if (opt.codecNone) ropt.codec = "none";
-    else if (opt.compress) ropt.codec = !opt.codec.empty() ? opt.codec : (zstdAvailable() ? "zstd" : "zlib");
-    ropt.checksum = opt.checksumNone ? "none" : opt.checksum;
-    ropt.imageIndex = opt.imageIndex;
-    ropt.verifyInput = opt.verify;
-    ropt.readBack = opt.verify;
-    ropt.subblockSize = opt.subblockSize;
+    xisfconv_rewrite_options r;
+    xisfconv_rewrite_options_init(&r, sizeof r);
+    std::string codec;  // as it is named in the report
+    if (opt.codecNone) {
+        r.codec = XISFCONV_CODEC_NONE;
+        codec = "none";
+    } else if (opt.compress) {
+        codec = !opt.codec.empty() ? opt.codec : (zstdAvailable() ? "zstd" : "zlib");
+        r.codec = codec == "zstd" ? XISFCONV_CODEC_ZSTD : XISFCONV_CODEC_ZLIB;
+    }
+    r.checksum = opt.checksumNone ? XISFCONV_CHECKSUM_NONE : opt.checksum.empty() ? XISFCONV_CHECKSUM_KEEP : checksumOption(opt.checksum);
+    r.image = opt.imageIndex ? *opt.imageIndex : XISFCONV_ALL_IMAGES;
+    r.verify_input = opt.verify;
+    r.read_back = opt.verify;
+    r.subblock_size = opt.subblockSize;
+    r.overwrite = opt.force;
 
-    const std::string output = opt.inPlace ? std::string() : outputPathFor(input, opt, Format::Xisf);
-    const XisfFileRewrite done = rewriteXisfFile(input, output, opt.inPlace, opt.force, ropt);
+    xisfconv_rewrite_result done;
+    xisfconv_rewrite_result_init(&done, sizeof done);
+    std::string output;
+    if (opt.inPlace) {
+        // The file itself is replaced, not a link that leads to it: that is the name reported.
+        std::error_code pathError;
+        const fs::path real = fs::canonical(toPath(input), pathError);
+        output = pathError ? input : fromPath(real);
+        lib.check(xisfconv_rewrite_in_place(lib.ctx, input.c_str(), &r, &done));
+    } else {
+        output = outputPathFor(input, opt, XISFCONV_FORMAT_XISF);
+        lib.check(xisfconv_rewrite(lib.ctx, input.c_str(), output.c_str(), &r, &done));
+    }
     if (opt.quiet) return;
-    if (done.unchanged) {
+    if (opt.inPlace && !done.changed) {
         std::cout << input << ": already stored as requested; left unchanged\n";
         return;
     }
-    const XisfRewriteResult& r = done.result;
     std::string what;
-    auto add = [&](size_t n, const std::string& text) {
+    auto add = [&](uint64_t n, const std::string& text) {
         if (!n) return;
         if (!what.empty()) what += ", ";
         what += std::to_string(n) + " " + text;
     };
-    add(r.compressed, std::string(r.compressed == 1 ? "block" : "blocks") + " compressed with " + ropt.codec);
-    add(r.decompressed, std::string(r.decompressed == 1 ? "block" : "blocks") + " decompressed");
-    add(r.kept, std::string(r.kept == 1 ? "block" : "blocks") + " kept as stored");
-    add(r.checksums, std::string(r.checksums == 1 ? "checksum" : "checksums") + " computed");
-    add(r.checksumsRemoved, std::string(r.checksumsRemoved == 1 ? "checksum" : "checksums") + " removed");
+    add(done.compressed, std::string(done.compressed == 1 ? "block" : "blocks") + " compressed with " + codec);
+    add(done.decompressed, std::string(done.decompressed == 1 ? "block" : "blocks") + " decompressed");
+    add(done.kept, std::string(done.kept == 1 ? "block" : "blocks") + " kept as stored");
+    add(done.checksums, std::string(done.checksums == 1 ? "checksum" : "checksums") + " computed");
+    add(done.checksums_removed, std::string(done.checksums_removed == 1 ? "checksum" : "checksums") + " removed");
     if (what.empty()) what = "no attached data blocks";
     char percent[32];
     std::snprintf(percent, sizeof percent, "%.1f%%",
-                  done.inputSize ? 100.0 * static_cast<double>(r.outputSize) / static_cast<double>(done.inputSize) : 100.0);
-    std::cout << input << " -> " << done.output << ": " << megabytes(done.inputSize) << " -> " << megabytes(r.outputSize)
-              << " (" << percent << "); " << what << (r.readBack ? "; read back and compared with the input" : "") << "\n";
+                  done.input_size ? 100.0 * static_cast<double>(done.output_size) / static_cast<double>(done.input_size) : 100.0);
+    std::cout << input << " -> " << output << ": " << megabytes(done.input_size) << " -> " << megabytes(done.output_size)
+              << " (" << percent << "); " << what << (done.read_back ? "; read back and compared with the input" : "") << "\n";
 }
 
-void convertXisfInput(const std::string& input, const Options& opt) {
+void convertXisfInput(const Library& lib, const std::string& input, const Options& opt) {
     if (opt.treeJson) throw Error("--asdf-tree-json needs an ASDF file");
-    Format format = opt.inPlace ? Format::Xisf : Format::Fits;
+    xisfconv_format format = opt.inPlace ? XISFCONV_FORMAT_XISF : XISFCONV_FORMAT_FITS;
     if (opt.format) format = *opt.format;
     else if (!opt.output.empty()) {
         if (auto f = formatFromExtension(opt.output)) format = *f;
     }
-    if (format == Format::Xisf && !opt.dumpHeader && !opt.info) {
-        rewriteXisfInput(input, opt);
+    if (format == XISFCONV_FORMAT_XISF && !opt.dumpHeader && !opt.info) {
+        rewriteXisfInput(lib, input, opt);
         return;
     }
     if (opt.dumpHeader || opt.info || opt.inPlace) {
-        XisfFile file(input);
-        if (opt.dumpHeader) std::cout << file.headerXml() << "\n";
-        else if (opt.info) printInfo(file);
-        else throw Error("--in-place is for rewriting XISF files as XISF");
+        const OpenFile file(lib, input);
+        if (opt.dumpHeader) {
+            const char* header = "";
+            size_t size = 0;
+            lib.check(xisfconv_header_text(file.file, &header, &size));
+            std::cout.write(header, static_cast<std::streamsize>(size));   // all of it, whatever bytes it holds
+            std::cout << "\n";
+        } else if (opt.info) {
+            printXisfInfo(lib, input, file.file);
+        } else {
+            throw Error("--in-place is for rewriting XISF files as XISF");
+        }
         return;
     }
     const std::string outPath = outputPathFor(input, opt, format);
-    convertXisfFile(input, outPath, format, conversionOptions(opt));
+    const xisfconv_convert_options c = conversionOptions(opt, format);
+    lib.check(xisfconv_convert(lib.ctx, input.c_str(), outPath.c_str(), &c));
     if (!opt.quiet) std::cout << input << " -> " << outPath << "\n";
 }
 
-void printKeywords(const std::vector<FitsKeyword>& keywords) {
-    std::cout << "  Keywords (" << keywords.size() << "):\n";
-    for (const auto& k : keywords) {
-        std::cout << "    " << k.name;
-        if (k.name.size() < 8) std::cout << std::string(8 - k.name.size(), ' ');
-        if (!k.value.empty()) std::cout << "= " << k.value;
-        if (!k.comment.empty()) std::cout << (k.value.empty() ? " " : " / ") << k.comment;
-        std::cout << "\n";
-    }
-}
-
-void printFitsInfo(const FitsFile& f) {
-    std::cout << f.path << ": FITS, " << f.fileSize << " bytes, " << f.images.size() << " image HDU(s)\n";
-    for (const auto& img : f.images) {
-        std::cout << "\nHDU " << img.hduIndex;
-        if (!img.name.empty()) std::cout << " \"" << img.name << "\"";
-        std::cout << ": " << img.pixels.width << " x " << img.pixels.height << " x " << img.pixels.channels
-                  << ", BITPIX " << img.bitpix;
-        if (!img.tileCompression.empty()) std::cout << ", tile-compressed (" << img.tileCompression << ")";
-        if (img.bscale != 1 || img.bzero != 0) std::cout << ", BZERO " << img.bzero << ", BSCALE " << img.bscale;
-        std::cout << ", rows " << (img.hasRowOrder ? (img.topDown ? "top-down (ROWORDER)" : "bottom-up (ROWORDER)")
-                                                    : "bottom-up (FITS default, no ROWORDER)")
-                  << "\n";
-        printKeywords(img.keywords);
-    }
-    for (const auto& s : f.skipped) std::cout << "\nSkipped " << s << "\n";
-}
-
-void printAsdfInfo(const FitsFile& f) {
-    std::cout << f.path << ": " << f.formatNote << ", " << f.fileSize << " bytes, " << f.images.size() << " image(s)\n";
-    for (const auto& img : f.images) {
-        std::cout << "\nImage " << img.hduIndex << " at " << img.source;
-        if (!img.generic && !img.name.empty()) std::cout << " \"" << img.name << "\"";
-        std::cout << ": " << img.pixels.width << " x " << img.pixels.height << " x " << img.pixels.channels << ", "
-                  << img.storage << "\n";
-        std::cout << "  rows:        "
-                  << (img.hasRowOrder ? (img.topDown ? "top-down (ROWORDER)" : "bottom-up (ROWORDER)")
-                                      : img.generic ? "assumed bottom-up (plain array)" : "bottom-up (FITS default, no ROWORDER)")
-                  << "\n";
-        if (!img.generic) printKeywords(img.keywords);
-    }
-    for (const auto& s : f.skipped) std::cout << "\nSkipped " << s << "\n";
-}
-
-std::string jsonString(const std::string& text) {
-    std::string out = "\"";
-    char buf[8];
-    for (unsigned char c : text) {
-        if (c == '"' || c == '\\') {
-            out += '\\';
-            out += static_cast<char>(c);
-        } else if (c < 0x20) {
-            std::snprintf(buf, sizeof buf, "\\u%04x", c);
-            out += buf;
-        } else {
-            out += static_cast<char>(c);
-        }
-    }
-    return out + "\"";
-}
-
-// Prints a parsed YAML tree as JSON (mappings as {"m": [[key, value], ...]}); used by the tests.
-void printYamlJson(const YamlNode& node, int depth) {
-    if (depth > 1000) throw Error("tree too deep");
-    if (node.isSequence()) {
-        std::cout << "[";
-        for (size_t i = 0; i < node.items.size(); ++i) {
-            if (i) std::cout << ",";
-            printYamlJson(*node.items[i], depth + 1);
-        }
-        std::cout << "]";
-    } else if (node.isMapping()) {
-        std::cout << "{\"t\":" << jsonString(node.tag) << ",\"m\":[";
-        for (size_t i = 0; i < node.pairs.size(); ++i) {
-            std::cout << (i ? ",[" : "[");
-            printYamlJson(*node.pairs[i].first, depth + 1);
-            std::cout << ",";
-            printYamlJson(*node.pairs[i].second, depth + 1);
-            std::cout << "]";
-        }
-        std::cout << "]}";
-    } else {
-        const YamlValue v = yamlResolve(node);
-        switch (v.type) {
-            case YamlValue::Type::Null: std::cout << "null"; break;
-            case YamlValue::Type::Bool: std::cout << (v.boolean ? "true" : "false"); break;
-            case YamlValue::Type::Int: std::cout << v.text; break;
-            case YamlValue::Type::Float:
-                if (v.number != v.number || v.number - v.number != 0) std::cout << "{\"f\":" << jsonString(v.text) << "}";
-                else std::cout << "{\"f\":" << jsonString(formatDouble(v.number)) << "}";
-                break;
-            case YamlValue::Type::String: std::cout << jsonString(v.text); break;
-        }
-    }
-}
-
 // Converts a FITS or ASDF file. Both readers deliver the images in the same form.
-void convertFitsOrAsdfInput(const std::string& input, InputFormat kind, const Options& opt) {
-    const bool asdfInput = kind == InputFormat::Asdf;
+void convertFitsOrAsdfInput(const Library& lib, const std::string& input, bool asdfInput, const Options& opt) {
     if (asdfInput && opt.treeJson) {
-        printYamlJson(*parseYaml(readAsdfTree(input)), 0);
-        std::cout << "\n";
+        size_t size = 0;
+        lib.check(xisfconv_asdf_tree_json(lib.ctx, input.c_str(), nullptr, 0, &size));
+        std::string json(size, '\0');
+        lib.check(xisfconv_asdf_tree_json(lib.ctx, input.c_str(), &json[0], json.size(), &size));
+        std::cout << json << "\n";
         return;
     }
     if (opt.treeJson) throw Error("--asdf-tree-json needs an ASDF file");
     if (asdfInput && opt.dumpHeader) {
-        const std::string tree = readAsdfTree(input);
+        size_t size = 0;
+        lib.check(xisfconv_asdf_tree_text(lib.ctx, input.c_str(), nullptr, 0, &size));
+        std::string tree(size, '\0');
+        lib.check(xisfconv_asdf_tree_text(lib.ctx, input.c_str(), &tree[0], tree.size(), &size));
 #ifdef _WIN32
         // The tree is printed byte for byte; text mode would turn its CR LF into CR CR LF.
         std::cout.flush();
@@ -441,20 +613,24 @@ void convertFitsOrAsdfInput(const std::string& input, InputFormat kind, const Op
         return;
     }
     if (opt.info || opt.dumpHeader) {
-        if (asdfInput) printAsdfInfo(readAsdf(input, true, opt.verify));
-        else printFitsInfo(readFits(input, true));
+        const OpenFile file(lib, input);
+        if (asdfInput) printAsdfInfo(lib, input, file.file);
+        else printFitsInfo(lib, input, file.file);
         return;
     }
-    Format format = Format::Xisf;
+    xisfconv_format format = XISFCONV_FORMAT_XISF;
     if (opt.format) format = *opt.format;
     else if (!opt.output.empty()) {
         if (auto f = formatFromExtension(opt.output)) format = *f;
     }
     if (opt.inPlace) throw Error("--in-place is for rewriting XISF files as XISF");
     const std::string outPath = outputPathFor(input, opt, format);
-    convertFitsOrAsdfFile(input, kind, outPath, format, conversionOptions(opt));
+    const xisfconv_convert_options c = conversionOptions(opt, format);
+    lib.check(xisfconv_convert(lib.ctx, input.c_str(), outPath.c_str(), &c));
     if (!opt.quiet) std::cout << input << " -> " << outPath << "\n";
 }
+
+// ---------------------------------------------------------------- arguments
 
 bool parseArgs(int argc, char** argv, Options& opt, int& exitCode) {
     auto need = [&](int& i, const std::string& flag) -> std::string {
@@ -477,32 +653,32 @@ bool parseArgs(int argc, char** argv, Options& opt, int& exitCode) {
             return false;
         } else if (a == "-t" || a == "--to") {
             const std::string v = toLower(need(i, a));
-            if (v == "fits" || v == "fit") opt.format = Format::Fits;
-            else if (v == "tiff" || v == "tif") opt.format = Format::Tiff;
-            else if (v == "png") opt.format = Format::Png;
-            else if (v == "xisf") opt.format = Format::Xisf;
-            else if (v == "asdf") opt.format = Format::Asdf;
+            if (v == "fits" || v == "fit") opt.format = XISFCONV_FORMAT_FITS;
+            else if (v == "tiff" || v == "tif") opt.format = XISFCONV_FORMAT_TIFF;
+            else if (v == "png") opt.format = XISFCONV_FORMAT_PNG;
+            else if (v == "xisf") opt.format = XISFCONV_FORMAT_XISF;
+            else if (v == "asdf") opt.format = XISFCONV_FORMAT_ASDF;
             else throw Error("unknown output format '" + v + "' (use fits, asdf, tiff, png or xisf)");
         } else if (a == "-o" || a == "--output") opt.output = need(i, a);
         else if (a == "-d" || a == "--outdir") opt.outdir = need(i, a);
         else if (a == "-b" || a == "--bits") {
-            SampleFormat f;
+            xisfconv_sample_format f;
             const std::string v = need(i, a);
             if (!parseShortSampleFormat(v, f)) throw Error("unknown sample format '" + v + "' (use u8, u16, u32, f32, f64)");
             opt.bits = f;
         } else if (a == "-i" || a == "--image") {
             uint64_t n;
             const std::string v = need(i, a);
-            if (!parseUInt64(v, n)) throw Error("invalid image index '" + v + "'");
+            if (!parseUInt64(v, n) || n >= XISFCONV_ALL_IMAGES) throw Error("invalid image index '" + v + "'");
             opt.imageIndex = static_cast<size_t>(n);
         } else if (a == "-c" || a == "--compress") opt.compress = true;
-        else if (a == "-s" || a == "--stretch") opt.stretch = Stretch::Auto;
+        else if (a == "-s" || a == "--stretch") opt.stretch = XISFCONV_STRETCH_AUTO;
         else if (startsWith(a, "--stretch=")) {
             const std::string v = toLower(a.substr(10));
-            if (v == "auto") opt.stretch = Stretch::Auto;
-            else if (v == "linked") opt.stretch = Stretch::Linked;
-            else if (v == "unlinked") opt.stretch = Stretch::Unlinked;
-            else if (v == "stf") opt.stretch = Stretch::Stored;
+            if (v == "auto") opt.stretch = XISFCONV_STRETCH_AUTO;
+            else if (v == "linked") opt.stretch = XISFCONV_STRETCH_LINKED;
+            else if (v == "unlinked") opt.stretch = XISFCONV_STRETCH_UNLINKED;
+            else if (v == "stf") opt.stretch = XISFCONV_STRETCH_STORED;
             else throw Error("unknown stretch mode '" + v + "' (use auto, linked, unlinked or stf)");
         }
         else if (a == "--bottom-up") { opt.bottomUp = true; opt.rowOrderGiven = true; }
@@ -567,9 +743,11 @@ bool parseArgs(int argc, char** argv, Options& opt, int& exitCode) {
     if (!opt.output.empty() && !opt.format && !formatFromExtension(opt.output)) {
         throw Error("cannot infer output format from '" + opt.output + "'; add --to fits|asdf|tiff|png|xisf");
     }
-    if (!opt.outdir.empty() && !fs::is_directory(opt.outdir)) throw Error("output directory does not exist: " + opt.outdir);
+    if (!opt.outdir.empty() && !fs::is_directory(toPath(opt.outdir))) throw Error("output directory does not exist: " + opt.outdir);
     return true;
 }
+
+// ---------------------------------------------------------------- --verify
 
 // Collects the XISF, FITS and ASDF files in and below a directory. Directories that cannot be
 // read are reported in `errors`.
@@ -577,13 +755,13 @@ void findImageFiles(const fs::path& directory, std::vector<std::string>& found, 
     std::error_code ec;
     fs::directory_iterator it(directory, ec);
     if (ec || depth > 64) {
-        errors.push_back(directory.string() + ": " + (ec ? ec.message() : std::string("directories nested too deeply")));
+        errors.push_back(fromPath(directory) + ": " + (ec ? ec.message() : std::string("directories nested too deeply")));
         return;
     }
     std::vector<fs::path> directories;
     for (const fs::directory_iterator end; it != end; it.increment(ec)) {
         if (ec) {
-            errors.push_back(directory.string() + ": " + ec.message());
+            errors.push_back(fromPath(directory) + ": " + ec.message());
             break;
         }
         try {
@@ -591,14 +769,18 @@ void findImageFiles(const fs::path& directory, std::vector<std::string>& found, 
             if (it->is_directory(entryError) && !it->is_symlink(entryError)) {
                 directories.push_back(it->path());
             } else if (it->is_regular_file(entryError)) {
-                std::string name = it->path().string();
+                const std::string name = fromPath(it->path());
                 auto format = formatFromExtension(name);
                 // image.fits.fz: a FITS file with tile-compressed images
-                if (!format && lowerExt(name) == ".fz" && formatFromExtension(it->path().stem().string()) == Format::Fits) format = Format::Fits;
-                if (format && (*format == Format::Xisf || *format == Format::Fits || *format == Format::Asdf)) found.push_back(name);
+                if (!format && lowerExt(name) == ".fz" && formatFromExtension(fromPath(it->path().stem())) == XISFCONV_FORMAT_FITS) {
+                    format = XISFCONV_FORMAT_FITS;
+                }
+                if (format && (*format == XISFCONV_FORMAT_XISF || *format == XISFCONV_FORMAT_FITS || *format == XISFCONV_FORMAT_ASDF)) {
+                    found.push_back(name);
+                }
             }
-        } catch (const std::exception& e) {  // e.g. a name that has no narrow-character form
-            errors.push_back(directory.string() + ": " + e.what());
+        } catch (const std::exception& e) {
+            errors.push_back(fromPath(directory) + ": " + e.what());
         }
     }
     std::sort(directories.begin(), directories.end());
@@ -606,16 +788,16 @@ void findImageFiles(const fs::path& directory, std::vector<std::string>& found, 
 }
 
 // --verify: checks every file (and the image files in every directory) given.
-int verifyFiles(const Options& opt) {
+int verifyFiles(const Library& lib, const Options& opt) {
     std::vector<std::string> files, errors;
     for (const auto& input : opt.inputs) {
         std::error_code ec;
-        if (!fs::is_directory(input, ec)) {
+        if (!fs::is_directory(toPath(input), ec)) {
             files.push_back(input);
             continue;
         }
         std::vector<std::string> found;
-        findImageFiles(input, found, errors);
+        findImageFiles(toPath(input), found, errors);
         std::sort(found.begin(), found.end());
         if (found.empty()) std::cerr << "warning: " << input << ": no XISF, FITS or ASDF files found\n";
         files.insert(files.end(), found.begin(), found.end());
@@ -624,28 +806,18 @@ int verifyFiles(const Options& opt) {
     auto plural = [](size_t n, const char* word) { return std::to_string(n) + " " + word + (n == 1 ? "" : "s"); };
     size_t ok = 0, partly = 0, failed = 0;
     for (const auto& f : files) {
-        const MessageScope messages(messagePrinter(f, opt.quiet));
-        VerifyReport r;
-        const char* kind = "XISF";
-        try {
-            if (looksLikeFits(f)) {
-                kind = "FITS";
-                r = verifyFits(f);
-            } else if (looksLikeAsdf(f)) {
-                kind = "ASDF";
-                r = verifyAsdf(f);
-            } else {
-                r = verifyXisf(f);
-            }
-        } catch (const std::bad_alloc&) {
-            r.problems.push_back("out of memory");
-        } catch (const std::exception& e) {
-            r.problems.push_back(e.what());
+        xisfconv_report* report = nullptr;
+        std::vector<std::string> problems;
+        const xisfconv_status status = xisfconv_verify(lib.ctx, f.c_str(), &report);
+        if (status != XISFCONV_OK) {
+            problems.push_back(status == XISFCONV_ERR_MEMORY ? "out of memory" : xisfconv_error_message(lib.ctx));
+        } else {
+            for (size_t i = 0; i < xisfconv_report_problem_count(report); ++i) problems.push_back(xisfconv_report_problem(report, i));
         }
-        if (!r.problems.empty()) {
+        if (!problems.empty()) {
             ++failed;
             std::cout << f << ": FAILED\n";
-            for (std::string p : r.problems) {
+            for (std::string p : problems) {
                 // Hints meant for conversions do not apply here.
                 for (const char* hint : {" (use --no-verify to convert anyway)", " (the file is damaged; --no-verify skips this check)"}) {
                     const size_t at = p.find(hint);
@@ -653,17 +825,25 @@ int verifyFiles(const Options& opt) {
                 }
                 std::cout << "  " << p << "\n";
             }
+            xisfconv_report_free(report);
             continue;
         }
-        const bool complete = r.notChecked.empty();
+        const xisfconv_format format = xisfconv_report_format(report);
+        const char* kind = format == XISFCONV_FORMAT_FITS ? "FITS" : format == XISFCONV_FORMAT_ASDF ? "ASDF" : "XISF";
+        const size_t notChecked = xisfconv_report_not_checked_count(report);
+        const size_t verified = xisfconv_report_verified(report), unchecked = xisfconv_report_unchecked(report);
+        const bool complete = notChecked == 0;
         ++(complete ? ok : partly);
-        if (opt.quiet && complete) continue;
-        std::cout << f << ": " << (complete ? "OK" : "NOT FULLY CHECKED") << " (" << kind << ", " << r.summary << "; ";
-        if (r.verified) std::cout << plural(r.verified, "checksum") << " verified";
-        else std::cout << "no checksums " << (complete ? "in the file" : "verified");
-        if (r.verified && r.unchecked) std::cout << ", " << r.unchecked << " without checksum";
-        std::cout << ")\n";
-        for (const auto& n : r.notChecked) std::cout << "  not checked: " << n << "\n";
+        if (!(opt.quiet && complete)) {
+            std::cout << f << ": " << (complete ? "OK" : "NOT FULLY CHECKED") << " (" << kind << ", " << xisfconv_report_summary(report)
+                      << "; ";
+            if (verified) std::cout << plural(verified, "checksum") << " verified";
+            else std::cout << "no checksums " << (complete ? "in the file" : "verified");
+            if (verified && unchecked) std::cout << ", " << unchecked << " without checksum";
+            std::cout << ")\n";
+            for (size_t i = 0; i < notChecked; ++i) std::cout << "  not checked: " << xisfconv_report_not_checked(report, i) << "\n";
+        }
+        xisfconv_report_free(report);
     }
     for (const auto& e : errors) std::cout << e << ": FAILED (cannot be read)\n";
     failed += errors.size();
@@ -675,9 +855,7 @@ int verifyFiles(const Options& opt) {
     return failed ? 1 : 0;
 }
 
-}  // namespace
-
-int main(int argc, char** argv) {
+int run(int argc, char** argv) {
     Options opt;
     try {
         int exitCode = 0;
@@ -686,14 +864,17 @@ int main(int argc, char** argv) {
         std::cerr << "xisfconv: " << e.what() << "\n";
         return 2;
     }
-    if (opt.verifyMode) return verifyFiles(opt);
+    Library lib;
+    lib.quiet = opt.quiet;
+    if (opt.verifyMode) return verifyFiles(lib, opt);
     int failures = 0;
     for (const auto& input : opt.inputs) {
-        const MessageScope messages(messagePrinter(input, opt.quiet));
         try {
-            const InputFormat kind = detectInputFormat(input);
-            if (kind == InputFormat::Xisf) convertXisfInput(input, opt);
-            else convertFitsOrAsdfInput(input, kind, opt);
+            // A file that is neither FITS nor ASDF goes to the XISF reader, which says what is wrong with it.
+            xisfconv_format kind = XISFCONV_FORMAT_XISF;
+            if (xisfconv_detect_format(lib.ctx, input.c_str(), &kind) != XISFCONV_OK) kind = XISFCONV_FORMAT_XISF;
+            if (kind == XISFCONV_FORMAT_XISF) convertXisfInput(lib, input, opt);
+            else convertFitsOrAsdfInput(lib, input, kind == XISFCONV_FORMAT_ASDF, opt);
         } catch (const std::bad_alloc&) {
             std::cerr << "error: " << input << ": out of memory\n";
             ++failures;
@@ -704,3 +885,31 @@ int main(int argc, char** argv) {
     }
     return failures ? 1 : 0;
 }
+
+}  // namespace
+
+#ifdef _WIN32
+// The arguments arrive as UTF-16 and are handed on as UTF-8, which is what the library expects;
+// the console is told that the program's output is UTF-8 as well.
+int wmain(int argc, wchar_t** wargv) {
+    std::vector<std::string> args;
+    for (int i = 0; i < argc; ++i) {
+        const int size = WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, nullptr, 0, nullptr, nullptr);
+        std::string arg(size > 0 ? static_cast<size_t>(size - 1) : 0, '\0');
+        if (size > 1) WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, &arg[0], size, nullptr, nullptr);
+        args.push_back(std::move(arg));
+    }
+    std::vector<char*> argv;
+    for (auto& a : args) argv.push_back(&a[0]);
+    argv.push_back(nullptr);
+    const UINT codePage = GetConsoleOutputCP();
+    SetConsoleOutputCP(CP_UTF8);
+    const int status = run(argc, argv.data());
+    std::cout.flush();
+    std::cerr.flush();
+    if (codePage) SetConsoleOutputCP(codePage);
+    return status;
+}
+#else
+int main(int argc, char** argv) { return run(argc, argv); }
+#endif

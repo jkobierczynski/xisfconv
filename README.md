@@ -1,7 +1,9 @@
 # xisfconv
 
 A small, dependency-light command-line converter between PixInsight **XISF**, **FITS** and **ASDF**,
-in every direction, with **TIFF** and **PNG** export from all three.
+in every direction, with **TIFF** and **PNG** export from all three. The same code is available as a
+library, **libxisfconv**, with a plain C API for C, C++, Python and other languages: see
+[Library](#library-libxisfconv).
 
 ```
 xisfconv M31_integration.xisf                 # -> M31_integration.fits
@@ -293,6 +295,11 @@ sudo cmake --install build        # optional
 Windows (vcpkg): `vcpkg install zlib zstd`, then configure with
 `-DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake`.
 
+Options: `-DBUILD_SHARED_LIBS=ON` builds libxisfconv as a shared library (the default is a static
+library that is linked into the tool), `-DXISFCONV_BUILD_TESTS=ON` builds the C test programs of
+the library, `-DXISFCONV_WITH_ZSTD=OFF` leaves Zstandard out, `-DXISFCONV_PORTABLE=ON` makes the
+self-contained binary that is released.
+
 ## Usage
 
 ```
@@ -337,12 +344,108 @@ interrupted run, or another file) is not overwritten unless `--force` is given, 
 is the input itself. With several inputs, a failing file is reported and the rest are still
 converted (exit status 1).
 
+## Library (libxisfconv)
+
+Everything the tool does is done by a library with a plain C API, declared in
+[`include/xisfconv.h`](include/xisfconv.h). The tool itself uses nothing else. The library reads
+XISF, FITS and ASDF images into arrays, writes arrays as XISF, FITS, ASDF, TIFF or PNG, converts and
+rewrites files, verifies them, translates astrometric solutions and applies PixInsight's screen
+stretch.
+
+Its purpose is XISF and the conversion between XISF, FITS and ASDF. FITS and ASDF are supported as
+far as images need them: for tables and everything else in those formats, CFITSIO, astropy and
+Python's `asdf` are the libraries to use.
+
+```
+cmake -S . -B build -DBUILD_SHARED_LIBS=ON
+cmake --build build -j
+sudo cmake --install build      # libxisfconv, xisfconv.h, xisfconv.pc, the CMake package, the tool
+```
+
+```c
+#include "xisfconv.h"
+/* cc app.c $(pkg-config --cflags --libs xisfconv)      (add --static for the static library)
+   or, in CMake:  find_package(xisfconv REQUIRED)
+                  target_link_libraries(app PRIVATE xisfconv::xisfconv) */
+
+xisfconv_context *ctx = xisfconv_context_new();
+xisfconv_file *file = NULL;
+if (xisfconv_open(ctx, "M31.xisf", &file) != XISFCONV_OK) {
+    fprintf(stderr, "%s\n", xisfconv_error_message(ctx));
+} else {
+    xisfconv_read_options ro;
+    uint64_t size;
+    xisfconv_read_options_init(&ro, sizeof ro);
+    ro.sample_format = XISFCONV_SAMPLE_FLOAT32;      /* whatever the file holds */
+    xisfconv_pixels_size(file, 0, &ro, &size);
+    float *pixels = malloc(size);                    /* [channels][height][width], top row first */
+    xisfconv_read_pixels(file, 0, &ro, pixels, size);
+    ...
+    xisfconv_close(file);
+}
+xisfconv_convert(ctx, "M31.xisf", "M31.fits", NULL); /* what the tool does, in one call */
+xisfconv_context_free(ctx);
+```
+
+[`examples/example.c`](examples/example.c) is a complete program: it lists the images and keywords
+of a file, reads pixels, writes them as a compressed XISF file, makes a stretched PNG and verifies
+the input.
+
+What to know:
+
+- **Errors.** Functions return a status (`XISFCONV_OK` is 0); the text of the last failure is kept
+  in the context. No exception leaves the library, and it prints nothing: warnings and notes go to
+  a message handler, if one is set. A progress handler can cancel a long call.
+- **Pixels** are planar and in host byte order: `[channels, height, width]` for NumPy. The row
+  order is always stated: XISF, TIFF and PNG are top-down, FITS is bottom-up unless `ROWORDER` says
+  otherwise, and reading and writing take the order the caller wants.
+- **Keywords** come as the file has them. WCS keywords describe the rows in the order the image
+  info names (`wcs_row_order`): the stored order in FITS and ASDF, always bottom-up in XISF, as
+  PixInsight writes them. `xisfconv_wcs_keywords` returns them for any row order, and the writer
+  converts them when it stores the rows the other way round.
+- **Numbers** in files have a decimal point whatever locale the program has set.
+- **File names** are UTF-8 on every platform, Windows included.
+- **Threads.** There is no global state. A context and the handles made from it belong to one
+  thread at a time; different contexts are independent.
+- **From other languages.** The structs start with their size and enumerations are 32-bit integers,
+  so the header maps directly to Python's `ctypes` or `cffi`, Rust's bindgen and Perl's
+  FFI::Platypus. `tests/library_tests.py` drives the library through `ctypes` and shows how. A
+  Python package with NumPy arrays in and out is the next step.
+- **Stability.** Version 0.x: the API may still change between releases, and the shared library's
+  version changes with each of them (`libxisfconv.so.0.10`).
+- **Messages** are the tool's and some name its options (`--force`, `--bounds`): the option names
+  say which setting is meant.
+- The CMake package (`find_package(xisfconv)`) is installed with the shared library; a static
+  library comes with the pkg-config file only, to be used with `pkg-config --static`.
+- An ICC profile handed to the writer is stored in XISF as an inline `ICCProfile` block. The
+  library reads it back; whether PixInsight accepts it has not been checked yet.
+
+The library is licensed under the LGPL (version 3 or later), so that programs under other licences
+can use it; the command line tool remains under the GPL.
+
 ## Testing
 
 ```
 pip install numpy astropy tifffile imagecodecs xisf lz4 zstandard pillow asdf asdf-astropy asdf-compression
 python3 tests/run_tests.py build/xisfconv
+
+# the library: C test programs, and its API called from Python
+cmake -S . -B build-shared -DBUILD_SHARED_LIBS=ON -DXISFCONV_BUILD_TESTS=ON && cmake --build build-shared -j
+mkdir /tmp/capi && build-shared/xisfconv_capi_test /tmp/capi
+python3 tests/library_tests.py build-shared/libxisfconv.so build-shared/xisfconv
 ```
+
+The library is tested on its own. `tests/capi_test.c` is plain C99 and built by a C compiler, so the
+header stays C; it writes its test files with the library, reads them back and goes through the
+error paths: missing arguments, buffers that are too small, indices out of range, options of an
+older and shorter layout, handles that outlive their context, the message and progress callbacks and
+cancellation. `tests/library_tests.py` calls the API through `ctypes`: arrays written as XISF, FITS,
+ASDF, TIFF and PNG are read back by astropy, the `xisf` package, Python's `asdf`, tifffile and
+Pillow, and files written by astropy and the `xisf` package are read through the library and
+compared with what that software reads. It also checks the WCS functions through astropy, the
+stretch against the tool's `--stretch`, file names beyond ASCII, several threads with their own
+contexts at once, and that the library prints nothing. `tests/capi_readall.c` reads everything the
+API offers from any file and is the target for fuzzing.
 
 Test inputs come from two independent writers: the `xisf` PyPI package (all codecs ± shuffling,
 5 sample formats, gray and RGB) and a small encoder in the test script for the features that package
@@ -418,6 +521,7 @@ compared with PyYAML on random documents in all of PyYAML's output styles.
   file in place gives it a new inode: other hard links to the old file keep the old content.
 - FITS output carries no CHECKSUM/DATASUM keywords yet; `--verify` checks them where a file has them.
 - On Windows the shell does not expand `*.xisf`; name the files, or use a directory with `--verify`.
+  File names are handled as Unicode there (the console is switched to UTF-8 while the tool runs).
 - The PixInsight spline distortion model is approximated by SIP polynomials, not carried over exactly.
 - Please report any file that fails to convert, ideally with `xisfconv --info` output.
 
@@ -428,10 +532,11 @@ dependencies, testing, the planned library); [`TODO.md`](TODO.md) lists what is 
 
 ## Releasing
 
-Bump the version in `src/common.hpp` and `CMakeLists.txt`, commit, then push a matching tag:
+Bump the version in `include/xisfconv.h` (CMake reads it from there), commit, then push a matching
+tag:
 
 ```
-git tag v0.9.2 && git push origin v0.9.2
+git tag v0.10.0 && git push origin v0.10.0
 ```
 
 CI builds and tests all three platforms and, only if every one passes, publishes a GitHub release with
@@ -468,9 +573,16 @@ corners, with `ex`/`ey` round-trip errors of 1 to 2 pixels there.
 
 Copyright (C) 2026 Jurgen Kobierczynski
 
-xisfconv is free software: you can redistribute it and/or modify it under the terms of the GNU
-General Public License as published by the Free Software Foundation, either version 3 of the
-License, or (at your option) any later version. See [LICENSE](LICENSE).
+The command line tool (`src/main.cpp`) is free software under the terms of the GNU General Public
+License as published by the Free Software Foundation, either version 3 of the License, or (at your
+option) any later version: see [LICENSE](LICENSE).
+
+The library libxisfconv (`include/xisfconv.h` and everything else in `src/`) is free software under
+the terms of the GNU Lesser General Public License, either version 3 of the License, or (at your
+option) any later version: see [COPYING.LESSER](COPYING.LESSER), which adds its permissions to the
+terms in [LICENSE](LICENSE). A program may link the library without taking on the GPL, provided the
+conditions of the LGPL are met. Each source file says in its first lines which of the two applies;
+the build files and the example belong to the library, the tests to the tool.
 
 XISF and PixInsight are products of Pleiades Astrophoto S.L.; xisfconv is an independent
 implementation of the published XISF 1.0 specification and is not affiliated with them.

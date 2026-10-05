@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 Jurgen Kobierczynski
 #include "fitstile.hpp"
 
@@ -431,7 +431,7 @@ std::vector<uint8_t> decodeTiledImage(const TiledImage& image, const std::vector
         } catch (const Unsupported&) {
             throw;
         } catch (const Error& e) {
-            throw Error(label + ": " + e.what());
+            throw Error(label + ": " + e.what(), e.kind);
         }
 
         // Convert to samples of the image's type.
