@@ -51,11 +51,11 @@ The decisions are recorded in `DEVELOPMENT.md`; the API is `include/xisfconv.h`.
 
 Open checks of the Python package:
 
-- [ ] The Windows wheel: the `wheels` workflow built and tested the wheels for Linux (x86_64,
-      arm64) and macOS and the source distribution for v0.11.1, but the Windows wheel failed in
-      its build step (the cause is in the log of that step, not yet looked at). The same build
-      with GCC on Windows Python under Wine works, as do `delvewheel repair` and the tests of the
-      installed wheel.
+- [ ] The wheels for macOS and Windows: the `wheels` workflow builds and tests the wheels for
+      Linux (x86_64, arm64) and the source distribution. For v0.12.0 the macOS wheel was built
+      and failed one test that depended on the timing of a signal, and the Windows wheel was
+      built and then failed when its build directory could not be deleted. 0.12.1 answers both;
+      a run of the workflow has to confirm it.
 - [ ] Register the project on PyPI and switch publishing on (see "Releasing" in the README).
 
 Later, each when it is needed:

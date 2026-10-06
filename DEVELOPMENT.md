@@ -2,7 +2,7 @@
 
 What was decided while building xisfconv, and why. The README says what the program does and
 `TODO.md` what is planned; this file records the choices behind both, so that they are not
-reopened by accident. State: version 0.12.0, 6 October 2026.
+reopened by accident. State: version 0.12.1, 6 October 2026.
 
 ## Purpose and scope
 
@@ -293,6 +293,19 @@ Built in 0.11.0, in `python/`. What was decided:
   `xisfconv.h` and nothing else (a linker version script), so another copy of Zstandard or of the
   C++ library in the same process is not disturbed. musllinux, 32-bit Windows and Intel macOS are
   left for when someone needs them.
+- **On Windows the wheel is built in a directory that stays** (`build-wheel/`, an override in
+  `pyproject.toml`, 0.12.1). scikit-build-core builds in a temporary directory and deletes it
+  when the wheel is made. On the Windows runners that deletion failed, after a build without
+  an error: "the process cannot access the file because it is being used by another process",
+  for the build directory itself, which some process the compiler tools had started still had
+  open. Which one was not established (it cannot be reproduced without Visual Studio); a
+  directory that nobody deletes does not depend on the answer.
+- **A test must not depend on where a signal lands.** One test showed why the progress reporter
+  is a generator by sending signals at a plain function until one slipped through, and failed
+  when none did within 300 tries; that passed everywhere here and for one release in CI, then
+  failed on a macOS runner. It is a test of its own now, skipped where no signal arrives at
+  that moment within three seconds; what the package promises (nothing escapes the reporter)
+  never depended on it.
 - **Arrays have row 0 at the top and the channels last** by default: that is what Pillow,
   matplotlib, tifffile and the `xisf` package give, and what a Python user expects of an image.
   `row_order` and `channels` give the FITS conventions (bottom-up, planes first) on request, and

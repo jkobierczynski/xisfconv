@@ -188,61 +188,81 @@ def test_progress_is_called_where_the_call_was_made(tmp_path, many_blocks):
     assert len(sys._current_frames()) == threading.active_count()
 
 
-@pytest.mark.skipif(not hasattr(signal, "setitimer") or threading.current_thread() is not threading.main_thread(),
-                    reason="needs an interval timer (POSIX) and the main thread")
-def test_no_exception_escapes_the_reporter():
-    """What the library calls between its steps is the `send` of a generator, because that
-    catches whatever a signal handler raises at the moment it is entered; an ordinary function
-    cannot. Driven here as the library drives it, from C with no Python code in between, with a
-    signal at another moment each time: every exception is caught inside, none comes out."""
-    import ctypes
-    import itertools
-    import operator
-    from functools import partial
+class _Stop(Exception):
+    """What the signal handler of the two tests below raises."""
 
-    from xisfconv import _core, _lib
 
-    class Stop(Exception):
-        pass
+class _Strikes:
+    """Calls a progress handler as the library does, from C with no Python code in between, with
+    a signal at another moment each time whose handler raises, and says where the exception
+    went."""
 
-    armed = []
+    def __init__(self):
+        import ctypes
 
-    def handler(signum, frame):
+        from xisfconv import _lib
+
+        self.go_on, self.stop = _lib.HOST_GO_ON, _lib.HOST_STOP
+        self.armed = []
+        self.argument = ctypes.pointer(_lib.ProgressReport(None, b"testing", 1, 2))
+        self.old = signal.signal(signal.SIGALRM, self.handler)
+
+    def handler(self, signum, frame):
         # (only while a run is on: a signal that is delivered late, after its timer was stopped,
         # would strike the test itself; macOS does that)
-        if armed:
-            armed.clear()
-            raise Stop()
+        if self.armed:
+            self.armed.clear()
+            raise _Stop()
 
-    report = _lib.ProgressReport(None, b"testing", 1, 2)
-    argument = ctypes.pointer(report)
-    call = operator.methodcaller("__call__")
-    calls = []
+    def close(self):
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, self.old)
 
-    def run(send, raised, delay):
-        steps = [partial(send, argument) for _ in range(300)]
-        sends = iter(steps)
+    def run(self, send, raised, delay):
+        """"caught": the handler's exception was caught inside `send`, which answered "stop";
+        "escaped": it came out of `send`; "outside": it struck between two calls, in this
+        function; "quiet": there was no signal in time."""
+        import itertools
+        import operator
+        from functools import partial
+
+        call = operator.methodcaller("__call__")
+        sends = iter([partial(send, self.argument) for _ in range(300)])
         try:
-            armed.append(True)
+            self.armed.append(True)
             signal.setitimer(signal.ITIMER_REAL, delay)
             try:
                 # in C, nothing of Python between the steps; up to the first answer that is not "go on"
-                answers = list(itertools.takewhile(_lib.HOST_GO_ON.__eq__, map(call, sends)))
-                answers.append(_lib.HOST_STOP if raised[1] is not None else None)
+                answers = list(itertools.takewhile(self.go_on.__eq__, map(call, sends)))
+                answers.append(self.stop if raised[1] is not None else None)
             finally:
-                armed.clear()
+                self.armed.clear()
                 signal.setitimer(signal.ITIMER_REAL, 0)
-        except Stop as e:
+        except _Stop as e:
             traceback = e.__traceback__
-            while traceback.tb_next is not None and traceback.tb_next.tb_frame.f_code is not handler.__code__:
+            while traceback.tb_next is not None and traceback.tb_next.tb_frame.f_code is not _Strikes.handler.__code__:
                 traceback = traceback.tb_next
-            return "outside" if traceback.tb_frame.f_code is run.__code__ else "escaped"
+            return "outside" if traceback.tb_frame.f_code is _Strikes.run.__code__ else "escaped"
         if raised[1] is None:
             return "quiet"
         # one "stop", and after it the generator has come to its end (the library asks no more)
-        return "caught" if answers.count(_lib.HOST_STOP) == 1 else "wrong"
+        return "caught" if answers.count(self.stop) == 1 else "wrong"
 
-    old = signal.signal(signal.SIGALRM, handler)
+
+_needs_timer = pytest.mark.skipif(not hasattr(signal, "setitimer") or threading.current_thread() is not threading.main_thread(),
+                                  reason="needs an interval timer (POSIX) and the main thread")
+
+
+@_needs_timer
+def test_no_exception_escapes_the_reporter():
+    """What the library calls between its steps is the `send` of a generator, because that
+    catches whatever a signal handler raises at the moment it is entered; an ordinary function
+    cannot (see the next test). Driven here as the library drives it, with a signal at another
+    moment each time: every exception is caught inside, none comes out."""
+    from xisfconv import _core
+
+    strikes = _Strikes()
+    calls = []
     try:
         outcomes = {}
         deadline = time.monotonic() + 2.0
@@ -252,34 +272,50 @@ def test_no_exception_escapes_the_reporter():
             state = [lambda *a: calls.append(a), None]
             reporter = _core._reporter(state)
             next(reporter)
-            outcome = run(reporter.send, state, 20e-6 + (n % 50) * 3e-6)
+            outcome = strikes.run(reporter.send, state, 20e-6 + (n % 50) * 3e-6)
             outcomes[outcome] = outcomes.get(outcome, 0) + 1
             try:
                 reporter.close()      # (here, not when it is collected, while a late signal may still come)
-            except Stop:
+            except _Stop:
                 pass
             if outcome == "caught":
-                assert isinstance(state[1], Stop)
+                assert isinstance(state[1], _Stop)
         assert outcomes.get("caught", 0) > 50 and not outcomes.get("escaped") and not outcomes.get("wrong"), outcomes
         assert calls and calls[0] == ("testing", 1, 2)
-
-        # the same with a function in its place: that is what does not work (from Python 3.11
-        # on; before, the interpreter did not look for signals at the start of a function that
-        # begins with `try`)
-        def function(pointer):
-            try:
-                return _lib.HOST_GO_ON
-            except BaseException:      # noqa: BLE001
-                return _lib.HOST_STOP
-
-        lost = 0
-        for n in range(300):
-            if run(function, [None, None], 20e-6 + (n % 50) * 3e-6) == "escaped":
-                lost += 1
-        assert lost > 0 or sys.version_info < (3, 11), "a function caught everything: is the generator still needed?"
     finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, old)
+        strikes.close()
+
+
+@_needs_timer
+@pytest.mark.skipif(sys.version_info < (3, 11), reason="before Python 3.11 the interpreter did not look for signals at the "
+                                                       "start of a function that begins with `try`")
+def test_a_function_in_the_place_of_the_reporter_loses_exceptions():
+    """Why the reporter is a generator: a function with the same `try` around all of its body
+    lets the exception of a signal handler out, when the signal arrives as the function is
+    entered. That is a matter of microseconds, and of how the system times its signals: where
+    no signal lands there within the time given, there is nothing to show, and the test is
+    skipped (it says something about the interpreter, not about the package)."""
+    from xisfconv import _lib
+
+    def function(pointer):
+        try:
+            return _lib.HOST_GO_ON
+        except BaseException:      # noqa: BLE001
+            return _lib.HOST_STOP
+
+    strikes = _Strikes()
+    try:
+        outcomes = {}
+        deadline = time.monotonic() + 3.0
+        n = 0
+        while time.monotonic() < deadline and not outcomes.get("escaped"):
+            n += 1
+            outcome = strikes.run(function, [None, None], 5e-6 + (n % 97) * 2e-6)
+            outcomes[outcome] = outcomes.get(outcome, 0) + 1
+    finally:
+        strikes.close()
+    if not outcomes.get("escaped"):
+        pytest.skip("no signal arrived at the moment a function is entered, in %d tries: %r" % (n, outcomes))
 
 
 def test_a_progress_report_that_fails(tmp_path, many_blocks, monkeypatch):
