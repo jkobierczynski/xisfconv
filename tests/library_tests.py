@@ -95,7 +95,7 @@ class ConvertOptions(C.Structure):
     _fields_ = [("struct_size", size_t), ("output_format", i32), ("sample_format", i32), ("image", size_t), ("stretch", i32),
                 ("codec", i32), ("checksum", i32), ("subblock_size", u64), ("row_order", i32), ("property_keywords", i32),
                 ("wcs", i32), ("sip_order", i32), ("verify_checksums", i32), ("use_bounds", i32), ("overwrite", i32),
-                ("lower_bound", f64), ("upper_bound", f64)]
+                ("lower_bound", f64), ("upper_bound", f64), ("properties", i32)]
 
 
 class WriteOptions(C.Structure):
@@ -153,6 +153,8 @@ image_detail = declare("image_detail", text, ptr, size_t, text)
 image_keywords = declare("image_keywords", i32, ptr, size_t, C.POINTER(ptr))
 property_count = declare("property_count", size_t, ptr, size_t)
 property_find = declare("property_find", C.c_int64, ptr, size_t, text)
+property_get = declare("property_get", i32, ptr, size_t, size_t, C.POINTER(text), C.POINTER(text), C.POINTER(text),
+                       C.POINTER(text), C.POINTER(i32))
 property_read_f64 = declare("property_read_f64", i32, ptr, size_t, text, C.POINTER(f64), size_t, C.POINTER(size_t),
                             C.POINTER(size_t))
 read_options_init = declare("read_options_init", None, C.POINTER(ReadOptions), size_t)
@@ -703,6 +705,108 @@ def test_read_xisf():
                     check(same(f.read(rows=ROWS_BOTTOM_UP), np.moveaxis(a, -1, 0)[:, ::-1, :]), "XISF: bottom-up on request")
 
 
+def properties_of(f, image=0):
+    """[(id, type, value, comment)] through the library: the value is text, or an array for vectors and matrices."""
+    out = []
+    for n in range(property_count(f.handle, image)):
+        pid, kind, value, comment, block = text(), text(), text(), text(), i32()
+        assert property_get(f.handle, image, n, C.byref(pid), C.byref(kind), C.byref(value), C.byref(comment), C.byref(block)) == OK
+        entry = value.value.decode()
+        if block.value:
+            rows, columns = size_t(), size_t()
+            st = property_read_f64(f.handle, image, pid.value, None, 0, C.byref(rows), C.byref(columns))
+            if st == OK:
+                entry = np.empty((rows.value, columns.value))
+                assert property_read_f64(f.handle, image, pid.value, entry.ctypes.data_as(C.POINTER(f64)), entry.size,
+                                         C.byref(rows), C.byref(columns)) == OK
+            else:
+                entry = None
+        out.append((pid.value.decode(), kind.value.decode(), entry, comment.value.decode()))
+    return out
+
+
+def test_carried_properties():
+    """The XISF properties of a file the xisf package wrote, through FITS and ASDF and back."""
+    rng = np.random.default_rng(31)
+    a = (rng.random((9, 14, 1)) * 60000).astype(np.uint16)
+    vector, matrix = rng.normal(size=5), rng.normal(size=(3, 4))
+    props = {
+        "Instrument:ExposureTime": {"id": "Instrument:ExposureTime", "type": "Float32", "value": 180.5},
+        "Observation:Object:Name": {"id": "Observation:Object:Name", "type": "String", "value": "NGC 7000 \u2604 <north> & co"},
+        "Instrument:Camera:Gain": {"id": "Instrument:Camera:Gain", "type": "Int32", "value": 120},
+        "Lab:Vector": {"id": "Lab:Vector", "type": "F64Vector", "value": vector},
+        "Lab:Matrix": {"id": "Lab:Matrix", "type": "F64Matrix", "value": matrix},
+        "Lab:Counts": {"id": "Lab:Counts", "type": "UI16Vector", "value": np.array([1, 2, 65535], np.uint16)},
+        "Lab:Flag": {"id": "Lab:Flag", "type": "Boolean", "value": True},
+    }
+    src = os.path.join(TMP, "carried.xisf")
+    XISF.write(src, a, image_metadata={"XISFProperties": props},
+               xisf_metadata={"Note:Author": {"id": "Note:Author", "type": "String", "value": "somebody"}})
+    with Opened(src) as f:
+        first, first_file = properties_of(f), properties_of(f, FILE_PROPERTIES)
+    by_id = {p[0]: p for p in first}
+    check(len(first) == len(props) and np.array_equal(by_id["Lab:Matrix"][2], matrix) and by_id["Lab:Flag"][1] == "Boolean",
+          f"the properties the xisf package wrote: {[p[0] for p in first]}")
+    note = [p for p in first_file if p[0] == "Note:Author"]
+
+    def same_properties(a, b):
+        # (a Boolean by its value: the xisf package writes True, which an ASDF tree holds as true)
+        return len(a) == len(b) and all(x[0] == y[0] and x[1] == y[1] and x[3] == y[3] and (
+            np.array_equal(x[2], y[2]) if isinstance(x[2], np.ndarray) else
+            x[2].lower() == y[2].lower() if x[1] == "Boolean" else x[2] == y[2]) for x, y in zip(a, b))
+
+    co = ConvertOptions()
+    convert_options_init(C.byref(co), C.sizeof(co))
+    check(co.properties == 1, "properties are taken along by default")
+    co.overwrite = 1
+    for kind, codec in (("fits", CODEC_NONE), ("fits", CODEC_DEFAULT), ("asdf", CODEC_NONE), ("asdf", CODEC_ZLIB)):
+        label = f"{kind}{' compressed' if codec else ''}"
+        mid, back = os.path.join(TMP, "carried." + kind), os.path.join(TMP, "carried_back.xisf")
+        co.codec, co.properties = codec, 1
+        check(convert(ctx, enc(src), enc(mid), C.byref(co)) == OK, f"XISF -> {label}: {err()}")
+        with Opened(mid) as f:
+            check(same_properties(properties_of(f), first) and same_properties(properties_of(f, FILE_PROPERTIES), note),
+                  f"{label}: the library reads the properties the file carries, those of the image and of the file")
+        if kind == "fits":
+            with fits.open(mid) as hdul:
+                table = hdul["XISF_PROPERTIES"].data
+                row = {r["ID"]: r for r in table}["Lab:Matrix"]
+                check(row["TYPE"] == "F64Matrix" and row["BLOCK"] and (row["ROWS"], row["COLUMNS"]) == (3, 4) and
+                      np.array_equal(np.frombuffer(bytes(np.asarray(row["VALUE"], np.uint8)), "<f8").reshape(3, 4), matrix),
+                      f"{label}: astropy reads the matrix from the table")
+                name = {r["ID"]: r for r in table}["Observation:Object:Name"]
+                check(bytes(np.asarray(name["VALUE"], np.uint8)).decode() == "NGC 7000 \u2604 <north> & co" and not name["BLOCK"],
+                      f"{label}: and the text, as UTF-8")
+                check([r["ID"] for r in hdul["XISF_METADATA"].data] == ["Note:Author"], f"{label}: the property of the file has its own table")
+        elif HAVE_ASDF:
+            with asdf.open(mid) as af:
+                tree = af["xisf"]["images"][0]["properties"]
+                check(np.array_equal(np.asarray(tree["Lab:Matrix"]["value"]), matrix) and tree["Lab:Flag"]["value"] is True and
+                      tree["Instrument:Camera:Gain"]["value"] == 120 and tree["Observation:Object:Name"]["value"] == "NGC 7000 \u2604 <north> & co" and
+                      np.asarray(tree["Lab:Counts"]["value"]).dtype == np.uint16 and af["xisf"]["metadata"]["Note:Author"]["value"] == "somebody",
+                      f"{label}: the asdf library reads them from the tree")
+        co.codec = CODEC_NONE
+        check(convert(ctx, enc(mid), enc(back), C.byref(co)) == OK, f"{label} -> XISF: {err()}")
+        with Opened(back) as f:
+            check(same_properties(properties_of(f), first) and
+                  same_properties([p for p in properties_of(f, FILE_PROPERTIES) if p[0] == "Note:Author"], note),
+                  f"{label} -> XISF: they are the properties of the XISF file again")
+        theirs = XISF(back).get_images_metadata()[0]["XISFProperties"]
+        check(list(theirs) == list(props) and np.array_equal(theirs["Lab:Matrix"]["value"], matrix) and
+              np.array_equal(theirs["Lab:Counts"]["value"], [1, 2, 65535]) and theirs["Lab:Counts"]["value"].dtype == np.uint16 and
+              theirs["Observation:Object:Name"]["value"] == "NGC 7000 \u2604 <north> & co" and theirs["Instrument:Camera:Gain"]["value"] == 120,
+              f"{label} -> XISF: and the xisf package reads them as it read the first file")
+        co.properties = 0
+        check(convert(ctx, enc(mid), enc(back), C.byref(co)) == OK, f"{label} -> XISF without properties")
+        with Opened(back) as f:
+            check(properties_of(f) == [] and not [p for p in properties_of(f, FILE_PROPERTIES) if p[0] == "Note:Author"],
+                  f"{label} -> XISF: properties = 0 leaves them where they are")
+        check(convert(ctx, enc(src), enc(mid), C.byref(co)) == OK, f"XISF -> {label} without properties")
+        with Opened(mid) as f:
+            check(property_count(f.handle, 0) == 0 and property_count(f.handle, FILE_PROPERTIES) == 0,
+                  f"XISF -> {label}: properties = 0 leaves them out")
+
+
 # ---------------------------------------------------------------------------------------------
 # Astrometry, stretch
 # ---------------------------------------------------------------------------------------------
@@ -1170,7 +1274,7 @@ if __name__ == "__main__":
     print("xisfconv:", EXE or "(not given: the comparison with the tool's --stretch is skipped)")
     print("asdf + asdf-astropy:", "yes" if HAVE_ASDF else "no")
     for t in (test_write_fits, test_write_fits_tile_compressed, test_write_xisf, test_write_asdf, test_write_tiff_png, test_writer_arguments, test_read_fits,
-              test_read_xisf, test_wcs, test_wcs_forms, test_stretch, test_odd_files, test_locale, test_progress_and_cancel,
+              test_read_xisf, test_carried_properties, test_wcs, test_wcs_forms, test_stretch, test_odd_files, test_locale, test_progress_and_cancel,
               test_kept_messages_and_cancel_from_another_thread, test_threads, test_silence):
         try:
             t()

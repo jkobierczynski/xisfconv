@@ -246,36 +246,10 @@ std::string projectionName(const std::string& code) {
     return {};
 }
 
-XisfOutProperty scalarProperty(const std::string& id, const char* type, const std::string& value) {
-    XisfOutProperty p;
-    p.id = id;
-    p.type = type;
-    p.value = value;
-    return p;
-}
-
-XisfOutProperty vectorProperty(const std::string& id, std::vector<double> data) {
-    XisfOutProperty p;
-    p.id = id;
-    p.type = "F64Vector";
-    p.data = std::move(data);
-    return p;
-}
-
-XisfOutProperty matrixProperty(const std::string& id, size_t rows, size_t columns, std::vector<double> data) {
-    XisfOutProperty p;
-    p.id = id;
-    p.type = "F64Matrix";
-    p.rows = rows;
-    p.columns = columns;
-    p.data = std::move(data);
-    return p;
-}
-
 }  // namespace
 
 bool wcsToAstrometricSolution(const std::vector<FitsKeyword>& kw, uint64_t width, uint64_t height,
-                              std::vector<XisfOutProperty>& properties, std::string& summary) {
+                              std::vector<Property>& properties, std::string& summary) {
     const std::string ctype1 = toUpper(cardString(kw, "CTYPE1")), ctype2 = toUpper(cardString(kw, "CTYPE2"));
     if (ctype1.empty() || ctype2.empty()) return false;  // no WCS at all: nothing to say
     if (ctype1.compare(0, 4, "RA--") != 0 || ctype2.compare(0, 4, "DEC-") != 0 || ctype1.size() < 8 ||

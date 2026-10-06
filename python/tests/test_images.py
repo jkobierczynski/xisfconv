@@ -253,3 +253,122 @@ def test_property_keywords(tmp_path):
     with xisfconv.open(path) as file:
         assert set(file.properties) == set(theirs) and file.properties["Note:Author"] == "somebody"
         assert len(file[0].properties) == 0
+
+
+def test_properties_through_fits_and_asdf(tmp_path):
+    """XISF properties go along to FITS and ASDF, are read from there, and come back."""
+    pytest.importorskip("xisf")
+    from xisf import XISF
+
+    matrix = np.arange(12, dtype=np.float64).reshape(3, 4) / 7
+    properties = {
+        "Instrument:ExposureTime": {"id": "Instrument:ExposureTime", "type": "Float32", "value": 180.5},
+        "Observation:Object:Name": {"id": "Observation:Object:Name", "type": "String", "value": "NGC 7000 \u2604"},
+        "Instrument:Camera:Gain": {"id": "Instrument:Camera:Gain", "type": "Int32", "value": 120},
+        "Lab:Matrix": {"id": "Lab:Matrix", "type": "F64Matrix", "value": matrix},
+        "Lab:Vector": {"id": "Lab:Vector", "type": "F64Vector", "value": matrix[0]},
+    }
+    path = tmp_path / "p.xisf"
+    XISF.write(str(path), sample("uint16", (8, 8))[:, :, None], image_metadata={"XISFProperties": properties},
+               xisf_metadata={"Note:Author": {"id": "Note:Author", "type": "String", "value": "somebody"}})
+
+    def check(mapping):
+        assert list(mapping) == list(properties)
+        assert mapping["Instrument:ExposureTime"] == 180.5 and mapping.type("Instrument:ExposureTime") == "Float32"
+        assert mapping["Observation:Object:Name"] == "NGC 7000 \u2604" and mapping["Instrument:Camera:Gain"] == 120
+        assert isinstance(mapping["Instrument:Camera:Gain"], int)
+        assert same(mapping["Lab:Matrix"], matrix) and same(mapping["Lab:Vector"], matrix[0])
+
+    for kind, codec in (("fits", None), ("fits.fz", None), ("asdf", None), ("asdf", True)):
+        carrier, back = tmp_path / ("p." + kind), tmp_path / "back.xisf"
+        xisfconv.convert(path, carrier, codec=codec, overwrite=True)
+        with xisfconv.open(carrier) as file:
+            assert len(file) == 1 and file.format == kind.split(".")[0]
+            check(file[0].properties)
+            assert file.properties["Note:Author"] == "somebody" and len(file.properties) == 1
+            image = file[0].read_image()
+            assert set(image.properties) == set(properties) and same(image.properties["Lab:Matrix"], matrix)
+        xisfconv.convert(carrier, back, overwrite=True)
+        with xisfconv.open(back) as file:
+            check(file[0].properties)
+            assert file.properties["Note:Author"] == "somebody"
+        theirs = XISF(str(back)).get_images_metadata()[0]["XISFProperties"]
+        assert list(theirs) == list(properties) and same(theirs["Lab:Matrix"]["value"], matrix)
+        # without them: the way there, and the way back
+        xisfconv.convert(carrier, back, overwrite=True, properties=False)
+        with xisfconv.open(back) as file:
+            assert len(file[0].properties) == 0 and "Note:Author" not in file.properties
+        xisfconv.convert(path, carrier, codec=codec, overwrite=True, properties=False)
+        with xisfconv.open(carrier) as file:
+            assert len(file[0].properties) == 0 and len(file.properties) == 0
+    # a FITS file of another program has none
+    fits.PrimaryHDU(sample("uint16", (8, 8))).writeto(tmp_path / "plain.fits")
+    with xisfconv.open(tmp_path / "plain.fits") as file:
+        assert len(file[0].properties) == 0 and len(file.properties) == 0 and dict(file[0].properties) == {}
+
+
+def test_solution_comes_back_as_it_was(tmp_path):
+    """The astrometric solution of an XISF file returns from FITS number for number, unless the
+    WCS keywords were changed on the way: then it is made from them."""
+    a = sample("uint16", (HEIGHT, WIDTH))
+    first = tmp_path / "solved.xisf"
+    xisfconv.write(first, a, keywords=sky_header(sip=True), wcs_row_order="bottom-up")
+    with xisfconv.open(first) as file:
+        solution = dict(file[0].properties)
+    assert "PCL:AstrometricSolution:SplineWorldTransformation:ControlPoints:World" in solution
+    carrier, back = tmp_path / "solved.fits", tmp_path / "back.xisf"
+    xisfconv.convert(first, carrier)
+
+    def returned():
+        xisfconv.convert(carrier, back, overwrite=True)
+        with xisfconv.open(back) as file:
+            return dict(file[0].properties)
+
+    again = returned()
+    assert list(again) == list(solution)
+    assert all(same(again[key], value) if isinstance(value, np.ndarray) else again[key] == value for key, value in solution.items())
+    with fits.open(carrier, mode="update") as hdus:
+        hdus[0].header["CRVAL1"] += 0.5
+    changed = returned()
+    key = "PCL:AstrometricSolution:ReferenceCelestialCoordinates"
+    assert changed[key][0] == pytest.approx(solution[key][0] + 0.5) and changed[key][1] == pytest.approx(solution[key][1])
+
+
+def test_property_types_and_format(tmp_path):
+    """Vectors and matrices under every name the element types have, a length that the block
+    contradicts, and the format of a property: in a file written by hand."""
+    import base64
+
+    def block(kind, values, shape):
+        data = base64.b64encode(np.asarray(values, kind).tobytes()).decode()
+        return '%s location="inline:base64">%s</Property>' % (shape, data)
+
+    pixels = base64.b64encode(np.arange(12, dtype="<u2").tobytes()).decode()
+    header = ('<?xml version="1.0" encoding="UTF-8"?>\n<xisf version="1.0" xmlns="http://www.pixinsight.com/xisf">'
+              '<Image geometry="4:3:1" sampleFormat="UInt16" colorSpace="Gray" location="inline:base64">' + pixels +
+              '<Property id="A" type="ByteMatrix" ' + block("u1", [1, 2, 3, 4, 5, 6], 'rows="2" columns="3"') +
+              '<Property id="B" type="Vector" ' + block("<f8", [1.5, -2.5], 'length="2"') +
+              '<Property id="C" type="Matrix" ' + block("<f8", [1, 2, 3, 4], 'rows="2" columns="2"') +
+              '<Property id="D" type="ByteArray" ' + block("u1", [7, 8, 9], 'length="3"') +
+              '<Property id="E" type="UI16Vector" ' + block("<u2", [10, 20, 30], 'length="9"') +
+              '<Property id="F" type="C32Vector" ' + block("<c8", [1 + 2j], 'length="1"') +
+              '<Property id="G" type="Float32" value="0.25" comment="a quarter" format="%.3f"/>'
+              '</Image></xisf>').encode()
+    path = tmp_path / "types.xisf"
+    path.write_bytes(b"XISF0100" + len(header).to_bytes(4, "little") + bytes(4) + header)
+    carrier, back = tmp_path / "types.fits", tmp_path / "back.xisf"
+    xisfconv.convert(path, carrier)
+    xisfconv.convert(carrier, back)
+    for name in (path, carrier, back):
+        with xisfconv.open(name) as file:
+            properties = file[0].properties
+            assert list(properties) == list("ABCDEFG")
+            assert same(properties["A"], np.array([[1, 2, 3], [4, 5, 6]], float))
+            assert same(properties["B"], np.array([1.5, -2.5])) and same(properties["C"], np.array([[1.0, 2.0], [3.0, 4.0]]))
+            assert same(properties["D"], np.array([7.0, 8.0, 9.0]))
+            assert same(properties["E"], np.array([10.0, 20.0, 30.0]))     # the block says how long it is
+            assert properties["F"] is None and properties.type("F") == "C32Vector"   # complex numbers are not read as numbers
+            assert properties["G"] == 0.25 and properties.comment("G") == "a quarter"
+            assert properties.format("G") == "%.3f" and properties.format("A") == ""
+            with pytest.raises(KeyError):
+                properties.format("No:Such")

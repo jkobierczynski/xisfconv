@@ -15,7 +15,19 @@ namespace xisfconv {
 
 struct AsdfWriteOptions {
     std::string codec;  // block compression: empty (none), "zlib" or "zstd"
+    std::vector<Property> metadata;   // the XISF properties of the file the images come from. Empty: none.
 };
+
+// XISF properties in an ASDF file: the key "xisf" of the tree, with
+//   images:    a list with an entry per HDU of "fits", in their order: a mapping that is empty,
+//              or has "properties" and "wcs_digest" (what FitsHdu::wcsDigest holds);
+//   metadata:  the properties of the file.
+// Properties are a mapping from id to {type, value, comment, format}: type is the XISF type
+// name; value is a YAML scalar of that kind (true, 42, 1.5, "text"; a complex number as
+// core/complex) and for vectors and matrices an ndarray of their shape in a binary block.
+// A String that is not UTF-8 is an array of its bytes; one that XISF keeps in a data block has
+// "block: true". A data block of a type this library does not know is an array of its bytes
+// too, with the "length", or the "rows" and "columns", of its element.
 
 // Writes the images as a FITS HDU list (tag:astropy.org:astropy/fits/fits-1.0.0) under the
 // tree's "fits" key: each HDU has the header as [keyword, value, comment] entries and the

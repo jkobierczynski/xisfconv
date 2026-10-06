@@ -141,6 +141,7 @@ struct Options {
     std::optional<std::pair<double, double>> bounds;  // FITS/ASDF input: range of floating point data
     uint64_t subblockSize = 1u << 30;
     bool propertyKeywords = true;
+    bool properties = true;      // take XISF properties along to FITS and ASDF, and use those such a file carries
     bool verify = true;
     bool wcs = true;
     int sipOrder = 3;
@@ -197,6 +198,8 @@ void usage(std::ostream& os) {
           "      --bottom-up             FITS and ASDF input: the rows are stored bottom-up, whatever ROWORDER says\n"
           "      --no-property-keywords  from XISF: don't add missing keywords (EXPTIME, DATE-OBS, BAYERPAT...)\n"
           "                              derived from XISF properties\n"
+          "      --no-properties         from XISF: don't take the XISF properties along to FITS and ASDF\n"
+          "                              from FITS and ASDF: leave the XISF properties a file carries where they are\n"
           "      --no-wcs                from XISF: don't write WCS keywords from a PixInsight astrometric solution\n"
           "                              to XISF: don't write PixInsight solution properties from WCS keywords\n"
           "      --sip-order <n>         from XISF: SIP distortion order fitted to the solution (2-7, default 3;\n"
@@ -343,6 +346,7 @@ xisfconv_convert_options conversionOptions(const Options& opt, xisfconv_format f
         c.upper_bound = opt.bounds->second;
     }
     c.property_keywords = opt.propertyKeywords;
+    c.properties = opt.properties;
     c.verify_checksums = opt.verify;
     c.wcs = opt.wcs;
     c.sip_order = opt.sipOrder;
@@ -379,6 +383,27 @@ xisfconv_image_info infoOf(const Library& lib, const xisfconv_file* f, size_t im
 }
 
 bool isFloat(xisfconv_sample_format f) { return f == XISFCONV_SAMPLE_FLOAT32 || f == XISFCONV_SAMPLE_FLOAT64; }
+
+void printProperties(const Library& lib, xisfconv_file* f, size_t image, const char* indent) {
+    const size_t properties = xisfconv_property_count(f, image);
+    for (size_t p = 0; p < properties; ++p) {
+        const char *pid = "", *type = "", *value = "";
+        int32_t block = 0;
+        lib.check(xisfconv_property_get(f, image, p, &pid, &type, &value, nullptr, &block));
+        std::cout << indent << pid << " (" << type << ")";
+        if (block) std::cout << " [data block]";
+        else {
+            std::string v = value;
+            if (image != XISFCONV_FILE_PROPERTIES) {
+                if (v.size() > 100) v = v.substr(0, 100) + "...";
+                for (auto& c : v)
+                    if (c == '\n' || c == '\r') c = ' ';
+            }
+            std::cout << " = " << v;
+        }
+        std::cout << "\n";
+    }
+}
 
 void printXisfInfo(const Library& lib, const std::string& path, xisfconv_file* f) {
     const char* header = "";
@@ -425,37 +450,23 @@ void printXisfInfo(const Library& lib, const std::string& path, xisfconv_file* f
         const xisfconv_keywords* kw = cardsOf(lib, f, i);
         std::cout << "  FITS keywords (" << xisfconv_keywords_count(kw) << "):\n";
         printCards(kw);
-        const size_t properties = xisfconv_property_count(f, i);
-        std::cout << "  Properties (" << properties << "):\n";
-        for (size_t p = 0; p < properties; ++p) {
-            const char *pid = "", *type = "", *value = "";
-            int32_t block = 0;
-            lib.check(xisfconv_property_get(f, i, p, &pid, &type, &value, nullptr, &block));
-            std::cout << "    " << pid << " (" << type << ")";
-            if (block) std::cout << " [data block]";
-            else {
-                std::string v = value;
-                if (v.size() > 100) v = v.substr(0, 100) + "...";
-                for (auto& c : v)
-                    if (c == '\n' || c == '\r') c = ' ';
-                std::cout << " = " << v;
-            }
-            std::cout << "\n";
-        }
+        std::cout << "  Properties (" << xisfconv_property_count(f, i) << "):\n";
+        printProperties(lib, f, i, "    ");
     }
     const size_t metadata = xisfconv_property_count(f, XISFCONV_FILE_PROPERTIES);
     if (metadata) {
         std::cout << "\nFile metadata (" << metadata << "):\n";
-        for (size_t p = 0; p < metadata; ++p) {
-            const char *pid = "", *type = "", *value = "";
-            int32_t block = 0;
-            lib.check(xisfconv_property_get(f, XISFCONV_FILE_PROPERTIES, p, &pid, &type, &value, nullptr, &block));
-            std::cout << "  " << pid << " (" << type << ")";
-            if (block) std::cout << " [data block]";
-            else std::cout << " = " << value;
-            std::cout << "\n";
-        }
+        printProperties(lib, f, XISFCONV_FILE_PROPERTIES, "  ");
     }
+}
+
+// FITS and ASDF: the XISF properties a file carries from the XISF file it was converted from.
+void printCarriedProperties(const Library& lib, xisfconv_file* f, size_t image) {
+    const size_t count = xisfconv_property_count(f, image);
+    if (!count) return;
+    if (image == XISFCONV_FILE_PROPERTIES) std::cout << "\nXISF file metadata (" << count << "):\n";
+    else std::cout << "  XISF properties (" << count << "):\n";
+    printProperties(lib, f, image, image == XISFCONV_FILE_PROPERTIES ? "  " : "    ");
 }
 
 void printKeywords(const xisfconv_keywords* kw) {
@@ -482,7 +493,9 @@ void printFitsInfo(const Library& lib, const std::string& path, xisfconv_file* f
         if (img.bscale != 1 || img.bzero != 0) std::cout << ", BZERO " << img.bzero << ", BSCALE " << img.bscale;
         std::cout << ", rows " << rowsText(img, "bottom-up (FITS default, no ROWORDER)") << "\n";
         printKeywords(cardsOf(lib, f, i));
+        printCarriedProperties(lib, f, i);
     }
+    printCarriedProperties(lib, f, XISFCONV_FILE_PROPERTIES);
     for (size_t s = 0; s < xisfconv_skipped_count(f); ++s) std::cout << "\nSkipped " << xisfconv_skipped_text(f, s) << "\n";
 }
 
@@ -501,7 +514,9 @@ void printAsdfInfo(const Library& lib, const std::string& path, xisfconv_file* f
                   << rowsText(img, img.plain_array ? "assumed bottom-up (plain array)" : "bottom-up (FITS default, no ROWORDER)")
                   << "\n";
         if (!img.plain_array) printKeywords(cardsOf(lib, f, i));
+        printCarriedProperties(lib, f, i);
     }
+    printCarriedProperties(lib, f, XISFCONV_FILE_PROPERTIES);
     for (size_t s = 0; s < xisfconv_skipped_count(f); ++s) std::cout << "\nSkipped " << xisfconv_skipped_text(f, s) << "\n";
 }
 
@@ -725,6 +740,7 @@ bool parseArgs(int argc, char** argv, Options& opt, int& exitCode) {
             opt.subblockSize = n;
         }
         else if (a == "--no-property-keywords") opt.propertyKeywords = false;
+        else if (a == "--no-properties") opt.properties = false;
         else if (a == "--no-verify") opt.verify = false;
         else if (a == "--no-wcs") opt.wcs = false;
         else if (a == "--sip-order") {

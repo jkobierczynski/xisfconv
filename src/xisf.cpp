@@ -157,6 +157,7 @@ XisfProperty XisfFile::parseProperty(const xml::Node& node) {
     p.id = attrOr(node, "id");
     p.type = attrOr(node, "type");
     p.comment = attrOr(node, "comment");
+    p.format = attrOr(node, "format");
     p.location = attrOr(node, "location");
     p.node = &node;
     if (const std::string* v = node.attr("value")) {
@@ -164,6 +165,12 @@ XisfProperty XisfFile::parseProperty(const xml::Node& node) {
     } else if (!p.location.empty()) {
         if (p.type == "String") {
             try {
+                // (texts are read when the file is opened: no more of them than the file can hold, see propertyBudget)
+                const uint64_t declared = declaredBlockSize(node), budget = propertyBudget(fileSize_);
+                if (declared > budget || stringBytes_ > budget - declared) {
+                    throw Error("the texts of this file declare more data than a file of its size can hold");
+                }
+                stringBytes_ += declared;
                 std::vector<uint8_t> bytes = readBlock(node, true, "property " + p.id);
                 // XISF String data blocks are UTF-8; drop a trailing NUL if present.
                 while (!bytes.empty() && bytes.back() == 0) bytes.pop_back();
@@ -445,79 +452,132 @@ std::vector<uint8_t> XisfFile::readIccProfile(size_t index, bool verify) {
     return readBlock(*img.iccNode, verify, "ICC profile of image " + std::to_string(index));
 }
 
-namespace {
-struct ElemType { const char* name; size_t size; bool isFloat; bool isSigned; };
-// The element types of vector and matrix properties that are read as numbers.
-const ElemType* numericElementType(const std::string& type) {
-    static const ElemType types[] = {{"I8", 1, false, true},   {"UI8", 1, false, false}, {"Byte", 1, false, false},
-                                     {"I16", 2, false, true},  {"UI16", 2, false, false}, {"I32", 4, false, true},
-                                     {"UI32", 4, false, false}, {"I64", 8, false, true},  {"UI64", 8, false, false},
-                                     {"F32", 4, true, true},   {"F64", 8, true, true}};
-    const bool matrix = type.size() > 6 && type.compare(type.size() - 6, 6, "Matrix") == 0;
-    const bool vector = type.size() > 6 && type.compare(type.size() - 6, 6, "Vector") == 0;
-    if (!matrix && !vector) return nullptr;
-    const std::string elem = type.substr(0, type.size() - 6);
-    for (const auto& e : types)
-        if (elem == e.name) return &e;
-    return nullptr;
+bool isNumericPropertyType(const std::string& type) {
+    PropertyElement e;
+    return propertyElement(type, e) && e.kind != 'c';
 }
-}  // namespace
 
-bool isNumericPropertyType(const std::string& type) { return numericElementType(type) != nullptr; }
+Property XisfFile::loadProperty(const XisfProperty& x, bool verify) {
+    Property p;
+    p.id = x.id;
+    p.type = x.type;
+    p.comment = x.comment;
+    p.format = x.format;
+    PropertyElement element;
+    const bool known = propertyElement(x.type, element);
+    // A property is a value, or a data block. One that is built of other elements (the tables
+    // and structures of the specification) is neither, and is not something this form can hold.
+    if (x.node) {
+        for (const auto& child : x.node->children) {
+            if (child->name != "Data") throw Error("it is made of <" + child->name + "> elements, which are not read");
+        }
+    }
+    const bool stringBlock = x.type == "String" && !x.location.empty() && x.node && !x.node->attr("value");
+    if (stringBlock) {
+        // the text as it is in its block, with whatever it ends in
+        const std::vector<uint8_t> bytes = readBlock(*x.node, verify, "property " + x.id);
+        p.text.assign(bytes.begin(), bytes.end());
+        p.block = true;
+        return p;
+    }
+    if (!x.hasBlockData) {
+        if (known) throw Error("a " + x.type + " without a data block");
+        p.text = x.value;
+        return p;
+    }
+    if (!x.node) throw Error("its data block was not found");
+    p.array = true;
+    p.data = readBlock(*x.node, verify, "property " + x.id);
+    auto number = [&](const char* name, uint64_t& out) {
+        const std::string* text = x.node->attr(name);
+        if (text && !parseUInt64(*text, out)) throw Error(std::string("its ") + name + " attribute is not a number");
+        return text != nullptr;
+    };
+    if (isMatrixPropertyType(x.type)) {
+        if (!number("rows", p.rows) || !number("columns", p.columns)) throw Error("a matrix without rows and columns");
+    } else if (known) {
+        // The block says how long a vector is; a length attribute that says otherwise is not believed.
+        number("length", p.rows);
+        if (p.data.size() % element.size != 0) throw Error("its data is not a whole number of elements");
+        p.rows = p.data.size() / element.size;
+    } else {
+        number("length", p.rows);
+    }
+    if (known) {
+        // XISF blocks are little-endian unless they say otherwise; a complex number is two numbers
+        const size_t part = element.kind == 'c' ? element.size / 2 : element.size;
+        if (attrOr(*x.node, "byteOrder", "little") == "big" && part > 1) byteSwapInPlace(p.data.data(), p.data.size() / part, part);
+        const std::string problem = propertyProblem(p);
+        if (!problem.empty()) throw Error(problem);
+    }
+    return p;
+}
+
+// What the data block of an element says it holds, without reading it: the size it is stored
+// with, or the size it declares to have once it is decompressed. 0 if it has none.
+uint64_t XisfFile::declaredBlockSize(const xml::Node& element) const {
+    const std::string location = attrOr(element, "location");
+    const xml::Node* source = &element;
+    uint64_t stored = 0;
+    if (startsWith(location, "attachment:")) {
+        const auto parts = split(location, ':');
+        if (parts.size() != 3 || !parseUInt64(parts[2], stored)) return 0;   // (reading it says what is wrong)
+    } else if (location == "embedded") {
+        if (const xml::Node* data = element.child("Data")) source = data;
+        stored = source->text.size();
+    } else {
+        stored = element.text.size();
+    }
+    const std::string* compression = source->attr("compression");
+    if (!compression) compression = element.attr("compression");
+    if (!compression || compression->empty()) return stored;
+    try {
+        return std::max<uint64_t>(stored, parseXisfCompression(*compression).uncompressedSize);
+    } catch (const Error&) {
+        return stored;
+    }
+}
+
+std::vector<Property> XisfFile::loadProperties(size_t imageIndex, bool verify) {
+    const std::vector<XisfProperty>& list = imageIndex == kFileProperties ? fileProperties_ : images_.at(imageIndex).properties;
+    const uint64_t budget = propertyBudget(fileSize_);
+    std::vector<Property> out;
+    out.reserve(list.size());
+    for (const XisfProperty& x : list) {
+        if (x.id.empty()) {
+            warn("a property without an id is left out");
+            continue;
+        }
+        try {
+            const uint64_t declared = x.node && !x.location.empty() ? declaredBlockSize(*x.node) : x.value.size();
+            if (declared > budget || propertyBytes_ > budget - declared) {
+                throw Error("the properties of this file declare more data than a file of its size can hold (" +
+                            std::to_string(declared) + " bytes on top of " + std::to_string(propertyBytes_) + ")");
+            }
+            out.push_back(loadProperty(x, verify));
+            propertyBytes_ += std::max<uint64_t>(declared, out.back().array ? out.back().data.size() : out.back().text.size());
+        } catch (const Error& e) {
+            warn("property " + x.id + " is left out: " + e.what());
+        }
+    }
+    return out;
+}
 
 bool XisfFile::readNumericProperty(size_t imageIndex, const std::string& id, std::vector<double>& out,
                                    size_t* rows, size_t* columns) {
-    const XisfProperty* p = findProperty(imageIndex, id);
-    if (!p || !p->node || p->location.empty()) return false;
-    std::string t = p->type;
-    const bool matrix = t.size() > 6 && t.compare(t.size() - 6, 6, "Matrix") == 0;
-    const ElemType* et = numericElementType(t);
-    if (!et) return false;
-    std::vector<uint8_t> bytes;
+    const XisfProperty* x = findProperty(imageIndex, id);
+    if (!x || !x->node || x->location.empty() || !isNumericPropertyType(x->type)) return false;
+    Property p;
     try {
-        bytes = readBlock(*p->node, true, "property " + id);
+        p = loadProperty(*x, true);
     } catch (const Error& e) {
         warn(std::string("cannot read property ") + id + ": " + e.what());
         return false;
     }
-    if (bytes.size() % et->size != 0) return false;
-    const bool swap = attrOr(*p->node, "byteOrder", "little") == "big" ? hostIsLittleEndian() : !hostIsLittleEndian();
-    if (swap) byteSwapInPlace(bytes.data(), bytes.size() / et->size, et->size);
-    const size_t n = bytes.size() / et->size;
-    out.resize(n);
-    for (size_t i = 0; i < n; ++i) {
-        const uint8_t* b = bytes.data() + i * et->size;
-        if (et->isFloat) {
-            if (et->size == 4) { float f; std::memcpy(&f, b, 4); out[i] = f; }
-            else { double d; std::memcpy(&d, b, 8); out[i] = d; }
-        } else if (et->isSigned) {
-            int64_t v = 0;
-            switch (et->size) {
-                case 1: { int8_t x; std::memcpy(&x, b, 1); v = x; break; }
-                case 2: { int16_t x; std::memcpy(&x, b, 2); v = x; break; }
-                case 4: { int32_t x; std::memcpy(&x, b, 4); v = x; break; }
-                default: std::memcpy(&v, b, 8);
-            }
-            out[i] = static_cast<double>(v);
-        } else {
-            uint64_t v = 0;
-            switch (et->size) {
-                case 1: v = b[0]; break;
-                case 2: { uint16_t x; std::memcpy(&x, b, 2); v = x; break; }
-                case 4: { uint32_t x; std::memcpy(&x, b, 4); v = x; break; }
-                default: std::memcpy(&v, b, 8);
-            }
-            out[i] = static_cast<double>(v);
-        }
-    }
-    uint64_t r = 1, c = n;
-    if (matrix) {
-        if (!parseUInt64(attrOr(*p->node, "rows"), r) || !parseUInt64(attrOr(*p->node, "columns"), c) || r * c != n) {
-            return false;
-        }
-    }
-    if (rows) *rows = static_cast<size_t>(r);
-    if (columns) *columns = static_cast<size_t>(c);
+    if (!propertyNumbers(p, out)) return false;
+    const bool matrix = isMatrixPropertyType(p.type);
+    if (rows) *rows = static_cast<size_t>(matrix ? p.rows : 1);
+    if (columns) *columns = static_cast<size_t>(matrix ? p.columns : p.rows);
     return true;
 }
 

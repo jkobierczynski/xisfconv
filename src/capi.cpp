@@ -1093,9 +1093,18 @@ const std::vector<XisfProperty>* propertiesOf(const xisfconv_file* file, size_t 
     if (image >= file->xisf->images().size()) return nullptr;
     return &file->xisf->images()[image].properties;
 }
+
+// FITS and ASDF: the XISF properties a file carries from the XISF file it was converted from.
+const std::vector<Property>* carriedOf(const xisfconv_file* file, size_t image) {
+    if (!file || isXisf(file)) return nullptr;
+    if (image == XISFCONV_FILE_PROPERTIES) return &file->fits.properties;
+    if (image >= file->fits.images.size()) return nullptr;
+    return &file->fits.images[image].properties;
+}
 }  // namespace
 
 size_t xisfconv_property_count(const xisfconv_file* file, size_t image) {
+    if (const auto* carried = carriedOf(file, image)) return carried->size();
     const auto* list = propertiesOf(file, image);
     return list ? list->size() : 0;
 }
@@ -1105,6 +1114,16 @@ xisfconv_status xisfconv_property_get(const xisfconv_file* file, size_t image, s
                                       int32_t* in_data_block) {
     if (!file) return XISFCONV_ERR_ARGUMENT;
     return guarded(file->state, file->path.c_str(), [&] {
+        if (const auto* carried = carriedOf(file, image)) {
+            if (index >= carried->size()) fail(XISFCONV_ERR_INDEX, "property index " + std::to_string(index) + " out of range");
+            const Property& p = (*carried)[index];
+            if (id) *id = p.id.c_str();
+            if (type) *type = p.type.c_str();
+            if (value) *value = p.array ? "" : p.text.c_str();
+            if (comment) *comment = p.comment.c_str();
+            if (in_data_block) *in_data_block = p.array ? 1 : 0;
+            return;
+        }
         const auto* list = propertiesOf(file, image);
         if (!list || index >= list->size()) fail(XISFCONV_ERR_INDEX, "property index " + std::to_string(index) + " out of range");
         const XisfProperty& p = (*list)[index];
@@ -1117,6 +1136,11 @@ xisfconv_status xisfconv_property_get(const xisfconv_file* file, size_t image, s
 }
 
 int64_t xisfconv_property_find(const xisfconv_file* file, size_t image, const char* id) {
+    if (const auto* carried = carriedOf(file, image)) {
+        for (size_t i = 0; id && i < carried->size(); ++i)
+            if ((*carried)[i].id == id) return static_cast<int64_t>(i);
+        return -1;
+    }
     const auto* list = propertiesOf(file, image);
     if (!list || !id) return -1;
     for (size_t i = 0; i < list->size(); ++i)
@@ -1124,26 +1148,52 @@ int64_t xisfconv_property_find(const xisfconv_file* file, size_t image, const ch
     return -1;
 }
 
+const char* xisfconv_property_format(const xisfconv_file* file, size_t image, size_t index) {
+    if (const auto* carried = carriedOf(file, image)) return index < carried->size() ? (*carried)[index].format.c_str() : "";
+    const auto* list = propertiesOf(file, image);
+    return list && index < list->size() ? (*list)[index].format.c_str() : "";
+}
+
 xisfconv_status xisfconv_property_read_f64(xisfconv_file* file, size_t image, const char* id, double* values,
                                            size_t capacity, size_t* rows, size_t* columns) {
     if (!file) return XISFCONV_ERR_ARGUMENT;
     return guarded(file->state, file->path.c_str(), [&] {
         if (!id) fail(XISFCONV_ERR_ARGUMENT, "xisfconv_property_read_f64: id is NULL");
-        if (!isXisf(file)) fail(XISFCONV_ERR_NOT_FOUND, "only XISF files have properties");
         if (image != XISFCONV_FILE_PROPERTIES) checkImage(file, image);
         std::vector<double> data;
         size_t r = 0, c = 0;
-        const XisfProperty* property = file->xisf->findProperty(image, id);
-        const bool numeric = property && property->type.size() > 6 &&
-                             (property->type.compare(property->type.size() - 6, 6, "Vector") == 0 ||
-                              property->type.compare(property->type.size() - 6, 6, "Matrix") == 0);
-        if (!numeric) fail(XISFCONV_ERR_NOT_FOUND, std::string("no numeric vector or matrix property '") + id + "'");
-        if (!isNumericPropertyType(property->type)) {
-            fail(XISFCONV_ERR_UNSUPPORTED, std::string("property '") + id + "' is of type " + property->type +
-                                           ", which is not read as numbers");
-        }
-        if (!file->xisf->readNumericProperty(image, id, data, &r, &c)) {
-            fail(XISFCONV_ERR_FORMAT, std::string("the data of property '") + id + "' cannot be read");
+        // (Vector and Matrix are type names themselves: the short ones for 64-bit floating point)
+        auto vectorOrMatrix = [](const std::string& type) {
+            return type == "ByteArray" ||
+                   (type.size() >= 6 && (type.compare(type.size() - 6, 6, "Vector") == 0 || type.compare(type.size() - 6, 6, "Matrix") == 0));
+        };
+        auto notNumbers = [&](const std::string& type) {
+            fail(XISFCONV_ERR_UNSUPPORTED, std::string("property '") + id + "' is of type " + type + ", which is not read as numbers");
+        };
+        if (isXisf(file)) {
+            const XisfProperty* property = file->xisf->findProperty(image, id);
+            if (!property || !vectorOrMatrix(property->type)) {
+                fail(XISFCONV_ERR_NOT_FOUND, std::string("no numeric vector or matrix property '") + id + "'");
+            }
+            if (!isNumericPropertyType(property->type)) notNumbers(property->type);
+            if (!file->xisf->readNumericProperty(image, id, data, &r, &c)) {
+                fail(XISFCONV_ERR_FORMAT, std::string("the data of property '") + id + "' cannot be read");
+            }
+        } else {
+            // as in an XISF file: the properties of the image first, then those of the file
+            const Property* property = nullptr;
+            if (const auto* own = carriedOf(file, image)) property = findProperty(*own, id);
+            if (!property) property = findProperty(file->fits.properties, id);
+            if (!property || !property->array || !vectorOrMatrix(property->type)) {
+                fail(XISFCONV_ERR_NOT_FOUND, std::string("no numeric vector or matrix property '") + id + "'");
+            }
+            if (!isNumericPropertyType(property->type)) notNumbers(property->type);
+            if (!propertyNumbers(*property, data)) {
+                fail(XISFCONV_ERR_FORMAT, std::string("the data of property '") + id + "' cannot be read");
+            }
+            const bool matrix = isMatrixPropertyType(property->type);
+            r = static_cast<size_t>(matrix ? property->rows : 1);
+            c = static_cast<size_t>(matrix ? property->columns : property->rows);
         }
         if (rows) *rows = r;
         if (columns) *columns = c;
@@ -1460,6 +1510,7 @@ void xisfconv_convert_options_init(xisfconv_convert_options* options, size_t str
     defaults.sip_order = 3;
     defaults.verify_checksums = 1;
     defaults.upper_bound = 1;
+    defaults.properties = 1;
     initStruct(options, struct_size, defaults);
 }
 
@@ -1490,6 +1541,7 @@ xisfconv_status xisfconv_convert(xisfconv_context* ctx, const char* input, const
         if (o.sip_order != 0 && (o.sip_order < 2 || o.sip_order > 7)) fail(XISFCONV_ERR_ARGUMENT, "--sip-order must be 0 (off) or 2..7");
         c.sipOrder = o.sip_order;
         c.force = o.overwrite != 0;
+        c.properties = o.properties != 0;
         const Format format = outputFormat(o.output_format, output);
         mustBeReadable(input);
         const InputFormat kind = detectInputFormat(input);

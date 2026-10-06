@@ -68,6 +68,7 @@ add_library(xisfconv_core
   src/fitsread.cpp
   src/fitstile.cpp
   src/pipeline.cpp
+  src/property.cpp
   src/tiff.cpp
   src/png.cpp
   src/wcs.cpp

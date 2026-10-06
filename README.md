@@ -30,7 +30,8 @@ xisfconv --info light_0001.xisf               # geometry, codecs, FITS keywords,
   byte shuffling, including compressed **subblocks**
 - Data blocks as attachments, `inline:base64`/`inline:hex`, or `embedded` `<Data>` elements
 - Checksum verification: SHA-1, SHA-256, SHA-512, SHA3-256 and SHA3-512
-- FITS keywords, XISF properties, ColorFilterArray, Resolution, ICC profile, multiple images
+- FITS keywords, XISF properties of every type (scalars, strings, time points, vectors and
+  matrices, complex numbers included), ColorFilterArray, Resolution, ICC profile, multiple images
 
 **FITS output**
 - BITPIX 8/16/32/64/-32/-64 with the standard BZERO offsets for unsigned data
@@ -92,6 +93,73 @@ xisfconv --info light_0001.xisf               # geometry, codecs, FITS keywords,
   settings PixInsight uses; `--codec zlib` for zlib), blocks over 1 GiB are written as subblocks, and
   `--checksum sha1|sha256|sha512` adds an integrity checksum (`sha3-256` and `sha3-512` are also
   written, but PixInsight does not open such files: see below).
+
+**XISF properties through FITS and ASDF, and back**
+- PixInsight keeps much of what it knows about an image outside the FITS keywords, in XISF
+  properties: the processing history, the instrument and the observation, the astrometric solution
+  with its splines. FITS and ASDF have no place for them, so xisfconv takes them along: every
+  property of every image and of the file, with its type, its exact value, its comment and format.
+  Converted to XISF again, the file gives them back.
+- **FITS**: a binary table extension named `XISF_PROPERTIES` behind the image it belongs to, and
+  `XISF_METADATA` at the end for the properties of the file. A row per property, with the columns
+  `ID`, `TYPE` (the XISF type name), `BLOCK`, `ROWS`, `COLUMNS`, `VALUE`, `COMMENT` and `FORMAT`.
+  `VALUE` is an array of bytes: UTF-8 text, and for vectors and matrices their elements as
+  little-endian numbers, row after row, with the shape in `ROWS` and `COLUMNS`. `BLOCK` says
+  whether XISF keeps the value in a data block (vectors, matrices, and the texts PixInsight
+  stores that way) or as text in its header. It is plain FITS: fitsverify accepts it, fpack and
+  funpack keep it, a program that knows nothing of it passes over one more extension.
+  (HIERARCH keywords cannot do this. The plate-solved test frame has 77 properties, identifiers
+  of up to 113 characters among them, and 9 MB of spline data.)
+
+  ```python
+  from astropy.io import fits
+  import numpy as np
+  with fits.open("image.fits") as hdul:
+      for row in hdul["XISF_PROPERTIES"].data:
+          value = bytes(np.asarray(row["VALUE"], np.uint8))
+          if row["TYPE"] == "F64Matrix":
+              print(row["ID"], np.frombuffer(value, "<f8").reshape(row["ROWS"], row["COLUMNS"]))
+          elif row["TYPE"] == "String" or not row["BLOCK"]:
+              print(row["ID"], row["TYPE"], value.decode())
+  ```
+- **ASDF**: in the tree, under the key `xisf`: `images` has an entry per HDU of `fits` with the
+  `properties` of that image, `metadata` holds those of the file. A property is
+  `id: {type, value, comment, format}`. The value is a YAML scalar of its kind (true, 42, 1.5,
+  "text", a complex number) and for vectors and matrices an array of their element type and shape
+  in a binary block. A String that XISF keeps in a data block has `block: true`.
+
+  ```python
+  import asdf
+  with asdf.open("image.asdf") as af:
+      properties = af["xisf"]["images"][0]["properties"]
+      focal = properties["Instrument:Telescope:FocalLength"]["value"]              # a float
+      matrix = properties["PCL:AstrometricSolution:LinearTransformationMatrix"]["value"]   # a 2x2 array
+  ```
+- **Back to XISF** they are the properties of the image again, in their order. From FITS every
+  value is the text or the bytes it was, and it is stored where it was: a text in the header as
+  text in the header, a data block as a data block. (With `-c --checksum sha1`, the long spline
+  serializations of the test frame as PixInsight saved it with Zstandard come out as the same
+  compressed bytes, with the same checksum.) In an ASDF tree numbers are numbers: their value is the same, their text may
+  be written another way (`1e-05` comes back as `1.0e-05`, `True` as `true`), and a file that the
+  asdf library wrote again has its properties sorted by id.
+- **The astrometric solution comes back as PixInsight wrote it**, splines included, number for
+  number. That holds as long as the WCS keywords of the file, the size of the image and the order of
+  its rows are what they were when the file was written: a digest of them is stored with the
+  properties (`WCSDIGST`). If another program changed them (a new plate solution, a crop, rows
+  stored in the other order), the solution that was carried is left out and PixInsight's solution
+  properties are made from the keywords, as for any FITS file; the other properties are still
+  restored. A note says which of the two happened. Numbers written another way, cards in another
+  order and keywords that are not about the WCS change nothing. A program that turns or mirrors
+  the pixels and leaves the WCS keywords as they were cannot be noticed: its FITS file says
+  the wrong thing already.
+- From FITS to ASDF and back, and from FITS to FITS (`-c` to pack, `-t fits` to unpack), the
+  properties go along as they are. `--info` lists them for FITS and ASDF files as it does for XISF.
+- The properties of the file that describe that one XISF file (`XISF:CreationTime`,
+  `XISF:CreatorApplication`, `XISF:CreatorModule`, `XISF:CreatorOS`, `XISF:BlockAlignmentSize`,
+  `XISF:MaxInlineBlockSize`, `XISF:CompressionCodecs`, `XISF:CompressionLevel`) are not taken
+  along: the next XISF file has its own.
+- `--no-properties` turns it off in both directions: XISF → FITS and ASDF writes the images alone,
+  and from FITS and ASDF the properties a file carries are left where they are.
 
 **XISF → XISF: another compression, checksums, one image of several** (`-t xisf`, `-o name.xisf` or `--in-place`)
 - Rewrites a file with its attached data blocks stored another way, for example to shrink an archive
@@ -359,6 +427,8 @@ xisfconv [options] <file>...      # any of XISF, FITS, ASDF -> any other of them
                               from FITS/ASDF: the rows are stored top-down
       --bottom-up             from FITS/ASDF: the rows are stored bottom-up, whatever ROWORDER says
       --no-property-keywords  from XISF: don't derive missing keywords from XISF properties
+      --no-properties         from XISF: don't take the XISF properties along to FITS and ASDF
+                              from FITS/ASDF: leave the XISF properties a file carries where they are
       --no-wcs                from XISF: don't write WCS from a PixInsight astrometric solution
                               to XISF: don't write PixInsight solution properties from WCS
       --sip-order <n>         from XISF: SIP distortion order (2-7, default 3; 0 = linear only)
@@ -462,7 +532,7 @@ What to know:
   so the header maps directly to Python's `ctypes` or `cffi`, Rust's bindgen and Perl's
   FFI::Platypus. The Python package in `python/` is built that way, on `ctypes`.
 - **Stability.** Version 0.x: the API may still change between releases, and the shared library's
-  version changes with each of them (`libxisfconv.so.0.12`).
+  version changes with each of them (`libxisfconv.so.0.13`).
 - **Messages** are the tool's and some name its options (`--force`, `--bounds`): the option names
   say which setting is meant.
 - The CMake package (`find_package(xisfconv)`) is installed with the shared library; a static
@@ -520,10 +590,13 @@ Good to know:
   tile-compressed FITS.) The same holds for any signal whose handler raises, such as an alarm that sets a
   time limit. A function given as `progress=` is called between the steps, in the caller's
   thread, and stops the work by raising an exception.
-- XISF properties are read, not written. The astrometric solution of an XISF file is carried into
-  a new file as WCS keywords, from which the PixInsight solution properties are written again.
-  The saved screen stretch and the resolution of an XISF image are not carried by `read_image`
-  and `write`; `rewrite` copies an XISF file with everything in it.
+- `read_image` and `write` read XISF properties and do not write them: the astrometric solution
+  of an XISF file is carried into a new file as WCS keywords, from which the PixInsight solution
+  properties are written again. The saved screen stretch and the resolution of an XISF image are
+  not carried by them either. `convert` takes every property along to FITS and ASDF and back
+  (`properties=False` leaves them out), and `rewrite` copies an XISF file with everything in it.
+  A FITS or ASDF file that was converted from XISF shows the properties it carries as
+  `file[0].properties` and `file.properties`, like an XISF file.
 - An image is read and written as a whole, in memory. Reading takes about twice the size of the
   image for a moment, three times for a compressed file. Writing takes once its size on top of
   the array, twice for a colour image with the channels last, and about four times when the
@@ -594,6 +667,18 @@ reference. The XISF output is read back by the `xisf` package, and by a separate
 script for what that package lacks (subblocks, UInt64); checksums are verified there as well. Round
 trips XISF → FITS → XISF and FITS → XISF → FITS must return identical pixels, keywords and WCS.
 
+For the XISF properties, the test script writes a file with properties of every type and in every
+form XISF has for them (scalars with odd spellings, strings with markup, control characters and
+bytes that are not UTF-8, vectors and matrices of every element type, big-endian, compressed,
+embedded, empty, types nobody knows) and takes it through FITS, tile-compressed FITS, ASDF and
+chains of them. A reader in the script that shares no code with xisfconv compares what comes back
+with what went in: every id, type, value, comment and format, in order. astropy reads the table,
+the asdf library validates and reads the tree and writes it again after changes, fpack and
+funpack pass the table on. Damaged tables and trees that say other things must cost the one
+property or the one table, with a warning, and never the image. The astrometric solution must come
+back exactly when the WCS is unchanged (also after astropy rewrote the file and its header), and be
+made from the keywords when a value was changed, the image cropped or the rows taken the other way.
+
 Tile-compressed FITS is checked against astropy and CFITSIO: files written by astropy's
 `CompImageHDU` (every algorithm, every integer and floating point type, several tile shapes, cubes,
 each quantization and dithering method, NaN pixels) must decode to what astropy reads from them,
@@ -649,13 +734,38 @@ compared with PyYAML on random documents in all of PyYAML's output styles.
 - WCS keywords in an XISF header are taken to follow the FITS bottom-up convention (PixInsight's);
   they are converted when writing top-down FITS. Distortion models other than SIP (TPV, TNX) are
   copied without that conversion.
-- FITS → XISF writes the solution properties in the layout PixInsight 1.9.3 uses. Other XISF
-  properties (observation time, instrument) are not created; PixInsight derives those from the
-  keywords. Distortion other than SIP (TPV, TNX) and non-zenithal projections stay keyword-only.
-- A PixInsight spline solution that goes XISF → FITS → XISF comes back as a spline rebuilt from the
-  SIP approximation, not as the original: on the test frame the two agree to 0.5 arcsec rms.
-- FITS input: tables are not read; BLANK pixels of integer images are kept as ordinary values.
-  Tile-compressed images: `HCOMPRESS_1` is not read.
+- FITS → XISF writes the solution properties in the layout PixInsight 1.9.3 uses. For a FITS file
+  that was not converted from XISF, other XISF properties (observation time, instrument) are not
+  created; PixInsight derives those from the keywords. Distortion other than SIP (TPV, TNX) and
+  non-zenithal projections stay keyword-only.
+- A PixInsight spline solution that goes XISF → FITS → XISF comes back as the original. If the
+  WCS keywords were changed on the way, or the properties were left out (`--no-properties`), it is
+  a spline rebuilt from the SIP approximation: on the test frame the two agree to 0.5 arcsec rms.
+- XISF → FITS or ASDF → XISF returns the pixels and every property. It does not return the file
+  as it was: the saved screen stretch (STF), the resolution, the thumbnail and the ICC profile
+  have no place in FITS and ASDF and are not taken along, the image attributes survive as far as
+  keywords say them (`IMAGETYP`, `BAYERPAT`, the id as `EXTNAME`), and the keywords gain what the
+  conversion wrote: keywords derived from properties, WCS keywords made from a solution, a
+  `HISTORY` line for each conversion. (`-t xisf` rewrites an XISF file with everything in it.)
+- What does not come back as a property, each with a warning: a property that is built of other
+  elements (the tables and structures of the specification), one without an id, one whose id or
+  type is not plain ASCII (FITS) or not UTF-8 (ASDF), the second of two properties with the same
+  id (ASDF), and what goes beyond the size limit below. A comment, a format or the value of a
+  scalar with a character XML has no way to write (a control character) gets a blank in its place.
+- A String that is text in the XISF header and has a blank at either end, or a carriage return on
+  its own, comes back as a data block: that is the form in which every reader takes it as it is.
+  Text in the header with CR LF line ends (PixInsight writes short spline serializations so) is
+  written with the same bytes; whether that reads as CR LF or as LF is a matter of the XML
+  reader, for the original and for the result alike.
+- The properties of a file are held in memory together. More than the size of the file plus
+  256 MiB is not accepted (a damaged file, or one made to exhaust the memory, could otherwise
+  declare any amount): what is beyond is left out with a warning.
+- XISF properties of an image that is exported with `--stretch` or `--bits` describe the image
+  as it was (the processing history does not mention the stretch).
+- Files with XISF properties read by xisfconv 0.12 or older: the tables of a FITS file are
+  reported as skipped HDUs, and the matrices in an ASDF tree are taken for images.
+- FITS input: tables are not read, other than those of the XISF properties; BLANK pixels of
+  integer images are kept as ordinary values. Tile-compressed images: `HCOMPRESS_1` is not read.
 - Tile-compressed FITS is written without loss only (`RICE_1`, `GZIP_2`), a row per tile: no
   quantized floating point, no `HCOMPRESS_1`, no choice of tile shape. Images of 64-bit integers
   are left uncompressed. Packing a FITS file (`-t fits -c`) converts it, as every other path
@@ -687,7 +797,7 @@ Bump the version in `include/xisfconv.h` (CMake reads it from there), commit, th
 tag:
 
 ```
-git tag v0.12.1 && git push origin v0.12.1
+git tag v0.13.0 && git push origin v0.13.0
 ```
 
 CI builds and tests all three platforms and, only if every one passes, publishes a GitHub release with
@@ -726,6 +836,14 @@ model to under 0.01 arcseconds, once one behaviour of PixInsight itself is taken
 the very border of the image its 8-pixel point grid returns the value belonging to a point
 1.33 pixels inside, so the printed corner coordinates sit about 1.4 arcseconds inside the true
 corners, with `ex`/`ey` round-trip errors of 1 to 2 pixels there.
+
+The properties of the plate-solved test frame (77 of them: instrument, observation, processing
+history, previews, and the astrometric solution with 9 MB of spline grids) go through FITS,
+tile-compressed FITS and ASDF and come back identical, as the `xisf` package reads both files:
+every value and every array. That was checked with the frame as PixInsight saves it in nine ways
+(uncompressed, zlib, LZ4, LZ4HC and Zstandard, with and without checksums). That PixInsight opens
+the file that comes back and reports the same solution as for the original has not been checked
+yet.
 
 ## License
 

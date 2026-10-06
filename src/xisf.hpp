@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "common.hpp"
+#include "property.hpp"
 #include "xml.hpp"
 
 namespace xisfconv {
@@ -19,6 +20,7 @@ struct XisfProperty {
     std::string type;
     std::string value;     // scalar value, or decoded text for String properties
     std::string comment;
+    std::string format;
     bool hasBlockData = false;  // vector/matrix (or unread) data stored in a data block
     std::string location;
     const xml::Node* node = nullptr;
@@ -137,6 +139,14 @@ public:
     // Looks up a property by id: image properties first, then file-level metadata.
     const XisfProperty* findProperty(size_t imageIndex, const std::string& id) const;
 
+    // A property with its value: the content of its data block read, decompressed and put in
+    // little-endian order. Throws if the block cannot be read or does not fit the shape.
+    Property loadProperty(const XisfProperty& property, bool verifyChecksum);
+    // All properties of an image, or (kFileProperties) of the file. One that cannot be read is
+    // left out with a warning.
+    static constexpr size_t kFileProperties = static_cast<size_t>(-1);
+    std::vector<Property> loadProperties(size_t imageIndex, bool verifyChecksum);
+
     // Reads a numeric vector or matrix property (I8..UI64, F32, F64 Vector/Matrix) as doubles,
     // row-major. Returns false if the property is missing or not numeric.
     bool readNumericProperty(size_t imageIndex, const std::string& id, std::vector<double>& out,
@@ -151,6 +161,9 @@ private:
     std::unique_ptr<xml::Node> root_;
     std::vector<XisfImage> images_;
     std::vector<XisfProperty> fileProperties_;
+    uint64_t propertyBytes_ = 0;   // what loadProperties has loaded so far (see propertyBudget)
+    uint64_t stringBytes_ = 0;     // what the String properties in data blocks hold that were read when the file was opened
+    uint64_t declaredBlockSize(const xml::Node& element) const;
 
     void parseImage(const xml::Node& node);
     XisfProperty parseProperty(const xml::Node& node);

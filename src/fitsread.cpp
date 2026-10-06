@@ -325,6 +325,48 @@ bool isTiledImage(const Header& hdr, const std::string& xtension) {
     return xtension == "BINTABLE" && z && trim(z->value) == "T";
 }
 
+// The columns of a binary table, from TFIELDS, TTYPEn and TFORMn.
+std::vector<TileColumn> tableColumns(const Header& hdr, const std::string& label, uint64_t rowBytes) {
+    std::vector<TileColumn> columns;
+    long long fields = 0;
+    if (!hdr.getInt("TFIELDS", fields) || fields < 1 || fields > 999) throw Error(label + ": missing or invalid TFIELDS");
+    uint64_t offset = 0;
+    for (long long i = 1; i <= fields; ++i) {
+        TileColumn c;
+        c.name = toUpper(hdr.getString("TTYPE" + std::to_string(i)));
+        const std::string form = toUpper(hdr.getString("TFORM" + std::to_string(i)));
+        size_t p = 0;
+        uint64_t repeat = 0;
+        bool hasRepeat = false;
+        while (p < form.size() && form[p] >= '0' && form[p] <= '9' && repeat < 100000000) {
+            repeat = repeat * 10 + static_cast<uint64_t>(form[p++] - '0');
+            hasRepeat = true;
+        }
+        c.repeat = hasRepeat ? repeat : 1;
+        if (p >= form.size()) throw Error(label + ": invalid TFORM" + std::to_string(i));
+        uint64_t width = 0;
+        if (form[p] == 'P' || form[p] == 'Q') {
+            c.variable = true;
+            c.wide = form[p] == 'Q';
+            if (p + 1 >= form.size()) throw Error(label + ": invalid TFORM" + std::to_string(i));
+            c.type = form[p + 1];
+            width = c.repeat * (c.wide ? 16 : 8);
+        } else {
+            c.type = form[p];
+            static const std::string known = "LXBIJKAEDCM";
+            const size_t code = known.find(c.type);
+            if (code == std::string::npos) throw Error(label + ": invalid TFORM" + std::to_string(i));
+            static const uint64_t bytes[] = {1, 0, 1, 2, 4, 8, 1, 4, 8, 8, 16};
+            width = c.type == 'X' ? (c.repeat + 7) / 8 : c.repeat * bytes[code];
+        }
+        c.offset = offset;
+        offset += width;
+        columns.push_back(std::move(c));
+    }
+    if (offset != rowBytes) throw Error(label + ": the columns do not add up to the row length of the table");
+    return columns;
+}
+
 // Gathers the compression parameters and the table layout from the header.
 TiledImage tiledImageFromHeader(const Header& hdr, const std::string& label, uint64_t rowBytes, uint64_t rows) {
     TiledImage t;
@@ -361,43 +403,114 @@ TiledImage tiledImageFromHeader(const Header& hdr, const std::string& label, uin
         if (v < 0 || static_cast<uint64_t>(v) < t.heapOffset) throw Error(label + ": invalid THEAP");
         t.heapOffset = static_cast<uint64_t>(v);
     }
-    long long fields = 0;
-    if (!hdr.getInt("TFIELDS", fields) || fields < 1 || fields > 999) throw Error(label + ": missing or invalid TFIELDS");
-    uint64_t offset = 0;
-    for (long long i = 1; i <= fields; ++i) {
-        TileColumn c;
-        c.name = toUpper(hdr.getString("TTYPE" + std::to_string(i)));
-        const std::string form = toUpper(hdr.getString("TFORM" + std::to_string(i)));
-        size_t p = 0;
-        uint64_t repeat = 0;
-        bool hasRepeat = false;
-        while (p < form.size() && form[p] >= '0' && form[p] <= '9' && repeat < 100000000) {
-            repeat = repeat * 10 + static_cast<uint64_t>(form[p++] - '0');
-            hasRepeat = true;
-        }
-        c.repeat = hasRepeat ? repeat : 1;
-        if (p >= form.size()) throw Error(label + ": invalid TFORM" + std::to_string(i));
-        uint64_t width = 0;
-        if (form[p] == 'P' || form[p] == 'Q') {
-            c.variable = true;
-            c.wide = form[p] == 'Q';
-            if (p + 1 >= form.size()) throw Error(label + ": invalid TFORM" + std::to_string(i));
-            c.type = form[p + 1];
-            width = c.repeat * (c.wide ? 16 : 8);
-        } else {
-            c.type = form[p];
-            static const std::string known = "LXBIJKAEDCM";
-            const size_t code = known.find(c.type);
-            if (code == std::string::npos) throw Error(label + ": invalid TFORM" + std::to_string(i));
-            static const uint64_t bytes[] = {1, 0, 1, 2, 4, 8, 1, 4, 8, 8, 16};
-            width = c.type == 'X' ? (c.repeat + 7) / 8 : c.repeat * bytes[code];
-        }
-        c.offset = offset;
-        offset += width;
-        t.columns.push_back(std::move(c));
-    }
-    if (offset != rowBytes) throw Error(label + ": the columns do not add up to the row length of the table");
+    t.columns = tableColumns(hdr, label, rowBytes);
     return t;
+}
+
+// The XISF properties of a table written by the FITS writer (kPropertyTable in fits.hpp). `table`
+// is its data unit. A property that is damaged is left out with a warning; a table that cannot
+// be read at all throws.
+std::vector<Property> propertiesFromTable(const Header& hdr, const std::string& label, uint64_t rowBytes, uint64_t rows,
+                                          const std::vector<uint8_t>& table, uint64_t& budget) {
+    const std::vector<TileColumn> columns = tableColumns(hdr, label, rowBytes);
+    auto find = [&](const char* name) -> const TileColumn* {
+        for (const auto& c : columns)
+            if (c.name == name) return &c;
+        return nullptr;
+    };
+    const TileColumn *id = find("ID"), *type = find("TYPE"), *comment = find("COMMENT"), *format = find("FORMAT"),
+                     *nrows = find("ROWS"), *ncolumns = find("COLUMNS"), *value = find("VALUE"), *binary = find("BLOCK");
+    auto text = [](const TileColumn* c) { return c && c->type == 'A' && !c->variable; };
+    auto number = [](const TileColumn* c) { return c && c->type == 'K' && !c->variable && c->repeat == 1; };
+    auto bytes = [](const TileColumn* c) { return c && c->variable && c->type == 'B' && c->repeat == 1; };
+    if (!text(id) || !text(type) || !bytes(value) || (comment && !bytes(comment)) || (format && !bytes(format)) ||
+        (nrows && !number(nrows)) || (ncolumns && !number(ncolumns)) ||
+        (binary && (binary->type != 'L' || binary->variable || binary->repeat != 1))) {
+        throw Error("its columns are not those of a table of XISF properties");
+    }
+    uint64_t heapOffset = checkedMul(rowBytes, rows, "table size");
+    long long theap = 0;
+    if (hdr.getInt("THEAP", theap)) {
+        if (theap < 0 || static_cast<uint64_t>(theap) < heapOffset) throw Error("invalid THEAP");
+        heapOffset = static_cast<uint64_t>(theap);
+    }
+    if (heapOffset > table.size()) throw Error("the table is truncated");
+    const uint64_t heapSize = table.size() - heapOffset;
+
+    std::vector<Property> properties;
+    for (uint64_t r = 0; r < rows; ++r) {
+        const uint8_t* row = table.data() + r * rowBytes;
+        auto field = [&](const TileColumn* c) {
+            // text ends at a NUL, or is padded with blanks (if another program rewrote the table)
+            std::string s(reinterpret_cast<const char*>(row + c->offset), static_cast<size_t>(c->repeat));
+            const size_t nul = s.find('\0');
+            if (nul != std::string::npos) s.resize(nul);
+            else while (!s.empty() && s.back() == ' ') s.pop_back();
+            return s;
+        };
+        auto be = [&](const uint8_t* p, size_t n) {
+            uint64_t v = 0;
+            for (size_t i = 0; i < n; ++i) v = (v << 8) | p[i];
+            return v;
+        };
+        // the bytes a variable-length column has in this row; false if they are not in the heap
+        auto heap = [&](const TileColumn* c, const uint8_t*& at, size_t& size) {
+            at = table.data();
+            size = 0;
+            if (!c) return true;
+            const size_t width = c->wide ? 8 : 4;
+            const uint64_t n = be(row + c->offset, width), offset = be(row + c->offset + width, width);
+            if (offset > heapSize || n > heapSize - offset) return false;
+            at = table.data() + heapOffset + offset;
+            size = static_cast<size_t>(n);
+            return true;
+        };
+        Property p;
+        p.id = field(id);
+        p.type = field(type);
+        p.rows = nrows ? be(row + nrows->offset, 8) : 0;
+        p.columns = ncolumns ? be(row + ncolumns->offset, 8) : 0;
+        if (p.id.empty()) {
+            warn(label + ": a property without an id is left out");
+            continue;
+        }
+        const uint8_t *valueAt = nullptr, *commentAt = nullptr, *formatAt = nullptr;
+        size_t valueSize = 0, commentSize = 0, formatSize = 0;
+        if (!heap(value, valueAt, valueSize) || !heap(comment, commentAt, commentSize) || !heap(format, formatAt, formatSize)) {
+            warn(label + ": property " + p.id + " lies beyond the end of the table; it is left out");
+            continue;
+        }
+        // (rows that all point at the same bytes of the heap would hold more than the file does)
+        const uint64_t bytes3 = static_cast<uint64_t>(valueSize) + commentSize + formatSize;
+        if (bytes3 > budget) {
+            warn(label + ": property " + p.id + " is left out: the properties of this file hold more data than a file of its size can");
+            continue;
+        }
+        budget -= bytes3;
+        p.comment.assign(reinterpret_cast<const char*>(commentAt), commentSize);
+        p.format.assign(reinterpret_cast<const char*>(formatAt), formatSize);
+        PropertyElement element;
+        const bool known = propertyElement(p.type, element);
+        const bool inBlock = binary ? row[binary->offset] == 'T' : known || p.rows != 0 || p.columns != 0;
+        if (p.type == "String") {
+            p.block = inBlock;
+        } else {
+            p.array = inBlock;
+            if (known && !p.array) {
+                warn(label + ": property " + p.id + " is left out: a " + p.type + " whose value is said to be text");
+                continue;
+            }
+        }
+        if (p.array) p.data.assign(valueAt, valueAt + valueSize);
+        else p.text.assign(reinterpret_cast<const char*>(valueAt), valueSize);
+        const std::string problem = propertyProblem(p);
+        if (!problem.empty()) {
+            warn(label + ": property " + p.id + " is left out: " + problem);
+            continue;
+        }
+        properties.push_back(std::move(p));
+    }
+    return properties;
 }
 
 std::vector<uint8_t> readBytes(std::ifstream& in, uint64_t pos, uint64_t size, const std::string& label) {
@@ -568,9 +681,15 @@ FitsFile readFits(const std::string& path, bool headersOnly, std::optional<size_
     file.fileSize = static_cast<uint64_t>(in.tellg());
 
     uint64_t pos = 0;
+    // The image the HDU before the current one became, if it became one: a table of XISF
+    // properties belongs to it.
+    std::optional<size_t> imageBefore;
+    uint64_t budget = propertyBudget(file.fileSize);   // what the XISF properties of the file may hold together
     for (size_t hduIndex = 0;; ++hduIndex) {
         Header hdr;
         if (!readHeader(in, file.fileSize, pos, hdr, hduIndex == 0)) break;
+        const std::optional<size_t> owner = imageBefore;
+        imageBefore.reset();
 
         long long bitpix = 0, naxis = 0, pcount = 0, gcount = 1;
         if (!hdr.getInt("BITPIX", bitpix) || !hdr.getInt("NAXIS", naxis) || naxis < 0 || naxis > 999) {
@@ -639,6 +758,27 @@ FitsFile readFits(const std::string& path, bool headersOnly, std::optional<size_
             elements = dims.empty() ? 0 : 1;
             for (uint64_t d : dims) elements = checkedMul(elements, d, "FITS data size");
         } else if (!isImage) {
+            const std::string name = hdr.getString("EXTNAME");
+            if (xtension == "BINTABLE" && (name == kPropertyTable || name == kMetadataTable)) {
+                // XISF properties, written by a conversion from XISF: of the image before, or of the file
+                // (not when the pixels of one image are asked for: who asks has read the headers before)
+                const bool ofImage = name == kPropertyTable;
+                if (onlyImage) continue;
+                try {
+                    if (dims.size() != 2) throw Error("invalid binary table");
+                    if (ofImage && !owner) throw Error("there is no image before it that it could belong to");
+                    std::vector<Property> properties = propertiesFromTable(hdr, label, dims[0], dims[1], readBytes(in, dataPos, dataBytes, label), budget);
+                    if (ofImage) {
+                        file.images[*owner].properties = std::move(properties);
+                        file.images[*owner].wcsDigest = hdr.getString(kWcsDigestKeyword);
+                    } else {
+                        file.properties = std::move(properties);
+                    }
+                } catch (const Error& e) {
+                    warn(label + ": the table of XISF properties is not used: " + e.what());
+                }
+                continue;
+            }
             file.skipped.push_back(label + ": " + (xtension.empty() ? "unknown" : xtension) + " extension (not an image)");
             continue;
         }
@@ -700,6 +840,7 @@ FitsFile readFits(const std::string& path, bool headersOnly, std::optional<size_
             img.hasData = true;
         }
         file.images.push_back(std::move(img));
+        imageBefore = file.images.size() - 1;
         if (onlyImage && file.images.size() > *onlyImage) break;   // the one image that was asked for is read
     }
     return file;

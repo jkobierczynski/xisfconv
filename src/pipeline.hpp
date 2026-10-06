@@ -43,6 +43,8 @@ struct ConvertOptions {
     bool wcs = true;                        // translate the astrometric solution
     int sipOrder = 3;                       // from XISF: order of the SIP fit (0 = linear only)
     bool force = false;                     // overwrite an existing output
+    bool properties = true;                 // from XISF to FITS and ASDF: take the XISF properties along; from FITS
+                                            //   and ASDF: use the properties a file carries (see carriedProperties)
 };
 
 // The output is written to "<output>.part" and renamed when it is complete.
@@ -74,6 +76,12 @@ void flipKeywordRows(std::vector<FitsKeyword>& keywords, uint64_t height);
 // `wcsSummary`, if given, receives the line about a fitted solution.
 std::vector<FitsKeyword> xisfImageFitsKeywords(XisfFile& file, size_t index, bool bottomUp, bool propertyKeywords,
                                                bool wcs, int sipOrder, std::string* wcsSummary);
+
+// The XISF properties that go with an image, or with the file (XisfFile::kFileProperties), when
+// it is converted to FITS or ASDF: all of them with their values, but for the properties of
+// the file that describe how that one XISF file was made and stored. A property that cannot be
+// read is left out with a warning.
+std::vector<Property> carriedProperties(XisfFile& file, size_t index, bool verify);
 
 // The range given to floating point data from FITS and ASDF when nothing else is said: 0:1 if
 // the data fits, else 0:65535 if it fits, else its minimum and maximum.

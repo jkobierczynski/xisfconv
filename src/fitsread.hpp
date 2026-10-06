@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "common.hpp"
+#include "property.hpp"
 
 namespace xisfconv {
 
@@ -33,6 +34,10 @@ struct FitsImage {
     // Images handed over in memory (the C API's writer) only:
     std::optional<std::pair<double, double>> bounds;  // range of floating point samples, if the caller states it
     std::vector<uint8_t> iccProfile;    // written to TIFF and PNG
+    // The XISF properties the image carries: from the table behind it in a FITS file, from the
+    // tree of an ASDF file (both written by a conversion from XISF).
+    std::vector<Property> properties;
+    std::string wcsDigest;              // the WCS keywords an astrometric solution among them was written with
 };
 
 struct FitsFile {
@@ -41,10 +46,12 @@ struct FitsFile {
     std::vector<FitsImage> images;
     std::vector<std::string> skipped;   // descriptions of HDUs that are not convertible images
     std::string formatNote;             // ASDF input: versions and block count
+    std::vector<Property> properties;   // the XISF properties of the file the images were converted from, if carried
 };
 
 // Reads all image HDUs. With headersOnly the pixel data is skipped (for --info); with onlyImage
-// the pixels of that one image are read and the others are left as headers.
+// the pixels of that one image are read and the others are left as headers. The XISF properties
+// a file carries are read in both cases but the last.
 // Throws xisfconv::Error on malformed files.
 FitsFile readFits(const std::string& path, bool headersOnly = false, std::optional<size_t> onlyImage = std::nullopt);
 

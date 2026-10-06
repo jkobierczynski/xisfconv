@@ -440,7 +440,7 @@ static void test_writer_and_readers(xisfconv_context *ctx, const xisfconv_keywor
               "and read top-down when asked");
         CHECK(xisfconv_image_keywords(f, 0, &cards) == XISFCONV_OK && xisfconv_keywords_find(cards, "EXPTIME") >= 0, "keywords");
         CHECK(strcmp(xisfconv_image_name(f, 0), "gray") == 0, "name");
-        CHECK(xisfconv_property_count(f, 0) == 0, "no properties outside XISF");
+        CHECK(xisfconv_property_count(f, 0) == 0, "no properties in a file that was not converted from XISF");
         CHECK(xisfconv_read_icc_profile(f, 0, NULL, 0, NULL) == XISFCONV_ERR_NOT_FOUND, "no ICC profile outside XISF");
         xisfconv_close(f);
     }
@@ -1144,6 +1144,124 @@ static void test_stretch_and_wcs(xisfconv_context *ctx) {
 
 /* Handles keep their context alive: the order of freeing does not matter. */
 /* The header of an image for FITS, cards as text, and the cards the writer does not take. */
+/* XISF properties in FITS and ASDF files that were converted from XISF */
+static void test_carried_properties(xisfconv_context *ctx) {
+    static const char *LINEAR = "PCL:AstrometricSolution:LinearTransformationMatrix";
+    static const char *SYSTEM = "PCL:AstrometricSolution:ProjectionSystem";
+    xisfconv_keywords *kw = NULL;
+    xisfconv_write_options wo;
+    xisfconv_convert_options co;
+    xisfconv_file *f = NULL;
+    double matrix[4] = {0, 0, 0, 0}, carried[4] = {0, 0, 0, 0};
+    size_t count = 0, rows = 0, columns = 0, i;
+    int k;
+
+    /* an XISF file with properties: the solution that is written from WCS keywords */
+    xisfconv_keywords_new(ctx, &kw);
+    xisfconv_keywords_append_string(kw, "CTYPE1", "RA---TAN", NULL);
+    xisfconv_keywords_append_string(kw, "CTYPE2", "DEC--TAN", NULL);
+    xisfconv_keywords_append_number(kw, "CRVAL1", 10.5, NULL);
+    xisfconv_keywords_append_number(kw, "CRVAL2", 41.25, NULL);
+    xisfconv_keywords_append_number(kw, "CRPIX1", 4.0, NULL);
+    xisfconv_keywords_append_number(kw, "CRPIX2", 2.0, NULL);
+    xisfconv_keywords_append_number(kw, "CD1_1", -0.0003, NULL);
+    xisfconv_keywords_append_number(kw, "CD1_2", 0.00001, NULL);
+    xisfconv_keywords_append_number(kw, "CD2_1", 0.00002, NULL);
+    xisfconv_keywords_append_number(kw, "CD2_2", 0.0003, NULL);
+    xisfconv_write_options_init(&wo, sizeof wo);
+    CHECK(write_gray(ctx, path_of("solved.xisf"), &wo, kw, NULL, 0) == XISFCONV_OK, "an XISF file with solution properties");
+    xisfconv_keywords_free(kw);
+    CHECK(xisfconv_open(ctx, path_of("solved.xisf"), &f) == XISFCONV_OK && f, "open it");
+    if (!f) return;
+    count = xisfconv_property_count(f, 0);
+    CHECK(count >= 6 && xisfconv_property_read_f64(f, 0, LINEAR, matrix, 4, &rows, &columns) == XISFCONV_OK && rows == 2 && columns == 2,
+          "its properties");
+    xisfconv_close(f);
+
+    xisfconv_convert_options_init(&co, sizeof co);
+    CHECK(co.properties == 1, "properties are taken along unless told otherwise");
+    for (k = 0; k < 2; ++k) {
+        const char *carrier = path_of(k ? "carried.asdf" : "carried.fits");
+        const char *label = k ? "ASDF" : "FITS";
+        const char *id = NULL, *type = NULL, *value = NULL, *comment = NULL;
+        int32_t block = -1;
+        int64_t at;
+        f = NULL;
+        xisfconv_convert_options_init(&co, sizeof co);
+        co.overwrite = 1;
+        CHECK(xisfconv_convert(ctx, path_of("solved.xisf"), carrier, &co) == XISFCONV_OK, label);
+        CHECK(xisfconv_open(ctx, carrier, &f) == XISFCONV_OK && f, label);
+        if (!f) continue;
+        CHECK(xisfconv_image_count(f) == 1 && xisfconv_skipped_count(f) == 0, "the properties are no image and nothing that is skipped");
+        CHECK(xisfconv_property_count(f, 0) == count && xisfconv_property_count(f, XISFCONV_FILE_PROPERTIES) == 0 &&
+                  xisfconv_property_count(f, 1) == 0,
+              "the file carries the properties of the image");
+        at = xisfconv_property_find(f, 0, SYSTEM);
+        CHECK(at >= 0 && xisfconv_property_find(f, 0, "No:Such") == -1 && xisfconv_property_find(f, 0, NULL) == -1 &&
+                  xisfconv_property_find(f, 7, SYSTEM) == -1,
+              "one of them is found by its id");
+        CHECK(at >= 0 && xisfconv_property_get(f, 0, (size_t)at, &id, &type, &value, &comment, &block) == XISFCONV_OK &&
+                  strcmp(id, SYSTEM) == 0 && strcmp(type, "String") == 0 && strcmp(value, "Gnomonic") == 0 && *comment == 0 && block == 0,
+              "a String with its text");
+        at = xisfconv_property_find(f, 0, LINEAR);
+        CHECK(at >= 0 && xisfconv_property_get(f, 0, (size_t)at, NULL, &type, &value, NULL, &block) == XISFCONV_OK &&
+                  strcmp(type, "F64Matrix") == 0 && *value == 0 && block == 1,
+              "a matrix is said to be numbers");
+        CHECK(xisfconv_property_get(f, 0, count, &id, NULL, NULL, NULL, NULL) == XISFCONV_ERR_INDEX, "an index beyond the last property");
+        CHECK(*xisfconv_property_format(f, 0, (size_t)at) == 0 && *xisfconv_property_format(f, 0, count) == 0 &&
+                  *xisfconv_property_format(f, 9, 0) == 0 && *xisfconv_property_format(NULL, 0, 0) == 0,
+              "a property without a format, and one that is not there, have the format \"\"");
+        rows = columns = 0;
+        CHECK(xisfconv_property_read_f64(f, 0, LINEAR, NULL, 0, &rows, &columns) == XISFCONV_OK && rows == 2 && columns == 2, "its shape");
+        CHECK(xisfconv_property_read_f64(f, 0, LINEAR, carried, 3, NULL, NULL) == XISFCONV_ERR_BUFFER, "a buffer that is too small");
+        CHECK(xisfconv_property_read_f64(f, 0, LINEAR, carried, 4, &rows, &columns) == XISFCONV_OK &&
+                  memcmp(carried, matrix, sizeof matrix) == 0,
+              "its numbers are those of the XISF file, bit for bit");
+        CHECK(xisfconv_property_read_f64(f, 0, SYSTEM, carried, 4, NULL, NULL) == XISFCONV_ERR_NOT_FOUND &&
+                  xisfconv_property_read_f64(f, 0, "No:Such", carried, 4, NULL, NULL) == XISFCONV_ERR_NOT_FOUND &&
+                  xisfconv_property_read_f64(f, 3, LINEAR, carried, 4, NULL, NULL) == XISFCONV_ERR_INDEX,
+              "what is no vector or matrix, what is not there, an image that is not there");
+        xisfconv_close(f);
+
+        /* back to XISF: the same properties, in the same order */
+        f = NULL;
+        CHECK(xisfconv_convert(ctx, carrier, path_of("restored.xisf"), &co) == XISFCONV_OK &&
+                  xisfconv_open(ctx, path_of("restored.xisf"), &f) == XISFCONV_OK && f,
+              "back to XISF");
+        if (f) {
+            xisfconv_file *first = NULL;
+            int same = xisfconv_property_count(f, 0) == count;
+            CHECK(xisfconv_open(ctx, path_of("solved.xisf"), &first) == XISFCONV_OK && first, "the first file again");
+            for (i = 0; first && same && i < count; ++i) {
+                const char *id2 = NULL, *type2 = NULL, *value2 = NULL;
+                if (xisfconv_property_get(first, 0, i, &id, &type, &value, NULL, NULL) != XISFCONV_OK ||
+                    xisfconv_property_get(f, 0, i, &id2, &type2, &value2, NULL, NULL) != XISFCONV_OK || strcmp(id, id2) != 0 ||
+                    strcmp(type, type2) != 0 || strcmp(value, value2) != 0) {
+                    same = 0;
+                }
+            }
+            CHECK(same, "every property is there again, the time the solution was made at included");
+            xisfconv_close(first);
+            xisfconv_close(f);
+        }
+
+        /* without them */
+        f = NULL;
+        co.properties = 0;
+        CHECK(xisfconv_convert(ctx, path_of("solved.xisf"), carrier, &co) == XISFCONV_OK &&
+                  xisfconv_open(ctx, carrier, &f) == XISFCONV_OK && f && xisfconv_property_count(f, 0) == 0,
+              "properties = 0 leaves them out");
+        xisfconv_close(f);
+        /* a caller built against the header of 0.12, whose options end before that field */
+        f = NULL;
+        co.struct_size = offsetof(xisfconv_convert_options, properties);
+        CHECK(xisfconv_convert(ctx, path_of("solved.xisf"), carrier, &co) == XISFCONV_OK &&
+                  xisfconv_open(ctx, carrier, &f) == XISFCONV_OK && f && xisfconv_property_count(f, 0) == count,
+              "options of the shorter layout of 0.12 take them along");
+        xisfconv_close(f);
+    }
+}
+
 static void test_fits_header(xisfconv_context *ctx) {
     xisfconv_keywords *kw = NULL, *out = NULL;
     const xisfconv_keywords *stored = NULL;
@@ -1368,6 +1486,7 @@ int main(int argc, char **argv) {
     test_host_progress(ctx);
     test_stretch_and_wcs(ctx);
     test_fits_header(ctx);
+    test_carried_properties(ctx);
     xisfconv_context_free(ctx);
     test_lifetime();
 

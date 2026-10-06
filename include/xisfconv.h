@@ -52,8 +52,8 @@
 #include <stdint.h>
 
 #define XISFCONV_VERSION_MAJOR 0
-#define XISFCONV_VERSION_MINOR 12
-#define XISFCONV_VERSION_PATCH 1
+#define XISFCONV_VERSION_MINOR 13
+#define XISFCONV_VERSION_PATCH 0
 
 #if defined(XISFCONV_STATIC)
 #  define XISFCONV_API
@@ -460,7 +460,19 @@ XISFCONV_API xisfconv_status xisfconv_image_keywords(const xisfconv_file *file, 
 /* --- XISF properties --------------------------------------------------------------------- */
 
 /* image = XISFCONV_FILE_PROPERTIES addresses the file-level metadata instead of an image.
- * For FITS and ASDF files the count is 0. */
+ *
+ * FITS and ASDF files have no properties of their own. One that was converted from XISF
+ * (since 0.13) carries those of the XISF file, and they are read with the same functions:
+ * a FITS file in a binary table behind each image (EXTNAME XISF_PROPERTIES, and XISF_METADATA
+ * for the properties of the file; a row per property with the columns ID, TYPE, BLOCK, ROWS,
+ * COLUMNS, VALUE, COMMENT and FORMAT, the value as UTF-8 text or as the little-endian elements
+ * of a vector or matrix), an ASDF file under the key "xisf" of its tree (images[n].properties and
+ * metadata: {id: {type, value, comment, format}}, vectors and matrices as arrays). For other
+ * FITS and ASDF files the count is 0.
+ *
+ * The properties of a file are held in memory together when it is converted, and those a FITS
+ * or ASDF file carries from the moment it is opened: more than the size of the file plus
+ * 256 MiB is not accepted, and what is beyond is left out with a warning. */
 #define XISFCONV_FILE_PROPERTIES ((size_t)-1)
 
 XISFCONV_API size_t xisfconv_property_count(const xisfconv_file *file, size_t image);
@@ -472,6 +484,9 @@ XISFCONV_API xisfconv_status xisfconv_property_get(const xisfconv_file *file, si
                                                    const char **comment, int32_t *in_data_block);
 /* Index of the property with this id, or -1. */
 XISFCONV_API int64_t xisfconv_property_find(const xisfconv_file *file, size_t image, const char *id);
+/* The format attribute of a property (how its value is meant to be shown, e.g. "%.3f"); "" if
+ * it has none or there is no such property. Owned by the file. (Since 0.13.) */
+XISFCONV_API const char *xisfconv_property_format(const xisfconv_file *file, size_t image, size_t index);
 
 /* Reads a numeric vector or matrix property as doubles, row-major. With an image index, the
  * image's properties are searched first, then the file-level metadata. Call with values = NULL
@@ -649,6 +664,16 @@ typedef struct xisfconv_convert_options {
     int32_t overwrite;                    /* --force; default 0: XISFCONV_ERR_EXISTS if the output exists */
     double lower_bound;
     double upper_bound;
+
+    /* --no-properties sets it to 0; default 1. (Since 0.13.)
+     * From XISF to FITS and ASDF: the XISF properties of the images and of the file are written
+     * along, with their types and exact values (see "XISF properties" above for where).
+     * From FITS and ASDF: the properties a file carries are used. To XISF they are the
+     * properties of the images again; an astrometric solution among them is written only if
+     * the WCS keywords, the size of the image and the order of its rows are what they were when
+     * it was carried, and is made from the WCS keywords otherwise (with wcs = 1). From FITS to
+     * ASDF and back, and from FITS to FITS, they are written along as they are. */
+    int32_t properties;
 } xisfconv_convert_options;
 
 XISFCONV_API void xisfconv_convert_options_init(xisfconv_convert_options *options, size_t struct_size);

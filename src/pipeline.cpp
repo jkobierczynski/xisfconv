@@ -120,6 +120,8 @@ void addPropertyKeywords(const XisfFile& file, size_t index, std::vector<FitsKey
     }
 }
 
+std::string countOf(size_t n, const char* one, const char* many) { return std::to_string(n) + " " + (n == 1 ? one : many); }
+
 std::string stretchDescription(const std::string& how, const std::vector<StretchParams>& params) {
     std::string desc = how + ":";
     char buf[96];
@@ -357,6 +359,16 @@ std::vector<FitsKeyword> xisfImageFitsKeywords(XisfFile& file, size_t idx, bool 
     return keywords;
 }
 
+std::vector<Property> carriedProperties(XisfFile& file, size_t index, bool verify) {
+    std::vector<Property> properties = file.loadProperties(index, verify);
+    if (index == XisfFile::kFileProperties) {
+        properties.erase(std::remove_if(properties.begin(), properties.end(),
+                                        [](const Property& p) { return isFileStorageProperty(p.id); }),
+                         properties.end());
+    }
+    return properties;
+}
+
 void flipKeywordRows(std::vector<FitsKeyword>& keywords, uint64_t height) {
     if (FitsKeyword* bp = findKeyword(keywords, "BAYERPAT")) {
         const std::string pattern = fitsUnquote(bp->value);
@@ -485,14 +497,27 @@ void convertXisfFile(const std::string& input, const std::string& outPath, Forma
                 if (!wcsSummary.empty()) info("image " + std::to_string(idx) + ": " + wcsSummary);
                 hdu.keywords.push_back({"HISTORY", "", std::string("Converted from XISF by xisfconv ") + kVersion});
                 if (n < stretchNotes.size()) hdu.keywords.push_back({"HISTORY", "", stretchNotes[n]});
+                if (opt.properties) {
+                    hdu.properties = carriedProperties(file, idx, opt.verify);
+                    if (!hdu.properties.empty()) {
+                        hdu.wcsDigest = wcsDigest(hdu.keywords, buffers[n].width, buffers[n].height, opt.bottomUp);
+                        info("image " + std::to_string(idx) + ": " + countOf(hdu.properties.size(), "XISF property", "XISF properties") +
+                             " taken along");
+                    }
+                }
                 hdus.push_back(std::move(hdu));
             }
+            std::vector<Property> metadata;
+            if (opt.properties) metadata = carriedProperties(file, XisfFile::kFileProperties, opt.verify);
             if (format == Format::Asdf) {
                 AsdfWriteOptions aopt;
                 if (opt.compress) aopt.codec = opt.codec.empty() ? "zlib" : opt.codec;
+                aopt.metadata = std::move(metadata);
                 writeAsdf(tmpPath, hdus, aopt);
             } else {
-                writeFits(tmpPath, hdus, fitsOptions);
+                FitsWriteOptions fopt = fitsOptions;
+                fopt.metadata = std::move(metadata);
+                writeFits(tmpPath, hdus, fopt);
             }
         } else if (format == Format::Tiff) {
             std::vector<TiffPage> pages;
@@ -767,6 +792,11 @@ void writeImageSet(FitsFile& fits, const ImageSetOrigin& source, const std::stri
             hdu.extname = img.name;
             hdu.bottomUp = !topDown;
             if (!history.empty()) hdu.keywords.push_back({"HISTORY", "", history});
+            if (opt.properties) {
+                // What was converted from XISF stays what it was, in the other container too.
+                hdu.properties = std::move(img.properties);
+                hdu.wcsDigest = img.wcsDigest;
+            }
             if (source.notes) {
                 std::string line = label + origin(img) + ": " + img.note + ", rows " +
                                    (img.hasRowOrder || opt.rowOrderGiven || !img.generic ? "" : "assumed ") +
@@ -780,9 +810,12 @@ void writeImageSet(FitsFile& fits, const ImageSetOrigin& source, const std::stri
             if (format == Format::Asdf) {
                 AsdfWriteOptions aopt;
                 if (opt.compress) aopt.codec = opt.codec.empty() ? "zlib" : opt.codec;
+                if (opt.properties) aopt.metadata = std::move(fits.properties);
                 writeAsdf(tmpPath, hdus, aopt);
             } else {
-                writeFits(tmpPath, hdus, fitsOptions);
+                FitsWriteOptions fopt = fitsOptions;
+                if (opt.properties) fopt.metadata = std::move(fits.properties);
+                writeFits(tmpPath, hdus, fopt);
             }
             replaceFile(tmpPath, outPath);
         } catch (...) {
@@ -800,6 +833,12 @@ void writeImageSet(FitsFile& fits, const ImageSetOrigin& source, const std::stri
 
         // XISF stores rows top-down. FITS rows are bottom-up unless ROWORDER (or the user) says otherwise.
         const bool topDown = opt.rowOrderGiven ? !opt.bottomUp : img.topDown;
+        // The XISF properties an image carries are its properties again. An astrometric solution
+        // among them describes the image as it was: it is the solution still if the WCS keywords
+        // (which were written from it, or with it) are the same and the rows are where they were.
+        const bool carried = opt.properties && !img.properties.empty();
+        const bool sameWcs = carried && topDown == img.topDown &&
+                             wcsDigest(img.keywords, px.width, px.height, !img.topDown) == img.wcsDigest;
         if (!topDown) {
             flipVertical(px);
             if (FitsKeyword* bp = findKeyword(img.keywords, "BAYERPAT")) {
@@ -848,14 +887,46 @@ void writeImageSet(FitsFile& fits, const ImageSetOrigin& source, const std::stri
         }
         o.keywords = img.keywords;
         o.iccProfile = img.iccProfile;
-        std::string solutionNote;
-        if (opt.wcs) {
+        std::string solutionNote, propertyNote;
+        if (sameWcs) {
+            o.properties = std::move(img.properties);
+            bool solution = false;
+            for (const auto& p : o.properties) solution = solution || isSolutionProperty(p.id);
+            propertyNote = countOf(o.properties.size(), "XISF property", "XISF properties") + " restored" +
+                           (solution ? ", the astrometric solution among them" : "");
+        } else if (opt.wcs) {
             // The keywords are now in the bottom-up convention PixInsight uses. PixInsight reads only
             // their linear part, so the solution is also written as its native properties.
             if (!wcsToAstrometricSolution(o.keywords, px.width, px.height, o.properties, solutionNote) &&
                 !solutionNote.empty()) {
                 warn(label + ": no PixInsight solution properties written: " + solutionNote);
                 solutionNote.clear();
+            }
+        }
+        if (carried && !sameWcs) {
+            // What the keywords say now comes first: the solution that was carried is not written,
+            // and neither is a property that was made from the keywords just now.
+            const size_t made = o.properties.size();
+            size_t restored = 0;
+            bool solution = false;
+            for (auto& p : img.properties) {
+                if (isSolutionProperty(p.id)) {
+                    solution = true;
+                    continue;
+                }
+                bool again = false;
+                for (size_t k = 0; k < made && !again; ++k) again = o.properties[k].id == p.id;
+                if (again) continue;
+                o.properties.push_back(std::move(p));
+                ++restored;
+            }
+            propertyNote = countOf(restored, "XISF property", "XISF properties") + " restored";
+            if (solution) {
+                propertyNote += std::string("; not the astrometric solution among them: ") +
+                                (topDown != img.topDown ? "the rows are taken in the other order than the file says"
+                                                        : "the WCS keywords, the size of the image or the order of its rows "
+                                                          "changed since it was written") +
+                                (made ? ", so it is made from the keywords" : "");
             }
         }
         if (!history.empty()) o.keywords.push_back({"HISTORY", "", history});
@@ -869,6 +940,7 @@ void writeImageSet(FitsFile& fits, const ImageSetOrigin& source, const std::stri
             if (!boundsNote.empty()) line += "; " + boundsNote;
             info(line);
             if (!solutionNote.empty()) info(label + ": " + solutionNote);
+            if (!propertyNote.empty()) info(label + ": " + propertyNote);
         }
         out.push_back(std::move(o));
     }
@@ -877,6 +949,7 @@ void writeImageSet(FitsFile& fits, const ImageSetOrigin& source, const std::stri
     if (opt.compress) wopt.codec = !opt.codec.empty() ? opt.codec : (zstdAvailable() ? "zstd" : "zlib");
     wopt.checksum = opt.checksum;
     wopt.subblockSize = opt.subblockSize;
+    if (opt.properties) wopt.metadata = std::move(fits.properties);
 
     try {
         writeXisf(tmpPath, out, wopt);

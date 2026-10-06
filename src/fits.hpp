@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "common.hpp"
+#include "property.hpp"
 
 namespace xisfconv {
 
@@ -15,7 +16,26 @@ struct FitsHdu {
     std::vector<FitsKeyword> keywords;  // user keywords; structural ones are filtered out
     std::string extname;
     bool bottomUp = false;  // pixel rows already flipped to bottom-up order
+    // The XISF properties the image brings along: written as a binary table behind the image
+    // (see kPropertyTable). Empty: no table.
+    std::vector<Property> properties;
+    // What the WCS keywords looked like when the properties were taken from an XISF file
+    // (wcsDigest), if they hold an astrometric solution: it goes with them.
+    std::string wcsDigest;
 };
+
+// XISF properties in a FITS file: a binary table extension with a row per property, named
+// XISF_PROPERTIES behind the image it belongs to and XISF_METADATA for the properties of the
+// file. The columns: ID and TYPE (the XISF type name) as text; BLOCK, true if the value is what
+// XISF keeps in a data block (a vector, a matrix, a String that was stored as a block); ROWS
+// and COLUMNS (the shape of a matrix; the length of a vector in ROWS); VALUE, COMMENT and
+// FORMAT, variable-length arrays of bytes: UTF-8 text, and in VALUE the elements of a vector
+// or matrix as little-endian numbers, row after row. This is not a
+// convention anyone else reads; it is plain FITS, though, and any program that reads tables can
+// show it.
+constexpr const char* kPropertyTable = "XISF_PROPERTIES";
+constexpr const char* kMetadataTable = "XISF_METADATA";
+constexpr const char* kWcsDigestKeyword = "WCSDIGST";
 
 // How the images are stored. With tile compression (the "tiled image compression convention" of
 // the FITS standard, the format of fpack) each image is a binary table that holds its rows
@@ -29,6 +49,7 @@ enum class FitsTiles {
 
 struct FitsWriteOptions {
     FitsTiles tiles = FitsTiles::None;
+    std::vector<Property> metadata;   // the XISF properties of the file: a table at the end. Empty: none.
 };
 
 void writeFits(const std::string& path, const std::vector<FitsHdu>& hdus, const FitsWriteOptions& options = {});

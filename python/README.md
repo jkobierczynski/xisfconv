@@ -139,6 +139,11 @@ that a signal handler raises there (an alarm's time limit) can be lost. `Keyboar
   (`entry.wcs_keywords()`), from which xisfconv writes PixInsight's solution properties again.
   The saved screen stretch and the resolution are not carried. A colour filter array is, as a
   BAYERPAT keyword.
+- `convert` does take the XISF properties along: to FITS as a table behind each image, to ASDF
+  under the key `xisf` of the tree, and back to XISF as the properties they were, the
+  astrometric solution of PixInsight included (as long as the WCS keywords were not changed on
+  the way). `properties=False` leaves them out. A FITS or ASDF file that carries properties shows
+  them as `file[0].properties` and `file.properties`.
 - FITS keywords are ASCII: other characters in a keyword text are written as `?`.
 - A `File` and the images read from it belong to one thread at a time; separate files, and the
   functions that take file names, can be used from several threads at once.

@@ -593,6 +593,121 @@ void writeTiledImage(std::ofstream& out, const std::string& path, const FitsHdu&
     out.seekp(endAt);
 }
 
+// The table of XISF properties (see kPropertyTable in fits.hpp).
+void writePropertyTable(std::ofstream& out, const std::vector<Property>& all, const char* name, size_t number,
+                        const std::string& digest) {
+    // The id and the type are text columns, which hold printable ASCII: that is what XISF
+    // allows them to be.
+    auto printable = [](const std::string& s) {
+        for (unsigned char c : s)
+            if (c < 0x20 || c > 0x7E) return false;
+        return true;
+    };
+    std::vector<const Property*> properties;
+    for (const Property& p : all) {
+        if (p.id.empty() || !printable(p.id) || !printable(p.type)) {
+            warn("property " + fitsSanitize(p.id) + " is not written to the FITS file: its id or its type is not plain text");
+            continue;
+        }
+        properties.push_back(&p);
+    }
+    if (properties.empty()) return;
+    // Text columns as wide as their longest entry (and at least one character, for readers
+    // that do not expect a column without width).
+    size_t idWidth = 1, typeWidth = 1;
+    uint64_t heap = 0, longest[3] = {0, 0, 0};   // of the values, the comments, the formats
+    auto value = [](const Property& p) { return p.array ? p.data.size() : p.text.size(); };
+    for (const Property* p : properties) {
+        // (a text that ends in a blank gets a column one wider, so that it ends in a NUL there:
+        // blanks at the end of a full column are padding to a reader)
+        idWidth = std::max(idWidth, p->id.size() + (p->id.back() == ' ' ? 1 : 0));
+        typeWidth = std::max(typeWidth, p->type.size() + (!p->type.empty() && p->type.back() == ' ' ? 1 : 0));
+        const uint64_t sizes[3] = {value(*p), p->comment.size(), p->format.size()};
+        for (int k = 0; k < 3; ++k) {
+            heap += sizes[k];
+            longest[k] = std::max(longest[k], sizes[k]);
+        }
+    }
+    const bool wide = heap > static_cast<uint64_t>(std::numeric_limits<int32_t>::max());
+    const size_t descriptor = wide ? 16 : 8;
+    const size_t rowBytes = idWidth + typeWidth + 1 + 16 + 3 * descriptor;
+
+    std::vector<std::string> cards;
+    cards.push_back(valueCard("XTENSION", fitsString("BINTABLE"), "binary table extension"));
+    cards.push_back(intCard("BITPIX", 8, "array data type"));
+    cards.push_back(intCard("NAXIS", 2, "number of array dimensions"));
+    cards.push_back(intCard("NAXIS1", static_cast<long long>(rowBytes), "width of table in bytes"));
+    cards.push_back(intCard("NAXIS2", static_cast<long long>(properties.size()), "number of rows in table: the properties"));
+    cards.push_back(intCard("PCOUNT", static_cast<long long>(heap), "size of the heap: values, comments, formats"));
+    cards.push_back(intCard("GCOUNT", 1, "one data group"));
+    cards.push_back(intCard("TFIELDS", 8, "number of fields in each row"));
+    auto column = [&](int n, const char* label, const std::string& form, const char* comment) {
+        cards.push_back(valueCard("TTYPE" + std::to_string(n), fitsString(label), comment));
+        cards.push_back(valueCard("TFORM" + std::to_string(n), fitsString(form), ""));
+    };
+    auto bytes = [&](uint64_t most) { return std::string(wide ? "1QB(" : "1PB(") + std::to_string(most) + ")"; };
+    column(1, "ID", std::to_string(idWidth) + "A", "property identifier");
+    column(2, "TYPE", std::to_string(typeWidth) + "A", "XISF type name");
+    column(3, "BLOCK", "1L", "T: VALUE is an XISF data block");
+    column(4, "ROWS", "1K", "rows of a matrix, length of a vector");
+    column(5, "COLUMNS", "1K", "columns of a matrix");
+    column(6, "VALUE", bytes(longest[0]), "UTF-8 text, or little-endian numbers");
+    column(7, "COMMENT", bytes(longest[1]), "comment of the property, UTF-8 text");
+    column(8, "FORMAT", bytes(longest[2]), "format specification of the property");
+    cards.push_back(valueCard("EXTNAME", fitsString(name), "XISF properties, written by xisfconv"));
+    cards.push_back(intCard("EXTVER", static_cast<long long>(number), "number of this table"));
+    if (!digest.empty()) cards.push_back(valueCard(kWcsDigestKeyword, fitsString(digest), "the WCS they were written with"));
+    const bool image = std::string(name) == kPropertyTable;
+    for (const char* line : {image ? "The XISF properties of the image in the HDU before this one: what PixInsight"
+                                   : "The XISF properties of the file this one was converted from: what PixInsight",
+                             "stores next to the pixels and the FITS keywords (instrument, observation,",
+                             "processing history, astrometric solution). xisfconv restores them when the",
+                             "file is converted to XISF again. VALUE is an array of bytes: UTF-8 text, and",
+                             "for vectors and matrices their elements as little-endian numbers, row after",
+                             "row. BLOCK = T: the value is what XISF keeps in a data block (vectors,",
+                             "matrices, and some text)."}) {
+        cards.push_back(finishCard(std::string("COMMENT ") + line));
+    }
+    const std::string header = headerBlocks(std::move(cards));
+    out.write(header.data(), static_cast<std::streamsize>(header.size()));
+
+    // (an id that is shorter than its column ends with NUL characters, as the standard allows)
+    std::vector<uint8_t> row(rowBytes);
+    uint64_t offset = 0;
+    for (const Property* p : properties) {
+        std::fill(row.begin(), row.end(), uint8_t(0));
+        uint8_t* at = row.data();
+        std::memcpy(at, p->id.data(), p->id.size());
+        at += idWidth;
+        std::memcpy(at, p->type.data(), p->type.size());
+        at += typeWidth;
+        *at++ = p->array || p->block ? 'T' : 'F';
+        storeBE<uint64_t>(at, p->array ? p->rows : 0);
+        storeBE<uint64_t>(at + 8, p->array ? p->columns : 0);
+        at += 16;
+        for (uint64_t size : {static_cast<uint64_t>(value(*p)), static_cast<uint64_t>(p->comment.size()),
+                              static_cast<uint64_t>(p->format.size())}) {
+            if (wide) {
+                storeBE<uint64_t>(at, size);
+                storeBE<uint64_t>(at + 8, offset);
+            } else {
+                storeBE<uint32_t>(at, static_cast<uint32_t>(size));
+                storeBE<uint32_t>(at + 4, static_cast<uint32_t>(offset));
+            }
+            at += descriptor;
+            offset += size;
+        }
+        out.write(reinterpret_cast<const char*>(row.data()), static_cast<std::streamsize>(row.size()));
+    }
+    for (const Property* p : properties) {
+        if (p->array) out.write(reinterpret_cast<const char*>(p->data.data()), static_cast<std::streamsize>(p->data.size()));
+        else out.write(p->text.data(), static_cast<std::streamsize>(p->text.size()));
+        out.write(p->comment.data(), static_cast<std::streamsize>(p->comment.size()));
+        out.write(p->format.data(), static_cast<std::streamsize>(p->format.size()));
+    }
+    padBlock(out, static_cast<uint64_t>(rowBytes) * properties.size() + heap);
+}
+
 }  // namespace
 
 void writeFits(const std::string& path, const std::vector<FitsHdu>& hdus, const FitsWriteOptions& options) {
@@ -602,6 +717,7 @@ void writeFits(const std::string& path, const std::vector<FitsHdu>& hdus, const 
     if (options.tiles == FitsTiles::None) {
         for (size_t h = 0; h < hdus.size(); ++h) {
             writePlainImage(out, hdus[h], h == 0, h == 0);
+            writePropertyTable(out, hdus[h].properties, kPropertyTable, h + 1, hdus[h].wcsDigest);
             if (!out) throw Error("write error on " + path, ErrorKind::Io);
         }
     } else {
@@ -631,9 +747,12 @@ void writeFits(const std::string& path, const std::vector<FitsHdu>& hdus, const 
         for (size_t h = 0; h < hdus.size(); ++h) {
             if (compressed(hdus[h])) writeTiledImage(out, path, hdus[h], h == 0, options.tiles);
             else writePlainImage(out, hdus[h], h == 0, h == 0);
+            writePropertyTable(out, hdus[h].properties, kPropertyTable, h + 1, hdus[h].wcsDigest);
             if (!out) throw Error("write error on " + path, ErrorKind::Io);
         }
     }
+    writePropertyTable(out, options.metadata, kMetadataTable, 1, std::string());
+    if (!out) throw Error("write error on " + path, ErrorKind::Io);
     out.close();
     if (!out) throw Error("write error on " + path, ErrorKind::Io);
 }

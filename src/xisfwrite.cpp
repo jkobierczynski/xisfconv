@@ -36,6 +36,61 @@ std::string xmlEscape(const std::string& s) {
     return out;
 }
 
+// The text of a property: UTF-8 as it is. (What XML cannot hold is not written this way, see
+// isXmlText.) In an attribute, tabs and line breaks are written as character references,
+// which is the only way they stay what they are there. As the content of an element they are
+// written as they are: a text that PixInsight wrote with its line breaks as CR LF is then the
+// same bytes again, and every reader makes of it what it made of the original.
+std::string xmlText(const std::string& s, bool attribute = true) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (unsigned char c : s) {
+        switch (c) {
+            case '&': out += "&amp;"; break;
+            case '<': out += "&lt;"; break;
+            case '>': out += "&gt;"; break;
+            case '"': out += "&quot;"; break;
+            case '\t': case '\n': case '\r':
+                if (attribute) out += "&#" + std::to_string(c) + ";";
+                else out += static_cast<char>(c);
+                break;
+            default: out += static_cast<char>(c);
+        }
+    }
+    return out;
+}
+
+// True if the text can be the content of an XML element and come back as it is, with its line
+// breaks written as they are: text that XML can hold (isXmlText), without white space at its
+// ends, which a reader may take for layout, and without a carriage return on its own, which an
+// XML reader turns into a line feed. (CR LF it turns into a line feed too; that is what it does
+// with the text PixInsight writes into its headers, and the same bytes are written again.)
+bool textFitsElement(const std::string& s) {
+    auto space = [](unsigned char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; };
+    if (!s.empty() && (space(static_cast<unsigned char>(s.front())) || space(static_cast<unsigned char>(s.back())))) return false;
+    for (size_t i = 0; i < s.size(); ++i)
+        if (s[i] == '\r' && (i + 1 >= s.size() || s[i + 1] != '\n')) return false;
+    return isXmlText(s);
+}
+
+// Text that is not XML text, made into some: a control character becomes a blank, a byte that
+// is not UTF-8 and a code point XML excludes a question mark. The rest stays.
+std::string madeXmlText(const std::string& s) {
+    std::string out;
+    for (size_t i = 0; i < s.size();) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        size_t n = c < 0x80 ? 1 : c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC2 ? 2 : 0;
+        if (n == 0 || i + n > s.size() || !isXmlText(s.substr(i, n))) {
+            out += c < 0x80 ? ' ' : '?';
+            ++i;
+            continue;
+        }
+        out.append(s, i, n);
+        i += n;
+    }
+    return out;
+}
+
 // XISF image ids must be identifiers: [A-Za-z_][A-Za-z0-9_]*
 std::string makeIdentifier(const std::string& text, size_t index, std::set<std::string>& used) {
     std::string id;
@@ -52,20 +107,6 @@ std::string makeIdentifier(const std::string& text, size_t index, std::set<std::
     return unique;
 }
 
-std::string propertyXml(const XisfOutProperty& p) {
-    std::string x = "<Property id=\"" + xmlEscape(p.id) + "\" type=\"" + p.type + "\"";
-    if (p.type == "String") return x + ">" + xmlEscape(p.value) + "</Property>\n";
-    if (p.type == "F64Vector" || p.type == "F64Matrix") {
-        std::vector<uint8_t> bytes(p.data.size() * 8);
-        if (!p.data.empty()) std::memcpy(bytes.data(), p.data.data(), bytes.size());
-        if (!hostIsLittleEndian()) byteSwapInPlace(bytes.data(), p.data.size(), 8);
-        if (p.type == "F64Vector") x += " length=\"" + std::to_string(p.data.size()) + "\"";
-        else x += " rows=\"" + std::to_string(p.rows) + "\" columns=\"" + std::to_string(p.columns) + "\"";
-        return x + " location=\"inline:base64\">" + base64Encode(bytes.data(), bytes.size()) + "</Property>\n";
-    }
-    return x + " value=\"" + xmlEscape(p.value) + "\"/>\n";
-}
-
 // The bytes stored for one image plus the attributes that describe them.
 struct Block {
     const uint8_t* data = nullptr;  // points into `owned` or into the pixel buffer
@@ -78,18 +119,17 @@ std::vector<uint8_t> compressChunk(const std::string& codec, const uint8_t* src,
     return codec == "zstd" ? zstdCompress(src, size) : zlibCompress(src, size);
 }
 
-void prepareBlock(const PixelBuffer& px, const XisfWriteOptions& opt, Block& block) {
-    const size_t rawSize = px.data.size();
-    const size_t itemSize = sampleBytes(px.format);
-    block.data = px.data.data();
+// `raw`: the bytes to store, `itemSize` the size of the numbers they consist of (1 if none).
+void prepareBlock(const uint8_t* raw, size_t rawSize, size_t itemSize, const XisfWriteOptions& opt, Block& block) {
+    block.data = raw;
     block.size = rawSize;
 
     if (!opt.codec.empty() && rawSize > 0) {
         const bool shuffle = opt.shuffle && itemSize > 1;
         std::vector<uint8_t> shuffledData;
-        const uint8_t* src = px.data.data();
+        const uint8_t* src = raw;
         if (shuffle) {
-            shuffledData = shuffled(px.data.data(), rawSize, itemSize);
+            shuffledData = shuffled(raw, rawSize, itemSize);
             src = shuffledData.data();
         }
         const uint64_t chunk = std::max<uint64_t>(1, opt.subblockSize);
@@ -123,6 +163,77 @@ void prepareBlock(const PixelBuffer& px, const XisfWriteOptions& opt, Block& blo
 
 uint64_t alignUp(uint64_t v) { return (v + kAlignment - 1) / kAlignment * kAlignment; }
 
+// Data blocks up to this size are written into the header, larger ones are attached to the
+// file: PixInsight's own limit (its XISF:MaxInlineBlockSize).
+constexpr size_t kMaxInlineBlock = 3072;
+
+// The properties of one element (an image, or the file), as XML. A property whose data is
+// attached gets a place in `blocks`, and its location is filled in from `positions` (which
+// holds zeros until the layout is known).
+struct PropertyWriter {
+    const XisfWriteOptions& opt;
+    std::vector<Block>& blocks;
+    const std::vector<uint64_t>& positions;
+    bool layout;       // the first pass: blocks are prepared
+    size_t next = 0;   // the block the next attached property uses
+
+    std::string dataBlock(const uint8_t* data, size_t size, size_t itemSize, bool inHeader = false) {
+        if (size <= kMaxInlineBlock || inHeader) return " location=\"inline:base64\">" + base64Encode(data, size) + "</Property>\n";
+        if (layout) {
+            blocks.emplace_back();
+            prepareBlock(data, size, itemSize, opt, blocks.back());
+        }
+        const size_t at = next++;
+        return " location=\"attachment:" + std::to_string(at < positions.size() ? positions[at] : 0) + ":" +
+               std::to_string(blocks[at].size) + "\"" + blocks[at].attributes + "/>\n";
+    }
+
+    // (the header is built more than once: what there is to say is said the first time)
+    void note(const std::string& message) const {
+        if (layout) warn(message);
+    }
+
+    std::string xml(const Property& p) {
+        // The id and the type are attributes of the element: text that XML cannot hold has no
+        // place there, and a property without them is none.
+        if (p.id.empty() || !isXmlText(p.id) || !isXmlText(p.type)) {
+            note("a property whose id or type is not text that XML can hold is not written" +
+                 (isXmlText(p.id) && !p.id.empty() ? " (" + p.id + ")" : std::string()));
+            return {};
+        }
+        std::string x = "<Property id=\"" + xmlText(p.id) + "\" type=\"" + xmlText(p.type) + "\"";
+        for (const auto& extra : {std::make_pair("comment", &p.comment), std::make_pair("format", &p.format)}) {
+            if (extra.second->empty()) continue;
+            if (!isXmlText(*extra.second)) {
+                note("property " + p.id + ": its " + extra.first + " is not text that XML can hold; characters are replaced");
+                x += std::string(" ") + extra.first + "=\"" + xmlText(madeXmlText(*extra.second)) + "\"";
+            } else {
+                x += std::string(" ") + extra.first + "=\"" + xmlText(*extra.second) + "\"";
+            }
+        }
+        if (p.array) {
+            PropertyElement element;
+            const bool known = propertyElement(p.type, element);
+            if (isMatrixPropertyType(p.type)) x += " rows=\"" + std::to_string(p.rows) + "\" columns=\"" + std::to_string(p.columns) + "\"";
+            else if (known || p.rows) x += " length=\"" + std::to_string(p.rows) + "\"";
+            // (shuffled by the size of its numbers: a complex number is two of them)
+            const size_t item = !known ? 1 : element.kind == 'c' ? element.size / 2 : element.size;
+            return x + dataBlock(p.data.data(), p.data.size(), item, p.inHeader);
+        }
+        if (p.type == "String") {
+            if (!p.block && textFitsElement(p.text)) return x + ">" + xmlText(p.text, false) + "</Property>\n";
+            // A text that was a data block is one again; so is a text that XML would not give
+            // back as it is. XISF allows that for a String.
+            return x + dataBlock(reinterpret_cast<const uint8_t*>(p.text.data()), p.text.size(), 1);
+        }
+        if (!isXmlText(p.text)) {
+            note("property " + p.id + ": its value is not text that XML can hold; characters are replaced");
+            return x + " value=\"" + xmlText(madeXmlText(p.text)) + "\"/>\n";
+        }
+        return x + " value=\"" + xmlText(p.text) + "\"/>\n";
+    }
+};
+
 }  // namespace
 
 void writeXisf(const std::string& path, const std::vector<XisfOutImage>& images, const XisfWriteOptions& opt) {
@@ -132,16 +243,21 @@ void writeXisf(const std::string& path, const std::vector<XisfOutImage>& images,
         throw Error("unsupported XISF compression codec '" + opt.codec + "' (use zlib or zstd)", ErrorKind::Argument);
     }
 
+    // The attached blocks: the pixels of each image, then the data of the properties that are
+    // too large for the header, in the order of the header.
     std::vector<Block> blocks(images.size());
     std::vector<std::string> ids;
     std::set<std::string> usedIds;
     for (size_t i = 0; i < images.size(); ++i) {
-        prepareBlock(*images[i].pixels, opt, blocks[i]);
+        const PixelBuffer& px = *images[i].pixels;
+        prepareBlock(px.data.data(), px.data.size(), sampleBytes(px.format), opt, blocks[i]);
         ids.push_back(makeIdentifier(images[i].id, i, usedIds));
     }
 
     const std::string created = utcTimestamp();
+    bool layout = true;   // the first header that is built finds out which properties are attached
     auto buildHeader = [&](const std::vector<uint64_t>& positions) {
+        PropertyWriter properties{opt, blocks, positions, layout, images.size()};
         std::string x;
         x += "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
         x += "<!--\nExtensible Image Serialization Format - XISF version 1.0\nCreated with xisfconv " +
@@ -170,7 +286,7 @@ void writeXisf(const std::string& path, const std::vector<XisfOutImage>& images,
                 x += "<ColorFilterArray pattern=\"" + xmlEscape(img.cfaPattern) + "\" width=\"" +
                      std::to_string(img.cfaWidth) + "\" height=\"" + std::to_string(img.cfaHeight) + "\"/>\n";
             }
-            for (const auto& p : img.properties) x += propertyXml(p);
+            for (const auto& p : img.properties) x += properties.xml(p);
             if (!img.iccProfile.empty()) {
                 x += "<ICCProfile location=\"inline:base64\">" + base64Encode(img.iccProfile.data(), img.iccProfile.size()) +
                      "</ICCProfile>\n";
@@ -185,7 +301,10 @@ void writeXisf(const std::string& path, const std::vector<XisfOutImage>& images,
             x += "<Property id=\"XISF:CompressionCodecs\" type=\"String\">" + opt.codec +
                  (opt.shuffle ? "+sh" : "") + "</Property>\n";
         }
+        for (const auto& p : opt.metadata)
+            if (!isFileStorageProperty(p.id)) x += properties.xml(p);
         x += "</Metadata>\n</xisf>\n";
+        layout = false;
         return x;
     };
 
@@ -195,9 +314,9 @@ void writeXisf(const std::string& path, const std::vector<XisfOutImage>& images,
     std::string header;
     for (int round = 0; round < 8; ++round) {
         header = buildHeader(positions);
-        std::vector<uint64_t> next(images.size());
+        std::vector<uint64_t> next(blocks.size());
         uint64_t p = alignUp(16 + header.size());
-        for (size_t i = 0; i < images.size(); ++i) {
+        for (size_t i = 0; i < blocks.size(); ++i) {
             next[i] = p;
             p = alignUp(p + blocks[i].size);
         }
@@ -218,7 +337,7 @@ void writeXisf(const std::string& path, const std::vector<XisfOutImage>& images,
     out.write(header.data(), static_cast<std::streamsize>(header.size()));
     uint64_t pos = 16 + header.size();
     const std::vector<char> zeros(kAlignment, 0);
-    for (size_t i = 0; i < images.size(); ++i) {
+    for (size_t i = 0; i < blocks.size(); ++i) {
         if (positions[i] > pos) out.write(zeros.data(), static_cast<std::streamsize>(positions[i] - pos));
         // Write in pieces: some platforms limit a single write to 2 GiB.
         uint64_t done = 0;

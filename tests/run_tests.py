@@ -794,7 +794,10 @@ def test_wcs():
     for first in ([], ["--top-down"]):
         f1 = os.path.join(TMP, "wcs_rt1.fits")
         x2 = os.path.join(TMP, "wcs_rt.xisf")
-        run(p, "-o", f1, "-f", "-q", *first)
+        # (--no-properties: the FITS file is to bring WCS keywords alone, as a file of any other
+        # program does; with the properties the solution would come back as it was, see
+        # test_property_round_trip)
+        run(p, "-o", f1, "-f", "-q", "--no-properties", *first)
         run(f1, "-o", x2, "-f", "-q")
         compare(f"WCS round trip pixels ({first or 'bottom-up'})", XISF.read(x2), a)
 
@@ -2144,7 +2147,7 @@ def test_asdf_roundtrips():
         check(all(h1[k] == h2[k] for k in keys), f"WCS keywords in ASDF equal those in FITS {row}")
         # and they come back as PixInsight solution properties
         x = os.path.join(d, "wcs_back.xisf")
-        r = run(mid, "-o", x, "-f")
+        r = run(mid, "-o", x, "-f", "--no-properties")
         check("PixInsight solution properties" in r.stderr, f"ASDF -> XISF restores the solution {row}")
         m = xisf_property(x, P + "LinearTransformationMatrix")
         check(m is not None and np.allclose(np.ravel(m), [-2.3565e-4, 1.1696e-5, -1.1715e-5, -2.3575e-4], rtol=1e-9),
@@ -2306,13 +2309,13 @@ def xisf_header(path):
     return raw, raw[16:16 + int.from_bytes(raw[8:12], "little")].decode()
 
 
-def xisf_blocks(path):
+def xisf_blocks(path, root=None):
     """Every data block of an XISF file, read without xisfconv: a list of dicts with the element name,
     its id, the location kind, the storage attributes, the stored bytes and the decoded bytes."""
     import xml.etree.ElementTree as ET
     raw, hdr = xisf_header(path)
     out = []
-    for el in ET.fromstring(hdr).iter():
+    for el in (ET.fromstring(hdr) if root is None else root).iter():
         loc = el.get("location")
         if loc is None:
             continue
@@ -2355,7 +2358,7 @@ def xisf_blocks(path):
                 cnt = len(data) // item
                 data = np.frombuffer(data[:cnt * item], np.uint8).reshape(item, cnt).T.tobytes() + data[cnt * item:]
         out.append({"tag": el.tag.split("}")[-1], "id": el.get("id"), "kind": loc.split(":")[0], "attr": attr,
-                    "stored": stored, "data": data, "location": loc})
+                    "stored": stored, "data": data, "location": loc, "element": el})
     return out
 
 
@@ -3574,6 +3577,808 @@ def test_fits_tile_writing():
         check(np.array_equal(fits.getdata(os.path.join(sub, "frame.fits.fz"), 1), fits.getdata(plain)), "ASDF -> tile-compressed FITS")
 
 
+# ---------------------------------------------------------------- XISF properties through FITS and ASDF
+
+ELEMENT_BYTES = {"I8": 1, "UI8": 1, "I16": 2, "UI16": 2, "I32": 4, "UI32": 4, "I64": 8, "UI64": 8, "F32": 4, "F64": 8,
+                 "C32": 8, "C64": 16, "I": 4, "UI": 4, "F": 4, "": 8}   # (IVector is I32Vector, Vector is F64Vector ...)
+ELEMENT_DTYPE = {"I8": "i1", "UI8": "u1", "I16": "<i2", "UI16": "<u2", "I32": "<i4", "UI32": "<u4", "I64": "<i8",
+                 "UI64": "<u8", "F32": "<f4", "F64": "<f8", "C32": "<c8", "C64": "<c16", "I": "<i4", "UI": "<u4", "F": "<f4",
+                 "": "<f8"}
+
+
+def element_of(ptype):
+    """The element type of a vector or matrix type, None for every other type."""
+    if ptype == "ByteArray":
+        return "UI8"
+    if ptype[-6:] in ("Vector", "Matrix") and ptype[:-6] in ELEMENT_BYTES:
+        return ptype[:-6]
+    return None
+
+
+def xisf_properties(path):
+    """The properties of an XISF file, read without xisfconv: (one list per image, the list of the file).
+    A property is a dict with id, type, comment, format and value: ("text", bytes) for what is text,
+    ("text in a block", bytes) for a String that is stored as a data block, and
+    ("data", (length, rows, columns), little-endian bytes) for every other data block."""
+    import xml.etree.ElementTree as ET
+    raw, hdr = xisf_header(path)
+    root = ET.fromstring(hdr)
+    blocks = {id(b["element"]): b for b in xisf_blocks(path, root)}
+
+    def local(el):
+        return el.tag.split("}")[-1]
+
+    def read(parent):
+        out = []
+        for el in parent:
+            if local(el) != "Property":
+                continue
+            p = {"id": el.get("id"), "type": el.get("type"), "comment": el.get("comment", ""), "format": el.get("format", "")}
+            b = blocks.get(id(el))
+            if b is None:
+                p["value"] = ("text", (el.get("value") if el.get("value") is not None else el.text or "").encode())
+            elif p["type"] == "String":
+                p["value"] = ("text in a block", b["data"])
+            else:
+                data = b["data"]
+                name = element_of(p["type"])
+                if name and el.get("byteOrder") == "big":
+                    part = ELEMENT_BYTES[name] // (2 if name.startswith("C") else 1)
+                    data = np.frombuffer(data, np.uint8).reshape(-1, part)[:, ::-1].tobytes()
+                shape = tuple(None if el.get(k) is None else int(el.get(k)) for k in ("length", "rows", "columns"))
+                p["value"] = ("data", shape, data)
+            out.append(p)
+        return out
+
+    return [read(el) for el in root if local(el) == "Image"], [p for el in root if local(el) == "Metadata" for p in read(el)]
+
+
+def property_zoo():
+    """Properties of every type and in every form XISF has for them: (their XML, {id: the text of a
+    scalar after it went through an ASDF tree, where that is not the text it had})."""
+    import html
+    xml, through_asdf = [], {}
+
+    def attribute(text):
+        return html.escape(text, quote=True).replace("\t", "&#9;").replace("\n", "&#10;").replace("\r", "&#13;")
+
+    def scalar(pid, ptype, value, asdf_text=None, extra=""):
+        xml.append(f'<Property id="{pid}" type="{ptype}" value="{attribute(value)}"{extra}/>')
+        if asdf_text is not None:
+            through_asdf[pid] = asdf_text
+
+    def text(pid, value, extra=""):
+        xml.append(f'<Property id="{pid}" type="String"{extra}>{html.escape(value, quote=False)}</Property>')
+
+    def block(pid, ptype, data, shape="", **kw):
+        b = Block(data, location="inline", **kw)
+        attrs = "".join(f' {k}="{v}"' for k, v in b.attrs.items())
+        xml.append(f'<Property id="{pid}" type="{ptype}"{shape} location="inline:{b.encoding}"{attrs}>{b.text}</Property>')
+
+    rng = np.random.default_rng(77)
+
+    def numbers(name, n):
+        dt = np.dtype(ELEMENT_DTYPE[name])
+        if dt.kind == "c":
+            return (rng.normal(size=n) + 1j * rng.normal(size=n)).astype(dt)
+        if dt.kind == "f":
+            a = rng.normal(size=n).astype(dt)
+            if n > 3:
+                a[1], a[2], a[3] = np.nan, -np.inf, -0.0
+            return a
+        info = np.iinfo(dt)
+        a = rng.integers(info.min, info.max, n, dtype=dt, endpoint=True)
+        if n > 1:
+            a[0], a[1] = info.min, info.max
+        return a
+
+    # --- scalars
+    scalar("S:True", "Boolean", "true")
+    scalar("S:False", "Boolean", "false")
+    scalar("S:One", "Boolean", "1", "true")
+    scalar("S:Zero", "Boolean", "0", "false")
+    scalar("S:Capital", "Boolean", "True", "true")     # as the xisf package of Python writes it
+    for ptype, value in (("Int8", "-128"), ("UInt8", "255"), ("Int16", "-32768"), ("UInt16", "65535"),
+                         ("Int32", "-2147483648"), ("UInt32", "4294967295"), ("Int64", "-9223372036854775808"),
+                         ("Int64", "9223372036854775807"), ("UInt64", "18446744073709551615"), ("UInt64", "0")):
+        scalar(f"S:{ptype}:{value}", ptype, value)
+    scalar("S:Plus", "Int32", "+7", "7")
+    scalar("S:LeadingZeros", "Int32", "007", "7")
+    scalar("S:Hexadecimal", "UInt32", "0x1F")          # not a decimal number: taken along as text
+    scalar("S:NotAnInteger", "Int16", "twelve")
+    for n, (value, after) in enumerate((("0.1", None), ("3.141592653589793", None), ("2000", None), ("-12", None),
+                                        ("1.5E+300", None), ("-2.5e-07", None), ("0.30000000000000004", None),
+                                        ("1e-05", "1.0e-05"), ("6.02e23", "6.02e+23"), (".5", "0.5"), ("5.", "5.0"),
+                                        ("-0", "-0.0"), ("+1.25", "1.25"), ("nan", "nan"), ("NaN", "nan"), ("inf", "inf"),
+                                        ("-inf", "-inf"), ("not a number", None))):
+        scalar(f"S:Float64:{n}", "Float64", value, after)
+    scalar("S:Float32", "Float32", "0.1")
+    scalar("S:Complex32", "Complex32", "(1.5,-2)", "(1.5,-2.0)")
+    scalar("S:Complex64", "Complex64", "(0.25, 1e-3)", "(0.25,0.001)")
+    scalar("S:ComplexOdd", "Complex64", "1+2i")        # not the form of a complex number: taken along as text
+    scalar("S:Time", "TimePoint", "2024-03-05T21:15:02.5Z")
+    scalar("S:Commented", "Float32", "0.25", extra=' comment="exposure in &#956;s, &quot;quoted&quot; &amp; more" format="%.3f"')
+    scalar("X:Thing", "Frobnication", "7 of 9")        # a type nobody knows
+    # --- strings
+    text("T:Plain", "hello world")
+    scalar("T:Attribute", "String", "in an attribute")
+    text("T:Utf8", "Ångström ☄ \U0001f30c مرحبا")
+    text("T:Markup", '<a href="x">1 & 2</a> ]]> \'single\'')
+    text("T:Empty", "")
+    text("T:Lines", "line 1\nline 2\n\ttabbed")
+    xml.append('<Property id="T:CDATA" type="String"><![CDATA[<raw> & data]]> and more</Property>')
+    block("T:Padded", "String", b"  padded \n")
+    block("T:Control", "String", b"bell\x07 escape\x1b unit\x1f delete\x7f")
+    block("T:Nul", "String", b"a\x00b")
+    block("T:NotUtf8", "String", b"caf\xe9 \xff\xfe\xc0\x80")
+    # as PixInsight stores the serialization of a spline when it is long: a compressed block of text with CR LF
+    block("T:BlockCrLf", "String", b"5000 3000\r\n0000 BA00\r\n" * 300 + b"\0\0", codec="zlib")
+    scalar("T:LoneCr", "String", "classic\rline ends")
+    scalar("T:Breaks", "String", "tab\there\nnew line")
+    text("T:Long", "".join(chr(0x61 + i % 26) + (" " if i % 7 == 0 else "") for i in range(19999)))
+    text("T:EdgeBlanks", "  blanks at both ends, in the header  ")
+    text("T:YamlTraps", 'yes: [no, {a: b}] # not a comment \\ "quoted" \'single\'  \u0085﻿  - ? : | > % @ `')
+    for n, value in enumerate(("1.5", "null", "~", "true", "0x10", "2024-03-05", "!tag", "&anchor", "*alias", "...", "---",
+                               "[]", "{}", "- item", "key: value", "# comment", "'", '"')):
+        text(f"T:Looks{n}", value)
+    text("T:CommentOnly", "x", extra=' comment="  blanks at both ends  "')
+    text("A:" + ":".join(["VeryLongIdentifier"] * 7), "an id of 135 characters")
+    text("A:" + "x" * 1100, "an id beyond the 1024 characters that a key of a YAML mapping may have when it is written the short way")
+    text("A:EndsInABlank ", "an id with a blank at its end")
+    scalar("X:Blanks", "Frobnication", "  \u00fcn\u00ef \u2604  ")   # blanks at both ends of a value that is no String
+    # --- vectors and matrices
+    for name in ELEMENT_BYTES:
+        block(f"V:{name or 'Short'}", name + "Vector", numbers(name, 5).tobytes(), ' length="5"')
+        block(f"M:{name or 'Short'}", name + "Matrix", numbers(name, 6).tobytes(), ' rows="2" columns="3"')
+    block("V:Bytes", "ByteArray", bytes(range(7)), ' length="7"')
+    block("V:Empty", "F64Vector", b"", ' length="0"')
+    block("M:Empty", "F32Matrix", b"", ' rows="0" columns="4"')
+    # more than xisfconv writes into the header of an XISF file: these are attached there
+    block("V:Large", "F64Vector", numbers("F64", 700).tobytes(), ' length="700"', codec="zlib", shuffle_item=8, checksum="sha1")
+    block("M:Large", "F32Matrix", numbers("F32", 1200).tobytes(), ' rows="60" columns="20"', encoding="hex")
+    block("M:LargeComplex", "C32Matrix", numbers("C32", 500).tobytes(), ' rows="50" columns="10"')
+    block("V:BigEndian", "UI16Vector", np.arange(1, 6).astype(">u2").tobytes(), ' length="5" byteOrder="big"')
+    block("V:BigEndianComplex", "C64Vector", numbers("C64", 3).astype(">c16").tobytes(), ' length="3" byteOrder="big"')
+    xml.append('<Property id="V:Embedded" type="I32Vector" length="3" location="embedded"><Data encoding="base64">' +
+               base64.b64encode(np.array([1, -2, 3], "<i4").tobytes()).decode() + '</Data></Property>')
+    # data blocks of types nobody knows
+    block("X:Blob", "Opaque", b"\x00\x11\x22\x33\x44", ' length="2"')
+    block("X:BlobNoLength", "Opaque", b"\x00\x11\x22")
+    block("X:Pairs", "QuaternionMatrix", bytes(range(16)), ' rows="1" columns="2"')
+    return "".join(xml), through_asdf
+
+
+def test_property_round_trip():
+    """XISF -> FITS or ASDF -> XISF: every property comes back with its type, value, comment and format."""
+    import warnings
+    d = os.path.join(TMP, "properties")
+    os.makedirs(d, exist_ok=True)
+    zoo, through_asdf = property_zoo()
+    few = ('<Property id="Instrument:Filter:Name" type="String">Ha</Property>' +
+           f64_prop("Lab:Dark", np.linspace(0, 1, 12), 3, 4))
+    metadata = ('<Property id="XISF:CreationTime" type="TimePoint" value="2026-01-02T03:04:05Z"/>'
+                '<Property id="XISF:CompressionCodecs" type="String">zlib+sh</Property>'
+                '<Property id="Observatory:Name" type="String">Dark Sky &amp; Co</Property>' +
+                f64_prop("Observatory:Location", [4.35, 50.85, 120.0]))
+    images = [test_image(np.uint16, 6, 8, 1, 71), test_image(np.float32, 5, 7, 3, 72), test_image(np.uint8, 4, 4, 1, 73)]
+    src = os.path.join(d, "zoo.xisf")
+    write_xisf(src, [with_id(image_entry(images[0], children=zoo), "first"), with_id(image_entry(images[1]), "second"),
+                     with_id(image_entry(images[2], children=few), "third")], file_props=metadata)
+    original, original_file = xisf_properties(src)
+    check(len(original[0]) > 120 and not original[1] and len(original[2]) == 2 and len(original_file) == 5,
+          f"the test file has its properties: {[len(i) for i in original]}, {len(original_file)}")
+    storage = ("XISF:CreationTime", "XISF:CreatorApplication", "XISF:CreatorModule", "XISF:CreatorOS", "XISF:BlockAlignmentSize",
+               "XISF:MaxInlineBlockSize", "XISF:CompressionCodecs", "XISF:CompressionLevel")
+
+    def expected(properties, asdf_leg):
+        out = []
+        for p in properties:
+            q = dict(p)
+            if asdf_leg and p["id"] in through_asdf:
+                q["value"] = ("text", through_asdf[p["id"]].encode())
+            if p["id"] in ("T:LoneCr", "T:EdgeBlanks"):
+                # a carriage return on its own would be a line feed to an XML reader, and blanks at the ends of a
+                # text may be layout to it: such a text goes into a block
+                q["value"] = ("text in a block", p["value"][1])
+            out.append(q)
+        return out
+
+    def same(label, path, asdf_leg, image_numbers=(0, 1, 2)):
+        got, got_file = xisf_properties(path)
+        ok = len(got) == len(image_numbers)
+        for n, source in zip(range(len(got)), image_numbers):
+            want = expected(original[source], asdf_leg)
+            if got[n] != want:
+                ok = False
+                ids = [p["id"] for p in want]
+                have = {p["id"]: p for p in got[n]}
+                wrong = [(p["id"], have.get(p["id"], {}).get("value", "absent")) for p in want if have.get(p["id"]) != p][:3]
+                print(f"   {label}, image {source}: {len(got[n])} of {len(want)} properties, order "
+                      f"{'kept' if [p['id'] for p in got[n]] == ids else 'changed'}; first differences: {repr(wrong)[:600]}")
+        check(ok, f"{label}: the properties of the images are those of the XISF file, in their order")
+        want_file = [p for p in expected(original_file, asdf_leg) if p["id"] not in storage]
+        check([p for p in got_file if p["id"] not in storage] == want_file, f"{label}: and so are those of the file")
+        check([p["id"] for p in got_file if p["id"] in storage][:2] == ["XISF:CreationTime", "XISF:CreatorApplication"] and
+              got_file[0]["value"][1] != b"2026-01-02T03:04:05Z",
+              f"{label}: but for what describes the XISF file itself, which is the new file's own")
+        # (the pixels straight from their blocks: the xisf package does not read every value of the properties)
+        planes = [b["data"] for b in xisf_blocks(path) if b["tag"] == "Image"]
+        check(len(planes) == len(image_numbers) and all(
+            plane == as_planes(images[source]).astype(images[source].dtype.newbyteorder("<")).tobytes()
+            for plane, source in zip(planes, image_numbers)), f"{label}: and the pixels")
+
+    # ---- the routes there and back
+    X = os.path.join(d, "back.xisf")
+    routes = {
+        "FITS": (["a.fits"], [], False),
+        "FITS, rows top-down": (["a.fits"], ["--top-down"], False),
+        "tile-compressed FITS": (["a.fits.fz"], [], False),
+        "ASDF": (["a.asdf"], [], True),
+        "compressed ASDF": (["a.asdf"], ["-c"], True),
+        "FITS -> ASDF": (["a.fits", "b.asdf"], [], True),
+        "ASDF -> FITS": (["a.asdf", "b.fits"], [], True),
+        "FITS -> tile-compressed FITS -> ASDF -> FITS": (["a.fits", "b.fits.fz", "c.asdf", "d.fits"], [], True),
+        "tile-compressed FITS -> FITS": (["a.fits.fz", "b.fits"], [], False),
+    }
+    for label, (files, flags, asdf_leg) in routes.items():
+        previous = src
+        for n, name in enumerate(files):
+            out = os.path.join(d, name)
+            r = run(previous, "-o", out, "-f", *(flags if n == 0 else []))
+            check("warning" not in r.stderr, f"XISF -> {label}: no warning at {name}: {r.stderr.strip()[-300:]}")
+            if n == 0:
+                check("XISF properties taken along" in r.stderr, f"XISF -> {label}: the note says that properties are taken along")
+            previous = out
+        r = run(previous, "-o", X, "-f")
+        check(r.stderr.count("XISF properties restored") == 2 and "warning" not in r.stderr,
+              f"{label} -> XISF: the note says that they are restored: {r.stderr.strip()[-300:]}")
+        same(f"XISF -> {label} -> XISF", X, asdf_leg)
+        if label in ("FITS", "ASDF"):
+            # the file xisfconv wrote has its large properties attached, compressed and with checksums:
+            # the way back from there, and that file read by a program that is not xisfconv
+            packed, again = os.path.join(d, "packed.xisf"), os.path.join(d, "again.xisf")
+            run(previous, "-o", packed, "-f", "-q", "-c", "--checksum", "sha1")
+            same(f"XISF -> {label} -> compressed XISF", packed, asdf_leg)
+            attached = [b for b in xisf_blocks(packed) if b["tag"] == "Property" and b["kind"] == "attachment"]
+            check({b["id"] for b in attached} >= {"V:Large", "M:Large", "M:LargeComplex", "T:BlockCrLf"} and
+                  all(b["attr"]["checksum"] for b in attached) and any(b["attr"]["compression"] for b in attached),
+                  f"{label}: large values are attached to the XISF file, with checksums and compressed where it pays")
+            comp = {b["id"]: b["attr"]["compression"] for b in attached}
+            check(":8" in (comp.get("V:Large") or "") and ":4" in (comp.get("M:LargeComplex") or ""),
+                  f"numbers are shuffled by their size, a complex number by that of its parts: {comp.get('V:Large')}, {comp.get('M:LargeComplex')}")
+            run(packed, "-o", os.path.join(d, "second" + os.path.splitext(files[0])[1]), "-f", "-q")
+            run(os.path.join(d, "second" + os.path.splitext(files[0])[1]), "-o", again, "-f", "-q")
+            same(f"a second time through {label}", again, asdf_leg)
+            check(run(packed, "--verify").returncode == 0, f"{label}: --verify accepts the XISF file with its attached properties")
+
+    # one image of several takes its own properties along
+    for kind in ("fits", "asdf"):
+        one = os.path.join(d, "third." + kind)
+        run(src, "-o", one, "-f", "-q", "--image", "2")
+        run(one, "-o", X, "-f", "-q")
+        same(f"--image 2 through {kind.upper()}", X, kind == "asdf", image_numbers=(2,))
+        run(os.path.join(d, "a." + kind), "-o", X, "-f", "-q", "--image", "0")
+        same(f"--image 0 of the {kind.upper()} file", X, kind == "asdf", image_numbers=(0,))
+
+    # ---- what other programs see
+    f = os.path.join(d, "a.fits")
+    run(src, "-o", f, "-f", "-q")
+    fits_planes(f)   # fitsverify, and astropy's own verification
+    with fits.open(f) as hdul:
+        names = [(h.name, h.ver) for h in hdul]
+        check(names == [("first", 1), ("XISF_PROPERTIES", 1), ("second", 1), ("third", 1), ("XISF_PROPERTIES", 3), ("XISF_METADATA", 1)],
+              f"FITS: a table behind each image that has properties, and one for the file: {names}")
+        table = hdul[1].data
+        check(table.columns.names == ["ID", "TYPE", "BLOCK", "ROWS", "COLUMNS", "VALUE", "COMMENT", "FORMAT"],
+              f"the columns of the table: {table.columns.names}")
+        rows = []
+        for row in table:
+            value = bytes(np.asarray(row["VALUE"], np.uint8))
+            name = element_of(row["TYPE"])
+            if row["BLOCK"] and row["TYPE"] == "String":
+                value = ("text in a block", value)
+            elif row["BLOCK"]:
+                shape = ((None, int(row["ROWS"]), int(row["COLUMNS"])) if row["TYPE"].endswith("Matrix")
+                         else (int(row["ROWS"]) if name or row["ROWS"] else None, None, None))
+                value = ("data", shape, value)
+            else:
+                value = ("text", value)
+            # (astropy takes blanks at the end of a text column for padding: one id ends in one)
+            rows.append({"id": row["ID"] + (" " if row["ID"] == "A:EndsInABlank" else ""), "type": row["TYPE"], "comment": bytes(np.asarray(row["COMMENT"], np.uint8)).decode(),
+                         "format": bytes(np.asarray(row["FORMAT"], np.uint8)).decode(), "value": value})
+        if rows != original[0]:
+            print("   astropy:", repr([(r["id"], r["value"]) for r, o in zip(rows, original[0]) if r != o][:3])[:500])
+        check(rows == original[0], "astropy reads the table: every id, type, comment, format and value")
+        m = {r["id"]: r for r in rows}["M:F64"]["value"]
+        check(np.array_equal(np.frombuffer(m[2], "<f8").reshape(m[1][1:]), np.frombuffer(
+            [p for p in original[0] if p["id"] == "M:F64"][0]["value"][2], "<f8").reshape(2, 3), equal_nan=True),
+            "a matrix is its numbers in little-endian order, row after row")
+        check(len(hdul[1].header["WCSDIGST"]) == 40 and "WCSDIGST" not in hdul[5].header, "the table of an image names the WCS it was written with")
+        check([r["ID"] for r in hdul[5].data] == ["Observatory:Name", "Observatory:Location"],
+              "the table of the file leaves out what describes the XISF file itself")
+    def info(path):   # (one of the properties is text that is not UTF-8)
+        return subprocess.run([EXE, path, "--info"], capture_output=True, check=True).stdout.decode(errors="replace")
+
+    listing = info(f)
+    check("XISF properties (%d):" % len(original[0]) in listing and "XISF file metadata (2):" in listing and
+          "Observatory:Name (String) = Dark Sky & Co" in listing and "M:F64 (F64Matrix) [data block]" in listing and
+          "table" not in listing, "--info lists the properties a FITS file carries (and not their tables as skipped HDUs)")
+    check(run(f, "--verify").returncode == 0, "--verify accepts the FITS file with its tables")
+    a = os.path.join(d, "a.asdf")
+    run(src, "-o", a, "-f", "-q")
+    listing = info(a)
+    check("XISF properties (%d):" % len(original[0]) in listing and "XISF file metadata (2):" in listing and
+          listing.count("\nImage ") == 3, "--info lists the properties an ASDF file carries, and its three images only")
+    check(run(a, "--verify").returncode == 0, "--verify accepts the ASDF file with the blocks of its properties")
+    if HAVE_FPACK:
+        # CFITSIO's programs keep the tables
+        packed, plain = os.path.join(d, "cfitsio.fits.fz"), os.path.join(d, "cfitsio.fits")
+        subprocess.run(["fpack", "-O", packed, f], check=True, capture_output=True)
+        run(packed, "-o", X, "-f", "-q")
+        same("XISF -> FITS -> fpack -> XISF", X, False)
+        run(src, "-o", os.path.join(d, "ours.fits.fz"), "-f", "-q")
+        subprocess.run(["funpack", "-O", plain, os.path.join(d, "ours.fits.fz")], check=True, capture_output=True)
+        run(plain, "-o", X, "-f", "-q")
+        same("XISF -> tile-compressed FITS -> funpack -> XISF", X, False)
+    else:
+        skipped.append("properties through fpack and funpack")
+    if HAVE_ASDF:
+        import asdf as asdf_library
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", asdf_library.exceptions.AsdfWarning)
+            with asdf_library.open(a, validate_checksums=True, memmap=False) as af:
+                af.validate()
+                tree = af["xisf"]
+                p = tree["images"][0]["properties"]
+                check(list(tree) == ["images", "metadata"] and len(tree["images"]) == 3 and tree["images"][1] == {} and
+                      list(p) == [q["id"] for q in original[0]] and list(tree["metadata"]) == ["Observatory:Name", "Observatory:Location"],
+                      "asdf reads the tree: the properties of the images and of the file, by their ids and in their order")
+                kinds = {"S:True": True, "S:One": True, "S:Zero": False, "S:Int8:-128": -128, "S:UInt32:4294967295": 4294967295,
+                         "S:Int64:9223372036854775807": 9223372036854775807, "S:Int64:-9223372036854775808": "-9223372036854775808",
+                         "S:UInt64:18446744073709551615": "18446744073709551615", "S:Plus": 7, "S:Hexadecimal": "0x1F",
+                         "S:Float64:0": 0.1, "S:Float64:2": 2000, "S:Float64:7": 1e-05, "S:Float64:8": 6.02e23, "S:Float64:9": 0.5,
+                         "S:Float64:16": -np.inf, "S:Float64:17": "not a number", "S:Complex32": 1.5 - 2j, "S:Complex64": 0.25 + 0.001j,
+                         "S:Time": "2024-03-05T21:15:02.5Z", "T:Utf8": "Ångström ☄ \U0001f30c مرحبا",
+                         "T:Empty": "", "T:Lines": "line 1\nline 2\n\ttabbed", "T:Control": "bell\x07 escape\x1b unit\x1f delete\x7f",
+                         "T:Nul": "a\x00b", "T:LoneCr": "classic\rline ends", "T:Looks1": "null",
+                         "T:Looks3": "true", "T:Looks0": "1.5", "X:Thing": "7 of 9",
+                         "T:YamlTraps": 'yes: [no, {a: b}] # not a comment \\ "quoted" \'single\'  \u0085﻿  - ? : | > % @ `'}
+                wrong = [(k, p[k]["value"]) for k, v in kinds.items() if type(p[k]["value"]) is not type(v) or p[k]["value"] != v]
+                check(not wrong, f"scalars are YAML scalars of their kind: booleans, numbers, text: {wrong[:4]}")
+                check(np.isnan(p["S:Float64:13"]["value"]) and np.isnan(p["S:Float64:14"]["value"]) and p["S:Float64:15"]["value"] == np.inf,
+                      "values that are not finite numbers are YAML's .nan and .inf")
+                check(p["S:Commented"] == {"type": "Float32", "value": 0.25, "comment": "exposure in μs, \"quoted\" & more", "format": "%.3f"} and
+                      p["T:CommentOnly"]["comment"] == "  blanks at both ends  " and set(p["T:Plain"]) == {"type", "value"},
+                      "an entry has the type and the value, and the comment and the format if there are any")
+                check(p["T:Padded"] == {"type": "String", "value": "  padded \n", "block": True} and
+                      p["T:BlockCrLf"]["value"] == "5000 3000\r\n0000 BA00\r\n" * 300 + "\0\0" and p["T:BlockCrLf"]["block"] is True,
+                      "a String that XISF keeps in a data block is text too, and says where it was")
+                check(p["A:" + "x" * 1100]["type"] == "String" and p["A:EndsInABlank "]["value"] == "an id with a blank at its end" and
+                      p["X:Blanks"]["value"] == "  \u00fcn\u00ef \u2604  ", "ids that are long or end in a blank are keys as they are")
+                arrays_ok = True
+                for q in original[0]:
+                    name = element_of(q["type"])
+                    if name is None:
+                        continue
+                    v = np.asarray(p[q["id"]]["value"])
+                    shape = q["value"][1][1:] if q["type"].endswith("Matrix") else (q["value"][1][0],)
+                    if v.dtype != np.dtype(ELEMENT_DTYPE[name]) or v.shape != shape or v.astype(ELEMENT_DTYPE[name]).tobytes() != q["value"][2]:
+                        arrays_ok = False
+                        print("   asdf:", q["id"], v.dtype, v.shape, shape)
+                check(arrays_ok, "vectors and matrices are arrays of their element type and shape, with every number as it was")
+                check(bytes(np.asarray(p["T:NotUtf8"]["value"])) == b"caf\xe9 \xff\xfe\xc0\x80" and p["T:NotUtf8"]["block"] is True and
+                      bytes(np.asarray(p["X:Blob"]["value"])) == b"\x00\x11\x22\x33\x44" and p["X:Blob"]["length"] == 2 and
+                      "length" not in p["X:BlobNoLength"] and (p["X:Pairs"]["rows"], p["X:Pairs"]["columns"]) == (1, 2),
+                      "text that is not UTF-8 and blocks of unknown types are arrays of bytes")
+                check(len(tree["images"][0]["wcs_digest"]) == 40, "an image names the WCS its properties were written with")
+                # changed with the asdf library and written again, in its own way
+                p["T:Plain"]["value"] = "changed in Python"
+                p["Python:New"] = {"type": "F32Vector", "value": np.array([1.5, 2.5], ">f4"), "comment": "added in Python"}
+                p["Python:Scalar"] = {"type": "Float64", "value": 0.125}
+                del p["T:Utf8"]
+                edited = os.path.join(d, "edited.asdf")
+                af.write_to(edited, all_array_compression="zlib")
+        r = run(edited, "-o", X, "-f")
+        got, _ = xisf_properties(X)
+        want = [q for q in expected(original[0], True) if q["id"] != "T:Utf8"]
+        for q in want:
+            if q["id"] == "T:Plain":
+                q["value"] = ("text", b"changed in Python")
+        want += [{"id": "Python:New", "type": "F32Vector", "comment": "added in Python", "format": "",
+                  "value": ("data", (2, None, None), np.array([1.5, 2.5], "<f4").tobytes())},
+                 {"id": "Python:Scalar", "type": "Float64", "comment": "", "format": "", "value": ("text", b"0.125")}]
+        def by_value(properties):   # Python writes a number in its own way: 1.5E+300 as 1.5e+300
+            for q in properties:
+                if q["type"].startswith("Float") and q["value"][0] == "text":
+                    try:
+                        q["value"] = ("text", repr(float(q["value"][1])).encode())
+                    except ValueError:
+                        pass
+            return properties
+
+        # (and it writes the entries of a mapping sorted by their keys: the properties come in the
+        # order of their ids, which is the order PixInsight writes them in too)
+        got[0], want = by_value(got[0]), sorted(by_value(want), key=lambda q: q["id"])
+        if got[0] != want:
+            have = {q["id"]: q for q in got[0]}
+            print("   edited:", len(got[0]), len(want), repr([(q["id"], have.get(q["id"])) for q in want if have.get(q["id"]) != q][:3])[:700])
+        check(got[0] == want and "warning" not in r.stderr,
+              f"a file the asdf library changed and wrote again gives its properties to XISF: {r.stderr.strip()[-200:]}")
+    else:
+        skipped.append("XISF properties in the tree read by the asdf library")
+
+    # ---- the text of a String with CR LF line ends, as PixInsight writes it into the header
+    crlf = os.path.join(d, "crlf.xisf")
+    write_xisf(crlf, [image_entry(images[0], children='<Property id="P:Serialization" type="String">5000 3000\r\n0000 BA00\r\n10</Property>')])
+    for kind in ("fits", "asdf"):
+        run(crlf, "-o", os.path.join(d, "crlf." + kind), "-f", "-q")
+        run(os.path.join(d, "crlf." + kind), "-o", X, "-f", "-q")
+        check(b'type="String">5000 3000\r\n0000 BA00\r\n10</Property>' in open(X, "rb").read(),
+              f"through {kind.upper()}: a String with CR LF line ends is the same bytes in the header again")
+
+    # ---- two properties of one id (which XISF does not allow)
+    twice = os.path.join(d, "twice.xisf")
+    write_xisf(twice, [image_entry(images[0], children='<Property id="Twice" type="Int32" value="1"/>'
+                                                         '<Property id="Other" type="Int32" value="2"/>'
+                                                         '<Property id="Twice" type="Int32" value="3"/>')])
+    run(twice, "-o", os.path.join(d, "twice.fits"), "-f", "-q")
+    run(os.path.join(d, "twice.fits"), "-o", X, "-f", "-q")
+    check([(p["id"], p["value"][1]) for p in xisf_properties(X)[0][0]] == [("Twice", b"1"), ("Other", b"2"), ("Twice", b"3")],
+          "FITS carries two properties of the same id as they are")
+    r = run(twice, "-o", os.path.join(d, "twice.asdf"), "-f")
+    run(os.path.join(d, "twice.asdf"), "-o", X, "-f", "-q")
+    check("more than once" in r.stderr and [(p["id"], p["value"][1]) for p in xisf_properties(X)[0][0]] == [("Twice", b"1"), ("Other", b"2")],
+          "an ASDF tree, where the id is the key, keeps the first, and a warning says so")
+
+    # ---- --no-properties
+    run(src, "-o", f, "-f", "-q", "--no-properties")
+    with fits.open(f) as hdul:
+        check([h.name for h in hdul] == ["first", "second", "third"], "--no-properties: XISF -> FITS writes the images alone")
+    run(src, "-o", a, "-f", "-q", "--no-properties")
+    check(b"\nxisf:" not in open(a, "rb").read(), "--no-properties: XISF -> ASDF writes no xisf key")
+    run(src, "-o", f, "-f", "-q")
+    r = run(f, "-o", X, "-f", "--no-properties")
+    check(xisf_properties(X) == ([[], [], []], [p for p in xisf_properties(X)[1] if p["id"] in storage]) and "restored" not in r.stderr,
+          "--no-properties: FITS -> XISF leaves the properties the file carries where they are")
+    run(f, "-o", a, "-f", "-q", "--no-properties")
+    check(b"\nxisf:" not in open(a, "rb").read(), "--no-properties: FITS -> ASDF does not take them along")
+    run(src, "-o", a, "-f", "-q")
+    run(a, "-o", f, "-f", "-q", "--no-properties")
+    with fits.open(f) as hdul:
+        check(len(hdul) == 3, "--no-properties: ASDF -> FITS does not take them along")
+    # a file of another program: nothing changes for it
+    plain = os.path.join(d, "plain.fits")
+    fits.PrimaryHDU(images[0][..., 0]).writeto(plain, overwrite=True)
+    r = run(plain, "-o", X, "-f")
+    check(xisf_properties(X)[0] == [[]] and "restored" not in r.stderr, "a FITS file without properties gets none")
+
+    # ---- tables that are damaged, and tables that are not ours
+    run(src, "-o", f, "-f", "-q")
+    raw = bytearray(open(f, "rb").read())
+
+    def damaged(label, change, message, kept_images=3, expect_first=None):
+        bad = os.path.join(d, "damaged.fits")
+        data = bytearray(raw)
+        change(data)
+        open(bad, "wb").write(data)
+        r = run(bad, "-o", X, "-f", expect_ok=False)
+        got = xisf_properties(X)[0] if r.returncode == 0 else None
+        check(r.returncode == 0 and message in r.stderr and len(got) == kept_images and
+              (expect_first is None or [p["id"] for p in got[0]] == expect_first),
+              f"{label}: {r.stderr.strip()[-260:]}")
+
+    def replace(old, new):
+        def change(data):
+            at = data.find(old)
+            assert at > 0 and len(old) == len(new), old
+            data[at:at + len(old)] = new
+        return change
+
+    damaged("a table whose columns are others", replace(b"TTYPE6  = 'VALUE   '", b"TTYPE6  = 'WERT    '"),
+            "the table of XISF properties is not used", expect_first=[])
+    damaged("a table with a column of another type", replace(b"TFORM4  = '1K      '", b"TFORM4  = '1D      '"),
+            "the table of XISF properties is not used", expect_first=[])
+    at = raw.find(b"XTENSION= 'BINTABLE'")
+    rows_at = at + 2880 * (-(-(raw.find(b"END     ", at) + 80 - at) // 2880))   # the first row of the first table
+    width = int(fits.getheader(f, 1)["NAXIS1"])
+    ids = [p["id"] for p in original[0]]
+    id_width = len(max(ids, key=len))
+    type_width = max(len(p["type"]) for p in original[0])
+
+    def spoil_descriptor(data):   # the value of the second property is said to lie far beyond the heap
+        row = rows_at + width
+        data[row + id_width + type_width + 17 + 4:row + id_width + type_width + 17 + 8] = (0x7FFFFFF0).to_bytes(4, "big")
+    damaged("a value that lies beyond the table", spoil_descriptor, "lies beyond the end of the table", expect_first=ids[:1] + ids[2:])
+
+    def spoil_shape(data):   # a vector that says it is longer than its data
+        n = ids.index("V:F64")
+        row = rows_at + n * width
+        data[row + id_width + type_width + 1:row + id_width + type_width + 9] = (6).to_bytes(8, "big")
+    damaged("a vector whose data is not what its length asks for", spoil_shape, "V:F64 is left out",
+            expect_first=[i for i in ids if i != "V:F64"])
+
+    open(os.path.join(d, "cut.fits"), "wb").write(raw[:rows_at + 5760])
+    r = run(os.path.join(d, "cut.fits"), "-o", X, "-f", expect_ok=False)
+    check(r.returncode != 0 and "truncated" in r.stderr, f"a file that ends in the middle of a table is a truncated file: {r.stderr.strip()[-160:]}")
+    with fits.open(f) as hdul:
+        foreign = fits.BinTableHDU.from_columns([fits.Column(name="ID", format="8A", array=np.array(["x"])),
+                                                 fits.Column(name="FLUX", format="D", array=np.array([1.5]))], name="CATALOG")
+        fits.HDUList([hdul[0], foreign, hdul[1]]).writeto(os.path.join(d, "foreign.fits"), overwrite=True)
+    r = run(os.path.join(d, "foreign.fits"), "-o", X, "-f")
+    check("skipped" in r.stderr and "CATALOG" not in r.stdout and xisf_properties(X)[0] == [[]],
+          f"a table of properties that does not follow an image belongs to none, and other tables are skipped as before: {r.stderr.strip()[-200:]}")
+    if HAVE_ASDF:
+        # trees that say other things than xisfconv writes
+        def tree_of(entries):
+            return ("fits: !<tag:astropy.org:astropy/fits/fits-1.0.0>\n- header:\n  - [EXTNAME, x]\n  data: !core/ndarray-1.0.0\n"
+                    "    {source: 0, datatype: uint16, byteorder: little, shape: [6, 8]}\n"
+                    "xisf:\n  images:\n  - properties:\n" + "".join("      " + e + "\n" for e in entries))
+        pixels = asdf_block(images[0][..., 0].astype("<u2").tobytes())
+        vector = asdf_block(np.array([1.0, 2.0, 3.0], ">f8").tobytes(), compression=b"zlib")
+        cases = [
+            ('"Good": {type: F64Vector, value: !core/ndarray-1.0.0 {source: 1, datatype: float64, byteorder: big, shape: [3]}}', None),
+            ('Plain: {type: String, value: unquoted text}', None),
+            ('"Int": {type: Int32, value: 0x10}', None),
+            ('"Wrong:Datatype": {type: F64Vector, value: !core/ndarray-1.0.0 {source: 1, datatype: int64, byteorder: big, shape: [3]}}', "datatype"),
+            ('"Wrong:Shape": {type: F64Matrix, value: !core/ndarray-1.0.0 {source: 1, datatype: float64, byteorder: big, shape: [3]}}', "dimension"),
+            ('"Wrong:Block": {type: F64Vector, value: !core/ndarray-1.0.0 {source: 7, datatype: float64, byteorder: big, shape: [3]}}', "block 7"),
+            ('"Wrong:Size": {type: F64Vector, value: !core/ndarray-1.0.0 {source: 1, datatype: float64, byteorder: big, shape: [4]}}', "needs 32 bytes"),
+            ('"Wrong:Inline": {type: F64Vector, value: !core/ndarray-1.0.0 {data: [1.0, 2.0], datatype: float64, shape: [2]}}', "binary block"),
+            ('"Wrong:List": {type: String, value: [a, b]}', "list"),
+            ('"Wrong:Scalar": {type: F64Vector, value: 1.5}', "array"),
+            ('"Wrong:Array": {type: Int32, value: !core/ndarray-1.0.0 {source: 1, datatype: uint8, shape: [24]}}', "not the value"),
+            ('"Wrong:NoType": {value: 1.5}', "no type"),
+            ('"Wrong:NotAMapping": just text', "mapping"),
+        ]
+        odd = os.path.join(d, "odd.asdf")
+        write_asdf_raw(odd, tree_of([c[0] for c in cases]), [pixels, vector])
+        r = run(odd, "-o", X, "-f")
+        got = xisf_properties(X)[0][0]
+        check([(p["id"], p["type"], p["value"]) for p in got] ==
+              [("Good", "F64Vector", ("data", (3, None, None), np.array([1.0, 2.0, 3.0], "<f8").tobytes())),
+               ("Plain", "String", ("text", b"unquoted text")), ("Int", "Int32", ("text", b"16"))],
+              f"a tree written by hand: what is a property is one, in big-endian order and compressed too: {[p['id'] for p in got]}")
+        missing = [c[0].split(":")[1].split('"')[0] for c in cases if c[1] and not any(
+            c[0].split('"')[1] in line and c[1] in line for line in r.stderr.splitlines())]
+        check(not missing, f"and each entry that is none is left out with a warning that says why: {missing} {r.stderr[-400:] if missing else ''}")
+        write_asdf_raw(odd, tree_of([]).replace("  - properties:\n", "  - 17\n") + "  metadata: [1, 2]\n", [pixels])
+        r = run(odd, "-o", X, "-f")
+        check(xisf_properties(X)[0] == [[]], "an xisf key that holds something else is passed over")
+
+
+    # ---- what cannot go everywhere, and files that ask for more than they hold
+    def well_formed(path):
+        import xml.etree.ElementTree as ET
+        try:
+            ET.fromstring(xisf_header_bytes(path))
+            return True
+        except ET.ParseError as e:
+            return str(e)
+
+    def xisf_header_bytes(path):
+        raw = open(path, "rb").read()
+        return raw[16:16 + int.from_bytes(raw[8:12], "little")]
+
+    awkward = os.path.join(d, "awkward.xisf")
+    write_xisf(awkward, [image_entry(images[0], children=(
+        '<Property id="Good" type="Int32" value="1"/>'
+        '<Property id="" type="Int32" value="2"/>'
+        '<Property id="Structure" type="Table"><Row><Cell value="1"/></Row></Property>'
+        '<Property id="Odd:Type" type="TYPEBYTES" value="3"/>'
+        '<Property id="Odd:Comment" type="Int32" value="4" comment="COMMENTBYTES"/>'
+        '<Property id="Odd:Control" type="Int32" value="5" comment="bell&#7;here" format="&#27;[1m"/>'
+        '<Property id="Odd:Value" type="Frobnication" value="escape&#27;d"/>'
+        '<Property id="Last" type="String">kept</Property>'))])
+    raw = open(awkward, "rb").read()
+    raw = raw.replace(b"TYPEBYTES", b"T\xff\xfe\xe9YPE \xc3").replace(b"COMMENTBYTES", b"caf\xe9 \xff\xfe comm")   # bytes that are no UTF-8
+    open(awkward, "wb").write(raw)
+    for kind in ("fits", "asdf"):
+        mid = os.path.join(d, "awkward." + kind)
+        r1 = subprocess.run([EXE, awkward, "-o", mid, "-f"], capture_output=True)
+        e1 = r1.stderr.decode(errors="replace")
+        check(r1.returncode == 0 and "a property without an id is left out" in e1 and "Structure is left out: it is made of <Row>" in e1 and
+              ("whose id or " in e1 or "its id or its type" in e1), f"XISF -> {kind}: what is no property that can be carried is named: {e1[-300:]}")
+        r2 = subprocess.run([EXE, mid, "-o", X, "-f"], capture_output=True)
+        e2 = r2.stderr.decode(errors="replace")
+        ok = well_formed(X)
+        got = xisf_properties(X)[0][0] if ok is True else []
+        check(ok is True and [p["id"] for p in got] == ["Good", "Odd:Comment", "Odd:Control", "Odd:Value", "Last"],
+              f"{kind} -> XISF: the header is XML whatever the properties held: {ok} {[p['id'] for p in got]}")
+        by = {p["id"]: p for p in got}
+        check(ok is True and by["Odd:Control"]["comment"] == "bell here" and by["Odd:Control"]["format"] == " [1m" and
+              by["Odd:Value"]["value"] == ("text", b"escape d") and by["Odd:Comment"]["comment"] == "caf? ?? comm" and
+              (e1 + e2).count("Odd:Control: its comment") == 1 and (e1 + e2).count("Odd:Value: its value") == 1,
+              f"{kind} -> XISF: a character XML cannot hold is replaced, and a warning says so once: {e2[-300:]}")
+        if kind == "asdf" and HAVE_ASDF:
+            with asdf.open(mid) as af:
+                p = af["xisf"]["images"][0]["properties"]
+                check(list(p) == ["Good", "Odd:Comment", "Odd:Control", "Odd:Value", "Last"] and p["Odd:Control"]["comment"] == "bell\x07here" and
+                      p["Odd:Value"]["value"] == "escape\x1bd", "the asdf library reads such a tree, control characters included")
+
+    # a tree of another program that has a key "xisf" for its own things
+    theirs = os.path.join(d, "theirs.asdf")
+    write_asdf_raw(theirs, "xisf:\n  image: !core/ndarray-1.0.0 {source: 0, datatype: uint16, byteorder: little, shape: [6, 8]}\n  note: mine\n",
+                   [asdf_block(images[0][..., 0].astype("<u2").tobytes())])
+    r = run(theirs, "-o", X, "-f")
+    check(np.array_equal(read_xisf_any(X), images[0][::-1]), "an ASDF file with a key xisf that holds an image of its own is read as before")
+
+    # many properties that share one block: read once, and no more of them than a file of that size can hold
+    import time
+    zeros = asdf_block(bytes(4 << 20), compression=b"zlib")
+    tree = ("fits: !<tag:astropy.org:astropy/fits/fits-1.0.0>\n- header:\n  - [EXTNAME, x]\n  data: !core/ndarray-1.0.0\n"
+            "    {source: 0, datatype: uint16, byteorder: little, shape: [6, 8]}\nxisf:\n  images:\n  - properties:\n" +
+            "".join(f'      "P{n}": {{type: UI8Vector, value: !core/ndarray-1.0.0 {{source: 1, datatype: uint8, byteorder: little, shape: [4194304]}}}}\n'
+                    for n in range(300)))
+    greedy = os.path.join(d, "greedy.asdf")
+    write_asdf_raw(greedy, tree, [asdf_block(images[0][..., 0].astype("<u2").tobytes()), zeros])
+    started = time.time()
+    r = run(greedy, "--info")
+    check(r.stdout.count("(UI8Vector)") == 64 and r.stderr.count("is left out") == 236 and "more data than a file of its size" in r.stderr and
+          time.time() - started < 30,
+          f"ASDF: 300 properties of 4 MiB that share one compressed block of a small file: 64 are read ({r.stdout.count('(UI8Vector)')}), "
+          f"in {time.time() - started:.1f} s")
+    blocks = [Block(as_planes(images[0]).astype("<u2").tobytes()), Block(bytes(1000), codec="zlib")]
+    template = ('<?xml version="1.0" encoding="UTF-8"?>\n<xisf version="1.0" xmlns="http://www.pixinsight.com/xisf">'
+                '<Image geometry="8:6:1" sampleFormat="UInt16" colorSpace="Gray" {0}>' +
+                "".join(f'<Property id="P{n}" type="UI8Vector" length="1500000000" {{1}}/>' for n in range(40)) + '</Image></xisf>')
+    greedy = os.path.join(d, "greedy.xisf")
+    write_xisf_blocks(greedy, template, blocks)
+    raw = open(greedy, "rb").read().replace(b'compression="zlib:1000"', b'compression="zlib:1500000000"')
+    hlen = raw.index(b"</xisf>") + 7 - 16
+    assert hlen == int.from_bytes(raw[8:12], "little") + 6 * 40, "(the header grew by six digits per property)"
+    # (the positions of the attachments have to follow the longer header: written again with them)
+    template = template.replace('length="1500000000" {1}', 'length="1500000000" {1} ')
+    blocks[1].attrs["compression"] = "zlib:1500000000"
+    write_xisf_blocks(greedy, template, blocks)
+    started = time.time()
+    r = run(greedy, "-o", os.path.join(d, "greedy.fits"), "-f")
+    with fits.open(os.path.join(d, "greedy.fits")) as hdul:
+        check(len(hdul) == 1 and r.stderr.count("is left out") == 40 and time.time() - started < 20,
+              f"XISF: properties that declare 1.5 GB each in a file of a few kilobytes are left out without being read: {time.time() - started:.1f} s")
+
+    # texts in data blocks are read when a file is opened: the same holds for them
+    blocks = [Block(as_planes(images[0]).astype("<u2").tobytes()), Block(b"spline " * (8 << 17), codec="zlib")]
+    template = ('<?xml version="1.0" encoding="UTF-8"?>\n<xisf version="1.0" xmlns="http://www.pixinsight.com/xisf">'
+                '<Image geometry="8:6:1" sampleFormat="UInt16" colorSpace="Gray" {0}>' +
+                "".join(f'<Property id="S{n}" type="String" {{1}}/>' for n in range(100)) + '</Image></xisf>')
+    greedy = os.path.join(d, "greedy_text.xisf")
+    write_xisf_blocks(greedy, template, blocks)
+    started = time.time()
+    r = run(greedy, "--info")
+    check(r.stdout.count("(String) = spline spline") == 36 and r.stdout.count("(String) [data block]") == 64 and
+          r.stderr.count("more data than a file of its size") == 64 and time.time() - started < 30,
+          f"XISF: 100 texts of 7 MiB that share one compressed block of a small file: 36 are read "
+          f"({r.stdout.count('(String) = spline spline')}), in {time.time() - started:.1f} s")
+
+    # ---- the astrometric solution comes back as it was, as long as the WCS is what it was
+    from astropy.wcs import WCS
+    W, H = 300, 200
+    sky = test_image(np.uint16, H, W, 1, 81)
+    P = "PCL:AstrometricSolution:"
+    grid = np.random.default_rng(5).normal(size=(40, 40))
+    solution = "".join([
+        f'<Property id="{P}ProjectionSystem" type="String">Gnomonic</Property>',
+        f'<Property id="{P}CreatorApplication" type="String">PixInsight 1.9.3</Property>',
+        f64_prop(P + "ReferenceCelestialCoordinates", [328.178, 47.358]),
+        f64_prop(P + "ReferenceImageCoordinates", [150.3, 99.3]),
+        f64_prop(P + "ReferenceNativeCoordinates", [0, 90]),
+        f64_prop(P + "CelestialPoleNativeCoordinates", [180, 90]),
+        f64_prop(P + "LinearTransformationMatrix", [-2.3565e-4, 1.1696e-5, -1.1715e-5, -2.3575e-4], 2, 2),
+        f64_prop(P + "SplineWorldTransformation:PointGridInterpolation:ImageToNative:GridX", grid.ravel(), 40, 40),
+        '<Property id="Observation:CelestialReferenceSystem" type="String">ICRS</Property>',
+        '<Property id="Instrument:Filter:Name" type="String">OIII</Property>',
+    ])
+    solved = os.path.join(d, "solved.xisf")
+    write_xisf(solved, [image_entry(sky, children=solution)])
+    truth = xisf_properties(solved)[0][0]
+
+    def restored(path):
+        """exact: the properties are those of the file; rebuilt: the solution is xisfconv's, made from WCS keywords"""
+        got = xisf_properties(path)[0][0]
+        by_id = {p["id"]: p for p in got}
+        if got == truth:
+            return "exact"
+        if (by_id.get(P + "CreatorApplication", {}).get("value", ("", b""))[1].startswith(b"xisfconv") and
+                P + "SplineWorldTransformation:PointGridInterpolation:ImageToNative:GridX" not in by_id and
+                by_id.get("Instrument:Filter:Name") == truth[-1]):
+            return "rebuilt"
+        if not any(i.startswith(P) for i in by_id) and by_id.get("Instrument:Filter:Name") == truth[-1]:
+            return "none"
+        return "other: " + repr(sorted(by_id))[:300]
+
+    for kind in ("fits", "asdf", "fits.fz"):
+        for out_flags in ([], ["--top-down"], ["--no-wcs"], ["--sip-order", "0"]):
+            mid = os.path.join(d, "solved." + kind)
+            run(solved, "-o", mid, "-f", "-q", *out_flags)
+            r = run(mid, "-o", X, "-f")
+            check(restored(X) == "exact" and "the astrometric solution among them" in r.stderr,
+                  f"XISF -> {kind} {out_flags} -> XISF: the solution is the one PixInsight wrote, number for number: {restored(X)}")
+            r = run(mid, "-o", X, "-f", "--no-wcs")
+            check(restored(X) == "exact", f"XISF -> {kind} {out_flags} -> XISF --no-wcs: and with --no-wcs too: {restored(X)}")
+            # the rows taken in the other order than the file says: the solution cannot be the same
+            r = run(mid, "-o", X, "-f", "--bottom-up" if out_flags == ["--top-down"] else "--top-down")
+            check(restored(X) == ("none" if out_flags == ["--no-wcs"] else "rebuilt") and "the rows are taken in the other order" in r.stderr,
+                  f"XISF -> {kind} {out_flags} -> XISF with the rows the other way: {restored(X)}; {r.stderr.strip()[-200:]}")
+    mid = os.path.join(d, "solved.fits")
+    run(solved, "-o", mid, "-f", "-q")
+    changed = os.path.join(d, "solved_changed.fits")
+
+    def edit(label, change, want, message):
+        with fits.open(mid) as hdul:
+            change(hdul)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                hdul.writeto(changed, overwrite=True)
+        r = run(changed, "-o", X, "-f")
+        check(restored(X) == want and message in r.stderr, f"{label}: the solution is {want}: {restored(X)}; {r.stderr.strip()[-200:]}")
+        return r
+
+    def reformat(hdul):   # the same numbers, written another way, and other keywords changed
+        hdul[0].header["OBJECT"] = "renamed"
+        hdul[0].header["CRVAL1"] = float(hdul[0].header["CRVAL1"])
+        hdul[0].data = hdul[0].data + 1
+        cards = [c for c in hdul[0].header.cards if c.keyword.startswith(("CD", "CRPIX"))]
+        for c in cards:
+            del hdul[0].header[c.keyword]
+        for c in reversed(cards):
+            hdul[0].header.append((c.keyword, c.value, "moved"), end=True)
+    edit("the file written again by astropy with its WCS as it was", reformat, "exact", "the astrometric solution among them")
+
+    def shift(hdul):
+        hdul[0].header["CRVAL1"] += 0.25
+    edit("CRVAL1 changed", shift, "rebuilt", "the WCS keywords, the size of the image or the order of its rows changed")
+    check(abs(np.frombuffer({p["id"]: p for p in xisf_properties(X)[0][0]}[P + "ReferenceCelestialCoordinates"]["value"][2], "<f8")[0] - 328.428) < 1e-9,
+          "and it is made from the keywords as they are now")
+    for label, name, value in (("the equinox in its old spelling", "EPOCH", 1950.0), ("a matrix in its old spelling", "PC001002", 0.1),
+                               ("a distortion table", "CPDIS1", "LOOKUP"), ("IRAF's distortion", "WAT1_001", "wtype=tnx")):
+        def add(hdul, name=name, value=value):
+            hdul[0].header[name] = value
+        edit(label + " added (" + name + ")", add, "rebuilt", "the WCS keywords, the size of the image or the order of its rows changed")
+
+    def crop(hdul):
+        hdul[0].data = hdul[0].data[:150, :]
+    edit("the image cropped", crop, "rebuilt", "the WCS keywords, the size of the image or the order of its rows changed")
+
+    def unsolve(hdul):
+        for k in [k for k in hdul[0].header if k.startswith(("CTYPE", "CRVAL", "CRPIX", "CD", "A_", "B_", "AP_", "BP_", "LONPOLE", "LATPOLE", "RADESYS", "EQUINOX"))]:
+            del hdul[0].header[k]
+    edit("the WCS keywords removed", unsolve, "none", "not the astrometric solution among them")
+
+    def forget(hdul):
+        del hdul[1].header["WCSDIGST"]
+    edit("a table that does not say which WCS it was written with", forget, "rebuilt", "not the astrometric solution among them")
+    # a solution and WCS keywords next to it, one of them an integer that is minus zero: the tree of an
+    # ASDF file has no such integer, and the WCS is the same for it
+    both = os.path.join(d, "both.xisf")
+    write_xisf(both, [image_entry(sky, children="".join(
+        f'<FITSKeyword name="{k}" value="{v}" comment=""/>' for k, v in (
+            ("CTYPE1", "'RA---TAN'"), ("CTYPE2", "'DEC--TAN'"), ("CRVAL1", "328.178"), ("CRVAL2", "47.358"), ("CRPIX1", "150.8"),
+            ("CRPIX2", "100.2"), ("CD1_1", "-2.3565E-4"), ("CD1_2", "-0"), ("CD2_1", "0"), ("CD2_2", "2.3575E-4"))) + solution)])
+    truth_both = xisf_properties(both)[0][0]
+    for kind in ("fits", "asdf"):
+        mid = os.path.join(d, "both." + kind)
+        run(both, "-o", mid, "-f", "-q")
+        r = run(mid, "-o", X, "-f")
+        check(xisf_properties(X)[0][0] == truth_both and "the astrometric solution among them" in r.stderr,
+              f"a solution next to WCS keywords, one of them -0, comes back from {kind.upper()} as it was")
+    # WCS keywords without a solution: nothing is made of them that the XISF file did not have
+    keywords_only = os.path.join(d, "keywords_only.xisf")
+    cards = {"CTYPE1": "'RA---TAN'", "CTYPE2": "'DEC--TAN'", "CRVAL1": "328.178", "CRVAL2": "47.358", "CRPIX1": "150.8",
+             "CRPIX2": "100.2", "CD1_1": "-2.3565E-4", "CD1_2": "1.1696E-5", "CD2_1": "-1.1715E-5", "CD2_2": "2.3575D-4"}
+    write_xisf(keywords_only, [image_entry(sky, children="".join(
+        f'<FITSKeyword name="{k}" value="{v}" comment=""/>' for k, v in cards.items()) +
+        '<Property id="Instrument:Filter:Name" type="String">OIII</Property>')])
+    check("CTYPE1" in xisf_header(keywords_only)[1] and P not in xisf_header(keywords_only)[1], "(a file with WCS keywords and no solution)")
+    for kind in ("fits", "asdf"):
+        mid = os.path.join(d, "keywords_only." + kind)
+        run(keywords_only, "-o", mid, "-f", "-q")
+        r = run(mid, "-o", X, "-f")
+        check(not any(p["id"].startswith(P) for p in xisf_properties(X)[0][0]) and "1 XISF property restored" in r.stderr,
+              f"an XISF file with WCS keywords and no solution comes back from {kind.upper()} without one: {r.stderr.strip()[-200:]}")
+    r = run(mid, "-o", X, "-f", "--no-properties")
+    check(any(p["id"].startswith(P) for p in xisf_properties(X)[0][0]), "while the same keywords alone are made into a solution, as before")
+
+
 if __name__ == "__main__":
     print("xisfconv:", EXE)
     print(subprocess.run([EXE, "--version"], capture_output=True, text=True).stdout.strip())
@@ -3591,7 +4396,7 @@ if __name__ == "__main__":
               test_fits_to_xisf_formats, test_fits_to_xisf_metadata, test_fits_to_xisf_bounds_bits_hdus,
               test_xisf_fits_xisf_roundtrip, test_asdf_yaml, test_asdf_hand_written, test_asdf_output,
               test_asdf_python_files, test_asdf_roundtrips, test_export_from_fits_and_asdf, test_xisf_rewrite,
-              test_verify, test_fits_tile_compressed, test_fits_tile_writing):
+              test_verify, test_fits_tile_compressed, test_fits_tile_writing, test_property_round_trip):
         try:
             t()
         except Exception as e:  # noqa: BLE001

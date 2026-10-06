@@ -7,18 +7,9 @@
 #include <vector>
 
 #include "common.hpp"
+#include "property.hpp"
 
 namespace xisfconv {
-
-// An XISF image property. Scalars carry `value`; String properties carry it as element text;
-// F64Vector / F64Matrix properties carry `data` (row-major), written as an inline base64 block.
-struct XisfOutProperty {
-    std::string id;
-    std::string type;   // String, TimePoint, Boolean, Int32, Float32, Float64, F64Vector, F64Matrix
-    std::string value;
-    std::vector<double> data;
-    size_t rows = 0, columns = 0;  // F64Matrix only
-};
 
 struct XisfOutImage {
     const PixelBuffer* pixels = nullptr;  // host byte order, planar, rows top-down
@@ -28,7 +19,9 @@ struct XisfOutImage {
     std::vector<FitsKeyword> keywords;    // written as FITSKeyword elements, in order
     std::string cfaPattern;               // e.g. "RGGB" (empty = none)
     int cfaWidth = 0, cfaHeight = 0;
-    std::vector<XisfOutProperty> properties;
+    // Scalars are written as a value attribute, a String as the text of its element, vectors and
+    // matrices as data blocks: in the header (base64) when small, attached to the file otherwise.
+    std::vector<Property> properties;
     std::vector<uint8_t> iccProfile;      // written as an ICCProfile element with an inline block (empty = none)
 };
 
@@ -37,6 +30,9 @@ struct XisfWriteOptions {
     bool shuffle = true;            // byte shuffling before compression
     std::string checksum;           // "", "sha1", "sha256", "sha512" (PixInsight's spelling), "sha3-256" or "sha3-512"
     uint64_t subblockSize = 1u << 30;  // blocks larger than this are compressed in subblocks
+    // File-level properties (the Metadata element), written after those the writer sets itself
+    // (isFileStorageProperty), which are left out of this list.
+    std::vector<Property> metadata;
 };
 
 void writeXisf(const std::string& path, const std::vector<XisfOutImage>& images, const XisfWriteOptions& options);

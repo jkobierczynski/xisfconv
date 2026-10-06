@@ -33,6 +33,6 @@ bool flipWcsRowOrder(std::vector<FitsKeyword>& keywords, uint64_t height);
 // which PixInsight rebuilds its surface splines. Returns false (and says why in `summary`) when
 // the keywords hold no solution that can be expressed this way.
 bool wcsToAstrometricSolution(const std::vector<FitsKeyword>& keywords, uint64_t width, uint64_t height,
-                              std::vector<XisfOutProperty>& properties, std::string& summary);
+                              std::vector<Property>& properties, std::string& summary);
 
 }  // namespace xisfconv

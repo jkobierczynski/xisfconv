@@ -2,7 +2,7 @@
 
 What was decided while building xisfconv, and why. The README says what the program does and
 `TODO.md` what is planned; this file records the choices behind both, so that they are not
-reopened by accident. State: version 0.12.1, 6 October 2026.
+reopened by accident. State: version 0.13.0, 6 October 2026.
 
 ## Purpose and scope
 
@@ -155,6 +155,84 @@ These are the choices a user could otherwise be surprised by. Each has an option
 - **Verification outcomes** are OK, NOT FULLY CHECKED (a part this build cannot check, named) and
   FAILED. Only FAILED sets exit status 1.
 
+## XISF properties in FITS and ASDF
+
+Since 0.13.0 a conversion from XISF takes the properties along and a conversion to XISF restores
+them. The choices:
+
+- **A table, not HIERARCH keywords** (which the plan in `TODO.md` named). A card holds 80
+  characters. The plate-solved test frame has 77 properties: identifiers of up to 113 characters,
+  the processing history as one XML text, and the splines of the astrometric solution as matrices
+  of 9 MB together. Keywords could carry a handful of scalars and would lose the rest, and their
+  types with it.
+- **FITS: a binary table behind each image** (`XISF_PROPERTIES`, `EXTVER` the number of the image)
+  and one for the file (`XISF_METADATA`). PixInsight has no convention of its own for this that
+  could be followed, so the layout is ours: a row per property, id and type as text columns,
+  value, comment and format as variable-length byte arrays. Comment and format are bytes and not
+  text columns because FITS text columns are ASCII and a comment is UTF-8. Vectors and matrices
+  are stored as the bytes XISF stores, little-endian, with their shape in two columns: the way
+  back is then a copy, and a reader needs one line (`np.frombuffer(value, "<f8")`). A column says
+  whether the value is a data block in XISF, so that a block of a type nobody knows is told from
+  text, and a String that PixInsight keeps in a block from one in the header.
+- **ASDF: in the tree**, a mapping from id to `{type, value, comment, format}` under `xisf`. The id
+  is the key because that is how a Python user wants to get at a property; the price is that two
+  properties of one id (which XISF forbids) cannot both be kept, and that the asdf library sorts
+  the keys when it writes a file again. Values are YAML values of their kind and arrays are
+  `ndarray` blocks of their element type and shape, so that Python gets a float, a bool, a matrix.
+  That makes the tree lossless in value and not in spelling: `1e-05` comes back as `1.0e-05`.
+  A number is written with its own digits wherever YAML reads them as that number, and a text
+  that is no value of its type goes along as a string. The byte order of an array is always
+  stated: the schema of `ndarray` asks for it with `source`, also for single bytes.
+- **The astrometric solution and the WCS keywords are two descriptions of one thing**, and a FITS
+  file can be changed by a program that knows only the keywords. So a digest of the WCS keywords,
+  the size of the image and the order of its rows is stored with the properties (SHA-1 over the
+  sorted keywords; numbers as numbers, so that a program that writes `1.0E-5` as `1e-05` changes
+  nothing; every keyword the WCS papers, SIP and the distortion conventions define counts, in
+  its old spellings too). On the way back the carried solution is used if the digest still
+  matches, and left out otherwise, with the solution then made from the keywords as for any
+  FITS file. When it matches, nothing is made from the keywords at all: an XISF file that had
+  WCS keywords and no solution comes back without one.
+- **The properties that describe the XISF file itself** (creation time, creating application,
+  block alignment, compression) are not taken along. They would be untrue of the next XISF file,
+  which sets its own, and carrying them would give every FITS file a table of its own for them.
+- **On by default.** The cost is one more HDU in a FITS file, which programs that read the
+  primary image do not look at; the gain is that a conversion can be undone. `--no-properties`
+  is there for the program that minds.
+- **A String stays where it was.** XISF has two places for a text: the header, and a data block
+  (where PixInsight puts its long spline serializations, compressed). They are not the same to a
+  reader: XML turns CR LF in the header into LF, and may take blanks at the ends for layout; a
+  block is what it is. The first version wrote every String into the header, and the review found
+  what that did to PixInsight's own files: 703 carriage returns gone from a serialization, for
+  every reader that follows XML. So the place is carried with the value, and the bytes of a block
+  are never touched. A text from the header is written as text again, with its line breaks as
+  they are (the same bytes are the one form every reader takes as it took the original); only
+  what the header could not give back unchanged (control characters, bytes that are not UTF-8,
+  blanks at the ends, a carriage return on its own) goes into a block.
+- **Arrays** up to 3072 bytes are written into the header and larger ones attached, which is
+  PixInsight's own limit. The solution properties this library makes from WCS keywords stay in
+  the header whatever their size, as in every version before: that form is the one PixInsight
+  was seen to accept, and files without carried properties are byte for byte what 0.12 wrote.
+- **A file cannot ask for more memory than it could fill.** Properties are loaded when a file is
+  converted or opened, and a property is a few bytes of header that may point at any block: 200
+  of them at one compressed block of 64 MiB made a file of 89 KB ask for 12 GiB in the review.
+  The properties of a file may hold its size plus 256 MiB together; what is beyond is left out
+  with a warning. Compressed blocks of an ASDF file are decompressed once for all the properties
+  that share them.
+- **What a format cannot hold is said, not written.** An id or type that is not ASCII does not go
+  into a FITS text column, one that is not UTF-8 not into a YAML stream, a control character not
+  into an XML attribute. Such a property is left out, or the character replaced, with a warning;
+  no file is written that its own format would refuse. A long id (over 500 characters) is
+  written to the tree as an explicit key (`? id`), because the parser of Python reads a plain
+  key only up to 1024 characters and would refuse the whole file.
+- **One form in memory** (`Property` in `property.hpp`): id, type, comment, format, and the value
+  as text or as little-endian bytes with a shape. The three writers and three readers meet there,
+  and a type that is not known is carried without being understood.
+- Not done: properties given by the caller of the library (`xisfconv_image`, Python's `write`),
+  and the other things of an XISF image that FITS has no place for (see `TODO.md`).
+- A file written by 0.13 and read by an older xisfconv: the tables of a FITS file are named as
+  skipped HDUs, and the matrices in an ASDF tree are taken for images, since any array of two
+  dimensions is one there. `--no-properties` writes files without them.
+
 ## Care with files
 
 - Output is written to `<name>.part` and renamed when complete. An existing `.part` file is not
@@ -172,8 +250,9 @@ These are the choices a user could otherwise be surprised by. Each has an option
 ## Structure of the code
 
 - One module per format or concern in `src/`: `xisf`, `xisfwrite`, `xisfrewrite`, `fits`,
-  `fitsread`, `fitstile`, `asdf`, `yaml`, `xml`, `tiff`, `png`, `wcs`, `convert` (sample formats,
-  stretch), `codecs` (compression, digests), `common`.
+  `fitsread`, `fitstile`, `asdf`, `yaml`, `xml`, `tiff`, `png`, `wcs`, `property` (XISF
+  properties as they go from one format to another), `convert` (sample formats, stretch),
+  `codecs` (compression, digests), `common`.
 - `pipeline` holds the conversion of whole files. It takes an options struct and prints nothing.
   Its second half, `writeImageSet`, writes images that are in memory to any format: FITS and ASDF
   input and the API's writer both end there, so an array handed to the library is treated exactly
@@ -222,7 +301,7 @@ and built in 0.10.0. What remains is in `TODO.md`.
 - Writing images from memory and the stretch on buffers are in the first release, for all five
   output formats: saving an array as XISF is what Python users cannot get elsewhere.
 - Version 0.x with no ABI promise until two bindings have used the API. The shared library version
-  changes with every 0.x release (`libxisfconv.so.0.12`), so that a binding built for another
+  changes with every 0.x release (`libxisfconv.so.0.13`), so that a binding built for another
   release fails to load.
 - Bindings: Python first (NumPy arrays; it can register `xisf` with astropy's I/O registry), then
   Rust and Perl when someone asks for them.
@@ -478,7 +557,7 @@ Built in 0.11.0, in `python/`. What was decided:
 
 ## Testing
 
-- `tests/run_tests.py` drives the built program (4867 checks at 0.12.0). The Python packages it
+- `tests/run_tests.py` drives the built program (5086 checks at 0.13.0). The Python packages it
   needs are listed at its top; the `asdf` packages and the external tools (`tiffcp`, `fitsverify`,
   `pngcheck`, `fpack`/`funpack`) are used when installed and their checks skipped when not.
 - Every format is checked against an implementation that shares no code with xisfconv: astropy
@@ -500,7 +579,7 @@ Built in 0.11.0, in `python/`. What was decided:
   lifetimes, callbacks), a Python script that calls the API through ctypes and compares what the
   library writes and reads with astropy, the `xisf` package, asdf, tifffile and Pillow, and a
   program that reads all there is of any file, which is what gets fuzzed.
-- The Python package is tested with pytest (`python/tests`, 288 tests at 0.12.0): the same
+- The Python package is tested with pytest (`python/tests`, 292 tests at 0.13.0): the same
   comparisons with other software, made through the package, run from the source tree and from the
   installed wheel on Python 3.10 to 3.14, with the oldest NumPy and astropy the package allows and
   with the newest, and under AddressSanitizer.
@@ -522,8 +601,10 @@ Built in 0.11.0, in `python/`. What was decided:
 - The work is done together with Claude (Anthropic), credited as co-author in the commit messages.
   Each change is delivered as a `git format-patch` file to apply with `git am`, plus a source
   archive, after it has been built and tested on a clean clone.
-- Large features (so far ASDF and XISF rewriting) get an independent review pass before delivery;
-  its findings are fixed first.
+- Large features (so far ASDF, XISF rewriting, tile compression and the properties) get an
+  independent review pass before delivery; its findings are fixed first. The review of 0.13.0
+  is the example of why: every test passed, and it found that PixInsight's own files lost their
+  carriage returns, that a file of 89 KB could ask for 12 GiB, and a read beyond a buffer.
 - Limitations are written into the README when a feature ships, not left to be discovered.
 - Messages to the user say what happened and what to do about it; nothing is skipped silently.
 

@@ -176,6 +176,7 @@ _OPTION_WORDS = [
     ("--bounds", "bounds"),
     ("--image", "image"),
     ("--top-down", 'row_order="top-down"'),
+    ("--no-properties", "properties=False"),
     ("--no-verify", "verify=False"),
     ("add --in-place to replace it", "use rewrite_in_place() to replace it"),
     ("or directory with -o or -d", ""),
@@ -1265,9 +1266,12 @@ class Properties(Mapping):
     """The XISF properties of an image, or of a file: ``{id: value}``, read when asked for.
 
     Scalars are bool, int, float or str; numeric vectors and matrices are float64 arrays.
-    A property whose value this library does not read is None. :meth:`type` and
-    :meth:`comment` give the XISF type name and the comment of a property.
-    For FITS and ASDF files it is empty.
+    A property whose value this library does not read is None. :meth:`type`,
+    :meth:`comment` and :meth:`format` give the XISF type name, the comment and the format
+    specification of a property.
+
+    A FITS or ASDF file has no properties of its own: it has those of the XISF file it was
+    converted from, if it was (see :func:`convert`), and none otherwise.
     """
 
     def __init__(self, file, image):
@@ -1345,6 +1349,14 @@ class Properties(Mapping):
 
     def comment(self, key):
         return self._get(key)[2]
+
+    def format(self, key):
+        """How the value is meant to be shown (a format specification like "%.3f"); "" if
+        the property has none."""
+        index = self._load()[key]
+        file = self._file
+        with file._context.lock:
+            return _text(_library.xisfconv_property_format(file._pointer(), self._image, index))
 
     def __repr__(self):
         return "<xisfconv.Properties: %d>" % len(self)
@@ -2067,7 +2079,7 @@ def write(path, images, *, format=None, codec=None, checksum=None, stored_row_or
 
 def convert(input, output, *, format=None, sample_format=None, image=None, stretch=None, codec=None, checksum=None,
             subblock_size=None, row_order=None, property_keywords=True, wcs=True, sip_order=3, verify=True, bounds=None,
-            overwrite=False, progress=None):   # noqa: A002 - the names of the command line
+            overwrite=False, progress=None, properties=True):   # noqa: A002 - the names of the command line
     """Converts a file, as the command line tool does: XISF to FITS, ASDF, TIFF or PNG; FITS
     and ASDF to XISF, to each other, or to TIFF or PNG; FITS to FITS to pack a file
     (``codec=True``: tile-compressed) or to unpack one. (XISF to XISF is :func:`rewrite`.)
@@ -2101,6 +2113,15 @@ def convert(input, output, *, format=None, sample_format=None, image=None, stret
     progress
         A function ``progress(stage, done, total)`` called from time to time; an exception
         it raises stops the conversion, leaves no partly written file, and is passed on.
+    properties
+        ``--no-properties`` is False. From XISF to FITS and ASDF the XISF properties of the
+        images and of the file are written along, with their types and exact values: in a
+        FITS file as a table behind each image, in an ASDF file under the key ``xisf`` of the
+        tree. Converted to XISF again, such a file gives them back: the processing history,
+        the instrument and observation properties, and the astrometric solution as PixInsight
+        wrote it, as long as the WCS keywords of the file are still the ones it was written
+        with (else the solution is made from the keywords). False leaves the properties out,
+        and leaves alone those a FITS or ASDF file carries.
     """
     options = _lib.struct(_lib.ConvertOptions, _library.xisfconv_convert_options_init)
     options.output_format = _output_format(format)
@@ -2118,6 +2139,7 @@ def convert(input, output, *, format=None, sample_format=None, image=None, stret
     options.verify_checksums = int(bool(verify))
     options.use_bounds, options.lower_bound, options.upper_bound = _bounds(bounds)
     options.overwrite = int(bool(overwrite))
+    options.properties = int(bool(properties))
     context = _Context.borrow()
     with context.lock:
         context.about(input, other=output)

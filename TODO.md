@@ -13,8 +13,9 @@ in `DEVELOPMENT.md`.
       package: NumPy arrays, astropy `CCDData` and HDU lists (0.11.0); see "Library" below
 - [x] Write tile-compressed FITS (`-c` on FITS output, `image.fits.fz`): lossless, RICE_1 for
       integers and GZIP_2 for floating point, the tiles and the layout of fpack (0.12.0)
-- [ ] Lossless property round trip: carry all XISF properties through FITS (HIERARCH keywords) and
-      ASDF (tree entries) and restore them on the way back
+- [x] Lossless property round trip: every XISF property goes along to FITS (a table behind each
+      image) and ASDF (the tree) with its type and exact value, and is restored on the way back,
+      the astrometric solution as PixInsight wrote it (0.13.0)
 - [ ] Downsampling (`--resize` / `--bin`) for TIFF and PNG export, and a `.thumbnailer` entry so Linux
       file managers show previews of `.xisf` and `.fits` files
 - [ ] More platforms and packaging: Linux arm64 and Intel macOS release builds; Homebrew formula,
@@ -32,6 +33,12 @@ Smaller items, each closing a limitation listed in the README:
 - [ ] Read HCOMPRESS_1 tile compression
 - [ ] Tile-compressed FITS output: quantized floating point as an option (lossy, fpack's default
       for floats and much smaller), a choice of tile shape
+- [ ] Take the rest of an XISF image along to FITS and ASDF the way the properties go: the saved
+      screen stretch, the resolution, the ICC profile, the thumbnail and the image attributes
+      that no keyword says
+- [ ] Mark the keywords a conversion from XISF adds (derived from properties, made from a
+      solution) so that the way back can leave them out, and XISF -> FITS -> XISF returns the
+      keywords as they were
 
 ## Library
 
@@ -51,16 +58,15 @@ The decisions are recorded in `DEVELOPMENT.md`; the API is `include/xisfconv.h`.
 
 Open checks of the Python package:
 
-- [ ] The wheels for macOS and Windows: the `wheels` workflow builds and tests the wheels for
-      Linux (x86_64, arm64) and the source distribution. For v0.12.0 the macOS wheel was built
-      and failed one test that depended on the timing of a signal, and the Windows wheel was
-      built and then failed when its build directory could not be deleted. 0.12.1 answers both;
-      a run of the workflow has to confirm it.
+- [x] The wheels for macOS and Windows: for v0.12.1 the `wheels` workflow built and tested all
+      of them (Linux x86_64 and arm64, macOS arm64, Windows x64) and the source distribution.
 - [ ] Register the project on PyPI and switch publishing on (see "Releasing" in the README).
 
 Later, each when it is needed:
 
-- [ ] Python: write XISF properties (needs the lossless property round trip above); read and
+- [ ] Library and Python: write XISF properties from the caller's values (`xisfconv_image` and
+      `write` take none yet; `convert` carries those of a file since 0.13.0); read vectors and
+      matrices in their own element type instead of as float64, complex ones included; read and
       write an image in pieces instead of as a whole (which would also let Ctrl-C stop the reading
       or writing of one large image: it is one step now); wheels for musllinux and Intel macOS;
       type stubs.
@@ -76,4 +82,6 @@ Later, each when it is needed:
 
 Open check:
 
+- [ ] Open in PixInsight an XISF file that came back from FITS with its properties: it should
+      report the astrometric solution of the original and show the processing history
 - [ ] Confirm the tag-release job on macOS and Windows publishes working binaries

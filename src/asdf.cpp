@@ -153,6 +153,198 @@ const char* datatypeName(SampleFormat f) {
     return "uint8";
 }
 
+// Double-quoted YAML scalar of UTF-8 text. What a YAML stream may not hold as it is, is escaped:
+// control characters, the line breaks of Unicode, the byte order mark, and code points beyond
+// the basic plane (which older parsers refuse).
+std::string yamlText(const std::string& s) {
+    std::string out = "\"";
+    char buf[16];
+    for (size_t i = 0; i < s.size();) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        if (c < 0x80) {
+            switch (c) {
+                case '"': out += "\\\""; break;
+                case '\\': out += "\\\\"; break;
+                case '\n': out += "\\n"; break;
+                case '\t': out += "\\t"; break;
+                case '\r': out += "\\r"; break;
+                case 0: out += "\\0"; break;
+                default:
+                    if (c < 0x20 || c == 0x7F) {
+                        std::snprintf(buf, sizeof buf, "\\x%02X", c);
+                        out += buf;
+                    } else {
+                        out += static_cast<char>(c);
+                    }
+            }
+            ++i;
+            continue;
+        }
+        const size_t n = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : 2;
+        if (c < 0xC2 || i + n > s.size() || !isValidUtf8(s.substr(i, n))) {
+            out += '?';   // (not UTF-8: the callers do not hand such text over)
+            ++i;
+            continue;
+        }
+        uint32_t code = c & (0xFF >> (n + 1));
+        for (size_t k = 1; k < n; ++k) code = (code << 6) | (static_cast<unsigned char>(s[i + k]) & 0x3F);
+        if (code > 0xFFFF) {
+            std::snprintf(buf, sizeof buf, "\\U%08X", static_cast<unsigned>(code));
+            out += buf;
+        } else if (code < 0xA0 || code == 0x2028 || code == 0x2029 || code == 0xFEFF || code >= 0xFFFE) {
+            std::snprintf(buf, sizeof buf, code < 0x100 ? "\\x%02X" : "\\u%04X", static_cast<unsigned>(code));
+            out += buf;
+        } else {
+            out.append(s, i, n);
+        }
+        i += n;
+    }
+    return out + "\"";
+}
+
+// ---- XISF properties in the tree (see asdf.hpp)
+
+const char* propertyDatatype(const PropertyElement& e) {
+    switch (e.kind) {
+        case 'i': return e.size == 1 ? "int8" : e.size == 2 ? "int16" : e.size == 4 ? "int32" : "int64";
+        case 'u': return e.size == 1 ? "uint8" : e.size == 2 ? "uint16" : e.size == 4 ? "uint32" : "uint64";
+        case 'f': return e.size == 4 ? "float32" : "float64";
+        default: return e.size == 8 ? "complex64" : "complex128";
+    }
+}
+
+// (with the other names the specification has for some of them)
+bool isIntegerType(const std::string& type) {
+    for (const char* t : {"Int8", "UInt8", "Int16", "UInt16", "Int32", "UInt32", "Int64", "UInt64", "Char", "Byte", "Short", "UShort",
+                          "Int", "UInt"})
+        if (type == t) return true;
+    return false;
+}
+
+bool isFloatType(const std::string& type) { return type == "Float32" || type == "Float64" || type == "Float" || type == "Double"; }
+
+bool isFiniteNumber(const std::string& text) {
+    double v = 0;
+    return parseDouble(text, v) && std::isfinite(v);
+}
+
+// The value of a scalar property as a YAML scalar of its kind: a Boolean as true or false, a
+// number as a number, with its digits as they are. A text that is no value of its type (and
+// an integer the tree cannot hold) is written as a string, and comes back as it is.
+std::string yamlScalarProperty(const Property& p) {
+    const std::string v = trim(p.text);
+    if (p.type == "Boolean") {
+        const std::string word = toLower(v);   // (the xisf package of Python writes True)
+        if (word == "true" || v == "1") return "true";
+        if (word == "false" || v == "0") return "false";
+    } else if (isIntegerType(p.type)) {
+        if (isFitsInteger(v)) {
+            const std::string n = yamlInteger(v);
+            if (fitsAsdfInteger(n)) return n;
+        }
+    } else if (isFloatType(p.type)) {
+        // (a whole number stays one: the type says what it is, and the text is the same again)
+        if (isFitsInteger(v) && yamlInteger(v) == v && fitsAsdfInteger(v)) return v;
+        bool plain = false;   // digits.digits with an optional signed exponent: YAML's own form
+        size_t i = !v.empty() && v[0] == '-' ? 1 : 0, digits = 0;
+        for (; i < v.size() && v[i] >= '0' && v[i] <= '9'; ++i) ++digits;
+        if (digits && i < v.size() && v[i] == '.') {
+            for (digits = 0, ++i; i < v.size() && v[i] >= '0' && v[i] <= '9'; ++i) ++digits;
+            plain = digits && i == v.size();
+            if (digits && i + 2 < v.size() && (v[i] == 'e' || v[i] == 'E') && (v[i + 1] == '+' || v[i + 1] == '-')) {
+                for (i += 2, plain = true; i < v.size(); ++i) plain = plain && v[i] >= '0' && v[i] <= '9';
+            }
+        }
+        // (a number a double holds: 1e400 would be infinity to the reader of the tree)
+        if (plain && isFiniteNumber(v)) return v;
+        std::string real;
+        if (yamlReal(v, real) && isFiniteNumber(real)) return real;
+        const std::string word = toLower(v);
+        if (word == "nan" || word == "+nan" || word == "-nan") return ".nan";
+        if (word == "inf" || word == "+inf" || word == "infinity" || word == "+infinity") return ".inf";
+        if (word == "-inf" || word == "-infinity") return "-.inf";
+    } else if (p.type == "Complex32" || p.type == "Complex64") {
+        if (v.size() > 2 && v.front() == '(' && v.back() == ')') {
+            const auto parts = split(v.substr(1, v.size() - 2), ',');
+            std::string re, im;
+            // (both parts numbers a double holds: the reader makes the text of the property from them)
+            if (parts.size() == 2 && yamlReal(trim(parts[0]), re) && yamlReal(trim(parts[1]), im) && isFiniteNumber(re) &&
+                isFiniteNumber(im)) {
+                return "!core/complex-1.0.0 " + re + (im[0] == '-' ? "" : "+") + im + "j";
+            }
+        }
+    }
+    return yamlText(p.text);
+}
+
+// The blocks that hold the values of properties, in the order of their numbers.
+struct PropertyBlocks {
+    size_t first = 0;   // the number of the first of them
+    std::vector<std::pair<const uint8_t*, size_t>> data;
+
+    // (the byte order is said for single bytes too: the schema of an array asks for it)
+    std::string array(const uint8_t* bytes, size_t size, const char* datatype, const std::string& shape) {
+        data.emplace_back(bytes, size);
+        return "!core/ndarray-1.0.0 {source: " + std::to_string(first + data.size() - 1) + ", datatype: " + datatype +
+               ", byteorder: little, shape: [" + shape + "]}";
+    }
+};
+
+// One property as an entry of a mapping: its id, and its type, value, comment and format.
+std::string propertyEntry(const Property& p, const std::string& indent, PropertyBlocks& blocks) {
+    // An id that is long is written as an explicit key ("? id", then ": value"): the parser of
+    // Python reads a key that is written the short way only up to 1024 characters.
+    const std::string key = yamlText(p.id);
+    std::string e = key.size() > 500 ? indent + "? " + key + "\n" + indent + ": " : indent + key + ": ";
+    e += "{type: " + yamlText(p.type) + ", value: ";
+    PropertyElement element;
+    const bool known = propertyElement(p.type, element);
+    if (p.array && known) {
+        const std::string shape = element.matrix ? std::to_string(p.rows) + ", " + std::to_string(p.columns) : std::to_string(p.rows);
+        e += blocks.array(p.data.data(), p.data.size(), propertyDatatype(element), shape);
+    } else if (p.array) {
+        // a type this library does not know, with its data block: the bytes, and what the element said of their shape
+        e += blocks.array(p.data.data(), p.data.size(), "uint8", std::to_string(p.data.size()));
+        if (isMatrixPropertyType(p.type)) e += ", rows: " + std::to_string(p.rows) + ", columns: " + std::to_string(p.columns);
+        else if (p.rows) e += ", length: " + std::to_string(p.rows);
+    } else if (isValidUtf8(p.text)) {
+        e += p.type == "String" ? yamlText(p.text) : yamlScalarProperty(p);
+    } else if (p.type == "String") {
+        // text that is not UTF-8 cannot be in a YAML stream: its bytes
+        e += blocks.array(reinterpret_cast<const uint8_t*>(p.text.data()), p.text.size(), "uint8", std::to_string(p.text.size()));
+    } else {
+        warn("property " + p.id + " is not written to the tree: its value is not text");
+        return {};
+    }
+    if (p.block) e += ", block: true";   // a String that XISF keeps in a data block
+    for (const auto& extra : {std::make_pair("comment", &p.comment), std::make_pair("format", &p.format)}) {
+        if (extra.second->empty()) continue;
+        if (!isValidUtf8(*extra.second)) warn("property " + p.id + ": its " + extra.first + " is not UTF-8 text; characters are replaced");
+        e += std::string(", ") + extra.first + ": " + yamlText(*extra.second);
+    }
+    return e + "}\n";
+}
+
+// The entries of a list of properties. An id is the key of its entry: of two properties with
+// the same id, which XISF does not allow, the first is kept.
+std::string propertyEntries(const std::vector<Property>& properties, const std::string& indent, PropertyBlocks& blocks) {
+    std::string entries;
+    std::set<std::string> ids;
+    for (const Property& p : properties) {
+        if (p.id.empty() || !isValidUtf8(p.id) || !isValidUtf8(p.type)) {
+            warn("a property whose id or type is not UTF-8 text is not written to the tree" +
+                 (isValidUtf8(p.id) && !p.id.empty() ? " (" + p.id + ")" : std::string()));
+            continue;
+        }
+        if (!ids.insert(p.id).second) {
+            warn("property " + p.id + " is there more than once; the first is kept");
+            continue;
+        }
+        entries += propertyEntry(p, indent, blocks);
+    }
+    return entries;
+}
+
 void putBE(std::string& out, uint64_t v, int bytes) {
     for (int i = bytes - 1; i >= 0; --i) out += static_cast<char>((v >> (8 * i)) & 0xFF);
 }
@@ -366,11 +558,20 @@ public:
         if (!root || !root->isMapping()) throw Error("the ASDF tree is not a mapping");
         scanBlocks();
         file_.formatNote += ", " + std::to_string(blocks_.size()) + " binary block(s)";
+        YamlPtr carried;
         for (const auto& pair : root->pairs) {
             const std::string key = scalarText(pair.first.get());
             if (key == "asdf_library" || key == "history") continue;
+            if (key == "xisf" && pair.second && isCarried(*pair.second)) {
+                carried = pair.second;   // XISF properties: their arrays are not images
+                continue;
+            }
             walk(pair.second, key);
         }
+        // (not when the pixels of one image are asked for: who asks has read the tree before)
+        if (carried && !onlyImage_) readCarried(*carried);
+        cachedBlock_.reset();
+        cachedData_ = std::vector<uint8_t>();
         return std::move(file_);
     }
 
@@ -383,6 +584,10 @@ private:
     uint64_t scanEnd_ = 0;  // where the block scan stopped
     std::vector<Block> blocks_;
     std::set<const YamlNode*> visited_;
+    std::vector<std::pair<size_t, size_t>> hduImages_;   // the HDUs of the tree's "fits" that are images: their place there and in file_.images
+    uint64_t propertyBudget_ = 0;         // what the XISF properties may still hold together (see propertyBudget)
+    std::optional<size_t> cachedBlock_;   // the block the property read last is in, decompressed and verified:
+    std::vector<uint8_t> cachedData_;     //   many small values may share one block
 
     std::vector<uint8_t> readAt(uint64_t pos, uint64_t n) {
         if (pos > file_.fileSize || n > file_.fileSize - pos) throw Error("unexpected end of file");
@@ -856,7 +1061,193 @@ private:
                 file_.skipped.push_back(label + ": table (not an image)");
                 continue;
             }
+            const size_t before = file_.images.size();
             addArray(*data, label + ".data", std::move(img));
+            if (path == "fits" && file_.images.size() > before) hduImages_.emplace_back(i, before);
+        }
+    }
+
+    // ---- XISF properties (see asdf.hpp)
+
+    // True if the "xisf" key of a tree is what the writer puts there: "images", a list, and
+    // "metadata", a mapping, and nothing else. (A file of somebody else may have a key of that
+    // name for other things; its arrays are images then, as everywhere.)
+    static bool isCarried(const YamlNode& node) {
+        if (!node.isMapping() || node.pairs.empty()) return false;
+        for (const auto& pair : node.pairs) {
+            const std::string key = scalarText(pair.first.get());
+            if (!pair.second) return false;
+            if (key == "images" ? !pair.second->isSequence() : key == "metadata" ? !pair.second->isMapping() : true) return false;
+        }
+        return true;
+    }
+
+    // `count` bytes at `offset` of a block, for a property. A block that has to be read as a
+    // whole (to decompress it, to verify its checksum) is kept for the next property.
+    std::vector<uint8_t> propertyBytes(size_t index, uint64_t offset, uint64_t count, const std::string& label) {
+        if (count > propertyBudget_) throw Error("the properties of this file hold more data than a file of its size can");
+        propertyBudget_ -= count;
+        const Block& b = blocks_[index];
+        if (b.compression.empty() && !(verify_ && b.hasChecksum)) return blockData(index, offset, count, label);
+        if (!cachedBlock_ || *cachedBlock_ != index) {
+            cachedBlock_.reset();
+            cachedData_ = blockData(index, 0, b.compression.empty() ? b.used : b.dataSize, label);
+            cachedBlock_ = index;
+        }
+        if (offset > cachedData_.size() || count > cachedData_.size() - offset) {
+            throw Error(label + ": the array needs " + std::to_string(count) + " bytes at offset " + std::to_string(offset) +
+                        ", but block " + std::to_string(index) + " holds " + std::to_string(cachedData_.size()));
+        }
+        return std::vector<uint8_t>(cachedData_.begin() + static_cast<std::ptrdiff_t>(offset),
+                                    cachedData_.begin() + static_cast<std::ptrdiff_t>(offset + count));
+    }
+
+    // The value of a scalar property as XISF writes it.
+    static std::string propertyText(const std::string& type, const YamlNode& node) {
+        const bool number = isIntegerType(type) || isFloatType(type);
+        if (!node.plain) return node.value;
+        if (tagContains(node, "/core/complex-")) {
+            std::string fits;
+            if (!fitsComplex(node.value, fits)) return node.value;
+            std::string text;   // (1.5, -2.5) -> (1.5,-2.5)
+            for (char c : fits)
+                if (c != ' ') text += c;
+            return toLower(text);
+        }
+        if (!number && type != "Boolean") return node.value;
+        const YamlValue v = yamlResolve(node);
+        switch (v.type) {
+            case YamlValue::Type::Bool: return v.boolean ? "true" : "false";
+            case YamlValue::Type::Int: return v.text;
+            case YamlValue::Type::Float: {
+                if (std::isnan(v.number)) return "nan";
+                if (std::isinf(v.number)) return v.number > 0 ? "inf" : "-inf";
+                double same = 0;
+                return parseDouble(node.value, same) && same == v.number ? node.value : formatDouble(v.number);
+            }
+            default: return node.value;
+        }
+    }
+
+    // The array a property has as its value: its bytes in little-endian order, and its shape.
+    std::vector<uint8_t> propertyArray(const YamlNode& node, const std::string& label, const char* datatype,
+                                       std::vector<uint64_t>& dims) {
+        uint64_t blockIndex = 0, offset = 0;
+        if (!scalarUInt(node.get("source"), blockIndex)) throw Error("its array is not in a binary block of this file");
+        const YamlNode* shape = node.get("shape");
+        if (!shape || !shape->isSequence()) throw Error("its array has no shape");
+        uint64_t elements = 1;
+        for (const auto& item : shape->items) {
+            uint64_t d = 0;
+            if (!scalarUInt(item.get(), d)) throw Error("its array has an invalid shape");
+            dims.push_back(d);
+            elements = checkedMul(elements, d, "array size");
+        }
+        const std::string stored = scalarText(node.get("datatype"));
+        const DType* dt = findDatatype(stored);
+        if (!dt || stored != datatype) {
+            throw Error("its array has the datatype " + (stored.empty() ? std::string("of a table") : stored) + ", not " + datatype);
+        }
+        if (const YamlNode* o = node.get("offset")) {
+            if (!scalarUInt(o, offset)) throw Error("its array has an invalid offset");
+        }
+        if (node.get("strides")) throw Error("its array is a view (strides)");
+        if (blockIndex >= blocks_.size()) {
+            throw Error("its array is in block " + std::to_string(blockIndex) + ", but the file has " +
+                        std::to_string(blocks_.size()) + " block(s)");
+        }
+        std::vector<uint8_t> data = propertyBytes(static_cast<size_t>(blockIndex), offset, checkedMul(elements, dt->size, "array size"), label);
+        // a complex number is two numbers
+        const size_t part = dt->kind == DKind::Other && dt->size > 1 ? dt->size / 2 : dt->size;
+        if (part > 1 && scalarText(node.get("byteorder")) == "big") byteSwapInPlace(data.data(), data.size() / part, part);
+        return data;
+    }
+
+    Property carriedProperty(const std::string& id, const YamlNode& node, const std::string& label) {
+        if (!node.isMapping()) throw Error("it is not a mapping with a type and a value");
+        Property p;
+        p.id = id;
+        if (!node.get("type") || !node.get("type")->isScalar()) throw Error("it has no type");
+        p.type = scalarText(node.get("type"));
+        p.comment = scalarText(node.get("comment"));
+        p.format = scalarText(node.get("format"));
+        const YamlNode* value = node.get("value");
+        PropertyElement element;
+        const bool known = propertyElement(p.type, element);
+        if (value && value->isMapping()) {
+            std::vector<uint64_t> dims;
+            if (known) {
+                p.data = propertyArray(*value, label, propertyDatatype(element), dims);
+                if (dims.size() != (element.matrix ? 2u : 1u)) {
+                    throw Error(std::string("its array has ") + std::to_string(dims.size()) + " dimension(s), a " + p.type +
+                                " has " + (element.matrix ? "two" : "one"));
+                }
+                p.array = true;
+                p.rows = dims[0];
+                p.columns = element.matrix ? dims[1] : 0;
+                return p;
+            }
+            std::vector<uint8_t> bytes = propertyArray(*value, label, "uint8", dims);
+            if (p.type == "String") {
+                p.text.assign(bytes.begin(), bytes.end());
+                p.block = inBlock(node);
+                return p;
+            }
+            if (p.type == "Boolean" || p.type == "TimePoint" || isIntegerType(p.type) || isFloatType(p.type) ||
+                startsWith(p.type, "Complex")) {
+                throw Error("an array is not the value of a " + p.type);
+            }
+            p.array = true;
+            p.data = std::move(bytes);
+            auto number = [&](const char* name, uint64_t& out) {
+                const YamlNode* n = node.get(name);
+                if (n && !scalarUInt(n, out)) throw Error(std::string("its ") + name + " is not a number");
+            };
+            number(isMatrixPropertyType(p.type) ? "rows" : "length", p.rows);
+            number("columns", p.columns);
+            return p;
+        }
+        if (known) throw Error("a " + p.type + " has an array in a binary block as its value");
+        if (value && !value->isScalar()) throw Error("its value is a list");
+        if (value) p.text = p.type == "String" ? value->value : propertyText(p.type, *value);
+        p.block = p.type == "String" && inBlock(node);
+        return p;
+    }
+
+    // True if the entry of a String says that XISF keeps it in a data block.
+    static bool inBlock(const YamlNode& node) {
+        const YamlNode* flag = node.get("block");
+        if (!flag || !flag->isScalar()) return false;
+        const YamlValue v = yamlResolve(*flag);
+        return v.type == YamlValue::Type::Bool && v.boolean;
+    }
+
+    std::vector<Property> carriedProperties(const YamlNode* list, const std::string& where) {
+        std::vector<Property> out;
+        if (!list || !list->isMapping()) return out;
+        for (const auto& pair : list->pairs) {
+            const std::string id = scalarText(pair.first.get());
+            if (id.empty() || !pair.second) continue;
+            try {
+                out.push_back(carriedProperty(id, *pair.second, where + ", property " + id));
+            } catch (const Error& e) {
+                warn(where + ": property " + id + " is left out: " + e.what());
+            }
+        }
+        return out;
+    }
+
+    void readCarried(const YamlNode& xisf) {
+        propertyBudget_ = propertyBudget(file_.fileSize);
+        file_.properties = carriedProperties(xisf.get("metadata"), "xisf.metadata");
+        const YamlNode* images = xisf.get("images");
+        if (!images || !images->isSequence()) return;
+        for (const auto& place : hduImages_) {
+            if (place.first >= images->items.size() || !images->items[place.first] || !images->items[place.first]->isMapping()) continue;
+            const YamlNode& entry = *images->items[place.first];
+            FitsImage& img = file_.images[place.second];
+            img.properties = carriedProperties(entry.get("properties"), "xisf.images[" + std::to_string(place.first) + "]");
+            img.wcsDigest = scalarText(entry.get("wcs_digest"));
         }
     }
 
@@ -923,23 +1314,60 @@ void writeAsdf(const std::string& path, const std::vector<FitsHdu>& hdus, const 
         if (px.channels > 1) tree += std::to_string(px.channels) + ", ";
         tree += std::to_string(px.height) + ", " + std::to_string(px.width) + "]\n";
     }
+    // The XISF properties the images bring along, and those of the file they come from.
+    PropertyBlocks propertyBlocks;
+    propertyBlocks.first = hdus.size();
+    bool carried = !options.metadata.empty();
+    for (const auto& hdu : hdus) carried = carried || !hdu.properties.empty();
+    if (carried) {
+        tree += "xisf:\n  images:\n";
+        for (const auto& hdu : hdus) {
+            if (hdu.properties.empty()) {
+                tree += "  - {}\n";
+                continue;
+            }
+            tree += "  - wcs_digest: " + yamlQuote(fitsSanitize(hdu.wcsDigest)) + "\n    properties:\n";
+            const std::string entries = propertyEntries(hdu.properties, "      ", propertyBlocks);
+            if (entries.empty()) tree.insert(tree.size() - 1, " {}");
+            tree += entries;
+        }
+        if (!options.metadata.empty()) {
+            tree += "  metadata:\n";
+            const std::string entries = propertyEntries(options.metadata, "    ", propertyBlocks);
+            if (entries.empty()) tree.insert(tree.size() - 1, " {}");
+            tree += entries;
+        }
+    }
     tree += "...\n";
     out.write(tree.data(), static_cast<std::streamsize>(tree.size()));
 
     uint64_t pos = tree.size();
     std::vector<uint64_t> offsets;
-    for (const auto& hdu : hdus) {
-        const PixelBuffer& px = *hdu.pixels;
-        const size_t bytes = static_cast<size_t>(px.samples()) * sampleBytes(px.format);
+    for (size_t b = 0; b < hdus.size() + propertyBlocks.data.size(); ++b) {
+        const uint8_t* data = nullptr;
+        size_t bytes = 0;
+        if (b < hdus.size()) {
+            const PixelBuffer& px = *hdus[b].pixels;
+            data = px.data.data();
+            bytes = static_cast<size_t>(px.samples()) * sampleBytes(px.format);
+        } else {
+            data = propertyBlocks.data[b - hdus.size()].first;
+            bytes = propertyBlocks.data[b - hdus.size()].second;
+        }
         std::vector<uint8_t> packed;
-        const uint8_t* stored = px.data.data();
+        const uint8_t* stored = data;
         size_t storedSize = bytes;
-        if (!options.codec.empty()) {
-            if (options.codec == "zlib") packed = zlibCompress(px.data.data(), bytes);
-            else if (options.codec == "zstd") packed = zstdCompress(px.data.data(), bytes);
-            else throw Error("ASDF output: unknown codec " + options.codec);
-            stored = packed.data();
-            storedSize = packed.size();
+        std::string codec = options.codec;
+        if (!codec.empty()) {
+            if (codec == "zlib") packed = zlibCompress(data, bytes);
+            else if (codec == "zstd") packed = zstdCompress(data, bytes);
+            else throw Error("ASDF output: unknown codec " + codec);
+            if (b >= hdus.size() && packed.size() >= bytes) {
+                codec.clear();   // a small value that compression only makes larger
+            } else {
+                stored = packed.data();
+                storedSize = packed.size();
+            }
         }
         uint8_t digest[16];
         md5(stored, storedSize, digest);
@@ -947,7 +1375,7 @@ void writeAsdf(const std::string& path, const std::vector<FitsHdu>& hdus, const 
         std::string header(kBlockMagic, 4);
         putBE(header, kBlockHeaderSize, 2);
         putBE(header, 0, 4);  // flags
-        std::string label = options.codec;
+        std::string label = codec;
         label.resize(4, '\0');
         header += label;
         putBE(header, storedSize, 8);  // allocated
