@@ -29,6 +29,7 @@
 #include "wcs.hpp"
 #include "xisf.hpp"
 #include "xisfrewrite.hpp"
+#include "xisfwrite.hpp"
 #include "yaml.hpp"
 
 using namespace xisfconv;
@@ -121,6 +122,14 @@ struct xisfconv_file {
     std::string headerText;
     std::optional<size_t> iccImage;   // ICC profile read last
     std::vector<uint8_t> icc;
+    bool propertyHeld = false;        // xisfconv_property_read: the property that was asked for last
+    size_t propertyImage = 0, propertyIndex = 0;
+    Property property;
+};
+
+struct xisfconv_properties {
+    StatePtr state;
+    std::vector<Property> items;
 };
 
 struct xisfconv_report {
@@ -325,8 +334,8 @@ void codecFrom(xisfconv_codec codec, ConvertOptions& out) {
             out.compress = true;
             out.codec = "zstd";
             return;
-        case XISFCONV_CODEC_LZ4:
-        case XISFCONV_CODEC_LZ4HC: fail(XISFCONV_ERR_UNSUPPORTED, "LZ4 compression is read, not written");
+        case XISFCONV_CODEC_LZ4: out.compress = true; out.codec = "lz4"; return;
+        case XISFCONV_CODEC_LZ4HC: out.compress = true; out.codec = "lz4hc"; return;
         default: fail(XISFCONV_ERR_ARGUMENT, "unknown codec " + std::to_string(codec));
     }
 }
@@ -370,8 +379,8 @@ XisfRewriteOptions rewriteOptionsFrom(const xisfconv_rewrite_options& o) {
         case XISFCONV_CODEC_ZLIB: r.codec = "zlib"; break;
         case XISFCONV_CODEC_ZSTD: r.codec = "zstd"; break;
         case XISFCONV_CODEC_DEFAULT: r.codec = zstdAvailable() ? "zstd" : "zlib"; break;
-        case XISFCONV_CODEC_LZ4:
-        case XISFCONV_CODEC_LZ4HC: fail(XISFCONV_ERR_UNSUPPORTED, "LZ4 compression is read, not written");
+        case XISFCONV_CODEC_LZ4: r.codec = "lz4"; break;
+        case XISFCONV_CODEC_LZ4HC: r.codec = "lz4hc"; break;
         default: fail(XISFCONV_ERR_ARGUMENT, "unknown codec " + std::to_string(o.codec));
     }
     r.checksum = checksumName(o.checksum, true);
@@ -606,12 +615,13 @@ int32_t xisfconv_version_number(void) {
 }
 
 int32_t xisfconv_codec_available(xisfconv_codec codec, int32_t for_writing) {
+    (void)for_writing;   // (every codec that is read is written, since 0.15)
     switch (codec) {
         case XISFCONV_CODEC_NONE:
         case XISFCONV_CODEC_ZLIB:
+        case XISFCONV_CODEC_LZ4:      // (read since the beginning, written since 0.15)
+        case XISFCONV_CODEC_LZ4HC:
         case XISFCONV_CODEC_DEFAULT: return 1;
-        case XISFCONV_CODEC_LZ4:
-        case XISFCONV_CODEC_LZ4HC: return for_writing ? 0 : 1;
         case XISFCONV_CODEC_ZSTD: return zstdAvailable() ? 1 : 0;
         default: return 0;
     }
@@ -1064,6 +1074,16 @@ const char* xisfconv_image_detail(const xisfconv_file* file, size_t image, const
     }
     const FitsImage& img = file->fits.images[image];
     if (is("mapping")) return file->known[image].mapping.c_str();
+    if (is("carriedSolution")) {
+        bool solution = false;
+        for (const Property& p : img.properties) solution = solution || isSolutionProperty(p.id);
+        if (!solution) return "";
+        try {
+            return wcsDigest(img.keywords, img.pixels.width, img.pixels.height, !img.topDown) == img.wcsDigest ? "current" : "stale";
+        } catch (...) {
+            return "stale";
+        }
+    }
     if (file->format == XISFCONV_FORMAT_FITS) {
         if (is("tileCompression")) return img.tileCompression.c_str();
     } else {
@@ -1155,6 +1175,27 @@ const char* xisfconv_property_format(const xisfconv_file* file, size_t image, si
     return list && index < list->size() ? (*list)[index].format.c_str() : "";
 }
 
+xisfconv_property_storage xisfconv_property_stored(const xisfconv_file* file, size_t image, size_t index) try {
+    if (!file) return XISFCONV_PROPERTY_NONE;
+    if (const auto* carried = carriedOf(file, image)) {
+        if (index >= carried->size()) return XISFCONV_PROPERTY_NONE;
+        const Property& p = (*carried)[index];
+        PropertyElement e;
+        if (p.array) return propertyElement(p.type, e) ? XISFCONV_PROPERTY_ARRAY : XISFCONV_PROPERTY_UNREAD;
+        return p.block ? XISFCONV_PROPERTY_TEXT_BLOCK : XISFCONV_PROPERTY_VALUE;
+    }
+    const auto* list = propertiesOf(file, image);
+    if (!list || index >= list->size() || !file->xisf) return XISFCONV_PROPERTY_NONE;
+    switch (file->xisf->propertyStorage((*list)[index])) {
+        case XisfFile::PropertyStorage::Header: return XISFCONV_PROPERTY_VALUE;
+        case XisfFile::PropertyStorage::TextBlock: return XISFCONV_PROPERTY_TEXT_BLOCK;
+        case XisfFile::PropertyStorage::Array: return XISFCONV_PROPERTY_ARRAY;
+        default: return XISFCONV_PROPERTY_UNREAD;
+    }
+} catch (...) {
+    return XISFCONV_PROPERTY_NONE;
+}
+
 xisfconv_status xisfconv_property_read_f64(xisfconv_file* file, size_t image, const char* id, double* values,
                                            size_t capacity, size_t* rows, size_t* columns) {
     if (!file) return XISFCONV_ERR_ARGUMENT;
@@ -1203,6 +1244,221 @@ xisfconv_status xisfconv_property_read_f64(xisfconv_file* file, size_t image, co
             fail(XISFCONV_ERR_BUFFER, "the property holds " + std::to_string(data.size()) + " numbers, the buffer " + std::to_string(capacity));
         }
         std::copy(data.begin(), data.end(), values);
+    });
+}
+
+namespace {
+xisfconv_element elementOf(const PropertyElement& e) {
+    switch (e.kind) {
+        case 'i': return e.size == 1 ? XISFCONV_ELEMENT_INT8 : e.size == 2 ? XISFCONV_ELEMENT_INT16
+                       : e.size == 4 ? XISFCONV_ELEMENT_INT32 : XISFCONV_ELEMENT_INT64;
+        case 'u': return e.size == 1 ? XISFCONV_ELEMENT_UINT8 : e.size == 2 ? XISFCONV_ELEMENT_UINT16
+                       : e.size == 4 ? XISFCONV_ELEMENT_UINT32 : XISFCONV_ELEMENT_UINT64;
+        case 'f': return e.size == 4 ? XISFCONV_ELEMENT_FLOAT32 : XISFCONV_ELEMENT_FLOAT64;
+        case 'c': return e.size == 8 ? XISFCONV_ELEMENT_COMPLEX32 : XISFCONV_ELEMENT_COMPLEX64;
+        default: return XISFCONV_ELEMENT_NONE;
+    }
+}
+
+// The elements of a vector or matrix between little-endian (as a Property holds them) and the
+// order of the host. A complex number is two numbers.
+void elementsToOrFromHost(uint8_t* data, size_t size, const PropertyElement& e) {
+    const size_t part = e.kind == 'c' ? e.size / 2 : e.size;
+    if (!hostIsLittleEndian() && part > 1) byteSwapInPlace(data, size / part, part);
+}
+}  // namespace
+
+xisfconv_element xisfconv_property_element(const char* type, int32_t* is_matrix) {
+    if (is_matrix) *is_matrix = 0;
+    if (!type) return XISFCONV_ELEMENT_NONE;
+    try {
+        PropertyElement e;
+        if (!propertyElement(type, e)) return XISFCONV_ELEMENT_NONE;
+        if (is_matrix) *is_matrix = e.matrix ? 1 : 0;
+        return elementOf(e);
+    } catch (...) {
+        return XISFCONV_ELEMENT_NONE;
+    }
+}
+
+size_t xisfconv_element_size(xisfconv_element element) {
+    switch (element) {
+        case XISFCONV_ELEMENT_INT8:
+        case XISFCONV_ELEMENT_UINT8: return 1;
+        case XISFCONV_ELEMENT_INT16:
+        case XISFCONV_ELEMENT_UINT16: return 2;
+        case XISFCONV_ELEMENT_INT32:
+        case XISFCONV_ELEMENT_UINT32:
+        case XISFCONV_ELEMENT_FLOAT32: return 4;
+        case XISFCONV_ELEMENT_INT64:
+        case XISFCONV_ELEMENT_UINT64:
+        case XISFCONV_ELEMENT_FLOAT64:
+        case XISFCONV_ELEMENT_COMPLEX32: return 8;
+        case XISFCONV_ELEMENT_COMPLEX64: return 16;
+        default: return 0;
+    }
+}
+
+xisfconv_status xisfconv_property_read(xisfconv_file* file, size_t image, size_t index, void* buffer, size_t buffer_size,
+                                       size_t* size, size_t* rows, size_t* columns) {
+    if (!file) return XISFCONV_ERR_ARGUMENT;
+    return guarded(file->state, file->path.c_str(), [&] {
+        if (image != XISFCONV_FILE_PROPERTIES) checkImage(file, image);
+        const bool held = file->propertyHeld && file->propertyImage == image && file->propertyIndex == index;
+        if (!held) {
+            file->propertyHeld = false;
+            file->property = Property();
+            auto notAnArray = [&](const std::string& id, const std::string& type) {
+                fail(XISFCONV_ERR_NOT_FOUND, "property '" + id + "' is of type " + type + ", which is not a vector or a matrix of numbers");
+            };
+            auto beyond = [&] { fail(XISFCONV_ERR_INDEX, "property index " + std::to_string(index) + " out of range"); };
+            PropertyElement e;
+            if (const auto* carried = carriedOf(file, image)) {
+                if (index >= carried->size()) beyond();
+                const Property& p = (*carried)[index];
+                if (!p.array || !propertyElement(p.type, e)) notAnArray(p.id, p.type);
+                const std::string problem = propertyProblem(p);
+                if (!problem.empty()) fail(XISFCONV_ERR_FORMAT, "property '" + p.id + "': " + problem);
+                file->property = p;
+            } else {
+                const auto* list = propertiesOf(file, image);
+                if (!list || index >= list->size()) beyond();
+                const XisfProperty& x = (*list)[index];
+                if (!x.hasBlockData || !propertyElement(x.type, e)) notAnArray(x.id, x.type);
+                try {
+                    file->property = file->xisf->loadPropertyCounted(x, true);
+                } catch (const Error& err) {
+                    throw Error("property '" + x.id + "': " + err.what(), err.kind);
+                }
+            }
+            file->propertyImage = image;
+            file->propertyIndex = index;
+            file->propertyHeld = true;
+        }
+        const Property& p = file->property;
+        PropertyElement e;
+        propertyElement(p.type, e);
+        if (size) *size = p.data.size();
+        if (rows) *rows = static_cast<size_t>(e.matrix ? p.rows : 1);
+        if (columns) *columns = static_cast<size_t>(e.matrix ? p.columns : p.rows);
+        if (!buffer) return;
+        if (buffer_size < p.data.size()) {
+            fail(XISFCONV_ERR_BUFFER, "the property holds " + std::to_string(p.data.size()) + " bytes, the buffer " + std::to_string(buffer_size));
+        }
+        if (!p.data.empty()) std::memcpy(buffer, p.data.data(), p.data.size());
+        elementsToOrFromHost(static_cast<uint8_t*>(buffer), p.data.size(), e);
+        // handed over: not kept any longer
+        file->propertyHeld = false;
+        file->property = Property();
+    });
+}
+
+// ------------------------------------------------------------------------------------------
+// Property lists
+// ------------------------------------------------------------------------------------------
+
+xisfconv_status xisfconv_properties_new(xisfconv_context* ctx, xisfconv_properties** out) {
+    if (!ctx) return XISFCONV_ERR_ARGUMENT;
+    if (out) *out = nullptr;
+    return guarded(ctx->state, nullptr, [&] {
+        if (!out) fail(XISFCONV_ERR_ARGUMENT, "xisfconv_properties_new: out is NULL");
+        auto list = std::make_unique<xisfconv_properties>();
+        list->state = ctx->state;
+        *out = list.release();
+    });
+}
+
+void xisfconv_properties_free(xisfconv_properties* properties) { delete properties; }
+
+size_t xisfconv_properties_count(const xisfconv_properties* properties) { return properties ? properties->items.size() : 0; }
+
+namespace {
+// What every property has: an id, a type, and perhaps a comment and a format.
+Property propertyHead(const char* function, const char* id, const char* type, const char* comment, const char* format) {
+    if (!id || !type) fail(XISFCONV_ERR_ARGUMENT, std::string(function) + ": id or type is NULL");
+    Property p;
+    p.id = id;
+    p.type = type;
+    if (comment) p.comment = comment;
+    if (format) p.format = format;
+    if (p.id.empty()) fail(XISFCONV_ERR_ARGUMENT, "a property needs an id");
+    if (!isXmlText(p.id)) fail(XISFCONV_ERR_ARGUMENT, "the id of a property is not text that XML can hold");
+    if (!isXmlText(p.comment)) fail(XISFCONV_ERR_ARGUMENT, "property " + p.id + ": its comment is not text that XML can hold");
+    if (!isXmlText(p.format)) fail(XISFCONV_ERR_ARGUMENT, "property " + p.id + ": its format is not text that XML can hold");
+    return p;
+}
+
+void putProperty(xisfconv_properties* list, Property&& p) {
+    for (Property& have : list->items) {
+        if (have.id == p.id) {
+            have = std::move(p);
+            return;
+        }
+    }
+    list->items.push_back(std::move(p));
+}
+}  // namespace
+
+xisfconv_status xisfconv_properties_set(xisfconv_properties* properties, const char* id, const char* type, const char* value,
+                                        const char* comment, const char* format) {
+    if (!properties) return XISFCONV_ERR_ARGUMENT;
+    return guarded(properties->state, nullptr, [&] {
+        Property p = propertyHead("xisfconv_properties_set", id, type, comment, format);
+        if (!value) fail(XISFCONV_ERR_ARGUMENT, "property " + p.id + ": value is NULL");
+        p.text = value;
+        const std::string problem = scalarPropertyProblem(p.type, p.text);
+        if (!problem.empty()) fail(XISFCONV_ERR_ARGUMENT, "property " + p.id + ": " + problem);
+        // A long text goes into a data block and is compressed with the rest. So does a text
+        // with a carriage return (in the header an XML reader would read its CR LF as a line
+        // feed) or with white space at its ends (which a reader may take for layout).
+        p.block = p.type == "String" && (p.text.size() > kXisfMaxInlineBlock || !textFitsElement(p.text));
+        putProperty(properties, std::move(p));
+    });
+}
+
+xisfconv_status xisfconv_properties_set_as_read(xisfconv_properties* properties, const char* id, const char* type,
+                                                const char* value, const char* comment, const char* format,
+                                                xisfconv_property_storage storage) {
+    if (!properties) return XISFCONV_ERR_ARGUMENT;
+    return guarded(properties->state, nullptr, [&] {
+        Property p = propertyHead("xisfconv_properties_set_as_read", id, type, comment, format);
+        if (!value) fail(XISFCONV_ERR_ARGUMENT, "property " + p.id + ": value is NULL");
+        p.text = value;
+        PropertyElement e;
+        if (propertyElement(p.type, e)) fail(XISFCONV_ERR_ARGUMENT, "property " + p.id + ": a " + p.type + " is given by its elements, not by a text");
+        if (!isXmlText(p.type)) fail(XISFCONV_ERR_ARGUMENT, "property " + p.id + ": its type is not text that XML can hold");
+        if (storage != XISFCONV_PROPERTY_VALUE && (storage != XISFCONV_PROPERTY_TEXT_BLOCK || p.type != "String")) {
+            fail(XISFCONV_ERR_ARGUMENT, "property " + p.id + ": its storage is a value of the header, or for a String a text block");
+        }
+        // (What XML cannot hold is seen to by the writer, as for a conversion: a String with such
+        // bytes becomes a data block, another value is written with blanks in their place.)
+        p.block = storage == XISFCONV_PROPERTY_TEXT_BLOCK;
+        putProperty(properties, std::move(p));
+    });
+}
+
+xisfconv_status xisfconv_properties_set_array(xisfconv_properties* properties, const char* id, const char* type,
+                                              const void* elements, size_t size, uint64_t rows, uint64_t columns,
+                                              const char* comment, const char* format) {
+    if (!properties) return XISFCONV_ERR_ARGUMENT;
+    return guarded(properties->state, nullptr, [&] {
+        Property p = propertyHead("xisfconv_properties_set_array", id, type, comment, format);
+        PropertyElement e;
+        if (!propertyElement(p.type, e)) {
+            fail(XISFCONV_ERR_ARGUMENT, "property " + p.id + ": " + (isXmlText(p.type) && !p.type.empty() ? p.type : std::string("the type given")) +
+                                            " is not a vector or matrix type");
+        }
+        if (!elements && size) fail(XISFCONV_ERR_ARGUMENT, "property " + p.id + ": elements is NULL");
+        if (!e.matrix && columns != 0) fail(XISFCONV_ERR_ARGUMENT, "property " + p.id + ": a vector has no columns (rows is its length)");
+        p.array = true;
+        p.rows = rows;
+        p.columns = e.matrix ? columns : 0;
+        const uint8_t* bytes = static_cast<const uint8_t*>(elements);
+        if (size) p.data.assign(bytes, bytes + size);
+        const std::string problem = propertyProblem(p);
+        if (!problem.empty()) fail(XISFCONV_ERR_ARGUMENT, "property " + p.id + ": " + problem);
+        elementsToOrFromHost(p.data.data(), p.data.size(), e);
+        putProperty(properties, std::move(p));
     });
 }
 
@@ -1482,6 +1738,18 @@ xisfconv_status xisfconv_fits_keywords(xisfconv_file* file, size_t image, xisfco
     });
 }
 
+xisfconv_status xisfconv_wcs_digest(const xisfconv_keywords* kw, uint64_t width, uint64_t height, xisfconv_row_order row_order,
+                                    const char** out) {
+    if (!kw) return XISFCONV_ERR_ARGUMENT;
+    if (out) *out = nullptr;
+    return guarded(kw->state, nullptr, [&] {
+        if (!out) fail(XISFCONV_ERR_ARGUMENT, "xisfconv_wcs_digest: out is NULL");
+        checkRowOrder(row_order);
+        kw->text = wcsDigest(kw->cards, width, height, row_order != XISFCONV_ROWS_TOP_DOWN);
+        *out = kw->text.c_str();
+    });
+}
+
 xisfconv_status xisfconv_wcs_flip_rows(xisfconv_keywords* kw, uint64_t image_height) {
     if (!kw) return XISFCONV_ERR_ARGUMENT;
     return guarded(kw->state, nullptr, [&] {
@@ -1677,6 +1945,14 @@ const char* xisfconv_report_not_checked(const xisfconv_report* report, size_t in
 // Writing images from memory
 // ------------------------------------------------------------------------------------------
 
+// As for xisfconv_convert_options: what came after 0.14 begins where that layout ended.
+static_assert(sizeof(void*) != 8 || (offsetof(xisfconv_image, reserved) == 108 && offsetof(xisfconv_image, properties) == 112 &&
+                                     sizeof(xisfconv_image) == 120),
+              "xisfconv_image: a field where an older layout had padding, or padding at the end");
+static_assert(sizeof(void*) != 8 || (offsetof(xisfconv_write_options, shuffle) == 40 &&
+                                     offsetof(xisfconv_write_options, properties) == 48 && sizeof(xisfconv_write_options) == 64),
+              "xisfconv_write_options: padding inside, or at the end");
+
 void xisfconv_image_init(xisfconv_image* image, size_t struct_size) {
     xisfconv_image defaults;
     std::memset(static_cast<void*>(&defaults), 0, sizeof defaults);
@@ -1696,6 +1972,7 @@ void xisfconv_write_options_init(xisfconv_write_options* options, size_t struct_
     defaults.row_order = XISFCONV_ROWS_DEFAULT;
     defaults.subblock_size = 1u << 30;
     defaults.wcs = 1;
+    defaults.shuffle = 1;
     initStruct(options, struct_size, defaults);
 }
 
@@ -1718,6 +1995,28 @@ xisfconv_status xisfconv_writer_new(xisfconv_context* ctx, const char* path, con
         w->options.force = o.overwrite != 0;
         checkRowOrder(o.row_order);
         w->rowOrder = o.row_order;
+        // What only an XISF file has is checked for an XISF file, and means nothing to the others.
+        if (w->format == Format::Xisf) {
+            w->options.shuffle = o.shuffle != 0;
+            if (o.compression_level != 0) {
+                if (!w->options.compress) fail(XISFCONV_ERR_ARGUMENT, "a compression level without a codec");
+                const std::string codec = !w->options.codec.empty() ? w->options.codec : (zstdAvailable() ? "zstd" : "zlib");
+                xisfCompress(codec, nullptr, 0, o.compression_level);   // (says what is wrong with the level)
+                w->options.level = o.compression_level;
+            }
+            if (o.creator_application) {
+                w->options.creatorApplication = trim(o.creator_application);
+                bool oneLine = isXmlText(w->options.creatorApplication);
+                for (const char c : w->options.creatorApplication) oneLine = oneLine && static_cast<unsigned char>(c) >= 0x20;
+                if (!oneLine) {
+                    fail(XISFCONV_ERR_ARGUMENT, "the name of the creator application is one line of text that XML can hold");
+                }
+            }
+        }
+        if (o.properties) {
+            for (const Property& p : o.properties->items)
+                if (!isFileStorageProperty(p.id)) w->images.properties.push_back(p);
+        }
         *out = w.release();
     });
 }
@@ -1743,8 +2042,9 @@ xisfconv_status xisfconv_writer_add_image(xisfconv_writer* writer, const xisfcon
         }
         checkRowOrder(in.wcs_row_order);
         if (in.wcs_row_order != XISFCONV_ROWS_DEFAULT && (in.wcs_row_order == XISFCONV_ROWS_TOP_DOWN) != img.topDown) {
-            // the WCS keywords count rows from the other end than the buffer does
-            flipWcsRowOrder(img.keywords, img.pixels.height);
+            // The WCS keywords count rows from the other end than the buffer does. They are turned
+            // to the order of the file when it is written, and only if that is another one.
+            img.wcsTopDown = in.wcs_row_order == XISFCONV_ROWS_TOP_DOWN;
         }
         if (in.icc_profile && in.icc_profile_size) {
             const uint8_t* icc = static_cast<const uint8_t*>(in.icc_profile);
@@ -1753,6 +2053,10 @@ xisfconv_status xisfconv_writer_add_image(xisfconv_writer* writer, const xisfcon
         if (in.use_bounds) {
             if (!(in.upper_bound > in.lower_bound)) fail(XISFCONV_ERR_ARGUMENT, "the upper bound must be above the lower bound");
             img.bounds = std::make_pair(in.lower_bound, in.upper_bound);
+        }
+        if (in.properties && !in.properties->items.empty()) {
+            img.properties = in.properties->items;
+            img.propertiesGiven = true;
         }
         updateFloatRange(img);
         writer->images.images.push_back(std::move(img));
@@ -1767,8 +2071,28 @@ xisfconv_status xisfconv_writer_finish(xisfconv_writer* writer) {
         if (writer->format == Format::Fits || writer->format == Format::Asdf) {
             // FITS and ASDF keep the rows as they are handed over: put them in the order asked for.
             const bool storeTopDown = writer->rowOrder == XISFCONV_ROWS_TOP_DOWN;
-            for (FitsImage& img : writer->images.images)
-                if (img.topDown != storeTopDown) flipImageRows(img);
+            for (FitsImage& img : writer->images.images) {
+                // The pixels and BAYERPAT are turned if the rows are stored in the other order; the
+                // WCS keywords if they describe another order than the stored one.
+                const bool wcsTopDown = img.wcsTopDown ? *img.wcsTopDown : img.topDown;
+                if (img.topDown != storeTopDown) {
+                    flipVertical(img.pixels);
+                    flipBayerRows(img.keywords, img.pixels.height);
+                    img.topDown = storeTopDown;
+                    img.hasRowOrder = true;
+                }
+                if (wcsTopDown != storeTopDown) flipWcsRowOrder(img.keywords, img.pixels.height);
+                img.wcsTopDown.reset();
+                // An astrometric solution among the caller's properties goes along as the
+                // solution of these keywords: a conversion of the file to XISF then finds it to
+                // be the one it was written with. Without a solution nothing is noted, and
+                // such a conversion makes one from the keywords.
+                bool solution = false;
+                for (const Property& p : img.properties) solution = solution || isSolutionProperty(p.id);
+                if (img.propertiesGiven && solution) {
+                    img.wcsDigest = wcsDigest(img.keywords, img.pixels.width, img.pixels.height, !img.topDown);
+                }
+            }
         }
         ImageSetOrigin origin;
         origin.defaultName = fromPath(toPath(writer->path).stem());

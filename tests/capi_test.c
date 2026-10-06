@@ -174,7 +174,8 @@ static void test_basics(void) {
               xisfconv_sample_size(77) == 0,
           "sample sizes");
     CHECK(xisfconv_codec_available(XISFCONV_CODEC_ZLIB, 1) == 1 && xisfconv_codec_available(XISFCONV_CODEC_LZ4, 0) == 1 &&
-              xisfconv_codec_available(XISFCONV_CODEC_LZ4, 1) == 0 && xisfconv_codec_available(99, 0) == 0,
+              xisfconv_codec_available(XISFCONV_CODEC_LZ4, 1) == 1 && xisfconv_codec_available(XISFCONV_CODEC_LZ4HC, 1) == 1 &&
+              xisfconv_codec_available(99, 0) == 0,
           "codec availability");
 }
 
@@ -604,8 +605,8 @@ static void test_convert_rewrite_verify(xisfconv_context *ctx) {
     ro.image = 3;
     CHECK(xisfconv_rewrite(ctx, path_of("gray.xisf"), path_of("three.xisf"), &ro, NULL) == XISFCONV_ERR_INDEX, "an image that is not there");
     ro.image = XISFCONV_ALL_IMAGES;
-    ro.codec = XISFCONV_CODEC_LZ4;
-    CHECK(xisfconv_rewrite(ctx, path_of("gray.xisf"), path_of("lz4.xisf"), &ro, NULL) == XISFCONV_ERR_UNSUPPORTED, "LZ4 is not written");
+    ro.codec = 77;
+    CHECK(xisfconv_rewrite(ctx, path_of("gray.xisf"), path_of("lz4.xisf"), &ro, NULL) == XISFCONV_ERR_ARGUMENT, "a codec that is none");
 
     /* verify */
     CHECK(xisfconv_verify(ctx, path_of("gray.xisf"), &report) == XISFCONV_OK && report, "verify");
@@ -1308,6 +1309,780 @@ static void test_carried_properties(xisfconv_context *ctx) {
     }
 }
 
+/* Properties from the caller's values, their values in the type of their elements, and what the
+ * writer learned with them: the LZ4 codecs, a compression level, no byte shuffling, the name of
+ * the program that writes (0.15). */
+enum { BW = 64, BH = 48, MANY = 600 };
+
+static uint16_t g_smooth[BW * BH];   /* compresses */
+
+static xisfconv_status write_smooth(xisfconv_context *ctx, const char *path, const xisfconv_write_options *options,
+                                    const xisfconv_keywords *kw, const xisfconv_properties *properties) {
+    xisfconv_writer *w = NULL;
+    xisfconv_image img;
+    xisfconv_status st = xisfconv_writer_new(ctx, path, options, &w);
+    if (st != XISFCONV_OK) return st;
+    xisfconv_image_init(&img, sizeof img);
+    img.pixels = g_smooth;
+    img.width = BW;
+    img.height = BH;
+    img.sample_format = XISFCONV_SAMPLE_UINT16;
+    img.name = "smooth";
+    img.keywords = kw;
+    img.properties = properties;
+    st = xisfconv_writer_add_image(w, &img);
+    if (st != XISFCONV_OK) {
+        xisfconv_writer_discard(w);
+        return st;
+    }
+    return xisfconv_writer_finish(w);
+}
+
+static int smooth_comes_back(xisfconv_context *ctx, const char *path) {
+    static uint16_t back[BW * BH];
+    xisfconv_file *f = NULL;
+    xisfconv_read_options ro;
+    int ok;
+    if (xisfconv_open(ctx, path, &f) != XISFCONV_OK || !f) return 0;
+    xisfconv_read_options_init(&ro, sizeof ro);
+    ro.row_order = XISFCONV_ROWS_TOP_DOWN;
+    memset(back, 0, sizeof back);
+    ok = xisfconv_read_pixels(f, 0, &ro, back, sizeof back) == XISFCONV_OK && memcmp(back, g_smooth, sizeof back) == 0;
+    xisfconv_close(f);
+    return ok;
+}
+
+/* The XML header of an XISF file, as text; NULL if it cannot be read. Valid until the next call. */
+static const char *header_of(const char *path) {
+    static char text[200000];
+    unsigned char head[16];
+    unsigned long length;
+    FILE *file = fopen(path, "rb");
+    text[0] = 0;
+    if (!file) return NULL;
+    if (fread(head, 1, 16, file) != 16 || memcmp(head, "XISF0100", 8) != 0) {
+        fclose(file);
+        return NULL;
+    }
+    length = (unsigned long)head[8] | ((unsigned long)head[9] << 8) | ((unsigned long)head[10] << 16) | ((unsigned long)head[11] << 24);
+    if (length >= sizeof text || fread(text, 1, length, file) != length) {
+        fclose(file);
+        return NULL;
+    }
+    fclose(file);
+    text[length] = 0;
+    return text;
+}
+
+/* Replaces the first `from` in a file by `to`, of the same length. 1 if it was found. */
+static int change_in_file(const char *path, const char *from, const char *to) {
+    static char data[4000000];
+    const size_t n = strlen(from);
+    size_t size, i;
+    FILE *file = fopen(path, "rb");
+    if (!file || strlen(to) != n) {
+        if (file) fclose(file);
+        return 0;
+    }
+    size = fread(data, 1, sizeof data, file);
+    fclose(file);
+    for (i = 0; i + n <= size; ++i)
+        if (memcmp(data + i, from, n) == 0) break;
+    if (i + n > size) return 0;
+    memcpy(data + i, to, n);
+    file = fopen(path, "wb");
+    if (!file) return 0;
+    i = fwrite(data, 1, size, file);
+    return fclose(file) == 0 && i == size;
+}
+
+/* The value of a property of an image (or of the file) that is not an array; NULL if it has none of that id. */
+static const char *property_text(xisfconv_file *f, size_t image, const char *wanted, const char *wanted_type) {
+    const char *type = NULL, *value = NULL;
+    int32_t block = -1;
+    const int64_t at = xisfconv_property_find(f, image, wanted);
+    if (at < 0 || xisfconv_property_get(f, image, (size_t)at, NULL, &type, &value, NULL, &block) != XISFCONV_OK) return NULL;
+    if (block != 0 || (wanted_type && strcmp(type, wanted_type) != 0)) return NULL;
+    return value;
+}
+
+static void test_given_properties(xisfconv_context *ctx) {
+    static const float vector[3] = {1.5f, -2.5f, 1e-20f};
+    static const int16_t table[6] = {-1, 2, -3, 4, -5, 32767};
+    static const double pairs[4] = {1.0, 2.0, -3.5, 0.25}; /* two complex numbers */
+    static const unsigned char bytes[2] = {7, 250};
+    static double many[MANY], many_back[MANY];
+    static char long_text[4001], header_text[3500];
+    xisfconv_properties *own = NULL, *whole = NULL, *solved = NULL, *odd = NULL;
+    xisfconv_keywords *kw = NULL;
+    xisfconv_write_options wo;
+    xisfconv_convert_options co;
+    xisfconv_rewrite_options ro;
+    xisfconv_rewrite_result rr;
+    xisfconv_writer *w = NULL;
+    xisfconv_file *f = NULL;
+    const char *id = NULL, *type = NULL, *value = NULL, *comment = NULL, *text;
+    int32_t block = -1, matrix = -1;
+    int64_t at;
+    size_t size = 0, rows = 0, columns = 0, count, i;
+    float vector_back[3];
+    int16_t table_back[6];
+    double pairs_back[4];
+    unsigned char bytes_back[2];
+    int k, x, y;
+    union {
+        xisfconv_image image;
+        unsigned char raw[sizeof(xisfconv_image)];
+    } older;
+    union {
+        xisfconv_write_options options;
+        unsigned char raw[sizeof(xisfconv_write_options)];
+    } older_options;
+
+    for (y = 0; y < BH; ++y)
+        for (x = 0; x < BW; ++x) g_smooth[y * BW + x] = (uint16_t)(2000 + 3 * y + x / 4);
+    for (i = 0; i < MANY; ++i) many[i] = 0.5 * (double)i;
+
+    /* the elements of the vector and matrix types */
+    CHECK(xisfconv_property_element("F32Vector", &matrix) == XISFCONV_ELEMENT_FLOAT32 && matrix == 0, "the element of a vector type");
+    CHECK(xisfconv_property_element("UI16Matrix", &matrix) == XISFCONV_ELEMENT_UINT16 && matrix == 1, "and of a matrix type");
+    CHECK(xisfconv_property_element("ByteArray", NULL) == XISFCONV_ELEMENT_UINT8 &&
+              xisfconv_property_element("C64Vector", NULL) == XISFCONV_ELEMENT_COMPLEX64 &&
+              xisfconv_property_element("Vector", NULL) == XISFCONV_ELEMENT_FLOAT64 &&
+              xisfconv_property_element("IMatrix", NULL) == XISFCONV_ELEMENT_INT32 &&
+              xisfconv_property_element("I64Vector", NULL) == XISFCONV_ELEMENT_INT64,
+          "the other names");
+    matrix = 5;
+    CHECK(xisfconv_property_element("String", &matrix) == XISFCONV_ELEMENT_NONE && matrix == 0 &&
+              xisfconv_property_element("", NULL) == XISFCONV_ELEMENT_NONE && xisfconv_property_element(NULL, NULL) == XISFCONV_ELEMENT_NONE &&
+              xisfconv_property_element("Float64", NULL) == XISFCONV_ELEMENT_NONE,
+          "a type that is not a vector or a matrix has no element");
+    CHECK(xisfconv_element_size(XISFCONV_ELEMENT_INT8) == 1 && xisfconv_element_size(XISFCONV_ELEMENT_UINT16) == 2 &&
+              xisfconv_element_size(XISFCONV_ELEMENT_FLOAT32) == 4 && xisfconv_element_size(XISFCONV_ELEMENT_UINT64) == 8 &&
+              xisfconv_element_size(XISFCONV_ELEMENT_COMPLEX32) == 8 && xisfconv_element_size(XISFCONV_ELEMENT_COMPLEX64) == 16 &&
+              xisfconv_element_size(XISFCONV_ELEMENT_NONE) == 0 && xisfconv_element_size(99) == 0,
+          "element sizes");
+
+    /* a list of properties */
+    CHECK(xisfconv_properties_new(ctx, &own) == XISFCONV_OK && own && xisfconv_properties_count(own) == 0, "a property list");
+    CHECK(xisfconv_properties_new(NULL, &whole) == XISFCONV_ERR_ARGUMENT && xisfconv_properties_new(ctx, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_count(NULL) == 0,
+          "what a list is not made of");
+    xisfconv_properties_free(NULL);
+    if (!own) return;
+    CHECK(xisfconv_properties_set(own, "Lab:Flag", "Boolean", "true", NULL, NULL) == XISFCONV_OK &&
+              xisfconv_properties_set(own, "Lab:Count", "Int32", "-5", "a count", "%d") == XISFCONV_OK &&
+              xisfconv_properties_set(own, "Lab:Byte", "UInt8", "255", NULL, NULL) == XISFCONV_OK &&
+              xisfconv_properties_set(own, "Lab:Low", "Int64", "-9223372036854775808", NULL, NULL) == XISFCONV_OK &&
+              xisfconv_properties_set(own, "Lab:High", "UInt64", "18446744073709551615", NULL, NULL) == XISFCONV_OK &&
+              xisfconv_properties_set(own, "Lab:Gain", "Float32", "0.25", NULL, "%.2f") == XISFCONV_OK &&
+              xisfconv_properties_set(own, "Lab:Nothing", "Float64", "nan", NULL, NULL) == XISFCONV_OK &&
+              xisfconv_properties_set(own, "Lab:Phase", "Complex64", "(1,-2.5)", NULL, NULL) == XISFCONV_OK &&
+              xisfconv_properties_set(own, "Lab:Name", "String", "caf\xC3\xA9 <&> \"au lait\"", NULL, NULL) == XISFCONV_OK &&
+              xisfconv_properties_set(own, "Lab:Lines", "String", "one\ntwo", NULL, NULL) == XISFCONV_OK &&
+              xisfconv_properties_set(own, "Lab:Empty", "String", "", NULL, NULL) == XISFCONV_OK &&
+              xisfconv_properties_set(own, "Lab:When", "TimePoint", "2026-10-06T18:30:00.250Z", NULL, NULL) == XISFCONV_OK &&
+              xisfconv_properties_set(own, "Lab:Day", "TimePoint", "2026-10-06", NULL, NULL) == XISFCONV_OK &&
+              xisfconv_properties_set(own, "Lab:Short", "Short", "-32768", NULL, NULL) == XISFCONV_OK &&
+              xisfconv_properties_count(own) == 14,
+          "scalars, strings and time points");
+    count = xisfconv_properties_count(own);
+    CHECK(xisfconv_properties_set(own, "X", "UInt8", "256", NULL, NULL) == XISFCONV_ERR_ARGUMENT && strstr(xisfconv_error_message(ctx), "UInt8") &&
+              xisfconv_properties_set(own, "X", "Int8", "-129", NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set(own, "X", "UInt16", "-1", NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set(own, "X", "Int64", "9223372036854775808", NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set(own, "X", "UInt64", "18446744073709551616", NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set(own, "X", "Int32", "1.5", NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set(own, "X", "Int32", "", NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set(own, "X", "Int32", " 5", NULL, NULL) == XISFCONV_ERR_ARGUMENT,
+          "a number the type does not hold");
+    CHECK(xisfconv_properties_set(own, "X", "Boolean", "yes", NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set(own, "X", "Float64", "much", NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set(own, "X", "Complex32", "(1;2)", NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set(own, "X", "Complex32", "1,2", NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set(own, "X", "TimePoint", "yesterday", NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set(own, "X", "TimePoint", "2026-10-06T18", NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set(own, "X", "String", "\xFF\xFE", NULL, NULL) == XISFCONV_ERR_ARGUMENT,
+          "a value that is not one of its type");
+    CHECK(xisfconv_properties_set(own, "X", "Boolean", "1", NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set(own, "X", "Boolean", "True", NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set(own, "X", "Float64", " 1.5 ", NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set(own, "X", "Float64", "0x10", NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set(own, "X", "Float64", "1e999", NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set(own, "X", "Float32", "1e39", NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set(own, "X", "Complex64", "(1, 2)", NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set(own, "X", "Complex32", "(1e39,0)", NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set(own, "X", "TimePoint", "2026-13-06", NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set(own, "X", "TimePoint", "2026-10-32", NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set(own, "X", "TimePoint", "2026-10-06T25:00:00", NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set(own, "X", "TimePoint", "2026-10-06T18:61:00", NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set(own, "X", "TimePoint", "2026-10-06Z", NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set(own, "X", "TimePoint", "2026-02-30", NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set(own, "X", "TimePoint", "2026-02-29T12:00:00Z", NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set(own, "X", "TimePoint", "1900-02-29", NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set(own, "X", "TimePoint", "2026-04-31", NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_count(own) == count,
+          "nor is one that only looks like it");
+    xisfconv_properties_new(ctx, &odd);
+    CHECK(xisfconv_properties_set(odd, "X", "Float32", "3.4028235e38", NULL, NULL) == XISFCONV_OK &&
+              xisfconv_properties_set(odd, "X", "Float32", "-inf", NULL, NULL) == XISFCONV_OK &&
+              xisfconv_properties_set(odd, "X", "TimePoint", "2024-02-29", NULL, NULL) == XISFCONV_OK &&
+              xisfconv_properties_set(odd, "X", "TimePoint", "2000-02-29T23:59:60Z", NULL, NULL) == XISFCONV_OK &&
+              xisfconv_properties_set(odd, "X", "TimePoint", "2026-10-06T18:30:00+02:00", NULL, NULL) == XISFCONV_OK &&
+              xisfconv_properties_count(odd) == 1,
+          "the largest number of a type, and a time with its zone");
+    /* what a file said is carried as it said it */
+    memset(long_text, 'a', sizeof long_text - 1);
+    long_text[sizeof long_text - 1] = 0;
+    CHECK(xisfconv_properties_set_as_read(odd, "Odd:Wide", "Float128", "1.5", "sixteen bytes", NULL, XISFCONV_PROPERTY_VALUE) == XISFCONV_OK &&
+              xisfconv_properties_set_as_read(odd, "Odd:Flag", "Boolean", "1", NULL, NULL, XISFCONV_PROPERTY_VALUE) == XISFCONV_OK &&
+              xisfconv_properties_set_as_read(odd, "Odd:Whole", "Float64", " 2000 ", NULL, "%.1f", XISFCONV_PROPERTY_VALUE) == XISFCONV_OK &&
+              xisfconv_properties_set_as_read(odd, "Odd:Kind", "Table", "what is this", NULL, NULL, XISFCONV_PROPERTY_VALUE) == XISFCONV_OK &&
+              xisfconv_properties_set(odd, "Odd:Long", "String", long_text, NULL, NULL) == XISFCONV_OK &&
+              xisfconv_properties_count(odd) == 6,
+          "properties as a file had them");
+    CHECK(xisfconv_properties_set_as_read(odd, "Y\x01", "Float64", "1", NULL, NULL, XISFCONV_PROPERTY_VALUE) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set_as_read(odd, "Y", "Float64", "1", "a\x01", NULL, XISFCONV_PROPERTY_VALUE) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set_as_read(odd, "Y", "F64Vector", "1 2", NULL, NULL, XISFCONV_PROPERTY_VALUE) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set_as_read(odd, "Y", "UI8Matrix", "", NULL, NULL, XISFCONV_PROPERTY_VALUE) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set_as_read(odd, "", "Float64", "1", NULL, NULL, XISFCONV_PROPERTY_VALUE) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set_as_read(odd, "Y", "Float64", NULL, NULL, NULL, XISFCONV_PROPERTY_VALUE) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set_as_read(NULL, "Y", "Float64", "1", NULL, NULL, XISFCONV_PROPERTY_VALUE) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_count(odd) == 6,
+          "but not an id or a comment that XML cannot hold, nor a vector as text");
+    /* where a text is kept: in the header as it is, or as data */
+    for (i = 0; i + 1 < sizeof header_text; ++i) header_text[i] = i % 50 == 48 ? '\r' : i % 50 == 49 ? '\n' : 'b';
+    header_text[sizeof header_text - 2] = 'b';
+    header_text[sizeof header_text - 1] = 0;
+    CHECK(xisfconv_properties_set_as_read(odd, "Odd:Header", "String", header_text, NULL, NULL, XISFCONV_PROPERTY_VALUE) == XISFCONV_OK &&
+              xisfconv_properties_set_as_read(odd, "Odd:Kept", "String", "one\r\ntwo", NULL, NULL, XISFCONV_PROPERTY_TEXT_BLOCK) ==
+                  XISFCONV_OK &&
+              xisfconv_properties_set(odd, "Odd:Lines", "String", "three\r\nfour", NULL, NULL) == XISFCONV_OK &&
+              xisfconv_properties_count(odd) == 9,
+          "a text of the header, a text that is kept as data, and a new one with a carriage return");
+    CHECK(xisfconv_properties_set_as_read(odd, "Y", "Float64", "1", NULL, NULL, XISFCONV_PROPERTY_TEXT_BLOCK) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set_as_read(odd, "Y", "String", "1", NULL, NULL, XISFCONV_PROPERTY_ARRAY) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set_as_read(odd, "Y", "String", "1", NULL, NULL, XISFCONV_PROPERTY_NONE) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set_as_read(odd, "Y", "String", "1", NULL, NULL, 99) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_count(odd) == 9,
+          "a storage a value does not have");
+    {
+        /* a property without a type, bytes that are no text, and texts with something at their ends */
+        xisfconv_properties *as_they_are = NULL;
+        xisfconv_properties_new(ctx, &as_they_are);
+        CHECK(xisfconv_properties_set_as_read(as_they_are, "Bare:NoType", "", "1", NULL, NULL, XISFCONV_PROPERTY_VALUE) == XISFCONV_OK &&
+                  xisfconv_properties_set_as_read(as_they_are, "Bare:Bytes", "String", "a\xFF\xFEz", NULL, NULL, XISFCONV_PROPERTY_TEXT_BLOCK) ==
+                      XISFCONV_OK &&
+                  xisfconv_properties_set_as_read(as_they_are, "Bare:Ends", "String", " line one\r\nline two\r\n", NULL, NULL,
+                                                  XISFCONV_PROPERTY_VALUE) == XISFCONV_OK &&
+                  xisfconv_properties_set_as_read(as_they_are, "Bare:Mac", "String", "one\rtwo", NULL, NULL, XISFCONV_PROPERTY_VALUE) ==
+                      XISFCONV_OK &&
+                  xisfconv_properties_set(as_they_are, "Bare:New", "String", " new, with blanks ", NULL, NULL) == XISFCONV_OK &&
+                  xisfconv_properties_set_as_read(as_they_are, "Bare:Bell", "Float64", "a\x01", NULL, NULL, XISFCONV_PROPERTY_VALUE) ==
+                      XISFCONV_OK &&
+                  xisfconv_properties_set_as_read(as_they_are, "Bare:Latin", "String", "caf\xE9", NULL, NULL, XISFCONV_PROPERTY_VALUE) ==
+                      XISFCONV_OK,
+              "what a file may say");
+        xisfconv_write_options_init(&wo, sizeof wo);
+        wo.overwrite = 1;
+        CHECK(write_smooth(ctx, path_of("bare.xisf"), &wo, NULL, as_they_are) == XISFCONV_OK &&
+                  (text = header_of(path_of("bare.xisf"))) != NULL && strstr(text, "<Property id=\"Bare:NoType\" type=\"\" value=\"1\"/>") &&
+                  strstr(text, "<Property id=\"Bare:Bytes\" type=\"String\" location=\"inline:base64\">Yf/+eg==</Property>") &&
+                  strstr(text, "<Property id=\"Bare:Ends\" type=\"String\"> line one\r\nline two\r\n</Property>") &&
+                  strstr(text, "<Property id=\"Bare:Mac\" type=\"String\">one\rtwo</Property>") &&
+                  strstr(text, "<Property id=\"Bare:New\" type=\"String\" location=\"inline:base64\">") &&
+                  strstr(text, "<Property id=\"Bare:Bell\" type=\"Float64\" value=\"a \"/>") &&
+                  strstr(text, "<Property id=\"Bare:Latin\" type=\"String\" location=\"inline:base64\">Y2Fm6Q==</Property>"),
+              "is written as the file said it: a text of the header with the bytes it had, a new one with blanks as data, "
+              "and what XML cannot hold as a conversion writes it");
+        f = NULL;
+        if (xisfconv_open(ctx, path_of("bare.xisf"), &f) == XISFCONV_OK && f) {
+            CHECK((text = property_text(f, 0, "Bare:Ends", "String")) != NULL && strcmp(text, " line one\r\nline two\r\n") == 0 &&
+                      (text = property_text(f, 0, "Bare:New", "String")) != NULL && strcmp(text, " new, with blanks ") == 0 &&
+                      xisfconv_property_stored(f, 0, (size_t)xisfconv_property_find(f, 0, "Bare:Ends")) == XISFCONV_PROPERTY_VALUE &&
+                      xisfconv_property_stored(f, 0, (size_t)xisfconv_property_find(f, 0, "Bare:New")) == XISFCONV_PROPERTY_TEXT_BLOCK,
+                  "and read again as it was");
+            xisfconv_close(f);
+        }
+        xisfconv_properties_free(as_they_are);
+    }
+    xisfconv_write_options_init(&wo, sizeof wo);
+    wo.overwrite = 1;
+    wo.codec = XISFCONV_CODEC_ZLIB;
+    CHECK(write_smooth(ctx, path_of("odd.xisf"), &wo, NULL, odd) == XISFCONV_OK, "are written");
+    f = NULL;
+    if (xisfconv_open(ctx, path_of("odd.xisf"), &f) == XISFCONV_OK && f) {
+        CHECK((text = property_text(f, 0, "Odd:Wide", "Float128")) != NULL && strcmp(text, "1.5") == 0 &&
+                  (text = property_text(f, 0, "Odd:Flag", "Boolean")) != NULL && strcmp(text, "1") == 0 &&
+                  (text = property_text(f, 0, "Odd:Whole", "Float64")) != NULL && strcmp(text, " 2000 ") == 0 &&
+                  (text = property_text(f, 0, "Odd:Kind", "Table")) != NULL && strcmp(text, "what is this") == 0 &&
+                  (text = property_text(f, 0, "Odd:Header", "String")) != NULL && strcmp(text, header_text) == 0 &&
+                  (text = property_text(f, 0, "Odd:Kept", "String")) != NULL && strcmp(text, "one\r\ntwo") == 0 &&
+                  (text = property_text(f, 0, "Odd:Lines", "String")) != NULL && strcmp(text, "three\r\nfour") == 0 &&
+                  xisfconv_property_count(f, 0) == 9,
+              "and are there as they were given");
+        at = xisfconv_property_find(f, 0, "Odd:Wide");
+        CHECK(at >= 0 && xisfconv_property_get(f, 0, (size_t)at, NULL, NULL, NULL, &comment, NULL) == XISFCONV_OK &&
+                  comment && strcmp(comment, "sixteen bytes") == 0,
+              "with their comments");
+        at = xisfconv_property_find(f, 0, "Odd:Long");
+        block = -1;
+        CHECK(at >= 0 && xisfconv_property_get(f, 0, (size_t)at, NULL, &type, &value, NULL, &block) == XISFCONV_OK &&
+                  strcmp(type, "String") == 0 && strcmp(value, long_text) == 0 && block == 0,
+              "a long text reads as any text");
+        CHECK(xisfconv_property_stored(f, 0, (size_t)at) == XISFCONV_PROPERTY_TEXT_BLOCK &&
+                  xisfconv_property_stored(f, 0, (size_t)xisfconv_property_find(f, 0, "Odd:Kept")) == XISFCONV_PROPERTY_TEXT_BLOCK &&
+                  xisfconv_property_stored(f, 0, (size_t)xisfconv_property_find(f, 0, "Odd:Lines")) == XISFCONV_PROPERTY_TEXT_BLOCK &&
+                  xisfconv_property_stored(f, 0, (size_t)xisfconv_property_find(f, 0, "Odd:Header")) == XISFCONV_PROPERTY_VALUE &&
+                  xisfconv_property_stored(f, 0, (size_t)xisfconv_property_find(f, 0, "Odd:Wide")) == XISFCONV_PROPERTY_VALUE &&
+                  xisfconv_property_stored(f, 0, 9) == XISFCONV_PROPERTY_NONE && xisfconv_property_stored(f, 7, 0) == XISFCONV_PROPERTY_NONE &&
+                  xisfconv_property_stored(NULL, 0, 0) == XISFCONV_PROPERTY_NONE,
+              "how each is stored");
+        xisfconv_close(f);
+        text = header_of(path_of("odd.xisf"));
+        CHECK(text && strstr(text, "id=\"Odd:Long\" type=\"String\" location=\"attachment:") && strstr(text, "compression=\"zlib:") &&
+                  !strstr(text, "aaaaaaaa"),
+              "and is a data block in the file, compressed with its codec");
+        CHECK(text && strstr(text, "<Property id=\"Odd:Header\" type=\"String\">bbbb") && strstr(text, "bbbb\r\nbbbb") &&
+                  strstr(text, "<Property id=\"Odd:Kept\" type=\"String\" location=\"inline:base64\">b25lDQp0d28=</Property>") &&
+                  strstr(text, "<Property id=\"Odd:Lines\" type=\"String\" location=\"inline:base64\">"),
+              "a text of the header stays there with its line ends, whatever its length; the two others are data");
+    } else {
+        CHECK(0, "open it");
+    }
+    xisfconv_properties_free(odd);
+    CHECK(xisfconv_properties_set_array(own, "X", "I16Matrix", NULL, 0, UINT64_MAX, 0, NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set_array(own, "X", "I16Matrix", NULL, 0, 0, (uint64_t)1 << 31, NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_count(own) == count,
+          "a matrix of more rows than can be counted, of no columns");
+    CHECK(xisfconv_properties_set(own, "X", "Table", "1", NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set(own, "X", "F64Vector", "1 2 3", NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set(own, "X", "", "1", NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set(own, "", "Int32", "1", NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set(own, "a\x01" "b", "Int32", "1", NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set(own, "X", "Int32", "1", "a\x02", NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set(own, NULL, "Int32", "1", NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set(own, "X", NULL, "1", NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set(own, "X", "Int32", NULL, NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set(NULL, "X", "Int32", "1", NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_count(own) == count,
+          "what is not a property, and nothing of it is kept");
+    CHECK(xisfconv_properties_set(own, "Lab:Count", "Int32", "7", "counted again", NULL) == XISFCONV_OK &&
+              xisfconv_properties_count(own) == count,
+          "an id that is set again replaces the property");
+    CHECK(xisfconv_properties_set_array(own, "Lab:Vector", "F32Vector", vector, sizeof vector, 3, 0, "three numbers", NULL) == XISFCONV_OK &&
+              xisfconv_properties_set_array(own, "Lab:Table", "I16Matrix", table, sizeof table, 2, 3, NULL, NULL) == XISFCONV_OK &&
+              xisfconv_properties_set_array(own, "Lab:Pairs", "C64Vector", pairs, sizeof pairs, 2, 0, NULL, NULL) == XISFCONV_OK &&
+              xisfconv_properties_set_array(own, "Lab:Bytes", "ByteArray", bytes, sizeof bytes, 2, 0, NULL, NULL) == XISFCONV_OK &&
+              xisfconv_properties_set_array(own, "Lab:Many", "F64Vector", many, sizeof many, MANY, 0, NULL, NULL) == XISFCONV_OK &&
+              xisfconv_properties_set_array(own, "Lab:None", "UI32Vector", NULL, 0, 0, 0, NULL, NULL) == XISFCONV_OK &&
+              xisfconv_properties_count(own) == count + 6,
+          "vectors and matrices");
+    count = xisfconv_properties_count(own);
+    CHECK(xisfconv_properties_set_array(own, "X", "F32Vector", vector, sizeof vector, 2, 0, NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set_array(own, "X", "F32Vector", vector, sizeof vector - 1, 3, 0, NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set_array(own, "X", "F32Vector", vector, sizeof vector, 3, 1, NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set_array(own, "X", "I16Matrix", table, sizeof table, 2, 2, NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set_array(own, "X", "I16Matrix", table, sizeof table, (uint64_t)1 << 63, 4, NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set_array(own, "X", "Float64", many, 8, 1, 0, NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set_array(own, "X", "F64Vector", NULL, 8, 1, 0, NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set_array(own, NULL, "F64Vector", many, 8, 1, 0, NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set_array(NULL, "X", "F64Vector", many, 8, 1, 0, NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_count(own) == count,
+          "what is not a vector or a matrix");
+
+    /* written to XISF: LZ4HC at its highest level, without byte shuffling, by a program with a name */
+    xisfconv_properties_new(ctx, &whole);
+    CHECK(xisfconv_properties_set(whole, "Note:Author", "String", "somebody", NULL, NULL) == XISFCONV_OK &&
+              xisfconv_properties_set(whole, "XISF:CreatorOS", "String", "an abacus", NULL, NULL) == XISFCONV_OK &&
+              xisfconv_properties_set(whole, "XISF:BlockAlignmentSize", "UInt16", "1", NULL, NULL) == XISFCONV_OK,
+          "properties of the file");
+    xisfconv_write_options_init(&wo, sizeof wo);
+    CHECK(wo.shuffle == 1 && wo.compression_level == 0 && wo.properties == NULL && wo.creator_application == NULL,
+          "the defaults of what is new in the write options");
+    wo.overwrite = 1;
+    wo.codec = XISFCONV_CODEC_LZ4HC;
+    wo.compression_level = 12;
+    wo.shuffle = 0;
+    wo.properties = whole;
+    wo.creator_application = "  capi test 1.0 ";
+    CHECK(write_smooth(ctx, path_of("given.xisf"), &wo, NULL, own) == XISFCONV_OK, "an image with properties");
+    CHECK(xisfconv_open(ctx, path_of("given.xisf"), &f) == XISFCONV_OK && f, "open it");
+    if (f) {
+        CHECK(xisfconv_property_count(f, 0) == count, "every property is there");
+        CHECK(xisfconv_property_get(f, 0, 0, &id, &type, &value, &comment, &block) == XISFCONV_OK && strcmp(id, "Lab:Flag") == 0 &&
+                  strcmp(type, "Boolean") == 0 && strcmp(value, "true") == 0 && block == 0,
+              "in the order they were set in");
+        at = xisfconv_property_find(f, 0, "Lab:Count");
+        CHECK(at == 1 && xisfconv_property_get(f, 0, 1, NULL, &type, &value, &comment, NULL) == XISFCONV_OK && strcmp(type, "Int32") == 0 &&
+                  strcmp(value, "7") == 0 && strcmp(comment, "counted again") == 0 && *xisfconv_property_format(f, 0, 1) == 0,
+              "the one that was replaced, in its place");
+        text = property_text(f, 0, "Lab:Gain", "Float32");
+        at = xisfconv_property_find(f, 0, "Lab:Gain");
+        CHECK(text && strcmp(text, "0.25") == 0 && at >= 0 && strcmp(xisfconv_property_format(f, 0, (size_t)at), "%.2f") == 0, "a format");
+        CHECK((text = property_text(f, 0, "Lab:Low", "Int64")) != NULL && strcmp(text, "-9223372036854775808") == 0 &&
+                  (text = property_text(f, 0, "Lab:High", "UInt64")) != NULL && strcmp(text, "18446744073709551615") == 0 &&
+                  (text = property_text(f, 0, "Lab:Nothing", "Float64")) != NULL && strcmp(text, "nan") == 0 &&
+                  (text = property_text(f, 0, "Lab:Phase", "Complex64")) != NULL && strcmp(text, "(1,-2.5)") == 0 &&
+                  (text = property_text(f, 0, "Lab:Short", "Short")) != NULL && strcmp(text, "-32768") == 0,
+              "numbers as they were given");
+        CHECK((text = property_text(f, 0, "Lab:Name", "String")) != NULL && strcmp(text, "caf\xC3\xA9 <&> \"au lait\"") == 0 &&
+                  (text = property_text(f, 0, "Lab:Lines", "String")) != NULL && strcmp(text, "one\ntwo") == 0 &&
+                  (text = property_text(f, 0, "Lab:Empty", "String")) != NULL && *text == 0 &&
+                  (text = property_text(f, 0, "Lab:When", "TimePoint")) != NULL && strcmp(text, "2026-10-06T18:30:00.250Z") == 0,
+              "text and time");
+
+        /* arrays in the type of their elements */
+        at = xisfconv_property_find(f, 0, "Lab:Vector");
+        CHECK(at >= 0 && xisfconv_property_get(f, 0, (size_t)at, NULL, &type, &value, &comment, &block) == XISFCONV_OK && block == 1 &&
+                  strcmp(type, "F32Vector") == 0 && strcmp(comment, "three numbers") == 0,
+              "a vector is a data block");
+        CHECK(at >= 0 && xisfconv_property_stored(f, 0, (size_t)at) == XISFCONV_PROPERTY_ARRAY &&
+                  xisfconv_property_stored(f, 0, (size_t)xisfconv_property_find(f, 0, "Lab:Lines")) == XISFCONV_PROPERTY_VALUE &&
+                  xisfconv_property_stored(f, XISFCONV_FILE_PROPERTIES, 0) == XISFCONV_PROPERTY_VALUE,
+              "and is stored as an array; a text and a property of the file as values");
+        CHECK(at >= 0 && xisfconv_property_read(f, 0, (size_t)at, NULL, 0, &size, &rows, &columns) == XISFCONV_OK && size == sizeof vector &&
+                  rows == 1 && columns == 3,
+              "its size and shape");
+        CHECK(at >= 0 && xisfconv_property_read(f, 0, (size_t)at, vector_back, sizeof vector_back - 1, NULL, NULL, NULL) == XISFCONV_ERR_BUFFER,
+              "a buffer that is too small");
+        memset(vector_back, 0, sizeof vector_back);
+        CHECK(at >= 0 && xisfconv_property_read(f, 0, (size_t)at, vector_back, sizeof vector_back, &size, NULL, NULL) == XISFCONV_OK &&
+                  memcmp(vector_back, vector, sizeof vector) == 0,
+              "its elements as 32-bit numbers");
+        at = xisfconv_property_find(f, 0, "Lab:Table");
+        memset(table_back, 0, sizeof table_back);
+        CHECK(at >= 0 && xisfconv_property_read(f, 0, (size_t)at, table_back, sizeof table_back, &size, &rows, &columns) == XISFCONV_OK &&
+                  size == sizeof table && rows == 2 && columns == 3 && memcmp(table_back, table, sizeof table) == 0,
+              "a matrix of 16-bit integers, read in one call");
+        at = xisfconv_property_find(f, 0, "Lab:Pairs");
+        CHECK(at >= 0 && xisfconv_property_read(f, 0, (size_t)at, pairs_back, sizeof pairs_back, &size, &rows, &columns) == XISFCONV_OK &&
+                  size == sizeof pairs && rows == 1 && columns == 2 && memcmp(pairs_back, pairs, sizeof pairs) == 0,
+              "complex numbers");
+        CHECK(xisfconv_property_read_f64(f, 0, "Lab:Pairs", NULL, 0, &rows, &columns) == XISFCONV_ERR_UNSUPPORTED,
+              "which are not read as doubles");
+        at = xisfconv_property_find(f, 0, "Lab:Bytes");
+        CHECK(at >= 0 && xisfconv_property_read(f, 0, (size_t)at, bytes_back, sizeof bytes_back, &size, NULL, &columns) == XISFCONV_OK &&
+                  size == 2 && columns == 2 && memcmp(bytes_back, bytes, 2) == 0,
+              "bytes");
+        at = xisfconv_property_find(f, 0, "Lab:Many");
+        CHECK(at >= 0 && xisfconv_property_read(f, 0, (size_t)at, many_back, sizeof many_back, &size, &rows, &columns) == XISFCONV_OK &&
+                  size == sizeof many && columns == MANY && memcmp(many_back, many, sizeof many) == 0,
+              "a vector that is attached to the file");
+        at = xisfconv_property_find(f, 0, "Lab:None");
+        size = 5;
+        CHECK(at >= 0 && xisfconv_property_read(f, 0, (size_t)at, many_back, sizeof many_back, &size, &rows, &columns) == XISFCONV_OK &&
+                  size == 0 && columns == 0,
+              "a vector of nothing");
+        CHECK(xisfconv_property_read(f, 0, 0, many_back, sizeof many_back, &size, NULL, NULL) == XISFCONV_ERR_NOT_FOUND &&
+                  xisfconv_property_read(f, 0, 9999, NULL, 0, &size, NULL, NULL) == XISFCONV_ERR_INDEX &&
+                  xisfconv_property_read(f, 5, 0, NULL, 0, &size, NULL, NULL) == XISFCONV_ERR_INDEX &&
+                  xisfconv_property_read(NULL, 0, 0, NULL, 0, &size, NULL, NULL) == XISFCONV_ERR_ARGUMENT,
+              "what is not a vector or a matrix, and what is not there");
+
+        /* the file: its own properties, the writer's, and how it is stored */
+        CHECK((text = property_text(f, XISFCONV_FILE_PROPERTIES, "Note:Author", "String")) != NULL && strcmp(text, "somebody") == 0,
+              "a property of the file");
+        CHECK(xisfconv_property_find(f, XISFCONV_FILE_PROPERTIES, "XISF:CreatorOS") == -1 &&
+                  (text = property_text(f, XISFCONV_FILE_PROPERTIES, "XISF:BlockAlignmentSize", "UInt16")) != NULL && strcmp(text, "4096") == 0,
+              "the properties that describe the storage are the writer's own");
+        CHECK((text = property_text(f, XISFCONV_FILE_PROPERTIES, "XISF:CreatorApplication", "String")) != NULL &&
+                  strcmp(text, "capi test 1.0") == 0 &&
+                  (text = property_text(f, XISFCONV_FILE_PROPERTIES, "XISF:CreatorModule", "String")) != NULL &&
+                  strncmp(text, "xisfconv ", 9) == 0,
+              "the program that wrote the file, and the library");
+        CHECK((text = property_text(f, XISFCONV_FILE_PROPERTIES, "XISF:CompressionCodecs", "String")) != NULL && strcmp(text, "lz4hc") == 0 &&
+                  xisfconv_property_find(f, XISFCONV_FILE_PROPERTIES, "XISF:CompressionLevel") == -1,
+              "the codec; its level is not named (XISF:CompressionLevel is no level of a codec)");
+        CHECK(strncmp(xisfconv_image_detail(f, 0, "compression"), "lz4hc:", 6) == 0, "LZ4HC without byte shuffling");
+        xisfconv_close(f);
+        f = NULL;
+    }
+    CHECK(smooth_comes_back(ctx, path_of("given.xisf")), "the pixels come back from LZ4HC");
+
+    /* the same to FITS and to ASDF, and from there to XISF */
+    for (k = 0; k < 2; ++k) {
+        const char *carrier = path_of(k ? "given.asdf" : "given.fits");
+        xisfconv_write_options_init(&wo, sizeof wo);
+        wo.overwrite = 1;
+        wo.properties = whole;
+        wo.compression_level = 99;   /* (of XISF: means nothing here) */
+        CHECK(write_smooth(ctx, carrier, &wo, NULL, own) == XISFCONV_OK, k ? "to ASDF" : "to FITS");
+        f = NULL;
+        CHECK(xisfconv_open(ctx, carrier, &f) == XISFCONV_OK && f && xisfconv_property_count(f, 0) == count &&
+                  xisfconv_property_count(f, XISFCONV_FILE_PROPERTIES) == 1,
+              "the file carries them");
+        if (f) {
+            at = xisfconv_property_find(f, 0, "Lab:Table");
+            memset(table_back, 0, sizeof table_back);
+            CHECK(at >= 0 && xisfconv_property_read(f, 0, (size_t)at, table_back, sizeof table_back, &size, &rows, &columns) == XISFCONV_OK &&
+                      rows == 2 && columns == 3 && memcmp(table_back, table, sizeof table) == 0,
+                  "a matrix from there");
+            CHECK(at >= 0 && xisfconv_property_stored(f, 0, (size_t)at) == XISFCONV_PROPERTY_ARRAY &&
+                      xisfconv_property_stored(f, 0, (size_t)xisfconv_property_find(f, 0, "Lab:Count")) == XISFCONV_PROPERTY_VALUE &&
+                      xisfconv_property_stored(f, 0, 9999) == XISFCONV_PROPERTY_NONE,
+                  "stored as an array there too");
+            CHECK(xisfconv_property_read(f, 0, 0, NULL, 0, &size, NULL, NULL) == XISFCONV_ERR_NOT_FOUND &&
+                      xisfconv_property_read(f, 0, 9999, NULL, 0, &size, NULL, NULL) == XISFCONV_ERR_INDEX,
+                  "and what is not one");
+            xisfconv_close(f);
+        }
+        xisfconv_convert_options_init(&co, sizeof co);
+        co.overwrite = 1;
+        co.codec = XISFCONV_CODEC_LZ4;
+        CHECK(xisfconv_convert(ctx, carrier, path_of("given-back.xisf"), &co) == XISFCONV_OK, "and back to XISF, with LZ4");
+        f = NULL;
+        CHECK(xisfconv_open(ctx, path_of("given-back.xisf"), &f) == XISFCONV_OK && f && xisfconv_property_count(f, 0) == count &&
+                  (text = property_text(f, 0, "Lab:When", "TimePoint")) != NULL && strcmp(text, "2026-10-06T18:30:00.250Z") == 0 &&
+                  (text = property_text(f, XISFCONV_FILE_PROPERTIES, "Note:Author", "String")) != NULL && strcmp(text, "somebody") == 0 &&
+                  strncmp(xisfconv_image_detail(f, 0, "compression"), "lz4+sh:", 7) == 0,
+              "they are the properties again");
+        xisfconv_close(f);
+        CHECK(smooth_comes_back(ctx, path_of("given-back.xisf")), "the pixels come back from LZ4");
+    }
+
+    /* an astrometric solution: made from WCS keywords unless the caller brings one */
+    xisfconv_keywords_new(ctx, &kw);
+    xisfconv_keywords_append_string(kw, "CTYPE1", "RA---TAN", NULL);
+    xisfconv_keywords_append_string(kw, "CTYPE2", "DEC--TAN", NULL);
+    xisfconv_keywords_append_number(kw, "CRVAL1", 10.5, NULL);
+    xisfconv_keywords_append_number(kw, "CRVAL2", 41.25, NULL);
+    xisfconv_keywords_append_number(kw, "CRPIX1", 4.0, NULL);
+    xisfconv_keywords_append_number(kw, "CRPIX2", 2.0, NULL);
+    xisfconv_keywords_append_number(kw, "CD1_1", -0.0003, NULL);
+    xisfconv_keywords_append_number(kw, "CD1_2", 0.00001, NULL);
+    xisfconv_keywords_append_number(kw, "CD2_1", 0.00002, NULL);
+    xisfconv_keywords_append_number(kw, "CD2_2", 0.0003, NULL);
+    xisfconv_write_options_init(&wo, sizeof wo);
+    wo.overwrite = 1;
+    CHECK(write_smooth(ctx, path_of("made.xisf"), &wo, kw, own) == XISFCONV_OK, "properties and WCS keywords");
+    f = NULL;
+    if (xisfconv_open(ctx, path_of("made.xisf"), &f) == XISFCONV_OK && f) {
+        CHECK((text = property_text(f, 0, "PCL:AstrometricSolution:ProjectionSystem", "String")) != NULL && strcmp(text, "Gnomonic") == 0 &&
+                  xisfconv_property_count(f, 0) > count && property_text(f, 0, "Lab:Gain", "Float32") != NULL,
+              "the solution is made from the keywords, and the properties are written with it");
+        xisfconv_close(f);
+    } else {
+        CHECK(0, "open it");
+    }
+    wo.wcs = 0;
+    CHECK(write_smooth(ctx, path_of("made.xisf"), &wo, kw, own) == XISFCONV_OK, "the same without a solution");
+    f = NULL;
+    if (xisfconv_open(ctx, path_of("made.xisf"), &f) == XISFCONV_OK && f) {
+        CHECK(xisfconv_property_count(f, 0) == count, "the properties alone");
+        xisfconv_close(f);
+    }
+    xisfconv_properties_new(ctx, &solved);
+    xisfconv_properties_set(solved, "PCL:AstrometricSolution:ProjectionSystem", "String", "Mercator", NULL, NULL);
+    xisfconv_properties_set(solved, "Lab:Gain", "Float32", "0.5", NULL, NULL);
+    wo.wcs = 1;
+    CHECK(write_smooth(ctx, path_of("brought.xisf"), &wo, kw, solved) == XISFCONV_OK, "a solution among the properties");
+    f = NULL;
+    if (xisfconv_open(ctx, path_of("brought.xisf"), &f) == XISFCONV_OK && f) {
+        CHECK(xisfconv_property_count(f, 0) == 2 &&
+                  (text = property_text(f, 0, "PCL:AstrometricSolution:ProjectionSystem", "String")) != NULL && strcmp(text, "Mercator") == 0,
+              "is written as it is given, and none is made");
+        xisfconv_close(f);
+    }
+    /* through FITS it stays the solution of these keywords */
+    CHECK(write_smooth(ctx, path_of("brought.fits"), &wo, kw, solved) == XISFCONV_OK, "the same to FITS");
+    xisfconv_convert_options_init(&co, sizeof co);
+    co.overwrite = 1;
+    CHECK(xisfconv_convert(ctx, path_of("brought.fits"), path_of("brought-back.xisf"), &co) == XISFCONV_OK, "and to XISF");
+    f = NULL;
+    if (xisfconv_open(ctx, path_of("brought-back.xisf"), &f) == XISFCONV_OK && f) {
+        CHECK(xisfconv_property_count(f, 0) == 2 &&
+                  (text = property_text(f, 0, "PCL:AstrometricSolution:ProjectionSystem", "String")) != NULL && strcmp(text, "Mercator") == 0,
+              "the solution the caller brought comes back");
+        xisfconv_close(f);
+    }
+    CHECK(smooth_comes_back(ctx, path_of("brought-back.xisf")), "with the pixels");
+    f = NULL;
+    if (xisfconv_open(ctx, path_of("brought.fits"), &f) == XISFCONV_OK && f) {
+        CHECK(strcmp(xisfconv_image_detail(f, 0, "carriedSolution"), "current") == 0, "the FITS file says the solution is that of its keywords");
+        xisfconv_close(f);
+    }
+    f = NULL;
+    if (xisfconv_open(ctx, path_of("brought-back.xisf"), &f) == XISFCONV_OK && f) {
+        CHECK(strcmp(xisfconv_image_detail(f, 0, "carriedSolution"), "") == 0, "an XISF file carries none: it has it");
+        xisfconv_close(f);
+    }
+    /* the keywords are changed by another program: the solution is no longer theirs */
+    CHECK(change_in_file(path_of("brought.fits"), "CRVAL1  =                 10.5", "CRVAL1  =                 11.5"),
+          "another reference value");
+    f = NULL;
+    if (xisfconv_open(ctx, path_of("brought.fits"), &f) == XISFCONV_OK && f) {
+        CHECK(strcmp(xisfconv_image_detail(f, 0, "carriedSolution"), "stale") == 0 &&
+                  (text = property_text(f, 0, "PCL:AstrometricSolution:ProjectionSystem", "String")) != NULL && strcmp(text, "Mercator") == 0,
+              "the solution is stale, and still there to be read");
+        xisfconv_close(f);
+    }
+    CHECK(xisfconv_convert(ctx, path_of("brought.fits"), path_of("brought-back.xisf"), &co) == XISFCONV_OK, "to XISF again");
+    f = NULL;
+    if (xisfconv_open(ctx, path_of("brought-back.xisf"), &f) == XISFCONV_OK && f) {
+        CHECK((text = property_text(f, 0, "PCL:AstrometricSolution:ProjectionSystem", "String")) != NULL && strcmp(text, "Gnomonic") == 0 &&
+                  (text = property_text(f, 0, "Lab:Gain", "Float32")) != NULL && strcmp(text, "0.5") == 0,
+              "the solution is made from the keywords as they are now, and the other properties stay");
+        xisfconv_close(f);
+    }
+    /* without one, a conversion of the FITS file makes it from the keywords */
+    CHECK(write_smooth(ctx, path_of("plainly.fits"), &wo, kw, own) == XISFCONV_OK &&
+              xisfconv_convert(ctx, path_of("plainly.fits"), path_of("plainly-back.xisf"), &co) == XISFCONV_OK,
+          "properties without a solution, through FITS");
+    f = NULL;
+    if (xisfconv_open(ctx, path_of("plainly-back.xisf"), &f) == XISFCONV_OK && f) {
+        CHECK((text = property_text(f, 0, "PCL:AstrometricSolution:ProjectionSystem", "String")) != NULL && strcmp(text, "Gnomonic") == 0 &&
+                  property_text(f, 0, "Lab:Gain", "Float32") != NULL,
+              "get a solution from the keywords there");
+        xisfconv_close(f);
+    }
+    f = NULL;
+    if (xisfconv_open(ctx, path_of("plainly.fits"), &f) == XISFCONV_OK && f) {
+        CHECK(strcmp(xisfconv_image_detail(f, 0, "carriedSolution"), "") == 0, "properties without a solution carry none");
+        xisfconv_close(f);
+    }
+    {
+        /* the digest a program compares for itself */
+        char first[200];
+        const char *digest = NULL;
+        CHECK(xisfconv_wcs_digest(kw, BW, BH, XISFCONV_ROWS_DEFAULT, &digest) == XISFCONV_OK && digest && strlen(digest) > 8 &&
+                  strlen(digest) < sizeof first,
+              "the digest of WCS keywords");
+        first[0] = 0;
+        if (digest && strlen(digest) < sizeof first) strcpy(first, digest);
+        CHECK(xisfconv_wcs_digest(kw, BW, BH, XISFCONV_ROWS_BOTTOM_UP, &digest) == XISFCONV_OK && strcmp(digest, first) == 0,
+              "bottom-up is the usual order");
+        CHECK(xisfconv_wcs_digest(kw, BW, BH, XISFCONV_ROWS_TOP_DOWN, &digest) == XISFCONV_OK && strcmp(digest, first) != 0 &&
+                  xisfconv_wcs_digest(kw, BW + 1, BH, XISFCONV_ROWS_DEFAULT, &digest) == XISFCONV_OK && strcmp(digest, first) != 0 &&
+                  xisfconv_wcs_digest(kw, BW, BH - 1, XISFCONV_ROWS_DEFAULT, &digest) == XISFCONV_OK && strcmp(digest, first) != 0,
+              "another row order or size is another digest");
+        xisfconv_keywords_append_string(kw, "OBJECT", "M 31", "not of the WCS");
+        CHECK(xisfconv_wcs_digest(kw, BW, BH, XISFCONV_ROWS_DEFAULT, &digest) == XISFCONV_OK && strcmp(digest, first) == 0,
+              "a keyword that says nothing of the WCS does not change it");
+        xisfconv_keywords_append_number(kw, "CROTA2", 1.0, NULL);
+        CHECK(xisfconv_wcs_digest(kw, BW, BH, XISFCONV_ROWS_DEFAULT, &digest) == XISFCONV_OK && strcmp(digest, first) != 0,
+              "one that does, does");
+        CHECK(xisfconv_wcs_digest(NULL, BW, BH, XISFCONV_ROWS_DEFAULT, &digest) == XISFCONV_ERR_ARGUMENT &&
+                  xisfconv_wcs_digest(kw, BW, BH, XISFCONV_ROWS_DEFAULT, NULL) == XISFCONV_ERR_ARGUMENT,
+              "what has no digest");
+    }
+    xisfconv_keywords_free(kw);
+    xisfconv_properties_free(solved);
+
+    /* text of keywords beyond ASCII: XISF keeps it, a FITS card has no place for it */
+    kw = NULL;
+    xisfconv_keywords_new(ctx, &kw);
+    CHECK(xisfconv_keywords_append_string(kw, "OBSERVER", "J\xC3\xBCrgen", "at 20\xC2\xB0") == XISFCONV_OK, "a name with an umlaut");
+    xisfconv_write_options_init(&wo, sizeof wo);
+    wo.overwrite = 1;
+    CHECK(write_smooth(ctx, path_of("umlaut.xisf"), &wo, kw, NULL) == XISFCONV_OK &&
+              (text = header_of(path_of("umlaut.xisf"))) != NULL && strstr(text, "J\xC3\xBCrgen") && strstr(text, "at 20\xC2\xB0\""),
+          "is written to XISF as it is");
+    CHECK(write_smooth(ctx, path_of("umlaut.fits"), &wo, kw, NULL) == XISFCONV_OK, "and to FITS");
+    f = NULL;
+    if (xisfconv_open(ctx, path_of("umlaut.fits"), &f) == XISFCONV_OK && f) {
+        const xisfconv_keywords *have = NULL;
+        int64_t where = -1;
+        if (xisfconv_image_keywords(f, 0, &have) == XISFCONV_OK) where = xisfconv_keywords_find(have, "OBSERVER");
+        text = NULL;
+        CHECK(where >= 0 && xisfconv_keywords_get_text(have, (size_t)where, &text) == XISFCONV_OK && text && strcmp(text, "J?rgen") == 0,
+              "where each character that is not ASCII is a question mark");
+        xisfconv_close(f);
+    } else {
+        CHECK(0, "open it");
+    }
+    xisfconv_keywords_free(kw);
+
+    /* the options of the writer */
+    xisfconv_write_options_init(&wo, sizeof wo);
+    wo.overwrite = 1;
+    wo.codec = XISFCONV_CODEC_ZLIB;
+    wo.compression_level = 10;
+    CHECK(xisfconv_writer_new(ctx, path_of("level.xisf"), &wo, &w) == XISFCONV_ERR_ARGUMENT && w == NULL &&
+              strstr(xisfconv_error_message(ctx), "1 to 9"),
+          "a level zlib does not have");
+    wo.compression_level = -1;
+    CHECK(xisfconv_writer_new(ctx, path_of("level.xisf"), &wo, &w) == XISFCONV_ERR_ARGUMENT, "a level below the first");
+    wo.codec = XISFCONV_CODEC_LZ4;
+    wo.compression_level = 3;
+    CHECK(xisfconv_writer_new(ctx, path_of("level.xisf"), &wo, &w) == XISFCONV_ERR_ARGUMENT, "LZ4 has no levels");
+    wo.codec = XISFCONV_CODEC_NONE;
+    CHECK(xisfconv_writer_new(ctx, path_of("level.xisf"), &wo, &w) == XISFCONV_ERR_ARGUMENT, "a level without a codec");
+    wo.codec = XISFCONV_CODEC_LZ4HC;
+    wo.compression_level = 13;
+    CHECK(xisfconv_writer_new(ctx, path_of("level.xisf"), &wo, &w) == XISFCONV_ERR_ARGUMENT, "a level LZ4HC does not have");
+    wo.compression_level = 1;
+    wo.creator_application = "two\nlines";
+    CHECK(xisfconv_writer_new(ctx, path_of("level.xisf"), &wo, &w) == XISFCONV_ERR_ARGUMENT && w == NULL, "a name of two lines is not one");
+    wo.creator_application = "caf\xFF";
+    CHECK(xisfconv_writer_new(ctx, path_of("level.xisf"), &wo, &w) == XISFCONV_ERR_ARGUMENT && w == NULL, "nor is one that is not UTF-8");
+    wo.creator_application = "   ";
+    CHECK(write_smooth(ctx, path_of("level.xisf"), &wo, NULL, NULL) == XISFCONV_OK && smooth_comes_back(ctx, path_of("level.xisf")),
+          "LZ4HC at its first level, and a name of blanks is none");
+    f = NULL;
+    if (xisfconv_open(ctx, path_of("level.xisf"), &f) == XISFCONV_OK && f) {
+        CHECK((text = property_text(f, XISFCONV_FILE_PROPERTIES, "XISF:CreatorApplication", "String")) != NULL &&
+                  strncmp(text, "xisfconv ", 9) == 0 && xisfconv_property_find(f, XISFCONV_FILE_PROPERTIES, "XISF:CreatorModule") == -1 &&
+                  strncmp(xisfconv_image_detail(f, 0, "compression"), "lz4hc+sh:", 9) == 0,
+              "the library names itself, and shuffles the bytes");
+        xisfconv_close(f);
+    }
+    CHECK(file_exists(path_of("level.xisf")) && !file_exists(path_of("level.xisf.part")), "no temporary file is left");
+    xisfconv_write_options_init(&wo, sizeof wo);
+    wo.overwrite = 1;
+    wo.codec = XISFCONV_CODEC_LZ4;
+    CHECK(write_smooth(ctx, path_of("lz4.fits"), &wo, NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              write_smooth(ctx, path_of("lz4.asdf"), &wo, NULL, NULL) == XISFCONV_ERR_ARGUMENT && !file_exists(path_of("lz4.asdf")),
+          "LZ4 is for XISF");
+
+    /* rewriting with LZ4 */
+    xisfconv_write_options_init(&wo, sizeof wo);
+    wo.overwrite = 1;
+    CHECK(write_smooth(ctx, path_of("plain-smooth.xisf"), &wo, NULL, own) == XISFCONV_OK, "an uncompressed file");
+    xisfconv_rewrite_options_init(&ro, sizeof ro);
+    xisfconv_rewrite_result_init(&rr, sizeof rr);
+    ro.overwrite = 1;
+    for (k = 0; k < 2; ++k) {
+        int32_t same = -1;
+        ro.codec = k ? XISFCONV_CODEC_LZ4HC : XISFCONV_CODEC_LZ4;
+        CHECK(xisfconv_rewrite(ctx, path_of("plain-smooth.xisf"), path_of("rewritten.xisf"), &ro, &rr) == XISFCONV_OK && rr.changed == 1 &&
+                  rr.compressed >= 1 && rr.read_back == 1 && rr.output_size < rr.input_size,
+              k ? "rewritten with LZ4HC" : "rewritten with LZ4");
+        CHECK(xisfconv_stored_as_requested(ctx, path_of("rewritten.xisf"), &ro, &same) == XISFCONV_OK && same == 1 &&
+                  smooth_comes_back(ctx, path_of("rewritten.xisf")),
+              "and stored that way");
+    }
+
+    /* a program built against 0.14: its structs end where they ended then */
+    memset(&older, 0xEE, sizeof older);
+    xisfconv_image_init(&older.image, offsetof(xisfconv_image, reserved));
+    CHECK(older.image.struct_size == offsetof(xisfconv_image, reserved) && older.raw[offsetof(xisfconv_image, reserved)] == 0xEE,
+          "an image of the size of 0.14");
+    older.image.struct_size = offsetof(xisfconv_image, properties);   /* (with its padding, as sizeof gave it) */
+    older.image.pixels = g_smooth;
+    older.image.width = BW;
+    older.image.height = BH;
+    older.image.sample_format = XISFCONV_SAMPLE_UINT16;
+    memset(&older_options, 0xEE, sizeof older_options);
+    xisfconv_write_options_init(&older_options.options, offsetof(xisfconv_write_options, shuffle));
+    older_options.options.overwrite = 1;
+    older_options.options.codec = XISFCONV_CODEC_ZLIB;
+    w = NULL;
+    CHECK(xisfconv_writer_new(ctx, path_of("older.xisf"), &older_options.options, &w) == XISFCONV_OK && w &&
+              xisfconv_writer_add_image(w, &older.image) == XISFCONV_OK && xisfconv_writer_finish(w) == XISFCONV_OK &&
+              smooth_comes_back(ctx, path_of("older.xisf")),
+          "is written, and what lies behind its structs is not looked at");
+    f = NULL;
+    if (xisfconv_open(ctx, path_of("older.xisf"), &f) == XISFCONV_OK && f) {
+        CHECK(xisfconv_property_count(f, 0) == 0 && strncmp(xisfconv_image_detail(f, 0, "compression"), "zlib+sh:", 8) == 0,
+              "without properties, with the bytes shuffled");
+        xisfconv_close(f);
+    }
+
+    xisfconv_properties_free(own);
+    xisfconv_properties_free(whole);
+}
+
 static void test_fits_header(xisfconv_context *ctx) {
     xisfconv_keywords *kw = NULL, *out = NULL;
     const xisfconv_keywords *stored = NULL;
@@ -1533,6 +2308,7 @@ int main(int argc, char **argv) {
     test_stretch_and_wcs(ctx);
     test_fits_header(ctx);
     test_carried_properties(ctx);
+    test_given_properties(ctx);
     xisfconv_context_free(ctx);
     test_lifetime();
 

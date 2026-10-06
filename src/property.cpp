@@ -3,6 +3,7 @@
 #include "property.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
 #include "codecs.hpp"
@@ -56,6 +57,10 @@ std::string propertyProblem(const Property& p) {
     if (!propertyElement(p.type, e)) return {};
     uint64_t count = p.rows;
     if (e.matrix) {
+        // (A matrix of nothing may have rows or columns, 0 x 4. Its other dimension is then not
+        // bounded by any data: 2^64 - 1 rows of no columns is no shape, and no program that is
+        // handed it can make an array of it. PixInsight counts rows and columns in 32 bits.)
+        if ((p.rows == 0 || p.columns == 0) && (p.rows > INT32_MAX || p.columns > INT32_MAX)) return "its shape is impossible";
         if (p.columns != 0 && p.rows > UINT64_MAX / p.columns) return "its shape is impossible";
         count = p.rows * p.columns;
     }
@@ -64,6 +69,153 @@ std::string propertyProblem(const Property& p) {
                (count > UINT64_MAX / e.size ? std::string("more than there can be") : std::to_string(count * e.size));
     }
     return {};
+}
+
+namespace {
+
+bool isDigit(char c) { return c >= '0' && c <= '9'; }
+
+// A whole number of at most `bits` bits, as text: digits, with a sign if `isSigned`.
+bool wholeNumberFits(const std::string& s, int bits, bool isSigned) {
+    size_t i = 0;
+    bool negative = false;
+    if (i < s.size() && (s[i] == '+' || s[i] == '-')) {
+        if (!isSigned && s[i] == '-') return false;
+        negative = s[i] == '-';
+        ++i;
+    }
+    if (i >= s.size()) return false;
+    uint64_t value = 0;
+    for (; i < s.size(); ++i) {
+        if (!isDigit(s[i])) return false;
+        const uint64_t digit = static_cast<uint64_t>(s[i] - '0');
+        if (value > (UINT64_MAX - digit) / 10) return false;
+        value = value * 10 + digit;
+    }
+    if (!isSigned) return bits == 64 || value <= (uint64_t(1) << bits) - 1;
+    const uint64_t most = uint64_t(1) << (bits - 1);   // the largest magnitude, of the most negative number
+    return negative ? value <= most : value <= most - 1;
+}
+
+// A floating point number as text, and nothing around it: digits with a point or an exponent
+// as C writes them, of a size the type holds (`single`: 32 bits), or not a number, or infinity.
+// (The syntax is checked here and not left to the library that reads numbers: what that takes
+// besides, hexadecimal for one, differs from one to the next.)
+bool isRealText(const std::string& s, bool single) {
+    const std::string word = toLower(s);
+    if (word == "nan" || word == "+nan" || word == "-nan" || word == "inf" || word == "+inf" || word == "-inf" ||
+        word == "infinity" || word == "+infinity" || word == "-infinity") {
+        return true;
+    }
+    size_t i = 0, digits = 0;
+    if (i < s.size() && (s[i] == '+' || s[i] == '-')) ++i;
+    for (; i < s.size() && isDigit(s[i]); ++i) ++digits;
+    if (i < s.size() && s[i] == '.') {
+        for (++i; i < s.size() && isDigit(s[i]); ++i) ++digits;
+    }
+    if (!digits) return false;
+    if (i < s.size() && (s[i] == 'e' || s[i] == 'E')) {
+        ++i;
+        if (i < s.size() && (s[i] == '+' || s[i] == '-')) ++i;
+        if (i >= s.size()) return false;
+        for (; i < s.size(); ++i)
+            if (!isDigit(s[i])) return false;
+    }
+    if (i != s.size()) return false;
+    bool complete = false;
+    const double value = strtodC(s, &complete);
+    if (!complete || std::isinf(value) || std::isnan(value)) return false;   // (1e400 is no number a double holds)
+    // The largest 32-bit number is (2^24 - 1) * 2^104; from half a step above it a number rounds to infinity.
+    return !single || std::fabs(value) < std::ldexp(16777215.5, 104);
+}
+
+// YYYY-MM-DD, with Thh:mm, Thh:mm:ss or Thh:mm:ss.sss behind it, and then Z or an offset
+// from UTC (+hh, +hh:mm). The year may have a sign and more than four digits.
+bool isTimePointText(const std::string& s) {
+    size_t i = 0;
+    auto digitsAt = [&](size_t count) {
+        for (size_t k = 0; k < count; ++k)
+            if (i + k >= s.size() || !isDigit(s[i + k])) return false;
+        i += count;
+        return true;
+    };
+    auto take = [&](char c) {
+        if (i < s.size() && s[i] == c) {
+            ++i;
+            return true;
+        }
+        return false;
+    };
+    if (i < s.size() && (s[i] == '+' || s[i] == '-')) ++i;
+    // two digits that make a number from `lowest` to `highest`
+    auto twoDigits = [&](int lowest, int highest) {
+        if (!digitsAt(2)) return false;
+        const int value = (s[i - 2] - '0') * 10 + (s[i - 1] - '0');
+        return value >= lowest && value <= highest;
+    };
+    const size_t yearAt = i;
+    if (!digitsAt(4)) return false;
+    while (i < s.size() && isDigit(s[i])) ++i;
+    int year = 0;   // modulo 400: what a leap year depends on
+    for (size_t k = yearAt; k < i; ++k) year = (year * 10 + (s[k] - '0')) % 400;
+    if (!take('-') || !twoDigits(1, 12)) return false;
+    const int month = (s[i - 2] - '0') * 10 + (s[i - 1] - '0');
+    const bool leap = year % 4 == 0 && (year % 100 != 0 || year == 0);
+    static const int days[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    if (!take('-') || !twoDigits(1, days[month - 1] + (month == 2 && leap ? 1 : 0))) return false;   // (a day the month has)
+    if (i == s.size()) return true;
+    if (!take('T')) return false;   // (a zone belongs to a time, not to a date)
+    if (!twoDigits(0, 23) || !take(':') || !twoDigits(0, 59)) return false;
+    if (take(':')) {
+        if (!twoDigits(0, 60)) return false;   // (60: a leap second)
+        if (take('.')) {
+            if (!digitsAt(1)) return false;
+            while (i < s.size() && isDigit(s[i])) ++i;
+        }
+    }
+    if (i == s.size()) return true;
+    if (take('Z')) return i == s.size();
+    if (!take('+') && !take('-')) return false;
+    if (!twoDigits(0, 23)) return false;
+    if (take(':') && !twoDigits(0, 59)) return false;
+    return i == s.size();
+}
+
+}  // namespace
+
+std::string scalarPropertyProblem(const std::string& type, const std::string& text) {
+    struct Whole { const char* name; int bits; bool isSigned; };
+    static const Whole wholes[] = {{"Int8", 8, true},    {"UInt8", 8, false},   {"Byte", 8, false},   {"Int16", 16, true},
+                                   {"Short", 16, true},  {"UInt16", 16, false}, {"UShort", 16, false}, {"Int32", 32, true},
+                                   {"Int", 32, true},    {"UInt32", 32, false}, {"UInt", 32, false},   {"Int64", 64, true},
+                                   {"UInt64", 64, false}};
+    if (type == "String") return isValidUtf8(text) ? std::string() : "its text is not UTF-8";
+    if (type == "TimePoint") {
+        return isTimePointText(text) ? std::string() : "'" + text + "' is not a date and time of ISO 8601 (2026-10-06T18:30:00Z)";
+    }
+    if (type == "Boolean") {   // (the two words of the specification; 1 and 0 are read, not written)
+        return text == "true" || text == "false" ? std::string() : "a Boolean is true or false, not '" + text + "'";
+    }
+    for (const Whole& w : wholes) {
+        if (type != w.name) continue;
+        return wholeNumberFits(text, w.bits, w.isSigned) ? std::string() : "'" + text + "' is not a number that " + type + " holds";
+    }
+    if (type == "Float32" || type == "Float64" || type == "Float" || type == "Double") {
+        return isRealText(text, type == "Float32" || type == "Float") ? std::string()
+                                                                      : "'" + text + "' is not a number that " + type + " holds";
+    }
+    if (type == "Complex32" || type == "Complex64") {
+        const bool single = type == "Complex32";
+        const size_t comma = text.find(',');
+        if (text.size() >= 5 && text.front() == '(' && text.back() == ')' && comma != std::string::npos &&
+            isRealText(text.substr(1, comma - 1), single) && isRealText(text.substr(comma + 1, text.size() - comma - 2), single)) {
+            return {};
+        }
+        return "'" + text + "' is not a complex number that " + type + " holds, written (re,im)";
+    }
+    PropertyElement element;
+    if (propertyElement(type, element)) return "a " + type + " is given by its elements, not by a text";
+    return "the type " + (isXmlText(type) && !type.empty() ? type : std::string("given")) + " is not one that is written from a value";
 }
 
 bool isFileStorageProperty(const std::string& id) {
@@ -104,6 +256,13 @@ bool validText(const std::string& s, bool xml) {
 bool isValidUtf8(const std::string& s) { return validText(s, false); }
 
 bool isXmlText(const std::string& s) { return validText(s, true); }
+
+bool textFitsElement(const std::string& s) {
+    auto space = [](unsigned char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; };
+    if (!s.empty() && (space(static_cast<unsigned char>(s.front())) || space(static_cast<unsigned char>(s.back())))) return false;
+    if (s.find('\r') != std::string::npos) return false;
+    return isXmlText(s);
+}
 
 uint64_t propertyBudget(uint64_t fileSize) {
     const uint64_t slack = uint64_t(256) << 20;

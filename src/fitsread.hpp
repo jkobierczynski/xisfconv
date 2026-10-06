@@ -38,6 +38,15 @@ struct FitsImage {
     // tree of an ASDF file (both written by a conversion from XISF).
     std::vector<Property> properties;
     std::string wcsDigest;              // the WCS keywords an astrometric solution among them was written with
+    // Images handed over in memory only: the properties are the caller's own. An astrometric
+    // solution among them is the caller's word and is written as it is; without one, a solution
+    // is made from the WCS keywords as for any image.
+    bool propertiesGiven = false;
+    // Images handed over in memory only: the row order the WCS keywords describe, where it is
+    // not that of the pixels. (They are turned to the order of the file when it is written, once:
+    // turned to the pixels first and from there to the file, a number would be computed twice
+    // and not come back as it was.)
+    std::optional<bool> wcsTopDown;
 };
 
 struct FitsFile {

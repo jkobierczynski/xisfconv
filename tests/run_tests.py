@@ -1065,6 +1065,7 @@ def read_xisf_any(path, n=0):
         parts = attr["compression"].split(":")
         codec = parts[0].split("+")[0]
         dec = (lambda b, u: zlib.decompress(b)) if codec == "zlib" else \
+              (lambda b, u: lz4.block.decompress(b, uncompressed_size=u)) if codec in ("lz4", "lz4hc") else \
               (lambda b, u: zstandard.decompress(b, max_output_size=u))
         if "subblocks" in attr:
             out, off = b"", 0
@@ -1114,12 +1115,13 @@ def test_fits_to_xisf_formats():
     }
     variants = [[], ["-c"], ["--codec", "zlib"], ["-c", "--checksum", "sha1"], ["--checksum", "sha512"],
                 ["--codec", "zlib", "--checksum", "sha256", "--xisf-subblock-size", "700"],
-                ["-c", "--xisf-subblock-size", "1000"]]
+                ["-c", "--xisf-subblock-size", "1000"], ["--codec", "lz4"], ["--codec", "lz4hc", "--checksum", "sha1"],
+                ["--codec", "lz4", "--xisf-subblock-size", "600"], ["--codec", "lz4hc", "--xisf-subblock-size", "900"]]
     for k, (name, (data, want)) in enumerate(cases.items()):
         src = os.path.join(TMP, f"f2x_{name}.fits")
         fits.PrimaryHDU(data).writeto(src, overwrite=True)
         exp = fits_expected(src)
-        for j, flags in enumerate([variants[k % len(variants)], variants[(k + 3) % len(variants)]]):
+        for j, flags in enumerate([variants[k % len(variants)], variants[(k + 3) % len(variants)], variants[(k + 7) % len(variants)]]):
             out = os.path.join(TMP, f"f2x_{name}_{j}.xisf")
             run(src, "-o", out, "-f", "-q", *flags)
             got = read_xisf_any(out)
@@ -1156,6 +1158,25 @@ def test_fits_to_xisf_formats():
     check("subblocks:" in info and "zstd+sh:" in info and "checksum:    sha256:" in info, "subblocks/codec/checksum attributes")
     compare("subblocked XISF read by the independent decoder", read_xisf_any(out), fits_expected(src))
     check(open(out, "rb").read(8) == b"XISF0100", "XISF signature")
+    # LZ4 and LZ4HC, written since 0.15: the names in the file, and the lz4 library reads the blocks
+    for codec in ("lz4", "lz4hc"):
+        run(src, "-o", out, "-f", "-q", "--codec", codec, "--xisf-subblock-size", "500")
+        info = run(out, "--info").stdout
+        check("subblocks:" in info and f"{codec}+sh:" in info, f"--codec {codec}: the attributes of the block")
+        compare(f"--codec {codec}: read by the independent decoder", read_xisf_any(out), fits_expected(src))
+        check(run(out, "--verify", expect_ok=False).returncode == 0, f"--codec {codec}: the file verifies")
+        _, hdr = xisf_header(out)
+        check(f'<Property id="XISF:CompressionCodecs" type="String">{codec}+sh</Property>' in hdr, f"--codec {codec}: named in the metadata")
+    r = run(src, "-o", out, "-f", "-q", "--codec", "brotli", expect_ok=False)
+    check(r.returncode != 0 and "unknown codec 'brotli' (use zlib, zstd, lz4, lz4hc or none)" in r.stderr,
+          f"a codec that is none: {r.stderr.strip()[:120]}")
+    for target in ("lz4.asdf", "lz4.fits"):
+        r = run(out, "-o", os.path.join(TMP, target), "-f", "-q", "--codec", "lz4", expect_ok=False)
+        check(r.returncode != 0 and ("XISF only" in r.stderr or "FITS has no LZ4 compression" in r.stderr) and
+              not os.path.exists(os.path.join(TMP, target)), f"--codec lz4 is for XISF, not for {target}: {r.stderr.strip()[:140]}")
+        r = run(src, "-o", os.path.join(TMP, target), "-f", "-q", "--codec", "lz4hc", expect_ok=False)
+        check(r.returncode != 0 and not os.path.exists(os.path.join(TMP, target)) and not os.path.exists(os.path.join(TMP, target + ".part")),
+              f"nor from FITS, and nothing is left of {target}")
 
 
 def test_fits_to_xisf_metadata():
@@ -2469,7 +2490,8 @@ def test_xisf_rewrite():
         sources["zstd+sh in subblocks, sha-256"] = (dict(codec="zstd", shuffle_item=1, subblocks=3, checksum="sha-256"), 1, "")
     default_codec = "zstd" if ZSTD_BUILD else "zlib"
     option_sets = [[], ["-c"], ["--codec", "zlib"], ["--codec", "none"], ["--checksum", "sha512"], ["--checksum", "none"],
-                   ["-c", "--checksum", "sha1"], ["--codec", "zlib", "--xisf-subblock-size", "500"]]
+                   ["-c", "--checksum", "sha1"], ["--codec", "zlib", "--xisf-subblock-size", "500"],
+                   ["--codec", "lz4"], ["--codec", "lz4hc", "--checksum", "sha256", "--xisf-subblock-size", "500"]]
     for name, (storage, align, meta) in sources.items():
         src = os.path.join(d, "src.xisf")
         images = rich_xisf(src, storage, align, meta)
@@ -3783,9 +3805,10 @@ def test_property_round_trip():
             q = dict(p)
             if asdf_leg and p["id"] in through_asdf:
                 q["value"] = ("text", through_asdf[p["id"]].encode())
-            if p["id"] in ("T:LoneCr", "T:EdgeBlanks"):
-                # a carriage return on its own would be a line feed to an XML reader, and blanks at the ends of a
-                # text may be layout to it: such a text goes into a block
+            if p["id"] == "T:LoneCr":
+                # a carriage return that a value attribute holds (as a character reference) is one for every
+                # reader; as text in a header it would be a line feed to an XML reader: such a text goes into a
+                # block. (A text of the header with blanks at its ends, T:EdgeBlanks, is written as it was.)
                 q["value"] = ("text in a block", p["value"][1])
             out.append(q)
         return out
@@ -3893,9 +3916,12 @@ def test_property_round_trip():
             # (astropy takes blanks at the end of a text column for padding: one id ends in one)
             rows.append({"id": row["ID"] + (" " if row["ID"] == "A:EndsInABlank" else ""), "type": row["TYPE"], "comment": bytes(np.asarray(row["COMMENT"], np.uint8)).decode(),
                          "format": bytes(np.asarray(row["FORMAT"], np.uint8)).decode(), "value": value})
-        if rows != original[0]:
-            print("   astropy:", repr([(r["id"], r["value"]) for r, o in zip(rows, original[0]) if r != o][:3])[:500])
-        check(rows == original[0], "astropy reads the table: every id, type, comment, format and value")
+        # (a text with a carriage return that is meant is carried as data, byte for byte: in a header it
+        # would be written as it is, and an XML reader would then make a line feed of it)
+        carried = [dict(p, value=("text in a block", p["value"][1])) if p["id"] == "T:LoneCr" else p for p in original[0]]
+        if rows != carried:
+            print("   astropy:", repr([(r["id"], r["value"]) for r, o in zip(rows, carried) if r != o][:3])[:500])
+        check(rows == carried, "astropy reads the table: every id, type, comment, format and value")
         m = {r["id"]: r for r in rows}["M:F64"]["value"]
         check(np.array_equal(np.frombuffer(m[2], "<f8").reshape(m[1][1:]), np.frombuffer(
             [p for p in original[0] if p["id"] == "M:F64"][0]["value"][2], "<f8").reshape(2, 3), equal_nan=True),

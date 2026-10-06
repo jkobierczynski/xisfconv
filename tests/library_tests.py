@@ -106,13 +106,15 @@ class ConvertOptions(C.Structure):
 
 class WriteOptions(C.Structure):
     _fields_ = [("struct_size", size_t), ("format", i32), ("codec", i32), ("checksum", i32), ("row_order", i32),
-                ("subblock_size", u64), ("wcs", i32), ("overwrite", i32)]
+                ("subblock_size", u64), ("wcs", i32), ("overwrite", i32), ("shuffle", i32), ("compression_level", i32),
+                ("properties", ptr), ("creator_application", text)]
 
 
 class ImageIn(C.Structure):
     _fields_ = [("struct_size", size_t), ("pixels", ptr), ("width", u64), ("height", u64), ("channels", u64),
                 ("sample_format", i32), ("row_order", i32), ("use_bounds", i32), ("lower_bound", f64), ("upper_bound", f64),
-                ("name", text), ("keywords", ptr), ("icc_profile", ptr), ("icc_profile_size", size_t), ("wcs_row_order", i32)]
+                ("name", text), ("keywords", ptr), ("icc_profile", ptr), ("icc_profile_size", size_t), ("wcs_row_order", i32),
+                ("reserved", i32), ("properties", ptr)]
 
 
 class StretchParams(C.Structure):
@@ -182,6 +184,7 @@ writer_new = declare("writer_new", i32, ptr, text, C.POINTER(WriteOptions), C.PO
 writer_add_image = declare("writer_add_image", i32, ptr, C.POINTER(ImageIn))
 writer_finish = declare("writer_finish", i32, ptr)
 writer_discard = declare("writer_discard", None, ptr)
+codec_available = declare("codec_available", i32, i32, i32)
 rewrite = declare("rewrite", i32, ptr, text, text, ptr, ptr)
 asdf_tree_json = declare("asdf_tree_json", i32, ptr, text, ptr, size_t, C.POINTER(size_t))
 skipped_count = declare("skipped_count", size_t, ptr)
@@ -600,6 +603,135 @@ def test_write_tiff_png():
     check(np.abs(d - np.round(a[0].astype(np.float64) * 65535)).max() <= 1, "PNG: floats 0..1 become 16-bit")
 
 
+def test_lz4_and_levels():
+    """LZ4 and LZ4HC blocks as the library writes them: decoded by the lz4 library itself, and read by the xisf package
+    and by the library. Compression levels, subblocks, and blocks without byte shuffling."""
+    import zlib
+
+    import lz4.block
+    path = os.path.join(TMP, "lz4.xisf")
+    rng = np.random.default_rng(7)
+
+    def stored(meta):
+        _, position, size = meta["location"]
+        with open(path, "rb") as f:
+            f.seek(position)
+            return f.read(size)
+
+    def unshuffled(data, item):
+        return np.frombuffer(data, np.uint8).reshape(item, -1).T.tobytes() if item else data
+
+    def lz4_decoded(meta):
+        """The block of the image, decoded by the lz4 library."""
+        raw = stored(meta)
+        _, size, item = meta["compression"]
+        if meta.get("subblocks"):
+            parts, at = [], 0
+            for pair in meta["subblocks"].split(":"):
+                packed, plain = (int(n) for n in pair.split(","))
+                parts.append(lz4.block.decompress(raw[at:at + packed], uncompressed_size=plain))
+                at += packed
+            data = b"".join(parts)
+        else:
+            data = lz4.block.decompress(raw, uncompressed_size=size)
+        return unshuffled(data, item)
+
+    arrays = {
+        "smooth 16 bit": (np.add.outer(np.arange(120), np.arange(160)) * 5 % 3000 + rng.integers(0, 6, (120, 160))).astype(np.uint16)[None],
+        "sky in floating point": rng.normal(0.1, 0.002, (1, 90, 110)).astype(np.float32),
+        "one value": np.full((1, 70, 90), 513, np.uint16),
+        # a period longer than the 65535 bytes a match may lie back: nothing to find, and nothing must be found
+        "a long period": np.tile(rng.integers(0, 255, 70001, dtype=np.uint8), 3)[:400 * 500].reshape(1, 400, 500),
+        "a short period": np.tile(np.arange(251, dtype=np.uint8), 800)[:300 * 600].reshape(1, 300, 600),
+        "runs between noise": np.concatenate([rng.integers(0, 255, 30000, dtype=np.uint8), np.zeros(30000, np.uint8),
+                                              rng.integers(0, 255, 30000, dtype=np.uint8), np.full(30000, 9, np.uint8)]).reshape(1, 300, 400),
+        "colour": image(np.uint16, (3, 60, 80)),
+        "64 bit floating point": image(np.float64, (1, 40, 50)),
+    }
+    for name, a in arrays.items():
+        for codec, word in ((CODEC_LZ4, "lz4"), (CODEC_LZ4HC, "lz4hc")):
+            for shuffle in (1, 0):
+                label = f"{word}{'' if shuffle else ' without byte shuffling'}, {name}"
+                check(write_images(path, [a], codec=codec, shuffle=shuffle) == OK, f"write {label}: {err()}")
+                x, d = xisf_read(path)
+                meta = x.get_images_metadata()[0]
+                check(same(d, a), f"{label}: the xisf package reads the array")
+                with Opened(path) as f:
+                    check(same(f.read(), a), f"{label}: and so does the library")
+                if name == "a long period":
+                    check("compression" not in meta or len(stored(meta)) > a.nbytes * 0.9, f"{label}: nothing to gain")
+                if "compression" not in meta:
+                    check(name in ("a long period", "sky in floating point", "64 bit floating point") or not shuffle,
+                          f"{label}: is compressed")
+                    continue
+                shuffled = shuffle and a.itemsize > 1
+                check(meta["compression"] == (word + ("+sh" if shuffled else ""), a.nbytes, a.itemsize if shuffled else None),
+                      f"{label}: the compression attribute: {meta['compression']}")
+                check(lz4_decoded(meta) == a.tobytes(), f"{label}: the lz4 library decodes the block")
+                check(len(stored(meta)) < a.nbytes, f"{label}: the block is smaller")
+    check(write_images(path, [rng.integers(0, 65535, (1, 50, 60)).astype(np.uint16)], codec=CODEC_LZ4HC) == OK and
+          "compression" not in XISF(path).get_images_metadata()[0], "noise is stored as it is")
+    # every size around what the format treats specially: a block of less than 13 bytes has no match
+    for n in list(range(1, 42)) + [63, 64, 65, 255, 256, 270, 271, 4096, 65535, 65536, 65537, 65550]:
+        a = ((np.arange(n) // 5) % 3).astype(np.uint8).reshape(1, 1, n)
+        for codec in (CODEC_LZ4, CODEC_LZ4HC):
+            ok = write_images(path, [a], codec=codec) == OK
+            x, d = xisf_read(path) if ok else (None, None)
+            meta = x.get_images_metadata()[0] if ok else {}
+            check(ok and same(d, a) and ("compression" not in meta or lz4_decoded(meta) == a.tobytes()),
+                  f"a row of {n} bytes, codec {codec}")
+            if n >= 64:
+                check("compression" in meta, f"a row of {n} bytes is compressed, codec {codec}")
+
+    # subblocks: each one a block of its own
+    a = arrays["smooth 16 bit"]
+    for codec, word in ((CODEC_LZ4, "lz4"), (CODEC_LZ4HC, "lz4hc")):
+        check(write_images(path, [a], codec=codec, subblock_size=5000) == OK, f"{word} in subblocks: {err()}")
+        meta = XISF(path).get_images_metadata()[0]
+        check(len(meta.get("subblocks", "").split(":")) == -(-a.nbytes // 5000) and lz4_decoded(meta) == a.tobytes(),
+              f"{word}: the subblocks decode one by one")
+        with Opened(path) as f:
+            check(same(f.read(), a), f"{word} in subblocks: the library reads them")
+
+    # compression levels
+    sizes = {}
+    for level in range(1, 13):
+        check(write_images(path, [a], codec=CODEC_LZ4HC, compression_level=level) == OK, f"lz4hc level {level}: {err()}")
+        x = XISF(path)
+        meta = x.get_images_metadata()[0]
+        sizes[level] = len(stored(meta))
+        check(lz4_decoded(meta) == a.tobytes() and "XISF:CompressionLevel" not in x.get_file_metadata(),
+              f"lz4hc level {level}: decodes (and XISF:CompressionLevel, which is no level of a codec, is not written)")
+    check(sizes[12] <= sizes[9] <= sizes[4] <= sizes[1] and sizes[12] < sizes[1], f"more searching, smaller blocks: {sizes}")
+    check(write_images(path, [a], codec=CODEC_LZ4HC) == OK and len(stored(XISF(path).get_images_metadata()[0])) == sizes[9],
+          "level 9 is the usual one of lz4hc")
+    for codec, levels, decode in ((CODEC_ZLIB, (1, 6, 9), zlib.decompress), (CODEC_ZSTD, (1, 3, 19), None)):
+        if codec == CODEC_ZSTD and not codec_available(CODEC_ZSTD, 1):
+            continue
+        got = []
+        for level in levels:
+            check(write_images(path, [a], codec=codec, compression_level=level) == OK, f"codec {codec} level {level}: {err()}")
+            x, d = xisf_read(path)
+            meta = x.get_images_metadata()[0]
+            got.append(len(stored(meta)))
+            check(same(d, a) and (decode is None or unshuffled(decode(stored(meta)), 2) == a.tobytes()), f"codec {codec} level {level} decodes")
+        check(got[2] == min(got) and got[2] < got[0], f"codec {codec}: the highest level makes the smallest block: {got}")
+        check(write_images(path, [a], codec=codec) == OK and len(stored(XISF(path).get_images_metadata()[0])) == got[1],
+              f"codec {codec}: the usual level is {levels[1]}")
+    check(write_images(path, [a], codec=CODEC_LZ4HC, compression_level=13) == ERR_ARGUMENT and "1 to 12" in err() and
+          write_images(path, [a], codec=CODEC_ZLIB, compression_level=10) == ERR_ARGUMENT and
+          write_images(path, [a], codec=CODEC_ZLIB, compression_level=-2) == ERR_ARGUMENT, "levels a codec does not have")
+    check(write_images(path, [a], codec=CODEC_LZ4, compression_level=1) == ERR_ARGUMENT and "no compression levels" in err(),
+          "lz4 has no levels")
+    check(write_images(path, [a], compression_level=5) == ERR_ARGUMENT, "a level without a codec")
+    fits_path = os.path.join(TMP, "lz4.fits")
+    check(write_images(fits_path, [a], codec=CODEC_LZ4) == ERR_ARGUMENT and "LZ4" in err() and not os.path.exists(fits_path) and
+          write_images(os.path.join(TMP, "lz4.asdf"), [a], codec=CODEC_LZ4HC) == ERR_ARGUMENT and "XISF only" in err(),
+          f"LZ4 is for XISF: {err()}")
+    check(write_images(fits_path, [a], compression_level=5, shuffle=0) == OK and same(np.array(fits.getdata(fits_path)), a[0][::-1]),
+          "what only an XISF file has means nothing to FITS")
+
+
 def test_writer_arguments():
     a = image(np.uint16, (1, 6, 7))
     path = os.path.join(TMP, "args.xisf")
@@ -610,7 +742,6 @@ def test_writer_arguments():
     check(write_images(os.path.join(TMP, "x.jpeg"), [a]) == ERR_ARGUMENT, "an extension that says nothing")
     check(write_images(os.path.join(TMP, "x.jpeg"), [a], format=FORMAT_TIFF) == OK and
           same(tifffile.imread(os.path.join(TMP, "x.jpeg")), a[0]), "the format can be stated")
-    check(write_images(path, [a], codec=CODEC_LZ4) == ERR_UNSUPPORTED, "LZ4 is not written")
     check(write_images(path, [a], codec=77) == ERR_ARGUMENT and write_images(path, [a], checksum=77) == ERR_ARGUMENT and
           write_images(path, [a], row_order=9) == ERR_ARGUMENT and write_images(path, [a], subblock_size=0) == ERR_ARGUMENT,
           "options out of range")
@@ -1336,7 +1467,7 @@ if __name__ == "__main__":
     print("libxisfconv:", LIB_PATH, version().decode())
     print("xisfconv:", EXE or "(not given: the comparison with the tool's --stretch is skipped)")
     print("asdf + asdf-astropy:", "yes" if HAVE_ASDF else "no")
-    for t in (test_write_fits, test_write_fits_tile_compressed, test_write_xisf, test_write_asdf, test_write_tiff_png, test_writer_arguments, test_read_fits,
+    for t in (test_write_fits, test_write_fits_tile_compressed, test_write_xisf, test_lz4_and_levels, test_write_asdf, test_write_tiff_png, test_writer_arguments, test_read_fits,
               test_read_xisf, test_smaller_pictures, test_carried_properties, test_wcs, test_wcs_forms, test_stretch, test_odd_files, test_locale, test_progress_and_cancel,
               test_kept_messages_and_cancel_from_another_thread, test_threads, test_silence):
         try:

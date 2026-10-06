@@ -3,6 +3,7 @@
 // Copyright (C) 2026 Jurgen Kobierczynski
 #pragma once
 
+#include <cstddef>
 #include <string>
 #include <vector>
 
@@ -26,14 +27,22 @@ struct XisfOutImage {
 };
 
 struct XisfWriteOptions {
-    std::string codec;              // "" (uncompressed), "zlib" or "zstd"
+    std::string codec;              // "" (uncompressed), "zlib", "lz4", "lz4hc" or "zstd"
+    int level = 0;                  // compression level; 0: the usual one of the codec (see xisfCompress)
     bool shuffle = true;            // byte shuffling before compression
     std::string checksum;           // "", "sha1", "sha256", "sha512" (PixInsight's spelling), "sha3-256" or "sha3-512"
     uint64_t subblockSize = 1u << 30;  // blocks larger than this are compressed in subblocks
     // File-level properties (the Metadata element), written after those the writer sets itself
     // (isFileStorageProperty), which are left out of this list.
     std::vector<Property> metadata;
+    // XISF:CreatorApplication. Empty: this library names itself. With another name the library
+    // is named in XISF:CreatorModule, as the specification has it for the code that did the writing.
+    std::string creatorApplication;
 };
+
+// Data blocks up to this size are written into the header, larger ones are attached to the
+// file: PixInsight's own limit (its XISF:MaxInlineBlockSize).
+constexpr size_t kXisfMaxInlineBlock = 3072;
 
 void writeXisf(const std::string& path, const std::vector<XisfOutImage>& images, const XisfWriteOptions& options);
 

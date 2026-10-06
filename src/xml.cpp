@@ -73,6 +73,7 @@ public:
 private:
     const std::string& s_;
     size_t p_ = 0;
+    bool crReference_ = false;   // decodeEntities met &#13;
 
     [[noreturn]] void fail(const std::string& msg) const {
         throw Error("malformed XML header: " + msg + " (offset " + std::to_string(p_) + ")");
@@ -90,8 +91,13 @@ private:
         while (p_ < s_.size() && isSpace(s_[p_])) ++p_;
     }
 
-    void skipPast(const char* terminator) {
-        const size_t q = s_.find(terminator, p_);
+    // (the end is looked for behind what opens the construct: "<!-->" does not close itself,
+    // and a processing instruction has a name: "<?>" is none)
+    void skipPast(const char* terminator, size_t opening = 2) {
+        if (opening == 2 && (p_ + 2 >= s_.size() || s_[p_ + 2] == '>' || s_[p_ + 2] == '?' || isSpace(s_[p_ + 2]))) {
+            fail("a processing instruction without a name");
+        }
+        const size_t q = s_.find(terminator, p_ + opening);
         if (q == std::string::npos) fail(std::string("unterminated construct, expected ") + terminator);
         p_ = q + std::strlen(terminator);
     }
@@ -101,7 +107,7 @@ private:
         for (;;) {
             skipSpace();
             if (at("<?")) skipPast("?>");
-            else if (at("<!--")) skipPast("-->");
+            else if (at("<!--")) skipPast("-->", 4);
             else if (at("<!DOCTYPE")) skipDoctype();
             else break;
         }
@@ -130,7 +136,7 @@ private:
         return colon == std::string::npos ? qname : qname.substr(colon + 1);
     }
 
-    std::string decodeEntities(size_t b, size_t e) const {
+    std::string decodeEntities(size_t b, size_t e) {
         std::string out;
         out.reserve(e - b);
         size_t i = b;
@@ -164,6 +170,7 @@ private:
                     if (cp > 0x10FFFF) ok = false;
                 }
                 if (!ok || (hex && ent.size() == 2)) fail("bad character reference &" + ent + ";");
+                if (cp == 13) crReference_ = true;
                 appendUtf8(out, cp);
             } else {
                 fail("unknown entity &" + ent + ";");
@@ -227,7 +234,7 @@ private:
                 node->end = p_;
                 return node;
             }
-            if (at("<!--")) { skipPast("-->"); continue; }
+            if (at("<!--")) { skipPast("-->", 4); continue; }
             if (at("<![CDATA[")) {
                 p_ += 9;
                 const size_t end = s_.find("]]>", p_);
@@ -243,7 +250,9 @@ private:
             }
             size_t end = s_.find('<', p_);
             if (end == std::string::npos) end = s_.size();
+            crReference_ = false;
             node->text += decodeEntities(p_, end);
+            if (crReference_) node->crReference = true;
             p_ = end;
         }
     }

@@ -321,8 +321,8 @@ def test_a_file_that_could_not_be_opened(tmp_path):
 # --- properties -------------------------------------------------------------------------------
 
 def test_a_property_that_is_not_read(tmp_path):
-    """A vector of a type the library has no reader for (complex numbers): its value is None,
-    and the image is read all the same."""
+    """A vector of a type the library has no reader for (elements nobody knows): its value is
+    None, the image is read all the same, and writing it leaves the property out and says so."""
     header = fits.Header()
     header["CTYPE1"], header["CTYPE2"], header["CRVAL1"], header["CRVAL2"] = "RA---TAN", "DEC--TAN", 10.0, 20.0
     header["CRPIX1"], header["CRPIX2"], header["CD1_1"], header["CD1_2"] = 3.0, 3.0, -1e-4, 0.0
@@ -331,13 +331,23 @@ def test_a_property_that_is_not_read(tmp_path):
     name = b"PCL:AstrometricSolution:ReferenceCelestialCoordinates"
     raw = (tmp_path / "solved.xisf").read_bytes()
     at = raw.index(b'type="F64Vector"', raw.index(name))
-    (tmp_path / "complex.xisf").write_bytes(raw[:at] + b'type="C64Vector"' + raw[at + 16:])
-    with xisfconv.open(tmp_path / "complex.xisf") as file:
+    (tmp_path / "odd.xisf").write_bytes(raw[:at] + b'type="Q64Vector"' + raw[at + 16:])
+    with xisfconv.open(tmp_path / "odd.xisf") as file:
         properties = file[0].properties
-        assert properties.type(name.decode()) == "C64Vector" and properties[name.decode()] is None
+        assert properties.type(name.decode()) == "Q64Vector" and properties[name.decode()] is None
         assert properties["PCL:AstrometricSolution:ReferenceImageCoordinates"].shape == (2,)
-    image = xisfconv.read_image(tmp_path / "complex.xisf")
+    image = xisfconv.read_image(tmp_path / "odd.xisf")
     assert image.properties[name.decode()] is None and image.data.shape == (6, 6)
+    assert image.properties.type(name.decode()) == "Q64Vector"
+    with pytest.warns(xisfconv.XisfconvWarning, match="has no value and is not written"):
+        xisfconv.write(tmp_path / "again.xisf", image)
+    with xisfconv.open(tmp_path / "again.xisf") as file:
+        assert name.decode() not in file[0].properties and len(file[0].properties) == len(image.properties) - 1
+    # the same elements as complex numbers are read, since 0.15
+    (tmp_path / "complex.xisf").write_bytes(raw[:at] + b'type="C32Vector"' + raw[at + 16:])
+    with xisfconv.open(tmp_path / "complex.xisf") as file:
+        value = file[0].properties[name.decode()]
+        assert value.dtype == np.complex64 and value.shape == (2,)
 
 
 def test_the_colour_filter_array_is_carried(tmp_path):

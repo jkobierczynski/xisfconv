@@ -33,7 +33,10 @@ struct ConvertOptions {
     std::optional<SampleFormat> bits;       // output sample format; default: as stored
     std::optional<size_t> imageIndex;       // convert only this image; default: all
     bool compress = false;                  // TIFF: Deflate; XISF and ASDF: `codec`, or the default codec
-    std::string codec;                      // XISF and ASDF output: "zlib" or "zstd"
+    std::string codec;                      // XISF output: "zlib", "lz4", "lz4hc" or "zstd"; ASDF output: "zlib" or "zstd"
+    int level = 0;                          // XISF output: compression level; 0: the usual one of the codec
+    bool shuffle = true;                    // XISF output: byte shuffling before compression
+    std::string creatorApplication;         // XISF output: XISF:CreatorApplication; empty: this library
     std::string checksum;                   // XISF output: "sha1", "sha256", "sha512", "sha3-256", "sha3-512"
     uint64_t subblockSize = 1u << 30;       // XISF output
     bool bottomUp = true;                   // from XISF: rows of FITS and ASDF output; from FITS and ASDF with
@@ -71,6 +74,8 @@ void writeImageSet(FitsFile& images, const ImageSetOrigin& origin, const std::st
 void flipImageRows(FitsImage& image);
 // The same for the keywords alone.
 void flipKeywordRows(std::vector<FitsKeyword>& keywords, uint64_t height);
+// And for BAYERPAT alone: the keyword that goes with the pixels whatever the WCS keywords describe.
+void flipBayerRows(std::vector<FitsKeyword>& keywords, uint64_t height);
 
 // The cards an XISF image gets when it is written to FITS or ASDF with its rows bottom-up or
 // top-down: its FITS keywords, keywords derived from properties where it has none, BAYERPAT and

@@ -52,6 +52,60 @@ xisfconv.write("copy.fits", xisfconv.read_image("m31.xisf"))       # the image w
 xisfconv.write("out.xisf", data, overwrite=True)                   # an existing file is kept otherwise
 ```
 
+XISF properties are written from Python values, to the image and to the file:
+
+```python
+import datetime
+import numpy as np
+
+xisfconv.write("out.xisf", data, codec="lz4hc", creator="my script 1.0",
+               properties={"Instrument:Telescope:FocalLength": 0.53,            # Float64
+                           "Instrument:Camera:Gain": np.float32(120),           # Float32
+                           "Observation:Object:Name": "M 31",                   # String
+                           "Observation:Time:Start": datetime.datetime.now(datetime.timezone.utc),   # TimePoint
+                           "Lab:Flat": np.array([[1.0, 0.5], [0.5, 1.0]])},     # F64Matrix
+               file_properties={"Note:Author": "somebody"})
+
+properties = xisfconv.PropertyDict()
+properties.set("Instrument:Sensor:XPixelSize", 3.76, type="Float32", comment="micrometres", format="%.2f")
+xisfconv.write("typed.xisf", data, properties=properties)
+```
+
+The XISF type follows from the value: `bool` is Boolean, `int` Int32 (Int64 or UInt64 if it
+does not fit), `float` Float64, `complex` Complex64, `str` String, a `datetime` a TimePoint, a
+1-D array the vector and a 2-D array the matrix of its element type (`uint16` gives UI16Vector,
+`complex64` C32Matrix); NumPy scalars keep their width and `bytes` are a ByteArray.
+`PropertyDict.set` states a type, a comment and a format where that is not what is wanted. The
+properties of an image that was read (`read_image(...).properties`) are such a `PropertyDict`
+and have what the file states, so `write` writes them as they were: a value that is not touched
+is written with the very text the file has, also where that is a type of 128 bits or a value
+this library would not write itself. To FITS and ASDF the properties go the way `convert` takes
+them along; TIFF and PNG have no place for them. A new text of more than 3072 bytes, with a
+carriage return in it or with white space at its ends is stored as a data block, where every
+reader finds it as it is (in the header an XML reader makes a line feed of CR LF, and may take
+blanks at the ends for layout); a text that was read from a header is written there again with
+the bytes it has. Vectors, matrices and texts of more than 3072 bytes are compressed with the
+codec of the pixels. A property the library has no value for (a table, a data block of a type
+it has no name for) is None, and is not written: a warning says so. `convert` does carry such
+a data block.
+
+An astrometric solution among the properties (`PCL:AstrometricSolution:...`) that you give is
+written as it is; without one, it is made from WCS keywords (`wcs=False` turns that off). A
+solution that was read from a file describes the WCS keywords and the size of that image:
+`write` writes it while they are the same. If the image was cropped or the keywords were
+changed, the solution is left out, so that the two never contradict each other, and one is made
+from the WCS keywords if the image has them. If it has none (PixInsight often keeps the
+solution in the properties alone), the file is written without a solution, and a warning says
+so. A solution is one thing: if you gave some of its properties new values and left the others
+as they were read, all of it is left out with such an image, with a warning; a solution you put
+in the place of the one that was read is written as it is. `properties.solution_of = None`
+says that the solution is right as it stands.
+
+A `datetime` without a zone and a `numpy.datetime64` are written without one; a `datetime` with
+`tzinfo` is written with its offset from UTC.
+
+`codec` is "zlib", "zstd", "lz4" or "lz4hc" for XISF; `level` sets the compression level
+(zlib 1 to 9, lz4hc 1 to 12, zstd 1 to 22) and `shuffle=False` turns byte shuffling off.
 `codec=True` compresses with the usual codec of the format. For FITS that is tile compression
 without loss (RICE_1 for integers, GZIP_2 for floating point; the format of fpack, which astropy
 and CFITSIO read), and a name that ends in `.fz` is written that way whatever `codec` says. (Up
@@ -97,6 +151,79 @@ Ctrl-C stops the work at the same places, and so does any other signal whose han
 raised from the call once the library has stopped and cleaned up. Pressed during the last
 step, Ctrl-C is raised when the file is complete.
 
+## Coming from the xisf package
+
+[`xisf`](https://github.com/sergio-dr/xisf) is the usual package for XISF files in Python. The
+module `xisfconv.xisf` has its class, with the same methods, arguments and return values, so
+that a program written for it runs on this library with one line changed:
+
+```python
+from xisfconv.xisf import XISF           # was: from xisf import XISF
+
+xisf = XISF("file.xisf")
+file_meta = xisf.get_file_metadata()     # {id: {"id": ..., "type": ..., "value": ...}}
+ims_meta = xisf.get_images_metadata()    # geometry, dtype, FITSKeywords, XISFProperties, ...
+im_data = xisf.read_image(0)             # [height, width, channels]
+XISF.write("output.xisf", im_data, creator_app="My script v1.0",
+           image_metadata=ims_meta[0], xisf_metadata=file_meta, codec="lz4hc", shuffle=True)
+im_data = XISF.read("file.xisf")
+```
+
+None of the code of that package is used; the files are read and written by the library. What
+you get with it:
+
+- Checksums are verified. Blocks compressed in subblocks, big-endian samples, the "Normal" pixel
+  storage, 64-bit integer samples, data embedded in the header, ByteArray and complex vectors are
+  read.
+- A file that is read and written again keeps its keywords as they were written (strings with
+  their quotes and blanks) and its properties with their types, comments, formats and line
+  breaks: a keyword value is a `str` that also remembers, in `raw`, what the file has, and so
+  is a text of the header that an XML reader does not give as it is written (one with CR LF).
+  Numbers among the properties are numbers, and one that is not changed is
+  written with the text the file has (`2000` stays `2000`); a new number is written in the
+  shortest form that reads back as the same one.
+- Files are written under another name and renamed when complete; vectors, matrices and texts
+  of more than 3072 bytes among the properties are compressed with the codec of the pixels.
+
+Where it differs from the package, on purpose:
+
+| | `xisf` | `xisfconv.xisf` |
+|---|---|---|
+| a damaged block | is returned | `ChecksumError` |
+| Float64 written as `3` | the int 3 | the float 3.0 |
+| Boolean written as `1` | False | True |
+| a complex scalar | a pair of numbers | a complex number |
+| a String without text | None | `""` |
+| a String with a `value` attribute and a text | the text | the value |
+| not-a-number, infinity | an error | read |
+| a property that cannot be read | an error, or printed and False | left out, with a warning |
+| two properties with one id | the last | the first, as everywhere in the library |
+| a file without Metadata | an error | no file properties |
+| a header with a DOCTYPE | read | refused: it could define text that is not in the file |
+| arrays | read-only views | writable |
+| an array with the channels first | written with a wrong geometry | written as it is |
+| a 2-D array | an error | one channel |
+| keyword text | written without quotes | a FITS string; numbers, `T` and `F` as they are |
+| SIMPLE, BITPIX, NAXIS and the like | written | left out |
+| a Boolean property | written as `True` | written as `true` |
+| an image id like "my frame" | written | written as `my_frame`, a name XISF takes |
+| a solution of PixInsight that was read, with a cropped image or other WCS keywords | written | left out; made from the WCS keywords if there are any, else a warning |
+| a new text with a carriage return or with blanks at its ends | in the header, where an XML reader may lose them | a data block |
+| a creator name of several lines | written | one line |
+| `XISF:CreationTime` and the like | set in the caller's dictionary | the writer's own; the dictionary is not changed |
+| bounds of floating point samples | always 0:1 | 0:1, 0:65535 or minimum:maximum, as the data needs |
+| 8-bit samples with `shuffle=True` | "zlib+sh" | "zlib": there is nothing to shuffle |
+
+Errors are those of xisfconv; where the package raises `ValueError` (not an XISF file, an image
+number the file does not have) or `NotImplementedError`, the error raised is one of those as
+well, so `except ValueError` still catches.
+
+The `xisf` package reads what this module writes as far as it reads such things from any file:
+it does not open a file with 64-bit integer samples, with a property that is not-a-number or
+infinite, or with a vector or matrix without elements, and it has no value for a ByteArray.
+The dictionaries remember what was read (the text of a value, the keywords a solution belongs
+to); a copy made with `dict(entry)` has the values only, and is written as a program's own.
+
 ## With astropy
 
 ```python
@@ -139,17 +266,20 @@ that a signal handler raises there (an alarm's time limit) can be lost. `Keyboar
   image for a moment (three times for a compressed file). Writing takes once the size of the
   image on top of the array, twice for a colour image with the channels last, and about four
   times when the file is compressed.
-- Not everything of an XISF file is carried by `read_image` and `write`. XISF properties are
-  read, not written: the astrometric solution goes into a new file as WCS keywords
-  (`entry.wcs_keywords()`), from which xisfconv writes PixInsight's solution properties again.
-  The saved screen stretch and the resolution are not carried. A colour filter array is, as a
-  BAYERPAT keyword.
+- Not everything of an XISF file is carried by `read_image` and `write`: the saved screen
+  stretch, the resolution and the thumbnail are not. The XISF properties are (since 0.15; up to
+  0.14 they were read and not written), with the astrometric solution of PixInsight among them,
+  and a colour filter array is, as a BAYERPAT keyword. `rewrite` copies an XISF file with
+  everything in it.
+- Vectors and matrices among the properties are NumPy arrays in the type of their elements,
+  complex ones too. Up to 0.14 they were float64 arrays, and complex ones None.
 - `convert` does take the XISF properties along: to FITS as a table behind each image, to ASDF
   under the key `xisf` of the tree, and back to XISF as the properties they were, the
   astrometric solution of PixInsight included (as long as the WCS keywords were not changed on
   the way). `properties=False` leaves them out. A FITS or ASDF file that carries properties shows
   them as `file[0].properties` and `file.properties`.
-- FITS keywords are ASCII: other characters in a keyword text are written as `?`.
+- FITS keywords are ASCII: in a FITS or ASDF file, other characters in a keyword text are
+  written as `?`. An XISF file keeps them.
 - A `File` and the images read from it belong to one thread at a time; separate files, and the
   functions that take file names, can be used from several threads at once.
 - Signal handlers run between the steps of a call only in the main thread, as everywhere in

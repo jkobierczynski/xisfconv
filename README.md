@@ -27,8 +27,8 @@ xisfconv --info light_0001.xisf               # geometry, codecs, FITS keywords,
 **Reading (monolithic XISF 1.0)**
 - Sample formats UInt8/16/32/64, Float32/64; Gray, RGB (and extra/alpha channels)
 - Planar and Normal (interleaved) pixel storage, little- and big-endian data
-- Compression: zlib, LZ4, LZ4HC (built-in decoder), Zstandard (via libzstd), each with or without
-  byte shuffling, including compressed **subblocks**
+- Compression: zlib, LZ4, LZ4HC (the library's own decoder and, for writing, compressor), Zstandard
+  (via libzstd), each with or without byte shuffling, including compressed **subblocks**
 - Data blocks as attachments, `inline:base64`/`inline:hex`, or `embedded` `<Data>` elements
 - Checksum verification: SHA-1, SHA-256, SHA-512, SHA3-256 and SHA3-512
 - FITS keywords, XISF properties of every type (scalars, strings, time points, vectors and
@@ -197,8 +197,10 @@ xisfconv --info light_0001.xisf               # geometry, codecs, FITS keywords,
   is refused. Files that are already stored as requested are left alone, so
   `xisfconv -c --in-place *.xisf` can be run again on a folder. Without `--in-place`, give `-o` or
   `-d`: the input is never overwritten by accident.
-- All codecs PixInsight writes are read (zlib, LZ4, LZ4HC, Zstandard, with subblocks); the output
-  uses zlib or Zstandard. Tested on PixInsight 1.9.3 files in each of those codecs, Float32, Float64
+- All codecs PixInsight writes are read (zlib, LZ4, LZ4HC, Zstandard, with subblocks) and written:
+  `-c` uses Zstandard, `--codec zlib|zstd|lz4|lz4hc` names one (LZ4 and LZ4HC since 0.15, with a
+  compressor of the library's own whose blocks the lz4 library decodes). Tested on PixInsight 1.9.3
+  files in each of those codecs, Float32, Float64
   and UInt32, with SHA-1/256/512 checksums: every block of every rewritten file decodes to the
   original bytes.
 
@@ -489,9 +491,10 @@ xisfconv [options] <file>...      # any of XISF, FITS, ASDF -> any other of them
                               to XISF: don't write PixInsight solution properties from WCS
       --sip-order <n>         from XISF: SIP distortion order (2-7, default 3; 0 = linear only)
       --no-verify             don't verify data block checksums
-      --codec <zlib|zstd|none>  XISF and ASDF output: compression codec (zlib, zstd imply -c);
-                              none = uncompressed (XISF -> XISF: decompress)
-                              FITS output: zlib = gzip tiles for every sample type; no zstd
+      --codec <zlib|zstd|lz4|lz4hc|none>
+                              XISF and ASDF output: compression codec (a codec implies -c; lz4 and
+                              lz4hc are for XISF only); none = uncompressed (XISF -> XISF: decompress)
+                              FITS output: zlib = gzip tiles for every sample type; no zstd or lz4
       --checksum <sha1|sha256|sha512|sha3-256|sha3-512|none>
                               XISF output: checksum of the pixel data;
                               XISF -> XISF: of every attached block (none removes them)
@@ -588,13 +591,30 @@ What to know:
   so the header maps directly to Python's `ctypes` or `cffi`, Rust's bindgen and Perl's
   FFI::Platypus. The Python package in `python/` is built that way, on `ctypes`.
 - **Stability.** Version 0.x: the API may still change between releases, and the shared library's
-  version changes with each of them (`libxisfconv.so.0.14`).
+  version changes with each of them (`libxisfconv.so.0.15`).
 - **Messages** are the tool's and some name its options (`--force`, `--bounds`): the option names
   say which setting is meant.
 - The CMake package (`find_package(xisfconv)`) is installed with the shared library; a static
   library comes with the pkg-config file only, to be used with `pkg-config --static`.
 - An ICC profile handed to the writer is stored in XISF as an inline `ICCProfile` block. The
   library reads it back; whether PixInsight accepts it has not been checked yet.
+- **XISF properties from the caller's values** (since 0.15): a property list
+  (`xisfconv_properties_new`, `_set` for scalars, strings and time points, `_set_array` for vectors
+  and matrices) is given to an image and to the write options. They are written to XISF as the
+  properties of the image and of the file, and to FITS and ASDF the way a conversion takes them
+  along. An astrometric solution among them is written as it is given; without one, it is made
+  from WCS keywords as before. `xisfconv_properties_set` checks a value against its type;
+  `xisfconv_properties_set_as_read` takes a property as a file had it, whatever it says, so that
+  a program which reads a file and writes it again loses nothing of it, and
+  `xisfconv_property_stored` says how the file has it (a value in the header, a text that is
+  kept as data, an array, or something that is not read, like a table). `xisfconv_property_read`
+  gives a vector or a matrix in the type of its elements (complex ones too), where
+  `xisfconv_property_read_f64` gives doubles. `xisfconv_wcs_digest` tells such a program whether
+  the WCS keywords of an image are still those its solution was read with, and the detail
+  `carriedSolution` of an image in a FITS or ASDF file says the same of the solution it carries.
+- The writer also takes a compression level, byte shuffling on or off, and the name of the program
+  that writes the file (`compression_level`, `shuffle` and `creator_application` of
+  `xisfconv_write_options`).
 
 The library is licensed under the LGPL (version 3 or later), so that programs under other licences
 can use it; the command line tool remains under the GPL.
@@ -610,6 +630,8 @@ import xisfconv
 data = xisfconv.read("m31.xisf")                    # [height, width] or [height, width, channels]
 image = xisfconv.read_image("m31.xisf")             # with keywords, name, bounds, XISF properties
 xisfconv.write("out.xisf", data, keywords={"OBJECT": "M 31"}, codec="zstd", checksum="sha256")
+xisfconv.write("out.xisf", data, properties={"Instrument:Telescope:FocalLength": 0.53})   # XISF properties
+xisfconv.write("copy.xisf", image)                  # what was read: pixels, keywords and properties
 xisfconv.write("out.fits.fz", data)                 # tile-compressed FITS, lossless
 xisfconv.convert("m31.xisf", "m31.fits")            # what the command line tool does
 print(xisfconv.verify("m31.xisf").verdict)
@@ -617,7 +639,19 @@ print(xisfconv.verify("m31.xisf").verdict)
 import xisfconv.astropy                             # CCDData.read("m31.xisf"), ccd.write("x.xisf"),
 from astropy.nddata import CCDData                  # and astropy.io.fits HDU lists
 ccd = CCDData.read("m31.xisf", unit="adu")
+
+from xisfconv.xisf import XISF                      # the interface of the xisf package
+im_data = XISF("m31.xisf").read_image(0)
 ```
+
+**Coming from the `xisf` package.** `xisfconv.xisf` has the class of that package, with its methods,
+its arguments and the structures it returns: `XISF(fname)`, `get_images_metadata()`,
+`get_file_metadata()`, `get_metadata_xml()`, `read_image()`, `XISF.read()` and `XISF.write()`. A
+program written for it runs with its import line changed to `from xisfconv.xisf import XISF`, and
+then has what the library does: checksums are verified, subblocks, big-endian samples, the Normal
+pixel storage, 64-bit integers and embedded data are read, properties keep their types, comments
+and formats, and files are written under another name and renamed. No code of that package is
+used. [`python/README.md`](python/README.md) lists where the two differ on purpose.
 
 ```
 pip install .                    # from a checkout: builds the library and installs the package
@@ -646,12 +680,19 @@ Good to know:
   tile-compressed FITS.) The same holds for any signal whose handler raises, such as an alarm that sets a
   time limit. A function given as `progress=` is called between the steps, in the caller's
   thread, and stops the work by raising an exception.
-- `read_image` and `write` read XISF properties and do not write them: the astrometric solution
-  of an XISF file is carried into a new file as WCS keywords, from which the PixInsight solution
-  properties are written again. The saved screen stretch and the resolution of an XISF image are
-  not carried by them either. `convert` takes every property along to FITS and ASDF and back
-  (`properties=False` leaves them out), and `rewrite` copies an XISF file with everything in it.
-  A FITS or ASDF file that was converted from XISF shows the properties it carries as
+- `read_image` reads the XISF properties of an image with their types, and `write` writes them
+  (since 0.15; before, they were read and not written): to XISF as the properties they were, to
+  FITS and ASDF the way `convert` takes them along. `properties=` and `file_properties=` of `write`
+  take a dict of Python values: numbers, strings, `datetime`, NumPy arrays for vectors and
+  matrices. Vectors and matrices are read in the type of their elements, complex ones included
+  (up to 0.14 as float64). A property that is not changed is written with the text the file
+  has for it, and PixInsight's astrometric solution is written as long as the image has the
+  size and the WCS keywords the solution was read with. After a crop, or with other keywords,
+  it is left out as a whole, and a solution is made from the WCS keywords if the image has
+  them; a warning says so if it has none (`properties.solution_of = None` says the solution is
+  right as it stands). The saved screen stretch, the resolution and the thumbnail of an XISF
+  image are not carried by `read_image` and `write`; `rewrite` copies an XISF file with everything
+  in it. A FITS or ASDF file that was converted from XISF shows the properties it carries as
   `file[0].properties` and `file.properties`, like an XISF file.
 - An image is read and written as a whole, in memory. Reading takes about twice the size of the
   image for a moment, three times for a compressed file. Writing takes once its size on top of
@@ -690,7 +731,9 @@ ASDF, TIFF and PNG are read back by astropy, the `xisf` package, Python's `asdf`
 Pillow, and files written by astropy and the `xisf` package are read through the library and
 compared with what that software reads. It also checks the WCS functions through astropy, the
 stretch against the tool's `--stretch`, file names beyond ASCII, several threads with their own
-contexts at once, and that the library prints nothing. `tests/capi_readall.c` reads everything the
+contexts at once, and that the library prints nothing. The LZ4 blocks the library writes are decoded
+there by the lz4 library itself: for both codecs, every level, subblocks, and rows of every length
+around the limits of the block format. `tests/capi_readall.c` reads everything the
 API offers from any file and is the target for fuzzing.
 
 The Python package has its tests in `python/tests` (pytest). They are the same comparisons made
@@ -707,7 +750,11 @@ with `KeyboardInterrupt` and an alarm with the exception its handler raises; han
 functions use the package themselves; a process is forked and Python is ended in the middle of
 calls. With
 `XISFCONV_TOOL` set, files converted by the package and by the tool must be identical byte for
-byte.
+byte. `xisfconv.xisf` is tested against the `xisf` package it stands in for: for files written by
+either, in every codec, the two must return the same dictionaries (key order, tuples and lists,
+dtypes) and the same arrays, the package must read what the module writes (but for the few
+values it does not read from any file, which the module's documentation names), and each
+difference that documentation names has a test.
 
 Test inputs come from two independent writers: the `xisf` PyPI package (all codecs ± shuffling,
 5 sample formats, gray and RGB) and a small encoder in the test script for the features that package
@@ -814,11 +861,15 @@ compared with PyYAML on random documents in all of PyYAML's output styles.
   type is not plain ASCII (FITS) or not UTF-8 (ASDF), the second of two properties with the same
   id (ASDF), and what goes beyond the size limit below. A comment, a format or the value of a
   scalar with a character XML has no way to write (a control character) gets a blank in its place.
-- A String that is text in the XISF header and has a blank at either end, or a carriage return on
-  its own, comes back as a data block: that is the form in which every reader takes it as it is.
-  Text in the header with CR LF line ends (PixInsight writes short spline serializations so) is
-  written with the same bytes; whether that reads as CR LF or as LF is a matter of the XML
-  reader, for the original and for the result alike.
+- A String that is text in the XISF header comes back as text in the header with the same bytes,
+  whatever line ends and blanks it has (PixInsight on Windows writes its spline serializations
+  with CR LF): whether that reads as CR LF or as LF, and with or without the blanks at its ends,
+  is a matter of the reader, for the original and for the result alike. (Up to 0.14 a text with a
+  blank at either end or a carriage return on its own came back as a data block, which an XML
+  reader does not read as it read the header.) A String comes back as a data block if it was one,
+  if its header text has a carriage return written as a character reference (`&#13;`), which
+  every reader keeps, or if it was a `value` attribute with a carriage return or with blanks at
+  its ends.
 - The properties of a file are held in memory together. More than the size of the file plus
   256 MiB is not accepted (a damaged file, or one made to exhaust the memory, could otherwise
   declare any amount): what is beyond is left out with a warning.
@@ -841,7 +892,9 @@ compared with PyYAML on random documents in all of PyYAML's output styles.
   tree are not recognized as such.
 - ASDF output always uses the FITS HDU list layout described above; it does not write generalized WCS
   (gwcs) objects or instrument-specific data models.
-- XISF output is not compressed with LZ4 (zlib and Zstandard only).
+- A compression level and byte shuffling can be chosen when an image is written from memory (the
+  library's writer, `xisfconv.write`), not for a conversion or a rewrite: the tool has no option
+  for them. LZ4 is written to XISF only (ASDF's own LZ4 layout is read, not written).
 - XISF files with SHA3-256 or SHA3-512 checksums are valid but cannot be opened by PixInsight 1.9.3.
 - XISF → XISF does not move blocks between the header (inline, embedded) and attachments. Replacing a
   file in place gives it a new inode: other hard links to the old file keep the old content.
@@ -862,7 +915,7 @@ Bump the version in `include/xisfconv.h` (CMake reads it from there), commit, th
 tag:
 
 ```
-git tag v0.14.1 && git push origin v0.14.1
+git tag v0.15.0 && git push origin v0.15.0
 ```
 
 CI builds and tests all three platforms and, only if every one passes, publishes a GitHub release with
@@ -909,6 +962,15 @@ every value and every array. That was checked with the frame as PixInsight saves
 (uncompressed, zlib, LZ4, LZ4HC and Zstandard, with and without checksums). That PixInsight opens
 the file that comes back and reports the same solution as for the original has not been checked
 yet.
+
+Not checked with PixInsight yet either, both since 0.15: XISF files compressed with LZ4 and LZ4HC
+by the library's own compressor (the lz4 library and the `xisf` package decode every block, and
+PixInsight reads those codecs from its own files), and properties written from the values of a
+program. The same nine files, read and written again through `xisfconv.xisf`, keep every keyword
+and every property as PixInsight wrote it: type, comment, format and the text of each value, and
+the content of each data block byte for byte (how a block is stored, its codec and checksum and
+whether it is attached or in the header, is the writer's). Of two more frames, which PixInsight
+saved uncompressed, every keyword and property element of the header comes back as the same bytes.
 
 ## License
 

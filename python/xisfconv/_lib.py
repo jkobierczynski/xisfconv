@@ -15,7 +15,7 @@ from ctypes import (CFUNCTYPE, POINTER, Structure, c_char, c_char_p, c_double, c
 
 # The library version this module was written for. In 0.x every release may change the layout
 # of the structures, so another library is refused.
-API_VERSION = (0, 14)
+API_VERSION = (0, 15)
 
 # ------------------------------------------------------------------------------------------
 # Constants of xisfconv.h
@@ -86,6 +86,23 @@ STRETCH_STORED = 4
 VERDICT_OK = 0
 VERDICT_NOT_FULLY_CHECKED = 1
 VERDICT_FAILED = 2
+
+ELEMENT_NONE = 0
+ELEMENT_INT8 = 1
+ELEMENT_UINT8 = 2
+ELEMENT_INT16 = 3
+ELEMENT_UINT16 = 4
+ELEMENT_INT32 = 5
+ELEMENT_UINT32 = 6
+ELEMENT_INT64 = 7
+ELEMENT_UINT64 = 8
+ELEMENT_FLOAT32 = 9
+ELEMENT_FLOAT64 = 10
+ELEMENT_COMPLEX32 = 11
+ELEMENT_COMPLEX64 = 12
+
+# xisfconv_property_storage
+PROPERTY_NONE, PROPERTY_VALUE, PROPERTY_TEXT_BLOCK, PROPERTY_ARRAY, PROPERTY_UNREAD = range(5)
 
 ALL_IMAGES = c_size_t(-1).value
 FILE_PROPERTIES = c_size_t(-1).value
@@ -238,6 +255,8 @@ class Image(Structure):
         ("icc_profile", c_void_p),
         ("icc_profile_size", c_size_t),
         ("wcs_row_order", c_int32),
+        ("reserved", c_int32),
+        ("properties", c_void_p),
     ]
 
 
@@ -251,6 +270,10 @@ class WriteOptions(Structure):
         ("subblock_size", c_uint64),
         ("wcs", c_int32),
         ("overwrite", c_int32),
+        ("shuffle", c_int32),
+        ("compression_level", c_int32),
+        ("properties", c_void_p),
+        ("creator_application", c_char_p),
     ]
 
 
@@ -310,8 +333,19 @@ _FUNCTIONS = {
     "xisfconv_property_get": (_status, [_p, c_size_t, c_size_t, _strp, _strp, _strp, _strp, POINTER(c_int32)]),
     "xisfconv_property_find": (c_int64, [_p, c_size_t, _str]),
     "xisfconv_property_format": (_str, [_p, c_size_t, c_size_t]),
+    "xisfconv_property_stored": (c_int32, [_p, c_size_t, c_size_t]),
     "xisfconv_property_read_f64": (_status, [_p, c_size_t, _str, c_void_p, c_size_t, POINTER(c_size_t),
                                              POINTER(c_size_t)]),
+    "xisfconv_property_element": (c_int32, [_str, POINTER(c_int32)]),
+    "xisfconv_element_size": (c_size_t, [c_int32]),
+    "xisfconv_property_read": (_status, [_p, c_size_t, c_size_t, c_void_p, c_size_t, POINTER(c_size_t),
+                                         POINTER(c_size_t), POINTER(c_size_t)]),
+    "xisfconv_properties_new": (_status, [_p, _pp]),
+    "xisfconv_properties_free": (None, [_p]),
+    "xisfconv_properties_count": (c_size_t, [_p]),
+    "xisfconv_properties_set": (_status, [_p, _str, _str, _str, _str, _str]),
+    "xisfconv_properties_set_as_read": (_status, [_p, _str, _str, _str, _str, _str, c_int32]),
+    "xisfconv_properties_set_array": (_status, [_p, _str, _str, c_void_p, c_size_t, c_uint64, c_uint64, _str, _str]),
     "xisfconv_read_options_init": (None, [POINTER(ReadOptions), c_size_t]),
     "xisfconv_load_pixels": (_status, [_p, c_size_t, c_int32]),
     "xisfconv_pixels_size": (_status, [_p, c_size_t, POINTER(ReadOptions), POINTER(c_uint64)]),
@@ -325,6 +359,7 @@ _FUNCTIONS = {
     "xisfconv_wcs_keywords": (_status, [_p, c_size_t, c_int32, c_int32, _pp, _strp]),
     "xisfconv_fits_keywords": (_status, [_p, c_size_t, c_int32, c_int32, c_int32, c_int32, _pp, _strp]),
     "xisfconv_wcs_flip_rows": (_status, [_p, c_uint64]),
+    "xisfconv_wcs_digest": (_status, [_p, c_uint64, c_uint64, c_int32, _strp]),
     "xisfconv_convert_options_init": (None, [POINTER(ConvertOptions), c_size_t]),
     "xisfconv_convert": (_status, [_p, _str, _str, POINTER(ConvertOptions)]),
     "xisfconv_rewrite_options_init": (None, [POINTER(RewriteOptions), c_size_t]),

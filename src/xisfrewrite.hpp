@@ -11,7 +11,7 @@
 namespace xisfconv {
 
 struct XisfRewriteOptions {
-    std::string codec;      // "" = keep every block as it is stored; "none", "zlib" or "zstd"
+    std::string codec;      // "" = keep every block as it is stored; "none", "zlib", "lz4", "lz4hc" or "zstd"
     std::string checksum;   // "" = keep (recomputed where the stored bytes change); "none" = remove;
                             // "sha1", "sha256", "sha512", "sha3-256" or "sha3-512"
     std::optional<size_t> imageIndex;  // keep only this image

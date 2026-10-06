@@ -2,7 +2,7 @@
 
 What was decided while building xisfconv, and why. The README says what the program does and
 `TODO.md` what is planned; this file records the choices behind both, so that they are not
-reopened by accident. State: version 0.14.1, 6 October 2026.
+reopened by accident. State: version 0.15.0, 6 October 2026.
 
 ## Purpose and scope
 
@@ -35,8 +35,8 @@ reopened by accident. State: version 0.14.1, 6 October 2026.
 
 - C++17, CMake 3.15 or later, warnings on (`-Wall -Wextra -Wpedantic`, `/W4`) and kept at zero.
 - The only required dependency is zlib; libzstd is optional (`XISFCONV_WITH_ZSTD`). Everything
-  else is in the source: XML and YAML readers, LZ4 decoder, MD5, SHA-1, SHA-2 and SHA-3, Rice and
-  PLIO decoders, the FITS, ASDF, TIFF and PNG readers and writers.
+  else is in the source: XML and YAML readers, LZ4 decoder and (since 0.15) compressor, MD5,
+  SHA-1, SHA-2 and SHA-3, Rice and PLIO decoders, the FITS, ASDF, TIFF and PNG readers and writers.
 - Release binaries are self-contained (`XISFCONV_PORTABLE`: static zstd and C++ runtime), built by
   CI for Linux x86_64, macOS arm64 and Windows x64 when a version tag is pushed. A tag that does
   not match the program version fails the build.
@@ -230,8 +230,11 @@ them. The choices:
   every reader that follows XML. So the place is carried with the value, and the bytes of a block
   are never touched. A text from the header is written as text again, with its line breaks as
   they are (the same bytes are the one form every reader takes as it took the original); only
-  what the header could not give back unchanged (control characters, bytes that are not UTF-8,
-  blanks at the ends, a carriage return on its own) goes into a block.
+  what XML cannot hold (control characters, bytes that are not UTF-8) goes into a block, and,
+  since 0.15, a text with a carriage return that the header wrote as a character reference.
+  (Up to 0.14 a text with blanks at its ends or a carriage return on its own went into a block
+  as well. That broke the rule of this paragraph for the readers it was meant to protect: see
+  "Where a text is kept is part of what was read".)
 - **Arrays** up to 3072 bytes are written into the header and larger ones attached, which is
   PixInsight's own limit. The solution properties this library makes from WCS keywords stay in
   the header whatever their size, as in every version before: that form is the one PixInsight
@@ -430,8 +433,29 @@ Built in 0.11.0, in `python/`. What was decided:
 - **`read_image()` gives the keywords as the file has them** and names the row order their WCS part
   describes (`wcs_row_order`), so that `write(read_image(...))` changes nothing. BAYERPAT is the
   exception: it is turned over when the rows are handed over in the other order than stored.
-- **XISF properties are read, not written.** Writing them needs the lossless property round trip
-  of `TODO.md` first.
+- **XISF properties are written from Python values** (0.15.0; read only before). `properties=` of
+  an image and `file_properties=` of `write` take `{id: value}`, and the XISF type follows from
+  the value: bool is Boolean, int is Int32 (Int64, UInt64 if it does not fit), float is Float64,
+  complex is Complex64, str is String, a `datetime` is a TimePoint, and an array is the vector or
+  matrix of its element type. NumPy scalars keep their width. That guess is right for what a
+  program makes up itself and wrong for what it read from a file (a UInt16 would come back as
+  Int32, a TimePoint as a String), so what `read_image` returns remembers what the file states:
+  `PropertyDict`, a dict with the type, comment and format of each key on the side. It is a
+  subclass of dict because programs written for 0.11 to 0.14 compare `image.properties` with a
+  dict and index it; a class of wrapped values would have broken `properties[id] == 120`.
+  Assigning a value keeps the stated type; deleting the key forgets it.
+- **Vectors and matrices are read in the type of their elements** (0.15.0; float64 before, complex
+  ones not at all). The package is not on PyPI yet, which is the moment to change what a call
+  returns.
+- **A solution the caller brings is the caller's word.** Properties given to the writer that hold
+  `PCL:AstrometricSolution:...` are written as they are, and no solution is made from WCS
+  keywords. Without one among them, a solution is made from the keywords as for an image without
+  properties: an unrelated property must not switch that off. Written to FITS or ASDF, a brought
+  solution gets the digest of the keywords it is stored with, so that a later conversion to XISF
+  restores it; properties without a solution get none, so that such a conversion makes it from
+  the keywords. A solution that was read with an image is the file's word, not the caller's: it
+  is written while the keywords and the size are those it was read with (see "Properties from
+  the caller's values").
 - **Errors are exceptions** derived from `xisfconv.Error` and, where one fits, from the built-in
   one (`OSError`, `FileNotFoundError`, `FileExistsError`, `ValueError`, `IndexError`,
   `LookupError`). Their text names the file. **Warnings are Python warnings**, raised when the
@@ -583,9 +607,169 @@ Built in 0.11.0, in `python/`. What was decided:
   uploaded once only, so that step is the maintainer's. It uses trusted publishing, without a
   stored token.
 
+### The interface of the `xisf` package (`xisfconv.xisf`, 0.15.0)
+
+The `xisf` package of Sergio Díaz is what Python programs read and write XISF with, and the
+oracle of this project's tests. `xisfconv.xisf` has its class, so that such a program can use the
+library with one line changed.
+
+- **Its interface, none of its code.** That package is under the GPL (version 3), this library
+  under the LGPL: its code cannot be part of it. Names, arguments and the shapes of what is
+  returned are an interface. The module was written from what the package returns for files, and
+  is tested by comparing the two on the same files, structure by structure: key order, tuples
+  against lists, dtypes.
+- **The same structures, the library's behaviour.** Where the package is wrong or stops, the
+  module does what the library does, and its documentation lists each case: checksums are
+  verified; subblocks, big-endian samples, Normal storage, UInt64, embedded data, ByteArray and
+  complex vectors are read; a Float64 written as `3` is a float; a Boolean written as `1` is
+  true; a property that cannot be read is left out with a warning and does not cost the file; an
+  array with the channels first is written with its real geometry; keyword strings are written
+  with their quotes; the dictionary given as `xisf_metadata` is not changed.
+- **What the package's structures cannot say is carried on the side.** It strips the quotes off a
+  keyword value, so `'7'` and `7` are the same to it, and an XML reader turns PixInsight's CR LF
+  into LF. A value read here is a `str` that also has `raw`, the text of the file, and `write`
+  uses it: a file that is read and written again keeps its keywords and its texts byte for
+  byte. A value without `raw` (one the program made) is written as a number or `T`/`F` if it
+  reads as one, else as a FITS string. A number among the properties cannot remember its
+  spelling the way a string can (it is a Python number), so the dictionary of the property
+  does: it keeps the text of the value and what that text was read as, and while the value in
+  the dictionary is still that one, the text is written. The first version wrote every number
+  anew, and a Float64 that PixInsight wrote as `2000` became `2000.0`: the same value, but also
+  a `Float128` nobody here can parse and a Boolean written as `1` had to be written from a
+  value, and could not be. A file that says something odd is no reason to lose the rest of it.
+- **The header is parsed twice**, by the library and by Python's ElementTree: the dictionaries
+  hold every attribute of an element as it is written, also those the library has no name for,
+  and `get_metadata_xml()` returns the tree. The two have to agree on which elements are images
+  and properties: the Image elements of the root in their order, the Property elements of each,
+  and for the file those of every Metadata element and of the root. The module counts both and
+  refuses a header on which they differ. (One such header was found by review: `<!-->` was a
+  whole comment to the library, which looked for the end from the start of the opening, and the
+  beginning of one to ElementTree. The library now reads it as XML does.) They do not agree on a
+  document type declaration: the library skips it, ElementTree reads it, and with it default
+  attributes and entities that are not in the file (an `ATTLIST` that gives every image a
+  `compression`, an entity of a gigabyte). A header with a DOCTYPE is refused by the module (one
+  that stands where a declaration stands, before the first element: the word in a comment or in a
+  text is none). The header is decoded as UTF-8 and its XML declaration taken off before
+  ElementTree sees it: the `xisf` package writes `encoding='utf8'`, a name expat does not know.
+- **Errors keep both families.** The package raises `ValueError` and `NotImplementedError`; the
+  library has its own classes. The module raises classes that are both (`NotXisfError` is a
+  `FormatError` and a `ValueError`), so that `except ValueError` in a program written for the
+  package still catches.
+- **Byte shuffling is off unless asked for** there (`shuffle=False`), on in `xisfconv.write`.
+  Each keeps its default.
+- **The wording is this project's.** The names of the public methods and their arguments are the
+  interface; everything else (private names, messages, comments, the order things are done in)
+  was written here, and where a first draft had come to resemble the package, it was rewritten.
+
+### Properties from the caller's values (0.15.0)
+
+- **Two ways to give a property.** `xisfconv_properties_set` checks the value against the type
+  and is strict about it (`true` or `false`, no blanks, a number the type holds, a date that
+  exists): what a program makes should be right. `xisfconv_properties_set_as_read` checks
+  nothing but that XML can hold it: what a file said is written again. The Python package picks
+  between them by whether the value is still the one that was read (0.0 and -0.0 are two
+  values there, and not-a-number is the one it was).
+- **Where a text is kept is part of what was read.** `xisfconv_property_stored` says whether a
+  String is a value of the header or a data block, and `xisfconv_properties_set_as_read` takes
+  that back. The second review found why it must: the writer put every text of more than 3072
+  bytes into a block, also the 31 KB spline serializations PixInsight keeps in the header
+  with CR LF. In the header an XML reader makes a line feed of CR LF; from a block it gets
+  both. The bytes were the same and the text other programs read was not. The third review
+  found the same in what the library had done since 0.13 on purpose: a text of the header with
+  a blank or a line break at an end was moved into a block, "where every reader takes it as it
+  is", which is true of the block and not of what the reader had before. A text of the header
+  is now written into the header again with the bytes it has, whatever its length and whatever
+  is at its ends: nothing is decided about what a reader makes of them, so nothing changes for
+  any reader. Only a text that is given (by a program, or by a `value` attribute) is looked at,
+  and kept as data if an element might not give it back.
+- **A carriage return that is meant is kept as data.** `&#13;` in a header is a carriage return
+  for every reader; a literal CR LF is one for PixInsight's own reader and a line feed for an
+  XML parser. In memory both are the same bytes, so the reader marks a String whose header
+  text has the reference (`xml::Node::crReference`) and it is carried and written as a block
+  (`Property::block`), as a String that was a block is. A new text with a carriage return,
+  given through `xisfconv_properties_set`, goes the same way. Literal CR LF stays literal: that
+  is what PixInsight writes on Windows, and those files must come back byte for byte. Two edges
+  stay: a text with both a literal CR LF and a reference is kept as data whole, so an XML reader
+  that read a line feed for the literal one reads CR LF afterwards; and a line break written as
+  such inside a `value` attribute, which XML reads as a blank, is read here as the line break.
+- **What is not read has no value, and says so.** A table, a property made of elements, a block
+  of a type without a name: `xisfconv_property_stored` calls them unread, the Python package
+  gives None, and `write` leaves them out with a warning. The first version wrote a Table back
+  as an empty value. A conversion does better in one case: it carries a data block of a type it
+  has no name for as the bytes it is, which the property functions of the API cannot hand over
+  (see TODO). A text block is handed over as its bytes also where they are not UTF-8; a NUL
+  character ends it, as it ends any C string.
+- **A solution belongs to the keywords it was read with.** An astrometric solution among the
+  properties a caller gives is written as it is, and none is made. But a program that reads an
+  image, crops it or solves it again and writes it would then write the old solution next to
+  new WCS keywords, and PixInsight prefers the properties. So `read_image` notes a digest of
+  the WCS keywords, the size and the row order with the solution (`PropertyDict.solution_of`,
+  `xisfconv_wcs_digest`), and `write` leaves the solution out when the digest of what is
+  written differs; one is then made from the WCS keywords if the image has them. It is the rule
+  a conversion through FITS and ASDF already had; a FITS or ASDF file written with a solution
+  stores the digest, and one written without stores none. The digest is kept per property, with
+  the value that was read, so that a solution the program puts in the place of the one that was
+  read is the program's word and is written. But a solution is one thing: if some of its
+  properties were set and the others are still those of another image, all of it goes, with a
+  warning. (For one release candidate the set ones stayed, and a reference coordinate was
+  written alone, which also kept a solution from being made from the keywords.) The same rule
+  holds wherever properties come from a file: `read_image`, the `properties` of an
+  open file given to `write` or to a `PropertyDict`, and the dictionaries of `xisfconv.xisf`
+  (where the `xisf` package writes the old solution: a difference on purpose).
+- **No solution is better than a wrong one, but not silently.** PixInsight often keeps the
+  solution in the properties alone, without WCS keywords. A crop of such an image is written
+  without any solution: there is nothing to make one from, and the old one is wrong by the
+  crop. That is a warning, not a log line; `solution_of = None` is the way to say that the
+  solution still holds. What is said depends on where the image goes: a FITS or ASDF file has
+  the WCS keywords and needs no warning, and for a TIFF or PNG, which holds no properties, the
+  question is not asked at all.
+- **`XISF:CompressionLevel` is not written.** It looked like the place to name the level of the
+  codec. PixInsight's is a number of its own scale, 0 to 100, whatever the codec: 12 there would
+  not have meant LZ4HC 12.
+- **The WCS keywords of an image in memory are converted once.** They were turned to the stored
+  row order when the image was added and again when it was written, with pixel coordinates that
+  are not symmetric about the middle row: CRPIX2 came back changed in its last digits. The image
+  now says which order its keywords describe, and the writer converts them if that is not the
+  order it stores.
+- **What a file may cost is counted before it is decompressed.** `xisfconv_property_read` reads
+  one property at a time, on demand, and each read was checked against the budget on its own:
+  a thousand blocks that each inflate to the limit passed. The file now keeps the count across
+  reads, and a property counts once however often it is read.
+- A new String of more than 3072 bytes given through the API is stored as a data block and so
+  compressed with the codec. Keyword text keeps its UTF-8 in XISF, where it is XML; in FITS
+  and ASDF it is ASCII as before.
+- A TimePoint is a date that exists (no 30 February), and Python writes one with the digits it
+  has: a `datetime64` of nanoseconds keeps them, and an offset from UTC that is not whole
+  minutes (local mean time before the time zones) is written as the UTC time it is. A
+  `datetime64` has no zone and is written without one, as a `datetime` without `tzinfo` is.
+
+### LZ4 written by the library's own compressor (0.15.0)
+
+- The `xisf` package writes `lz4` and `lz4hc`, and its documentation recommends `lz4hc` with
+  shuffling; an interface that refused them would not be its interface. PixInsight writes them
+  too. The block format is small: a compressor with one hash table (the codec `lz4`) and one
+  with hash chains and lazy matching for the levels 1 to 12 (`lz4hc`) are about 150 lines, where
+  linking liblz4 would be a second required dependency on three platforms and in the wheels.
+- They are not the reference compressors and do not make the same bytes. They make blocks the
+  lz4 library decodes, which is what the format asks, and come within a percent of its sizes on
+  image data. Tests decode the blocks with the lz4 library itself, for every size around the
+  limits of the format (no match in the last 12 bytes, 5 literals at the end, the window of
+  65535), and a fuzzer checked 84 000 blocks against those rules and its round trip.
+- One mistake worth keeping: the first version lengthened its step through incompressible data
+  with the distance since the last match. After 49 MB of noise (the low bytes of shuffled
+  float32 samples) the step was 768 KB, and the 16 MB that compress, behind them, were never
+  looked at. The reference adds a byte per 64 failed looks, which grows with the square root of
+  the distance. Found by comparing sizes with the lz4 library on a real frame, not by any test
+  of correctness.
+- **A compression level and byte shuffling off** are options of the writer (`xisfconv_write`,
+  `xisfconv.write`) because the interface of the `xisf` package has them. A conversion and a
+  rewrite keep the usual level and always shuffle; the tool has no option for either.
+- LZ4 is written to XISF only. ASDF has its own LZ4 layout, which is read; nothing asks for it
+  to be written.
+
 ## Testing
 
-- `tests/run_tests.py` drives the built program (5283 checks at 0.14.0). The Python packages it
+- `tests/run_tests.py` drives the built program (5711 checks at 0.15.0). The Python packages it
   needs are listed at its top; the `asdf` packages and the external tools (`tiffcp`, `fitsverify`,
   `pngcheck`, `fpack`/`funpack`) are used when installed and their checks skipped when not.
 - Every format is checked against an implementation that shares no code with xisfconv: astropy
@@ -607,7 +791,7 @@ Built in 0.11.0, in `python/`. What was decided:
   lifetimes, callbacks), a Python script that calls the API through ctypes and compares what the
   library writes and reads with astropy, the `xisf` package, asdf, tifffile and Pillow, and a
   program that reads all there is of any file, which is what gets fuzzed.
-- The Python package is tested with pytest (`python/tests`, 293 tests at 0.14.0): the same
+- The Python package is tested with pytest (`python/tests`, 341 tests at 0.15.0): the same
   comparisons with other software, made through the package, run from the source tree and from the
   installed wheel on Python 3.10 to 3.14, with the oldest NumPy and astropy the package allows and
   with the newest, and under AddressSanitizer.
@@ -631,6 +815,25 @@ Built in 0.11.0, in `python/`. What was decided:
   condition inside a lambda names the type, never a local of the enclosing function. The same
   release gives a starting value to the variables that MSVC called potentially uninitialized in
   `src/wcs.cpp` (warning C4701; they were always set before use).
+- `xisfconv.xisf` is tested against the package it stands in for: for files that package wrote
+  and files this library wrote, in every codec, both must return the same dictionaries, down to
+  key order and dtypes, and the same arrays; the package must read what the module writes (but
+  for what it reads from no file: a property that is not-a-number, a vector without elements);
+  and each difference its documentation names has a test that shows it.
+- A review by a reader who did not write the code, before delivery, found seventeen things in
+  0.15.0 that every test passed over: the old solution written next to new keywords, values the
+  module could read and not write again, the budget, the DOCTYPE. The tests had compared with
+  the `xisf` package on the files that package writes; the findings were all in files it does
+  not write. Hand-made headers (`handmade` in `python/tests/util.py`) are now part of the
+  module's tests. A second review, of the fixes, found nine more, most of them next to a fix:
+  the solution rule held for `read_image` and not for the two other ways properties come from
+  a file, and the long texts that the first review asked to be compressed were PixInsight's
+  own, moved out of the header. A third found twelve, smaller, again next to the fixes. A fix
+  is new code and gets the review new code gets.
+- A struct that grows is tested from the side of a program built before it grew: the C test hands
+  over `xisfconv_image` and `xisfconv_write_options` in the size of 0.14, with garbage behind.
+  (`xisfconv_image` ended in four bytes of padding, as `xisfconv_convert_options` did in 0.13: the
+  new pointer starts behind them, and a `static_assert` says so.)
 - CI builds and runs the suite on Linux, macOS and Windows.
 
 ## How changes are made

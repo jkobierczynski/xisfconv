@@ -231,12 +231,12 @@ Packed compressBlock(const std::vector<uint8_t>& raw, size_t itemSize, const Xis
         shuffledData = shuffled(raw.data(), raw.size(), itemSize);
         src = shuffledData.data();
     }
-    const uint64_t chunk = std::max<uint64_t>(1, opt.subblockSize);
+    const uint64_t chunk = xisfSubblockSize(opt.codec, opt.subblockSize);
     std::string subblocks;
     size_t chunks = 0;
     for (uint64_t off = 0; off < raw.size(); off += chunk, ++chunks) {
         const size_t n = static_cast<size_t>(std::min<uint64_t>(chunk, raw.size() - off));
-        const std::vector<uint8_t> c = opt.codec == "zstd" ? zstdCompress(src + off, n) : zlibCompress(src + off, n);
+        const std::vector<uint8_t> c = xisfCompress(opt.codec, src + off, n);
         p.bytes.insert(p.bytes.end(), c.begin(), c.end());
         if (!subblocks.empty()) subblocks += ':';
         subblocks += std::to_string(c.size()) + "," + std::to_string(n);
@@ -302,11 +302,11 @@ void readBack(const std::string& path, const std::vector<Fingerprint>& expected,
 }  // namespace
 
 XisfRewriteResult rewriteXisf(const std::string& input, const std::string& output, const XisfRewriteOptions& opt) {
-    if (!opt.codec.empty() && opt.codec != "none" && opt.codec != "zlib" && opt.codec != "zstd") {
-        throw Error("unsupported XISF compression codec '" + opt.codec + "' (use zlib, zstd or none)", ErrorKind::Argument);
+    if (!opt.codec.empty() && opt.codec != "none" && !isXisfWriteCodec(opt.codec)) {
+        throw Error("unsupported XISF compression codec '" + opt.codec + "' (use zlib, lz4, lz4hc, zstd or none)", ErrorKind::Argument);
     }
     if (opt.codec == "zstd" && !zstdAvailable()) throw Unsupported("this build has no Zstandard support; use --codec zlib");
-    const bool recompress = opt.codec == "zlib" || opt.codec == "zstd";
+    const bool recompress = isXisfWriteCodec(opt.codec);
     warnIfChecksumUnknownToPixInsight(opt.checksum);
 
     {

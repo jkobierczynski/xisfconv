@@ -18,6 +18,8 @@ Reading::
 Writing, to XISF, FITS, ASDF, TIFF or PNG::
 
     xisfconv.write("out.xisf", data, keywords={"OBJECT": "M 31"}, codec="zstd", checksum="sha256")
+    xisfconv.write("out.xisf", data, properties={"Instrument:Telescope:FocalLength": 0.53})
+    xisfconv.write("copy.xisf", image)            # what was read, with its keywords and properties
 
 Whole files, as the command line tool does it::
 
@@ -27,7 +29,9 @@ Whole files, as the command line tool does it::
 
 Arrays have row 0 at the top of the image and the channels last, unless ``row_order`` and
 ``channels`` say otherwise. With astropy: ``import xisfconv.astropy`` makes
-``CCDData.read("m31.xisf")`` work and gives the FITS conventions; see that module.
+``CCDData.read("m31.xisf")`` work and gives the FITS conventions; see that module. For programs
+written for the ``xisf`` package, ``from xisfconv.xisf import XISF`` gives its class on this
+library; see that module.
 
 Warnings of the library are Python warnings of the class :class:`XisfconvWarning`; its notes
 on how a conversion was done go to the logger "xisfconv" at level INFO.
@@ -38,7 +42,7 @@ those formats, use astropy or the asdf package.
 
 from ._core import (ArgumentError, Cancelled, Card, ChecksumError, Error, File, FileError, FileImage, FormatError,
                     Image, ImageIndexError, InputNotFoundError, InternalError, Keywords, NotFoundError,
-                    OutputExistsError, Properties, Report, RewriteResult, StretchParams, UnsupportedError,
+                    OutputExistsError, Properties, PropertyDict, Report, RewriteResult, StretchParams, UnsupportedError,
                     XisfconvWarning, apply_stretch, auto_stretch, codec_available, convert, detect_format,
                     library_path, library_version, open, read, read_image, rewrite, rewrite_in_place,
                     stored_as_requested, verify, wcs_flip_rows, write)
@@ -57,7 +61,7 @@ except ImportError:   # pragma: no cover
 __all__ = [
     "ArgumentError", "Cancelled", "Card", "ChecksumError", "Error", "File", "FileError", "FileImage", "FormatError",
     "Image", "ImageIndexError", "InputNotFoundError", "InternalError", "Keywords", "NotFoundError",
-    "OutputExistsError", "Properties", "Report", "RewriteResult", "StretchParams", "UnsupportedError",
+    "OutputExistsError", "Properties", "PropertyDict", "Report", "RewriteResult", "StretchParams", "UnsupportedError",
     "XisfconvWarning", "apply_stretch", "auto_stretch", "codec_available", "convert", "detect_format",
     "library_path", "library_version", "open", "read", "read_image", "rewrite", "rewrite_in_place",
     "stored_as_requested", "verify", "wcs_flip_rows", "write",

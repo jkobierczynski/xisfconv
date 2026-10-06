@@ -17,10 +17,25 @@ namespace {
 
 constexpr uint64_t kAlignment = 4096;
 
+// The text of a keyword. A FITS header is ASCII, but the keywords of an XISF file are XML, and
+// what one holds beyond ASCII (a name with an umlaut, a degree sign in a comment) is kept: a
+// character of UTF-8 as it is, any other byte as a question mark.
 std::string xmlEscape(const std::string& s) {
     std::string out;
     out.reserve(s.size() + 8);
-    for (unsigned char c : s) {
+    for (size_t i = 0; i < s.size();) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        if (c >= 0x80) {
+            const size_t n = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC2 ? 2 : 0;
+            if (n != 0 && i + n <= s.size() && isXmlText(s.substr(i, n))) {
+                out.append(s, i, n);
+                i += n;
+            } else {
+                out += '?';
+                ++i;
+            }
+            continue;
+        }
         switch (c) {
             case '&': out += "&amp;"; break;
             case '<': out += "&lt;"; break;
@@ -29,9 +44,9 @@ std::string xmlEscape(const std::string& s) {
             default:
                 if (c == '\t' || c == '\n' || c == '\r') out += "&#" + std::to_string(c) + ";";
                 else if (c < 0x20 || c == 0x7F) out += ' ';   // not representable in XML 1.0
-                else if (c >= 0x80) out += '?';                // FITS headers are ASCII
                 else out += static_cast<char>(c);
         }
+        ++i;
     }
     return out;
 }
@@ -58,19 +73,6 @@ std::string xmlText(const std::string& s, bool attribute = true) {
         }
     }
     return out;
-}
-
-// True if the text can be the content of an XML element and come back as it is, with its line
-// breaks written as they are: text that XML can hold (isXmlText), without white space at its
-// ends, which a reader may take for layout, and without a carriage return on its own, which an
-// XML reader turns into a line feed. (CR LF it turns into a line feed too; that is what it does
-// with the text PixInsight writes into its headers, and the same bytes are written again.)
-bool textFitsElement(const std::string& s) {
-    auto space = [](unsigned char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; };
-    if (!s.empty() && (space(static_cast<unsigned char>(s.front())) || space(static_cast<unsigned char>(s.back())))) return false;
-    for (size_t i = 0; i < s.size(); ++i)
-        if (s[i] == '\r' && (i + 1 >= s.size() || s[i + 1] != '\n')) return false;
-    return isXmlText(s);
 }
 
 // Text that is not XML text, made into some: a control character becomes a blank, a byte that
@@ -115,10 +117,6 @@ struct Block {
     std::string attributes;         // compression / subblocks / checksum, each with a leading space
 };
 
-std::vector<uint8_t> compressChunk(const std::string& codec, const uint8_t* src, size_t size) {
-    return codec == "zstd" ? zstdCompress(src, size) : zlibCompress(src, size);
-}
-
 // `raw`: the bytes to store, `itemSize` the size of the numbers they consist of (1 if none).
 void prepareBlock(const uint8_t* raw, size_t rawSize, size_t itemSize, const XisfWriteOptions& opt, Block& block) {
     block.data = raw;
@@ -132,13 +130,13 @@ void prepareBlock(const uint8_t* raw, size_t rawSize, size_t itemSize, const Xis
             shuffledData = shuffled(raw, rawSize, itemSize);
             src = shuffledData.data();
         }
-        const uint64_t chunk = std::max<uint64_t>(1, opt.subblockSize);
+        const uint64_t chunk = xisfSubblockSize(opt.codec, opt.subblockSize);
         std::vector<uint8_t> stored;
         std::string subblocks;
         size_t chunks = 0;
         for (uint64_t off = 0; off < rawSize; off += chunk, ++chunks) {
             const size_t n = static_cast<size_t>(std::min<uint64_t>(chunk, rawSize - off));
-            const std::vector<uint8_t> c = compressChunk(opt.codec, src + off, n);
+            const std::vector<uint8_t> c = xisfCompress(opt.codec, src + off, n, opt.level);
             stored.insert(stored.end(), c.begin(), c.end());
             if (!subblocks.empty()) subblocks += ':';
             subblocks += std::to_string(c.size()) + "," + std::to_string(n);
@@ -163,10 +161,6 @@ void prepareBlock(const uint8_t* raw, size_t rawSize, size_t itemSize, const Xis
 
 uint64_t alignUp(uint64_t v) { return (v + kAlignment - 1) / kAlignment * kAlignment; }
 
-// Data blocks up to this size are written into the header, larger ones are attached to the
-// file: PixInsight's own limit (its XISF:MaxInlineBlockSize).
-constexpr size_t kMaxInlineBlock = 3072;
-
 // The properties of one element (an image, or the file), as XML. A property whose data is
 // attached gets a place in `blocks`, and its location is filled in from `positions` (which
 // holds zeros until the layout is known).
@@ -178,7 +172,7 @@ struct PropertyWriter {
     size_t next = 0;   // the block the next attached property uses
 
     std::string dataBlock(const uint8_t* data, size_t size, size_t itemSize, bool inHeader = false) {
-        if (size <= kMaxInlineBlock || inHeader) return " location=\"inline:base64\">" + base64Encode(data, size) + "</Property>\n";
+        if (size <= kXisfMaxInlineBlock || inHeader) return " location=\"inline:base64\">" + base64Encode(data, size) + "</Property>\n";
         if (layout) {
             blocks.emplace_back();
             prepareBlock(data, size, itemSize, opt, blocks.back());
@@ -221,9 +215,11 @@ struct PropertyWriter {
             return x + dataBlock(p.data.data(), p.data.size(), item, p.inHeader);
         }
         if (p.type == "String") {
-            if (!p.block && textFitsElement(p.text)) return x + ">" + xmlText(p.text, false) + "</Property>\n";
-            // A text that was a data block is one again; so is a text that XML would not give
-            // back as it is. XISF allows that for a String.
+            // A text of a header is written as that header had it, whatever is at its ends:
+            // each reader then makes of it what it made of it before. A text that was a data
+            // block is one again, and so is one that is to come back byte for byte (see
+            // Property::block) and one that XML cannot hold. XISF allows that for a String.
+            if (!p.block && isXmlText(p.text)) return x + ">" + xmlText(p.text, false) + "</Property>\n";
             return x + dataBlock(reinterpret_cast<const uint8_t*>(p.text.data()), p.text.size(), 1);
         }
         if (!isXmlText(p.text)) {
@@ -239,8 +235,16 @@ struct PropertyWriter {
 void writeXisf(const std::string& path, const std::vector<XisfOutImage>& images, const XisfWriteOptions& opt) {
     if (images.empty()) throw Error("no images to write");
     warnIfChecksumUnknownToPixInsight(opt.checksum);
-    if (!opt.codec.empty() && opt.codec != "zlib" && opt.codec != "zstd") {
-        throw Error("unsupported XISF compression codec '" + opt.codec + "' (use zlib or zstd)", ErrorKind::Argument);
+    if (!opt.codec.empty() && !isXisfWriteCodec(opt.codec)) {
+        throw Error("unsupported XISF compression codec '" + opt.codec + "' (use zlib, lz4, lz4hc or zstd)", ErrorKind::Argument);
+    }
+    if (opt.level != 0) {
+        if (opt.codec.empty()) throw Error("a compression level without a codec", ErrorKind::Argument);
+        xisfCompress(opt.codec, nullptr, 0, opt.level);   // (says what is wrong with the level)
+    }
+    if (!opt.creatorApplication.empty() && !textFitsElement(opt.creatorApplication)) {
+        throw Error("the name of the creator application is not text that XML holds as it is (control characters, "
+                    "or blanks at its ends)", ErrorKind::Argument);
     }
 
     // The attached blocks: the pixels of each image, then the data of the properties that are
@@ -295,7 +299,12 @@ void writeXisf(const std::string& path, const std::vector<XisfOutImage>& images,
         }
         x += "<Metadata>\n";
         x += "<Property id=\"XISF:CreationTime\" type=\"TimePoint\" value=\"" + created + "\"/>\n";
-        x += "<Property id=\"XISF:CreatorApplication\" type=\"String\">xisfconv " + std::string(kVersion) + "</Property>\n";
+        if (opt.creatorApplication.empty()) {
+            x += "<Property id=\"XISF:CreatorApplication\" type=\"String\">xisfconv " + std::string(kVersion) + "</Property>\n";
+        } else {
+            x += "<Property id=\"XISF:CreatorApplication\" type=\"String\">" + xmlText(opt.creatorApplication, false) + "</Property>\n";
+            x += "<Property id=\"XISF:CreatorModule\" type=\"String\">xisfconv " + std::string(kVersion) + "</Property>\n";
+        }
         x += "<Property id=\"XISF:BlockAlignmentSize\" type=\"UInt16\" value=\"" + std::to_string(kAlignment) + "\"/>\n";
         if (!opt.codec.empty()) {
             x += "<Property id=\"XISF:CompressionCodecs\" type=\"String\">" + opt.codec +

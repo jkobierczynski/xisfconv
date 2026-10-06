@@ -7,6 +7,7 @@ Everything public here is re-exported by the package; see the package documentat
 
 import atexit
 import ctypes
+import datetime
 import logging
 import math
 import numbers
@@ -168,6 +169,7 @@ _OPTION_WORDS = [
     ("--bits f32", 'sample_format="float32"'),
     ("--bits", "sample_format"),
     ("--codec zlib", 'codec="zlib"'),
+    ("--codec zstd", 'codec="zstd"'),
     ("use --compress", "use codec=True"),
     ("add --compress", "add codec=True"),
     ("--compress", "codec"),
@@ -1203,6 +1205,623 @@ def apply_stretch(data, params, *, bounds=None, channels="last"):
 
 
 # ------------------------------------------------------------------------------------------
+# XISF properties
+# ------------------------------------------------------------------------------------------
+
+_ELEMENT_DTYPES = {
+    _lib.ELEMENT_INT8: np.dtype(np.int8), _lib.ELEMENT_UINT8: np.dtype(np.uint8),
+    _lib.ELEMENT_INT16: np.dtype(np.int16), _lib.ELEMENT_UINT16: np.dtype(np.uint16),
+    _lib.ELEMENT_INT32: np.dtype(np.int32), _lib.ELEMENT_UINT32: np.dtype(np.uint32),
+    _lib.ELEMENT_INT64: np.dtype(np.int64), _lib.ELEMENT_UINT64: np.dtype(np.uint64),
+    _lib.ELEMENT_FLOAT32: np.dtype(np.float32), _lib.ELEMENT_FLOAT64: np.dtype(np.float64),
+    _lib.ELEMENT_COMPLEX32: np.dtype(np.complex64), _lib.ELEMENT_COMPLEX64: np.dtype(np.complex128),
+}
+# NumPy's names for the types of XISF: of the elements of vectors and matrices, and of scalars
+_ELEMENT_NAMES = {"int8": "I8", "uint8": "UI8", "int16": "I16", "uint16": "UI16", "int32": "I32", "uint32": "UI32",
+                  "int64": "I64", "uint64": "UI64", "float32": "F32", "float64": "F64", "complex64": "C32",
+                  "complex128": "C64"}
+_SCALAR_NAMES = {"int8": "Int8", "uint8": "UInt8", "int16": "Int16", "uint16": "UInt16", "int32": "Int32",
+                 "uint32": "UInt32", "int64": "Int64", "uint64": "UInt64", "float32": "Float32", "float64": "Float64",
+                 "complex64": "Complex32", "complex128": "Complex64"}
+_WHOLE_TYPES = frozenset(("Int8", "UInt8", "Byte", "Int16", "Short", "UInt16", "UShort", "Int32", "Int", "UInt32",
+                          "UInt", "Int64", "UInt64"))
+_REAL_TYPES = {"Float32": np.float32, "Float": np.float32, "Float64": np.float64, "Double": np.float64}
+_COMPLEX_TYPES = {"Complex32": np.float32, "Complex64": np.float64}
+# the types the library checks a value of, and those of XISF that are too wide for it: a value
+# of one of these is written as the text it has
+_CHECKED_TYPES = _WHOLE_TYPES | frozenset(_REAL_TYPES) | frozenset(_COMPLEX_TYPES) | {"Boolean", "String", "TimePoint"}
+_WIDE_TYPES = frozenset(("Int128", "UInt128", "Float128", "Complex128"))
+_SOLUTION = "PCL:AstrometricSolution:"
+
+_elements = {}
+
+
+def _element_of(kind):
+    """(dtype, matrix) of the XISF type of a vector or a matrix; (None, False) for any other."""
+    try:
+        return _elements[kind]
+    except KeyError:
+        pass
+    matrix = c_int32()
+    try:
+        element = _library.xisfconv_property_element(_bytes(kind), byref(matrix))
+    except ValueError:
+        element = _lib.ELEMENT_NONE
+    found = (_ELEMENT_DTYPES.get(element), bool(matrix.value))
+    if len(_elements) < 256:
+        _elements[kind] = found
+    return found
+
+
+def _scalar_value(kind, value):
+    """The Python value of a property that is not a vector or a matrix, from its text."""
+    text = value.strip()
+    try:
+        if kind == "Boolean":
+            return text.lower() in ("1", "true")
+        if kind in _WHOLE_TYPES or kind.startswith(("Int", "UInt")):
+            return int(text)
+        if kind in _REAL_TYPES or kind.startswith("Float"):
+            return float(text)
+        if kind.startswith("Complex") and text.startswith("(") and text.endswith(")"):
+            real, imaginary = text[1:-1].split(",")
+            return complex(float(real), float(imaginary))
+    except ValueError:
+        pass
+    return value
+
+
+def _inferred_type(key, value):
+    """The XISF type a Python value is written with when none is stated."""
+    if isinstance(value, (bool, np.bool_)):
+        return "Boolean"
+    if isinstance(value, str):
+        return "String"
+    if isinstance(value, np.datetime64) or isinstance(value, (datetime.datetime, datetime.date)):
+        return "TimePoint"
+    if isinstance(value, np.generic):
+        try:
+            return _SCALAR_NAMES[value.dtype.name]
+        except KeyError:
+            raise TypeError("property %s: XISF has no type for a %s" % (key, value.dtype.name)) from None
+    if isinstance(value, numbers.Integral):
+        number = int(value)
+        if -2 ** 31 <= number < 2 ** 31:
+            return "Int32"
+        if -2 ** 63 <= number < 2 ** 63:
+            return "Int64"
+        if 0 <= number < 2 ** 64:
+            return "UInt64"
+        raise ValueError("property %s: %d is beyond 64 bits" % (key, number))
+    if isinstance(value, numbers.Real):
+        return "Float64"
+    if isinstance(value, numbers.Complex):
+        return "Complex64"
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return "ByteArray"
+    if isinstance(value, (np.ndarray, list, tuple)):
+        array = np.asarray(value)
+        if array.ndim not in (1, 2):
+            raise ValueError("property %s: a vector is a 1-D array and a matrix a 2-D one; this one has %d "
+                             "dimension(s)" % (key, array.ndim))
+        name = array.dtype.name
+        if not isinstance(value, np.ndarray) and array.dtype.kind in "iu":
+            # numbers from a list: 32 bits if they fit, whatever NumPy takes for its integer here
+            name = "int32" if array.size == 0 or (array.min() >= -2 ** 31 and array.max() < 2 ** 31) else name
+        if name not in _ELEMENT_NAMES:
+            raise TypeError("property %s: XISF has no vector or matrix of %s" % (key, name))
+        return _ELEMENT_NAMES[name] + ("Vector" if array.ndim == 1 else "Matrix")
+    raise TypeError("property %s: a value is a number, a string, True or False, a date and time, or an array of "
+                    "numbers; not %s" % (key, value.__class__.__name__))
+
+
+def _real_text(key, value, kind):
+    if not isinstance(value, numbers.Real):
+        raise TypeError("property %s: a number is needed, not %s" % (key, value.__class__.__name__))
+    number = float(value)
+    if kind is np.float32:
+        with np.errstate(over="ignore"):
+            single = np.float32(number)
+        if math.isfinite(number) and not np.isfinite(single):
+            raise ValueError("property %s: %r is beyond what Float32 holds" % (key, number))
+        return str(single)    # the shortest text that reads back as the same 32-bit number
+    return repr(number)
+
+
+def _time_text(key, value):
+    if isinstance(value, str):
+        return value
+    if isinstance(value, np.datetime64):
+        if np.isnat(value):
+            raise ValueError("property %s: not a time" % key)
+        unit = np.datetime_data(value.dtype)[0]
+        try:
+            # (through seconds for the fine units, and for the finest through nanoseconds: NumPy has
+            # no factor between years and picoseconds, nor between seconds and attoseconds)
+            coarse = value if unit in ("Y", "M", "W", "D", "h", "m") else \
+                (value.astype("datetime64[ns]") if unit in ("fs", "as") else value).astype("datetime64[s]")
+            year = int(coarse.astype("datetime64[Y]").astype(np.int64)) + 1970
+        except (OverflowError, ValueError):
+            year = None
+        if year is None or not 1 <= year <= 9999:
+            raise ValueError("property %s: a TimePoint is written with a year from 0001 to 9999, which %r is not of" % (key, value))
+        # In the unit it has: a date as a date, a time with all the digits of its seconds. Without
+        # a zone, as for a datetime without one: a datetime64 does not say where it is.
+        if unit in ("Y", "M", "W", "D"):
+            return str(np.datetime_as_string(value.astype("datetime64[D]")))
+        if unit in ("h", "m"):
+            value = value.astype("datetime64[s]")
+        return str(np.datetime_as_string(value))
+    if isinstance(value, datetime.datetime):
+        offset = value.utcoffset()
+        if offset is not None and (offset.seconds % 60 or offset.microseconds):
+            try:
+                value = value.astimezone(datetime.timezone.utc)   # (an offset is written in hours and minutes)
+            except OverflowError:
+                raise ValueError("property %s: %r is not a time in the years 0001 to 9999 once its offset of "
+                                 "seconds is taken off" % (key, value)) from None
+        text = value.isoformat()
+        return text[:-6] + "Z" if text.endswith("+00:00") else text
+    if isinstance(value, datetime.date):
+        return value.isoformat()
+    raise TypeError("property %s: a TimePoint is a datetime, or the text of one (2026-10-06T18:30:00Z), not %s" %
+                    (key, value.__class__.__name__))
+
+
+def _as_elements(key, array, dtype, kind):
+    """The array in the element type of the property, if its numbers can be that."""
+    have, want = array.dtype.kind, dtype.kind
+    allowed = {"i": "iu", "u": "iu", "f": "iuf", "c": "iufc"}[want]
+    if have not in allowed:
+        raise TypeError("property %s: an array of %s cannot be a %s" % (key, array.dtype.name, kind))
+    if want in "iu" and array.size:
+        limits = np.iinfo(dtype)
+        if int(array.min()) < limits.min or int(array.max()) > limits.max:
+            raise ValueError("property %s: the array holds numbers a %s does not" % (key, kind))
+    with np.errstate(over="ignore"):
+        out = np.ascontiguousarray(array, dtype=dtype)
+    if want in "fc" and array.dtype != dtype and bool((np.isfinite(array) & ~np.isfinite(out)).any()):
+        raise ValueError("property %s: the array holds numbers a %s does not" % (key, kind))
+    return out
+
+
+def _property_payload(key, value, kind):
+    """What the library is given as the value of a property of the XISF type `kind`: the text of
+    a scalar, or the array of a vector or a matrix."""
+    dtype, matrix = _element_of(kind)
+    if dtype is not None:
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            array = np.frombuffer(bytes(value), np.uint8)
+        else:
+            array = np.asarray(value)
+        if array.ndim != (2 if matrix else 1):
+            raise ValueError("property %s: a %s is a %d-D array; this one has %d dimension(s)" %
+                             (key, kind, 2 if matrix else 1, array.ndim))
+        return _as_elements(key, array, dtype, kind)
+    if kind == "Boolean":
+        if isinstance(value, (bool, np.bool_)) or (isinstance(value, numbers.Integral) and value in (0, 1)):
+            return "true" if value else "false"
+        raise TypeError("property %s: a Boolean is True or False, not %r" % (key, value))
+    if kind in _WHOLE_TYPES:
+        try:
+            return str(operator.index(value))
+        except TypeError:
+            raise TypeError("property %s: a whole number is needed for %s, not %s" %
+                            (key, kind, value.__class__.__name__)) from None
+    if kind in _REAL_TYPES:
+        return _real_text(key, value, _REAL_TYPES[kind])
+    if kind in _COMPLEX_TYPES:
+        if not isinstance(value, numbers.Complex):
+            raise TypeError("property %s: a number is needed, not %s" % (key, value.__class__.__name__))
+        number = complex(value)
+        part = _COMPLEX_TYPES[kind]
+        return "(%s,%s)" % (_real_text(key, number.real, part), _real_text(key, number.imag, part))
+    if kind == "TimePoint":
+        return _time_text(key, value)
+    if kind == "String":
+        if not isinstance(value, str):
+            raise TypeError("property %s: a String is text, not %s" % (key, value.__class__.__name__))
+        return value
+    raise ValueError("property %s: a property of the type %s is not written from a value" % (key, kind))
+
+
+def _plain_text(key, value, kind):
+    """The value of a property of a type that is too wide for the library to check (Float128,
+    UInt128), as the text it is written with."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (bool, np.bool_)):
+        return "true" if value else "false"
+    if isinstance(value, numbers.Integral):
+        return str(int(value))
+    if isinstance(value, numbers.Real):
+        return repr(float(value))
+    if isinstance(value, numbers.Complex):
+        return "(%r,%r)" % (complex(value).real, complex(value).imag)
+    raise TypeError("property %s: the value of a %s is given as a number or as its text, not as %s" %
+                    (key, kind, value.__class__.__name__))
+
+
+def _same_value(a, b):
+    """True if a value is still the one that was read: the same object, or one equal to it of
+    the same kind."""
+    if a is b:
+        return True
+    if a.__class__ is not b.__class__ or isinstance(a, np.ndarray):
+        return False
+    try:
+        if isinstance(a, (float, np.floating)):
+            # (0.0 and -0.0 are two values, and not-a-number is the one it was)
+            return bool((a == b and math.copysign(1.0, a) == math.copysign(1.0, b)) or (a != a and b != b))
+        if isinstance(a, (complex, np.complexfloating)):
+            return _same_value(float(a.real), float(b.real)) and _same_value(float(a.imag), float(b.imag))
+        return bool(a == b)
+    except Exception:   # noqa: BLE001 - a value that cannot be compared is another one
+        return False
+
+
+def _still_read(value, read):
+    """True if a property of an astrometric solution is still what was read: as for
+    :func:`_same_value`, and an array with the elements it had."""
+    if isinstance(value, np.ndarray) and isinstance(read, np.ndarray):
+        return value is read or (value.dtype == read.dtype and value.shape == read.shape and
+                                 bool(np.array_equal(value, read, equal_nan=value.dtype.kind in "fc")))
+    return _same_value(value, read)
+
+
+class PropertyDict(dict):
+    """XISF properties in memory: ``{id: value}``. This is what an :class:`Image` has and what
+    :func:`write` takes.
+
+    A value is a bool, an int, a float, a complex number, a str, a ``datetime``, or a NumPy
+    array of one dimension (a vector) or two (a matrix). It is written with the XISF type that
+    goes with it: Boolean, Int32 (Int64 or UInt64 if it does not fit), Float64, Complex64,
+    String, TimePoint, and vectors and matrices in the type of their elements (``uint16`` gives
+    UI16Vector, ``float64`` F64Matrix, ``complex64`` C32Vector). A NumPy scalar keeps its width
+    (``numpy.float32(0.5)`` is a Float32) and ``bytes`` are a ByteArray.
+
+    :meth:`set` states the type, and a comment and a format, where that is not what is wanted;
+    :meth:`type`, :meth:`comment` and :meth:`format` tell them, as for :class:`Properties`. A
+    value of the 128-bit types of XISF (Int128, UInt128, Float128, Complex128) is written as
+    the number it is given as, or as its text.
+
+    Properties read from a file (:func:`read_image`) have what the file states. A value that is
+    not touched is written again with the text the file has for it, whatever it says (only a
+    NUL character, and what stands behind it, is lost); assigning a new value to a
+    key keeps its type, comment and format, and deleting the key forgets them. ``update`` and
+    ``|`` carry all that over from another ``PropertyDict``; a plain ``dict`` made of one has
+    the values only.
+
+    A property whose value is None (one that could not be read) is not written.
+
+    ``solution_of`` belongs to an astrometric solution (``PCL:AstrometricSolution:...``) that
+    was read from a file: it says which WCS keywords and which image size the solution was
+    read with. :func:`write` writes such properties only with an image that still has those,
+    and leaves them out otherwise, so that a cropped image or new keywords are not contradicted
+    by an old solution; a solution is then made from the WCS keywords, if the image has them.
+    It is None for properties that were not read from a file, and a solution among those is
+    written as it is: a program that puts a solution of its own in the place of the one that
+    was read has it written. A solution is one thing, though: if only some of its properties
+    were given new values and the others no longer belong to the image, all of it is left out,
+    and a warning says so. Set ``solution_of`` to None to say that the solution is right as it
+    stands.
+    """
+
+    def __init__(self, *properties, **more):
+        dict.__init__(self)
+        self._about = {}     # {key: (type or None, comment, format)}: what is stated
+        # {key: (text, value, as a text block)}: a value as a file wrote it, what that text was
+        # read as, and whether the file keeps it as a data block (a String)
+        self._read = {}
+        self._solution = {}  # {key: (digest, value)}: a property of a solution, and what it was read with
+        self._untyped = set()   # the keys of properties a file has without a type
+        if len(properties) > 1:
+            raise TypeError("PropertyDict expected at most 1 argument, got %d" % len(properties))
+        if properties and properties[0] is not None:
+            self.update(properties[0])
+        if more:
+            self.update(more)
+
+    def set(self, key, value, type=None, comment="", format=""):   # noqa: A002 - the words of XISF
+        """Sets a property with what XISF states about it: ``type`` is the XISF type name
+        ("Float32", "UInt16", "TimePoint", "F32Vector"; None: the type that goes with the
+        value), ``comment`` a remark, and ``format`` how the value is meant to be shown
+        ("%.3f")."""
+        if type is not None and not isinstance(type, str):
+            raise TypeError("the type of a property is its XISF name, a string")
+        dict.__setitem__(self, key, value)
+        comment, format = str(comment or ""), str(format or "")   # noqa: A001
+        self._read.pop(key, None)
+        self._solution.pop(key, None)
+        self._untyped.discard(key)
+        if not type and not comment and not format:
+            self._about.pop(key, None)
+        else:
+            self._about[key] = (type or None, comment, format)
+
+    def _stated(self, key):
+        return self._about.get(key, (None, "", ""))
+
+    def _as_read(self, key):
+        """The text a file has for the value and whether it keeps it as a data block, if the
+        value is still the one that was read; else None."""
+        read = self._read.get(key)
+        if read is not None and _same_value(self[key], read[1]):
+            return read[0], bool(read[2])
+        return None
+
+    def _read_solution(self):
+        """{key: digest} for the properties of an astrometric solution that are still what a
+        file had."""
+        return {key: digest for key, (digest, value) in self._solution.items()
+                if key in self and _still_read(self[key], value)}
+
+    @property
+    def solution_of(self):
+        """What the astrometric solution among the properties was read with (a digest of WCS
+        keywords, image size and row order); None if it was not read from a file."""
+        for digest in self._read_solution().values():
+            return digest
+        return None
+
+    @solution_of.setter
+    def solution_of(self, digest):
+        self._solution.clear()
+        if digest is not None:
+            for key in self:
+                if isinstance(key, str) and key.startswith(_SOLUTION):
+                    self._solution[key] = (str(digest), self[key])
+
+    def type(self, key):   # noqa: A003
+        """The XISF type name the property is written with: the one stated, or the one that
+        goes with its value. "" for a property without a value, and for one that a file has
+        without a type and that was not given a new value."""
+        value = self[key]
+        stated = self._stated(key)[0]
+        if stated:
+            return stated
+        if value is None or (key in self._untyped and self._as_read(key) is not None):
+            return ""
+        return _inferred_type(key, value)
+
+    def comment(self, key):
+        self[key]
+        return self._stated(key)[1]
+
+    def format(self, key):   # noqa: A003
+        """How the value is meant to be shown (a format specification like "%.3f"); "" if
+        the property has none."""
+        self[key]
+        return self._stated(key)[2]
+
+    def _forget(self, key):
+        self._about.pop(key, None)
+        self._read.pop(key, None)
+        self._solution.pop(key, None)
+        self._untyped.discard(key)
+
+    def __delitem__(self, key):
+        dict.__delitem__(self, key)
+        self._forget(key)
+
+    def pop(self, key, *default):
+        value = dict.pop(self, key, *default)
+        self._forget(key)
+        return value
+
+    def popitem(self):
+        key, value = dict.popitem(self)
+        self._forget(key)
+        return key, value
+
+    def clear(self):
+        dict.clear(self)
+        self._about.clear()
+        self._read.clear()
+        self._solution.clear()
+        self._untyped.clear()
+
+    def update(self, *other, **more):
+        """As for a dict. From another :class:`PropertyDict`, and from the :class:`Properties`
+        of an open file, the types, comments and formats come along."""
+        if len(other) > 1:
+            raise TypeError("update expected at most 1 argument, got %d" % len(other))
+        source = other[0] if other else ()
+        if source is self:
+            source = ()
+        if isinstance(source, PropertyDict):
+            dict.update(self, source)
+            for key in source:
+                self._forget(key)
+                for mine, theirs in ((self._about, source._about), (self._read, source._read),
+                                     (self._solution, source._solution)):
+                    if key in theirs:
+                        mine[key] = theirs[key]
+                if key in source._untyped:
+                    self._untyped.add(key)
+        elif isinstance(source, Properties):
+            source._detach(self)
+        else:
+            dict.update(self, source)
+        if more:
+            dict.update(self, more)
+
+    def __ior__(self, other):
+        self.update(other)
+        return self
+
+    def __or__(self, other):
+        if not isinstance(other, Mapping):
+            return NotImplemented
+        merged = self.copy()
+        merged.update(other)
+        return merged
+
+    def __ror__(self, other):
+        if not isinstance(other, Mapping):
+            return NotImplemented
+        merged = PropertyDict(other)
+        merged.update(self)
+        return merged
+
+    def copy(self):
+        return PropertyDict(self)
+
+    __copy__ = copy
+
+    def _without(self, keys):
+        """A copy without these properties."""
+        out = self.copy()
+        for key in keys:
+            del out[key]
+        return out
+
+    def __reduce__(self):
+        return (_restored_properties, (dict(self), dict(self._about), dict(self._read), dict(self._solution),
+                                       set(self._untyped)))
+
+    def __repr__(self):
+        return "PropertyDict(%s)" % dict.__repr__(self)
+
+
+def _restored_properties(values, about, read, solution, untyped=()):
+    out = PropertyDict(values)
+    out._about, out._read, out._solution, out._untyped = about, read, solution, set(untyped)
+    return out
+
+
+def _stale_solution(context, properties, keywords, width, height, row_order):
+    """The properties of an astrometric solution that were read from a file with other WCS
+    keywords, another image size or another row order than these."""
+    read = properties._read_solution()
+    if not read:
+        return [], 0
+    now = _wcs_digest(context, keywords, width, height, row_order)
+    if all(digest == now for digest in read.values()):
+        return [], 0
+    # A solution is one thing: what was set since belongs to what was read, and goes with it.
+    whole = [key for key in properties if isinstance(key, str) and key.startswith(_SOLUTION)]
+    return whole, len(whole) - len(read)
+
+
+def _written_format(format, path):   # noqa: A002
+    """"xisf", "fits", "asdf", "tiff" or "png" as far as it can be told here; None if not."""
+    if isinstance(format, str) and format.strip():
+        return _FORMAT_NAMES.get(_FORMATS.get(format.strip().lower()))
+    try:
+        name = os.fsdecode(os.fspath(path)).lower()
+    except TypeError:
+        return None
+    for ending, kind in ((".xisf", "xisf"), (".fits", "fits"), (".fit", "fits"), (".fts", "fits"), (".fz", "fits"),
+                         (".asdf", "asdf"), (".tif", "tiff"), (".tiff", "tiff"), (".png", "png")):
+        if name.endswith(ending):
+            return kind
+    return None
+
+
+def _solution_left_out(name, own, keywords, wcs, kind="xisf"):
+    """Says that a solution that was read is not written, and what the file has instead. `own`:
+    how many properties of it had been given new values."""
+    said = "%s: the astrometric solution that was read from a file is not written: the image has not the size " \
+           "or the WCS keywords it was read with" % name
+    try:
+        cards = keywords if isinstance(keywords, Keywords) else Keywords(keywords)
+        # (the library decides whether they describe a WCS it has a solution for, and warns if not)
+        has_wcs = all(isinstance(cards.get(name), str) and cards.get(name).strip() for name in ("CTYPE1", "CTYPE2"))
+    except Exception:   # noqa: BLE001 - keywords that are not keywords are refused where they are written
+        has_wcs = False
+    hint = " (properties.solution_of = None says that the solution is right as it stands)"
+    if own:
+        said += "; the %d of its properties that were set since are left out with it, a solution being one thing" % own
+    if kind in ("fits", "asdf"):
+        if has_wcs and not own:
+            _log.info("%s; the file has the WCS keywords", said)
+        else:
+            _warn(said + ("; the file has the WCS keywords" if has_wcs else ", and the image has no WCS keywords either") + hint)
+    elif wcs and has_wcs:
+        (_warn if own else _log.info)("%s; the solution is made from the WCS keywords, if they describe one%s" %
+                                      (said, hint if own else ""))
+    else:
+        _warn("%s, and the file has no astrometric solution%s%s" %
+              (said, "" if wcs or not has_wcs else ": none is made from WCS keywords without wcs=True", hint))
+
+
+def _wcs_digest(context, keywords, width, height, row_order):
+    """What tells whether WCS keywords are still those a solution was read with (see
+    xisfconv_wcs_digest)."""
+    handle = Keywords(keywords)._to_handle(context)
+    try:
+        text = c_char_p()
+        context.quick(_library.xisfconv_wcs_digest, handle, int(width), int(height),
+                      _ROWS.get(row_order, _lib.ROWS_DEFAULT), byref(text))
+        return _text(text.value)
+    finally:
+        _library.xisfconv_keywords_free(handle)
+
+
+def _properties_handle(context, properties, what):
+    """A property list of the library from ``{id: value}``, or None if there is nothing to
+    write. The caller frees it."""
+    if properties is None:
+        return None
+    if not isinstance(properties, Mapping):
+        raise TypeError("%s are a dict {id: value}, not %s" % (what, properties.__class__.__name__))
+    if isinstance(properties, Properties):      # those of an open file, as they are
+        properties = PropertyDict(properties)
+    if not len(properties):
+        return None
+    handle = c_void_p()
+    context.quick(_library.xisfconv_properties_new, context.pointer, byref(handle))
+    try:
+        for key in properties:
+            if not isinstance(key, str):
+                raise TypeError("the id of a property is a string, not %s" % key.__class__.__name__)
+            as_read = None
+            if isinstance(properties, PropertyDict):
+                value = properties[key]
+                kind, comment, form = properties._stated(key)
+                as_read = properties._as_read(key)
+            else:
+                value, kind, comment, form = properties[key], None, "", ""
+            if value is None:
+                _warn("property %s%s has no value and is not written" % (key, " (a %s)" % kind if kind else ""))
+                continue
+            name = _bytes(key, "the id of a property")
+            comment = _bytes(comment, "the comment of property %s" % key) if comment else None
+            form = _bytes(form, "the format of property %s" % key) if form else None
+            if not kind:
+                # (a property a file has without a type is written again without one)
+                kind = "" if as_read is not None and isinstance(properties, PropertyDict) and key in properties._untyped \
+                    else _inferred_type(key, value)
+            array = _element_of(kind)[0] is not None
+            if not array and as_read is None and kind not in _CHECKED_TYPES:
+                if kind not in _WIDE_TYPES:
+                    raise ValueError("property %s: %s is not a type of XISF that is written from a value" % (key, kind))
+                as_read = _plain_text(key, value, kind), False      # 128 bits: written as its text says
+            if not array and as_read is not None:
+                # What a file has is written as the file has it; what it is, is the file's business.
+                context.quick(_library.xisfconv_properties_set_as_read, handle, name, _bytes(kind, "a property type"),
+                              _bytes(as_read[0], "the value of property %s" % key), comment, form,
+                              _lib.PROPERTY_TEXT_BLOCK if as_read[1] and kind == "String" else _lib.PROPERTY_VALUE)
+                continue
+            payload = _property_payload(key, value, kind)
+            if isinstance(payload, np.ndarray):
+                rows, columns = payload.shape if payload.ndim == 2 else (payload.shape[0], 0)
+                context.quick(_library.xisfconv_properties_set_array, handle, name, _bytes(kind, "a property type"),
+                              payload.ctypes.data_as(c_void_p), payload.nbytes, rows, columns, comment, form)
+            else:
+                context.quick(_library.xisfconv_properties_set, handle, name, _bytes(kind, "a property type"),
+                              _bytes(payload, "the value of property %s" % key), comment, form)
+        if not _library.xisfconv_properties_count(handle):
+            _library.xisfconv_properties_free(handle)
+            return None
+    except BaseException:
+        _library.xisfconv_properties_free(handle)
+        raise
+    return handle
+
+
+# ------------------------------------------------------------------------------------------
 # Images in memory
 # ------------------------------------------------------------------------------------------
 
@@ -1232,7 +1851,12 @@ class Image:
         The row order the WCS keywords describe, if it is not that of ``data``. An image read
         from an XISF file has "bottom-up" here: that is how PixInsight writes WCS keywords.
     properties
-        XISF properties of an image that was read, as a dict. They are not written.
+        XISF properties, ``{id: value}``: a :class:`PropertyDict`, or a dict it is made from.
+        Written to XISF as the properties of the image, and to FITS and ASDF the way
+        :func:`convert` takes the properties of an XISF file along. An astrometric solution
+        among them (``PCL:AstrometricSolution:...``) is written as it is, and none is made from
+        WCS keywords then. One that was read with the image is written only while the image
+        has the WCS keywords and the size it was read with (see :class:`PropertyDict`).
     color_space
         "gray", "rgb" or "other", of an image that was read. Writing goes by the number of
         channels: 3 are RGB.
@@ -1251,7 +1875,7 @@ class Image:
         self.row_order = row_order
         self.channels = channels
         self.wcs_row_order = wcs_row_order
-        self.properties = {} if properties is None else properties
+        self.properties = properties if isinstance(properties, PropertyDict) else PropertyDict(properties)
         self.color_space = color_space
 
     def __repr__(self):
@@ -1269,10 +1893,13 @@ class Image:
 class Properties(Mapping):
     """The XISF properties of an image, or of a file: ``{id: value}``, read when asked for.
 
-    Scalars are bool, int, float or str; numeric vectors and matrices are float64 arrays.
-    A property whose value this library does not read is None. :meth:`type`,
-    :meth:`comment` and :meth:`format` give the XISF type name, the comment and the format
-    specification of a property.
+    Scalars are bool, int, float, complex or str (a time point is the text the file has);
+    vectors and matrices are NumPy arrays in the type of their elements (an F32Vector is
+    float32, a UI16Matrix uint16, a C64Vector complex128; up to 0.14 they were all read as
+    float64, and complex ones not at all). A property this library does not read is None: a
+    table, a data block of a type it has no name for. A value of a type it has no name for
+    (Float128) is the text the file has. :meth:`type`, :meth:`comment` and :meth:`format` give
+    the XISF type name, the comment and the format specification of a property.
 
     A FITS or ASDF file has no properties of its own: it has those of the XISF file it was
     converted from, if it was (see :func:`convert`), and none otherwise.
@@ -1298,13 +1925,39 @@ class Properties(Mapping):
         return self._ids
 
     def _get(self, key):
-        index = self._load()[key]
+        return self._at(self._load()[key])[1:]
+
+    def _at(self, index):
+        """The property at a place in the list: id, type, value as text, comment, and whether
+        the value is a data block."""
         file = self._file
-        kind, value, comment, block = c_char_p(), c_char_p(), c_char_p(), c_int32()
+        name, kind, value, comment, block = c_char_p(), c_char_p(), c_char_p(), c_char_p(), c_int32()
         with file._context.lock:
-            file._context.quick(_library.xisfconv_property_get, file._pointer(), self._image, index, None, byref(kind),
-                                byref(value), byref(comment), byref(block))
-            return _text(kind.value), _text(value.value), _text(comment.value), bool(block.value)
+            file._context.quick(_library.xisfconv_property_get, file._pointer(), self._image, index, byref(name),
+                                byref(kind), byref(value), byref(comment), byref(block))
+            return _text(name.value), _text(kind.value), _text(value.value), _text(comment.value), bool(block.value)
+
+    def _count(self):
+        file = self._file
+        with file._context.lock:
+            return int(_library.xisfconv_property_count(file._pointer(), self._image))
+
+    def _as_stored(self, index, text, stored):
+        """What is written again for a value that is not touched: its text, or the bytes it has
+        if they are not UTF-8."""
+        if "\ufffd" not in text:
+            return text
+        file = self._file
+        value = c_char_p()
+        with file._context.lock:
+            file._context.quick(_library.xisfconv_property_get, file._pointer(), self._image, index, None, None,
+                                byref(value), None, None)
+            raw = value.value or b""
+        try:
+            raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return raw
+        return text
 
     def __len__(self):
         return len(self._load())
@@ -1315,37 +1968,92 @@ class Properties(Mapping):
     def __contains__(self, key):
         return key in self._load()
 
-    def __getitem__(self, key):
-        kind, value, _, block = self._get(key)
-        if block:
-            return self._read_block(key, kind)
-        text = value.strip()
-        try:
-            if kind == "Boolean":
-                return text.lower() in ("1", "true")
-            if kind.startswith(("Int", "UInt")):
-                return int(text)
-            if kind.startswith("Float"):
-                return float(text)
-        except ValueError:
-            pass
-        return value
-
-    def _read_block(self, key, kind):
+    def _stored(self, index):
+        """How the property is stored: one of the PROPERTY_ numbers of the library."""
         file = self._file
-        rows, columns = c_size_t(), c_size_t()
-        name = _bytes(key)
+        with file._context.lock:
+            return int(_library.xisfconv_property_stored(file._pointer(), self._image, index))
+
+    def __getitem__(self, key):
+        index = self._load()[key]
+        _, kind, value, _, _ = self._at(index)
+        stored = self._stored(index)
+        if stored == _lib.PROPERTY_ARRAY:
+            return self._read_block(index, kind)
+        if stored == _lib.PROPERTY_UNREAD:
+            return None
+        return _scalar_value(kind, value)
+
+    def _read_block(self, index, kind):
+        """A vector or a matrix in the type of its elements; None for a data block of any
+        other type."""
+        dtype, matrix = _element_of(kind)
+        if dtype is None:
+            return None
+        file = self._file
+        size, rows, columns = c_size_t(), c_size_t(), c_size_t()
         with file._context.lock:
             pointer = file._pointer()
+            file._context.call(_library.xisfconv_property_read, pointer, self._image, index, None, 0, byref(size),
+                               byref(rows), byref(columns))
+            out = np.empty((rows.value, columns.value) if matrix else (columns.value,), dtype)
+            if out.nbytes != size.value:
+                raise InternalError("the library has %d bytes for a property of %d" % (size.value, out.nbytes))
+            file._context.call(_library.xisfconv_property_read, pointer, self._image, index,
+                               out.ctypes.data_as(c_void_p), out.nbytes, byref(size), byref(rows), byref(columns))
+        return out
+
+    def _detach(self, into):
+        """Reads every property into a :class:`PropertyDict`, with its type, comment and
+        format. One that cannot be read is there without a value, and a warning says why."""
+        file = self._file
+        solved = [key for key in self._load() if key.startswith(_SOLUTION)]
+        digest = None
+        if solved and self._image != _lib.FILE_PROPERTIES:
+            entry = file[self._image]
+            if file.format != "xisf" and entry.detail("carriedSolution") == "stale":
+                # as a conversion of the file has it: the keywords say what the WCS is now
+                _log.info("%s: the astrometric solution the file carries is left out: its WCS keywords, its size "
+                          "or the order of its rows changed since the solution was written", file._name)
+            else:
+                info, keywords = entry._info(), entry.keywords
+                with file._context.lock:
+                    digest = _wcs_digest(file._context, keywords, info.width, info.height,
+                                         _ROW_NAMES.get(info.wcs_row_order))
+        names = [self._at(index)[0] for index in range(self._count())]
+        nameless = names.count("")
+        twice = len(names) - nameless - len(set(names) - {""})
+        if twice:
+            _warn("%s: %d propert%s the id of an earlier one, and %s left out" %
+                  (file._name, twice, "y has" if twice == 1 else "ies have", "is" if twice == 1 else "are"))
+        if nameless:
+            _warn("%s: %s left out" % (file._name, "a property without an id is" if nameless == 1 else
+                                       "%d properties without an id are" % nameless))
+        for key, index in self._load().items():
+            if not key:
+                continue
+            if digest is None and key in solved and self._image != _lib.FILE_PROPERTIES:
+                continue
+            _, kind, text, comment, _ = self._at(index)
+            stored = self._stored(index)
             try:
-                file._context.call(_library.xisfconv_property_read_f64, pointer, self._image, name, None, 0,
-                                   byref(rows), byref(columns))
-                out = np.empty((rows.value, columns.value), np.float64)
-                file._context.call(_library.xisfconv_property_read_f64, pointer, self._image, name,
-                                   out.ctypes.data_as(c_void_p), out.size, byref(rows), byref(columns))
-            except (NotFoundError, UnsupportedError):
-                return None   # a type that is not read as numbers
-        return out if kind.endswith("Matrix") else out.reshape(-1)
+                if stored == _lib.PROPERTY_ARRAY:
+                    value = self._read_block(index, kind)
+                else:
+                    value = None if stored == _lib.PROPERTY_UNREAD else _scalar_value(kind, text)
+            except Error as e:   # one property that cannot be read does not cost the others
+                _warn("%s: property %s is left out: %s" % (file._name, key, e))
+                value = None
+            into.set(key, value, kind, comment, self.format(key))
+            if stored in (_lib.PROPERTY_VALUE, _lib.PROPERTY_TEXT_BLOCK):
+                # written again as the file has it, if it is not touched (a text block with its
+                # bytes, which need not be UTF-8)
+                into._read[key] = (self._as_stored(index, text, stored), value, stored == _lib.PROPERTY_TEXT_BLOCK)
+                if not kind:
+                    into._untyped.add(key)
+            if digest is not None and key in solved:
+                into._solution[key] = (digest, value)
+        return into
 
     def type(self, key):
         """The XISF type name: "Float64", "String", "F64Matrix", "TimePoint"."""
@@ -1668,9 +2376,9 @@ class FileImage:
         colour filter array without it. WCS keywords stay as they are in the file, and
         ``wcs_row_order`` of the image names the row order they describe.
 
-        Not everything an XISF file holds is in an :class:`Image`: its properties are read but
-        not written, and the saved screen stretch and the resolution are not carried at all.
-        :func:`rewrite` copies an XISF file with everything in it."""
+        Not everything an XISF file holds is in an :class:`Image`: the saved screen stretch,
+        the resolution and the thumbnail are not carried. :func:`rewrite` copies an XISF file
+        with everything in it."""
         data = self.read(sample_format, row_order=row_order, channels=channels, verify=verify, bounds=bounds)
         info = self._info()
         stored = _ROW_NAMES.get(info.row_order, "top-down")
@@ -1695,15 +2403,9 @@ class FileImage:
                 keywords.append(pattern[0])
             elif pattern and pattern[0].value != keywords["BAYERPAT"]:
                 keywords["BAYERPAT"] = pattern[0].value
-        values = {}
+        values = PropertyDict()
         if properties:
-            mapping = self.properties
-            for key in mapping:
-                try:
-                    values[key] = mapping[key]
-                except Error as e:   # one property that cannot be read does not cost the image
-                    _warn("%s: property %s is left out: %s" % (self._file.path, key, e))
-                    values[key] = None
+            self.properties._detach(values)    # (with what tells whether a solution is still that of its keywords)
         return Image(data, keywords=keywords, name=self.name or None, bounds=image_bounds,
                      icc_profile=self.icc_profile, row_order=delivered, channels=channels,
                      wcs_row_order=_ROW_NAMES.get(info.wcs_row_order), color_space=self.color_space,
@@ -1874,11 +2576,14 @@ class File:
     def header_text(self):
         """The header as text: the XML header (XISF), the non-structural cards of the image
         HDUs, one per line (FITS), or the YAML tree (ASDF)."""
+        return self._header_bytes().decode("utf-8", "replace")
+
+    def _header_bytes(self):
         text = c_void_p()
         length = c_size_t()
         with self._context.lock:
             self._context.call(_library.xisfconv_header_text, self._pointer(), byref(text), byref(length))
-            return ctypes.string_at(text.value, length.value).decode("utf-8", "replace") if text.value else ""
+            return ctypes.string_at(text.value, length.value) if text.value else b""
 
     def detail(self, name):
         """A detail of the file as text, "" if it has none. XISF: "version". ASDF: "format"."""
@@ -1970,7 +2675,8 @@ def _output_format(value):
 
 def write(path, images, *, format=None, codec=None, checksum=None, stored_row_order=None, subblock_size=None,
           wcs=True, overwrite=False, keywords=None, name=None, bounds=None, icc_profile=None, row_order="top-down",
-          channels="last", wcs_row_order=None, progress=None):
+          channels="last", wcs_row_order=None, properties=None, file_properties=None, shuffle=True, level=None,
+          creator=None, progress=None):
     """Writes images to an XISF, FITS, ASDF, TIFF or PNG file.
 
     ``images`` is a NumPy array, an :class:`Image`, or a list of them: XISF images, FITS HDUs,
@@ -1982,8 +2688,9 @@ def write(path, images, *, format=None, codec=None, checksum=None, stored_row_or
     format
         "xisf", "fits", "asdf", "tiff" or "png"; None: from the extension of ``path``.
     codec
-        None: no compression. "zlib" or "zstd" for XISF and ASDF; any codec means Deflate
-        for TIFF. ``True`` or "default": the usual codec of the format.
+        None: no compression. "zlib", "zstd", "lz4" or "lz4hc" for XISF, "zlib" or "zstd" for
+        ASDF; any codec means Deflate for TIFF. ``True`` or "default": the usual codec of the
+        format.
         FITS: the images are written tile-compressed and without loss, in the format of
         fpack: ``True`` uses RICE_1 for integers and GZIP_2 for floating point, "zlib" gzip
         for both. A ``path`` that ends in ".fz" (``image.fits.fz``) is written that way
@@ -1994,8 +2701,24 @@ def write(path, images, *, format=None, codec=None, checksum=None, stored_row_or
     stored_row_order
         FITS and ASDF: the row order in the file. None: "bottom-up", the FITS convention.
         XISF, TIFF and PNG are always stored top-down.
+    shuffle
+        XISF: byte shuffling before compression (the bytes of the samples sorted by their
+        place in the sample, which compresses better). On unless it is False.
+    level
+        XISF: the compression level. None: the usual one of the codec (zlib 6, lz4hc 9,
+        zstd 3); else zlib 1 to 9, lz4hc 1 to 12, zstd 1 to 22. "lz4" has no levels.
     wcs
-        To XISF: also write PixInsight's astrometric solution properties from WCS keywords.
+        To XISF: also write PixInsight's astrometric solution properties from WCS keywords
+        (for an image that brings no such solution among its properties).
+    file_properties
+        XISF properties of the file, ``{id: value}`` (see :class:`PropertyDict`): its
+        ``Metadata``. To FITS and ASDF they go the way :func:`convert` takes them along. The
+        properties that describe how one XISF file was made and is stored
+        (``XISF:CreationTime``, ``XISF:CreatorApplication``, ``XISF:BlockAlignmentSize`` and
+        the like) are left out: a file that is written has its own.
+    creator
+        XISF: the name of the program that makes the file (``XISF:CreatorApplication``);
+        this library is then named in ``XISF:CreatorModule``. None: the library names itself.
     overwrite
         Replace an existing file. Without it :class:`OutputExistsError`.
     progress
@@ -2005,9 +2728,9 @@ def write(path, images, *, format=None, codec=None, checksum=None, stored_row_or
 
     About a NumPy array (an :class:`Image` brings its own): ``keywords``, ``name``, ``bounds``,
     ``icc_profile``, ``row_order`` (of the array: "top-down" or "bottom-up"), ``channels``
-    ("last" or "first") and ``wcs_row_order``, as described for :class:`Image`. Keywords
-    describe the array as it is given; BAYERPAT and WCS keywords are converted when the rows
-    are stored in the other order.
+    ("last" or "first"), ``wcs_row_order`` and ``properties`` (XISF properties of the image,
+    ``{id: value}``), as described for :class:`Image`. Keywords describe the array as it is
+    given; BAYERPAT and WCS keywords are converted when the rows are stored in the other order.
 
     The file is written under the name ``path + ".part"`` and renamed when it is complete.
     """
@@ -2019,7 +2742,7 @@ def write(path, images, *, format=None, codec=None, checksum=None, stored_row_or
     for item in images:
         if not isinstance(item, Image):
             item = Image(item, keywords=keywords, name=name, bounds=bounds, icc_profile=icc_profile,
-                         row_order=row_order, channels=channels, wcs_row_order=wcs_row_order)
+                         row_order=row_order, channels=channels, wcs_row_order=wcs_row_order, properties=properties)
         prepared.append(item)
 
     options = _lib.struct(_lib.WriteOptions, _library.xisfconv_write_options_init)
@@ -2030,15 +2753,33 @@ def write(path, images, *, format=None, codec=None, checksum=None, stored_row_or
     options.subblock_size = _subblock(subblock_size, options.subblock_size)
     options.wcs = int(bool(wcs))
     options.overwrite = int(bool(overwrite))
+    options.shuffle = int(bool(shuffle))
+    if level is not None:
+        if isinstance(level, bool):
+            raise TypeError("the compression level is a number, not %r" % level)
+        options.compression_level = operator.index(level)
+        if options.compression_level <= 0:
+            raise ValueError("the compression level is 1 or more (None: the usual one of the codec)")
+    if creator is not None:
+        if not isinstance(creator, str):
+            raise TypeError("creator is the name of a program, a string")
+        options.creator_application = _bytes(creator, "creator")
 
     context = _Context.borrow()
     with context.lock:
         context.about(path, reading=False)
         writer = c_void_p()
-        context.call(_library.xisfconv_writer_new, context.pointer, _path(path), byref(options), byref(writer),
-                     undo=lambda: _library.xisfconv_writer_discard(writer))
+        whole = _properties_handle(context, file_properties, "the properties of the file")
         try:
-            for item in prepared:
+            options.properties = whole
+            context.call(_library.xisfconv_writer_new, context.pointer, _path(path), byref(options), byref(writer),
+                         undo=lambda: _library.xisfconv_writer_discard(writer))
+        finally:
+            if whole is not None:
+                _library.xisfconv_properties_free(whole)
+        kind = _written_format(format, path)
+        try:
+            for number, item in enumerate(prepared):
                 planar, count = _planar(item.data, item.channels)
                 image = _lib.struct(_lib.Image, _library.xisfconv_image_init)
                 image.pixels = planar.ctypes.data
@@ -2058,15 +2799,32 @@ def write(path, images, *, format=None, codec=None, checksum=None, stored_row_or
                 if profile:
                     image.icc_profile = ctypes.cast(ctypes.c_char_p(profile), c_void_p)
                     image.icc_profile_size = len(profile)
-                handle = None
-                if item.keywords is not None and len(item.keywords):
-                    handle = Keywords(item.keywords)._to_handle(context)
-                    image.keywords = handle
+                handle = own = None
                 try:
+                    if item.keywords is not None and len(item.keywords):
+                        handle = Keywords(item.keywords)._to_handle(context)
+                        image.keywords = handle
+                    given = item.properties
+                    if isinstance(given, Properties):      # those of an open file
+                        given = PropertyDict(given)
+                    if isinstance(given, PropertyDict) and kind not in ("tiff", "png"):
+                        # A solution that was read from a file describes the WCS keywords and the
+                        # size it was read with. With others it is left out. (TIFF and PNG have
+                        # no place for properties at all.)
+                        stale, set_since = _stale_solution(context, given, item.keywords, planar.shape[2],
+                                                           planar.shape[1], item.wcs_row_order or item.row_order)
+                        if stale:
+                            given = given._without(stale)
+                            _solution_left_out(context._name() + (" (image %d)" % number if len(prepared) > 1 else ""),
+                                               set_since, item.keywords, wcs, kind)
+                    own = _properties_handle(context, given, "the properties of an image")
+                    image.properties = own
                     context.call(_library.xisfconv_writer_add_image, writer, byref(image))
                 finally:
                     if handle is not None:
                         _library.xisfconv_keywords_free(handle)
+                    if own is not None:
+                        _library.xisfconv_properties_free(own)
                 del planar, profile
         except BaseException:
             _library.xisfconv_writer_discard(writer)

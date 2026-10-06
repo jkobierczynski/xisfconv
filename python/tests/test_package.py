@@ -52,8 +52,9 @@ def test_public_names():
 
 def test_codecs():
     assert xisfconv.codec_available("zlib") and xisfconv.codec_available("zlib", writing=True)
-    assert xisfconv.codec_available("lz4") and not xisfconv.codec_available("lz4", writing=True)
-    assert xisfconv.codec_available("lz4hc") and xisfconv.codec_available("none")
+    assert xisfconv.codec_available("lz4") and xisfconv.codec_available("lz4", writing=True)
+    assert xisfconv.codec_available("lz4hc") and xisfconv.codec_available("lz4hc", writing=True)
+    assert xisfconv.codec_available("none")
     assert xisfconv.codec_available("zstd") == xisfconv.codec_available("zstd", writing=True)
     with pytest.raises(ValueError):
         xisfconv.codec_available("brotli")

@@ -52,8 +52,8 @@
 #include <stdint.h>
 
 #define XISFCONV_VERSION_MAJOR 0
-#define XISFCONV_VERSION_MINOR 14
-#define XISFCONV_VERSION_PATCH 1
+#define XISFCONV_VERSION_MINOR 15
+#define XISFCONV_VERSION_PATCH 0
 
 #if defined(XISFCONV_STATIC)
 #  define XISFCONV_API
@@ -112,8 +112,8 @@ enum {
     XISFCONV_CODEC_KEEP    = -1, /* rewrite only: leave every block as it is stored */
     XISFCONV_CODEC_NONE    = 0,
     XISFCONV_CODEC_ZLIB    = 1,
-    XISFCONV_CODEC_LZ4     = 2,  /* read only */
-    XISFCONV_CODEC_LZ4HC   = 3,  /* read only */
+    XISFCONV_CODEC_LZ4     = 2,  /* XISF; written since 0.15 */
+    XISFCONV_CODEC_LZ4HC   = 3,  /* XISF; the block format of LZ4, with more searching for it. Written since 0.15 */
     XISFCONV_CODEC_ZSTD    = 4,  /* needs a build with libzstd */
     XISFCONV_CODEC_DEFAULT = 5   /* writing: the usual codec of the format. XISF: Zstandard, or zlib in
                                     a build without libzstd; ASDF: zlib; TIFF: Deflate; FITS: tile
@@ -449,7 +449,11 @@ XISFCONV_API const char *xisfconv_image_unsupported_reason(const xisfconv_file *
  *   FITS  "tileCompression" (RICE_1, GZIP_1, ...), "mapping" (how the samples were mapped; known
  *         once the pixels are loaded)
  *   ASDF  "source" (place in the tree: fits[0].data), "storage" (datatype, byte order, block,
- *         compression), "mapping" */
+ *         compression), "mapping"
+ *   FITS and ASDF, since 0.15: "carriedSolution": "current" if the image carries the astrometric
+ *         solution of an XISF file and still has the WCS keywords it was written with, "stale"
+ *         if the keywords, the size or the row order changed since (a conversion to XISF then
+ *         makes the solution from the keywords), "" if it carries none */
 XISFCONV_API const char *xisfconv_image_detail(const xisfconv_file *file, size_t image, const char *name);
 
 /* The cards the file itself holds: XISF FITSKeyword elements, or every non-structural card of
@@ -487,6 +491,63 @@ XISFCONV_API int64_t xisfconv_property_find(const xisfconv_file *file, size_t im
 /* The format attribute of a property (how its value is meant to be shown, e.g. "%.3f"); "" if
  * it has none or there is no such property. Owned by the file. (Since 0.13.) */
 XISFCONV_API const char *xisfconv_property_format(const xisfconv_file *file, size_t image, size_t index);
+
+/* How the value of a property is stored. (Since 0.15.) */
+typedef int32_t xisfconv_property_storage;
+enum {
+    XISFCONV_PROPERTY_NONE       = 0, /* there is no such property */
+    XISFCONV_PROPERTY_VALUE      = 1, /* a value in the header; xisfconv_property_get gives it */
+    /* A String that is kept as data, byte for byte: its text is in a data block of the XISF
+     * file; or it has a carriage return that the header writes as a character reference (as
+     * text in a header again, an XML reader would read its CR LF as a line feed); or it is
+     * the text of a value attribute with a carriage return or with white space at its ends.
+     * xisfconv_property_get gives the text (up to a NUL character, if a block has one). */
+    XISFCONV_PROPERTY_TEXT_BLOCK = 2,
+    XISFCONV_PROPERTY_ARRAY      = 3, /* a vector or a matrix; xisfconv_property_read gives it */
+    /* What these functions have no value for: a table or another property made of elements, a
+     * data block of a type without a name here or of a type that is not a vector or a matrix,
+     * a vector without a data block, a text whose block is damaged. What xisfconv_property_get
+     * gives as its value is not one. (A conversion carries a data block of a type it has no
+     * name for as it is, and leaves the others out with a warning.) */
+    XISFCONV_PROPERTY_UNREAD     = 4
+};
+XISFCONV_API xisfconv_property_storage xisfconv_property_stored(const xisfconv_file *file, size_t image, size_t index);
+
+/* The numbers a vector or matrix property is made of. */
+typedef int32_t xisfconv_element;
+enum {
+    XISFCONV_ELEMENT_NONE      = 0,
+    XISFCONV_ELEMENT_INT8      = 1,
+    XISFCONV_ELEMENT_UINT8     = 2,
+    XISFCONV_ELEMENT_INT16     = 3,
+    XISFCONV_ELEMENT_UINT16    = 4,
+    XISFCONV_ELEMENT_INT32     = 5,
+    XISFCONV_ELEMENT_UINT32    = 6,
+    XISFCONV_ELEMENT_INT64     = 7,
+    XISFCONV_ELEMENT_UINT64    = 8,
+    XISFCONV_ELEMENT_FLOAT32   = 9,
+    XISFCONV_ELEMENT_FLOAT64   = 10,
+    XISFCONV_ELEMENT_COMPLEX32 = 11, /* two 32-bit floating point numbers: real part, imaginary part */
+    XISFCONV_ELEMENT_COMPLEX64 = 12  /* two 64-bit floating point numbers */
+};
+
+/* The element of a vector or matrix type, by the name of the type ("F64Vector", "UI16Matrix",
+ * "C32Vector", "ByteArray", and the short names of the specification: "IVector", "Matrix");
+ * XISFCONV_ELEMENT_NONE for every other type. *is_matrix (may be NULL) receives 1 for a matrix
+ * type, else 0. (Since 0.15.) */
+XISFCONV_API xisfconv_element xisfconv_property_element(const char *type, int32_t *is_matrix);
+/* Bytes of one element: 1 to 16. 0 for XISFCONV_ELEMENT_NONE or an unknown value. */
+XISFCONV_API size_t xisfconv_element_size(xisfconv_element element);
+
+/* Reads a vector or matrix property in the type of its elements (xisfconv_property_element of
+ * its type name): the elements in host byte order, row after row. (Since 0.15.) Call with
+ * buffer = NULL to learn the size: *size receives the number of bytes, *rows and *columns the
+ * shape (a vector has rows = 1). XISFCONV_ERR_BUFFER if buffer_size is too small,
+ * XISFCONV_ERR_INDEX beyond the last property, XISFCONV_ERR_NOT_FOUND if the property is not a
+ * vector or matrix of a known element type. The call that asks for the size reads the data
+ * block (its checksum is verified) and keeps it for the call that fetches it. */
+XISFCONV_API xisfconv_status xisfconv_property_read(xisfconv_file *file, size_t image, size_t index, void *buffer,
+                                                    size_t buffer_size, size_t *size, size_t *rows, size_t *columns);
 
 /* Reads a numeric vector or matrix property as doubles, row-major. With an image index, the
  * image's properties are searched first, then the file-level metadata. Call with values = NULL
@@ -613,9 +674,83 @@ XISFCONV_API xisfconv_status xisfconv_fits_keywords(xisfconv_file *file, size_t 
                                                     int32_t property_keywords, int32_t wcs, int32_t sip_order,
                                                     xisfconv_keywords **out, const char **fit_summary);
 
+/* What tells whether the WCS keywords of an image are still those an astrometric solution was
+ * read with: a digest of the keywords that describe the WCS (their values as numbers, whatever
+ * form they are written in), of the size of the image and of the row order the keywords
+ * describe (XISFCONV_ROWS_DEFAULT = bottom-up). (Since 0.15.) A program that reads an image
+ * with its PixInsight solution properties and writes it later asks for the digest at both ends:
+ * if it is not the same, the keywords were changed or the image was cropped, and the solution
+ * no longer describes them. *out is valid until the next call on the same list. */
+XISFCONV_API xisfconv_status xisfconv_wcs_digest(const xisfconv_keywords *kw, uint64_t width, uint64_t height,
+                                                 xisfconv_row_order row_order, const char **out);
+
 /* Converts WCS keywords in place between the bottom-up and top-down pixel conventions
  * (CRPIX2, CD/PC/CDELT, SIP coefficients). Applying it twice restores the original values. */
 XISFCONV_API xisfconv_status xisfconv_wcs_flip_rows(xisfconv_keywords *kw, uint64_t image_height);
+
+/* ------------------------------------------------------------------------------------------
+ * Property lists
+ *
+ * XISF properties to write: of an image (xisfconv_image) or of a file (xisfconv_write_options).
+ * (Since 0.15.) An id is used once in a list: setting it again replaces the property and keeps
+ * its place.
+ * ---------------------------------------------------------------------------------------- */
+
+typedef struct xisfconv_properties xisfconv_properties;
+
+XISFCONV_API xisfconv_status xisfconv_properties_new(xisfconv_context *ctx, xisfconv_properties **out); /* caller frees */
+XISFCONV_API void xisfconv_properties_free(xisfconv_properties *properties); /* NULL is allowed */
+XISFCONV_API size_t xisfconv_properties_count(const xisfconv_properties *properties);
+
+/* A property that is not a vector or a matrix. `type` is its XISF type name and `value` the
+ * value as XISF writes it, with nothing around it:
+ *   Boolean                          "true" or "false"
+ *   Int8, Int16, Int32, Int64,
+ *   UInt8, UInt16, UInt32, UInt64    a whole number that the type holds
+ *   Float32, Float64                 a number that the type holds ("0.25", "1e-5"; also "nan",
+ *                                    "inf", "-inf")
+ *   Complex32, Complex64             "(re,im)"
+ *   String                           the text, UTF-8
+ *   TimePoint                        a date, or a date and a time, of ISO 8601:
+ *                                    "2026-10-06T18:30:00Z"
+ * and the other names the specification has for these (Byte, Short, UShort, Int, UInt, Float,
+ * Double). comment and format (how the value is meant to be shown, "%.3f") may be NULL.
+ * XISFCONV_ERR_ARGUMENT for an empty id, for another type and for a value the type does not
+ * hold; an id may be any text XML can hold, although the specification wants names of letters,
+ * digits and underscores joined by colons (Instrument:Telescope:FocalLength). A String of more
+ * than 3072 bytes is written as a data block (and compressed with the others), and so is one
+ * with a carriage return, with white space at its ends (blanks, tabs, line breaks) or with a
+ * control character, which a reader of the header might not give back as they are or which
+ * XML cannot hold; any other as text in the header. */
+XISFCONV_API xisfconv_status xisfconv_properties_set(xisfconv_properties *properties, const char *id, const char *type,
+                                                     const char *value, const char *comment, const char *format);
+
+/* The same for a property that was read from a file and is written again as it is: type and
+ * value are what xisfconv_property_get gave, and are not looked at. So a property of a type
+ * this library has no name for (Float128, UInt128) is carried, and so is a value that is not
+ * one of its type; that a file says something odd is no reason to lose the rest of it.
+ * `storage` is what xisfconv_property_stored said of it: XISFCONV_PROPERTY_VALUE, or
+ * XISFCONV_PROPERTY_TEXT_BLOCK for a String that is kept as a data block (any bytes). A text
+ * of the header (a String with XISFCONV_PROPERTY_VALUE) is written into the header again as
+ * it is, whatever its length and whatever line ends and blanks it has: the same bytes, which
+ * every reader then reads as it read them before. A value with what XML cannot hold (a control
+ * character, bytes that are not UTF-8) is written as a conversion writes it: a String as a
+ * data block, any other value with a blank in the place of each such character.
+ * XISFCONV_ERR_ARGUMENT for an empty id, for an id, a comment or a format that XML cannot hold,
+ * for a vector or matrix type (whose value is not a text) and for another storage. */
+XISFCONV_API xisfconv_status xisfconv_properties_set_as_read(xisfconv_properties *properties, const char *id,
+                                                             const char *type, const char *value, const char *comment,
+                                                             const char *format, xisfconv_property_storage storage);
+
+/* A vector or a matrix. `type` names it and its elements (see xisfconv_property_element),
+ * `elements` holds them in host byte order, row after row, and `size` is their size in bytes.
+ * A matrix has rows and columns; a vector is given with rows = its length and columns = 0.
+ * XISFCONV_ERR_ARGUMENT if the type is not a vector or matrix type or the size is not that of
+ * the shape. The elements are copied. */
+XISFCONV_API xisfconv_status xisfconv_properties_set_array(xisfconv_properties *properties, const char *id,
+                                                           const char *type, const void *elements, size_t size,
+                                                           uint64_t rows, uint64_t columns, const char *comment,
+                                                           const char *format);
 
 /* ------------------------------------------------------------------------------------------
  * Converting files
@@ -633,14 +768,14 @@ typedef struct xisfconv_convert_options {
     size_t image;                         /* default XISFCONV_ALL_IMAGES; else only this one */
     xisfconv_stretch stretch;             /* --stretch; default XISFCONV_STRETCH_NONE */
 
-    /* -c / --codec. Default XISFCONV_CODEC_NONE. XISF: ZLIB or ZSTD, with byte shuffling. ASDF:
-     * ZLIB or ZSTD. TIFF: any value but NONE means Deflate with predictor. DEFAULT picks the
-     * usual codec of the output format.
+    /* -c / --codec. Default XISFCONV_CODEC_NONE. XISF: ZLIB, LZ4, LZ4HC or ZSTD, with byte
+     * shuffling. ASDF: ZLIB or ZSTD (LZ4 and LZ4HC are XISFCONV_ERR_ARGUMENT). TIFF: any value
+     * but NONE means Deflate with predictor. DEFAULT picks the usual codec of the output format.
      * FITS: the images are written tile-compressed (the tiled image compression convention of
      * the FITS standard, the format of fpack), one row per tile and without loss: DEFAULT uses
      * RICE_1 for integers and GZIP_2 for floating point, ZLIB uses gzip for both (GZIP_2, and
-     * GZIP_1 for 8-bit samples); ZSTD is XISFCONV_ERR_ARGUMENT (XISFCONV_ERR_UNSUPPORTED in a
-     * build without libzstd). Images of 64-bit integers stay uncompressed (a warning says so):
+     * GZIP_1 for 8-bit samples); ZSTD, LZ4 and LZ4HC are XISFCONV_ERR_ARGUMENT (ZSTD is
+     * XISFCONV_ERR_UNSUPPORTED in a build without libzstd). Images of 64-bit integers stay uncompressed (a warning says so):
      * CFITSIO reads no such compressed images. An output path that ends in ".fz"
      * (image.fits.fz) is written with DEFAULT also when the codec is NONE. Keywords that
      * describe a compressed image and its table (TFORMn, ZCMPTYPE, ZSCALE, ...) are left out of
@@ -712,7 +847,7 @@ XISFCONV_API xisfconv_status xisfconv_convert(xisfconv_context *ctx, const char 
 
 typedef struct xisfconv_rewrite_options {
     size_t struct_size;
-    xisfconv_codec codec;       /* default XISFCONV_CODEC_KEEP; NONE, ZLIB, ZSTD or DEFAULT */
+    xisfconv_codec codec;       /* default XISFCONV_CODEC_KEEP; NONE, ZLIB, LZ4, LZ4HC, ZSTD or DEFAULT */
     xisfconv_checksum checksum; /* default XISFCONV_CHECKSUM_KEEP; NONE removes them */
     size_t image;               /* default XISFCONV_ALL_IMAGES; else keep only this one */
     int32_t verify_input;       /* default 1 */
@@ -824,6 +959,14 @@ typedef struct xisfconv_image {
      * the buffer. Pixels and keywords read from a file go back out unchanged when this is set to
      * the wcs_row_order of xisfconv_image_info (which matters for XISF files). */
     xisfconv_row_order wcs_row_order;
+    int32_t reserved;                     /* not used (padding in the layout of 0.14) */
+    /* XISF properties of the image; may be NULL. (Since 0.15.) Written to XISF as its
+     * properties, to FITS and ASDF the way xisfconv_convert takes the properties of an XISF
+     * file along (a table behind the image, the tree); not written to TIFF and PNG. An
+     * astrometric solution among them (PCL:AstrometricSolution:...) is written as it is given,
+     * and then none is made from WCS keywords. The list is copied by
+     * xisfconv_writer_add_image. */
+    const xisfconv_properties *properties;
 } xisfconv_image;
 
 XISFCONV_API void xisfconv_image_init(xisfconv_image *image, size_t struct_size);
@@ -841,6 +984,23 @@ typedef struct xisfconv_write_options {
     int32_t wcs;                  /* to XISF: also write PixInsight solution properties from WCS
                                      keywords; default 1 */
     int32_t overwrite;            /* default 0 */
+    /* (Since 0.15.) */
+    int32_t shuffle;              /* XISF: byte shuffling before compression; default 1 */
+    int32_t compression_level;    /* XISF: 0 (default) is the usual level of the codec (ZLIB 6,
+                                     LZ4HC 9, ZSTD 3); else ZLIB 1..9, LZ4HC 1..12, ZSTD 1..22.
+                                     LZ4 has no levels. XISFCONV_ERR_ARGUMENT for a level the
+                                     codec does not have. (The file does not name the level:
+                                     XISF:CompressionLevel is a number of PixInsight's own
+                                     scale, 0 to 100, not one of the codec.) */
+    /* XISF properties of the file (its Metadata element); may be NULL. To FITS and ASDF they go
+     * as with xisfconv_convert. The properties that describe how one XISF file was made and is
+     * stored (XISF:CreationTime, XISF:CreatorApplication, XISF:BlockAlignmentSize and the
+     * like) are left out: a file that is written has its own. The list is copied by
+     * xisfconv_writer_new. */
+    const xisfconv_properties *properties;
+    /* XISF: the program that makes the file, written as XISF:CreatorApplication, with this
+     * library named in XISF:CreatorModule. NULL (default): the library names itself. */
+    const char *creator_application;
 } xisfconv_write_options;
 
 XISFCONV_API void xisfconv_write_options_init(xisfconv_write_options *options, size_t struct_size);

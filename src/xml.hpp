@@ -14,6 +14,10 @@ struct Node {
     std::string name;  // local name (namespace prefix removed)
     std::vector<std::pair<std::string, std::string>> attributes;
     std::string text;  // concatenated character data of this element (not of children)
+    // The character data has a carriage return that is written as a character reference
+    // (&#13;). That one is meant: an XML reader keeps it, where it reads a CR LF that is
+    // written as such as a line feed.
+    bool crReference = false;
     std::vector<std::unique_ptr<Node>> children;
 
     // Where the element sits in the parsed document (byte offsets), for editing the text in place.

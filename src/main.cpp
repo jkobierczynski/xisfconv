@@ -132,7 +132,7 @@ struct Options {
     bool compress = false;
     bool bottomUp = true;  // FITS convention: first stored row is the bottom of the image
     bool rowOrderGiven = false;  // --top-down / --bottom-up given explicitly (overrides ROWORDER on FITS input)
-    std::string codec;           // XISF and ASDF output: zlib or zstd; FITS output: zlib (GZIP tiles)
+    std::string codec;           // XISF output: zlib, zstd, lz4 or lz4hc; ASDF: zlib or zstd; FITS: zlib (GZIP tiles)
     bool codecNone = false;      // --codec none: store uncompressed (XISF -> XISF: decompress)
     std::string checksum;        // XISF output: sha1, sha256, sha512, sha3-256 or sha3-512
     bool checksumNone = false;   // --checksum none (XISF -> XISF: remove checksums)
@@ -219,11 +219,13 @@ void usage(std::ostream& os) {
           "      --no-verify             don't verify data block checksums (XISF -> XISF: nor read the output\n"
           "                              back, except with --in-place)\n\n"
           "XISF, ASDF and FITS output:\n"
-          "      --codec <zlib|zstd|none>  compression codec (zlib and zstd imply --compress). XISF blocks are\n"
-          "                              also byte shuffled. zstd in ASDF needs the asdf-compression package\n"
-          "                              in Python. none: no compression; XISF -> XISF: decompress the blocks\n"
+          "      --codec <zlib|zstd|lz4|lz4hc|none>\n"
+          "                              compression codec (a codec implies --compress). XISF blocks are\n"
+          "                              also byte shuffled; lz4 and lz4hc are for XISF only. zstd in ASDF\n"
+          "                              needs the asdf-compression package in Python. none: no compression;\n"
+          "                              XISF -> XISF: decompress the blocks\n"
           "                              FITS: zlib compresses the tiles of every sample type with gzip\n"
-          "                              (GZIP_2; GZIP_1 for 8-bit data); there is no zstd for FITS\n"
+          "                              (GZIP_2; GZIP_1 for 8-bit data); there is no zstd or lz4 for FITS\n"
           "      --checksum <sha1|sha256|sha512|sha3-256|sha3-512|none>\n"
           "                              XISF: store a checksum of the pixel data block; XISF -> XISF: of every\n"
           "                              attached block (none removes them). ASDF blocks always carry MD5.\n"
@@ -337,6 +339,12 @@ xisfconv_checksum checksumOption(const std::string& name) {
     return XISFCONV_CHECKSUM_NONE;
 }
 
+// --codec as the library names it; `unnamed` for --compress without a codec.
+xisfconv_codec codecOption(const std::string& name, xisfconv_codec unnamed) {
+    return name == "zlib" ? XISFCONV_CODEC_ZLIB : name == "zstd" ? XISFCONV_CODEC_ZSTD : name == "lz4" ? XISFCONV_CODEC_LZ4
+           : name == "lz4hc" ? XISFCONV_CODEC_LZ4HC : unnamed;
+}
+
 xisfconv_convert_options conversionOptions(const Options& opt, xisfconv_format format) {
     xisfconv_convert_options c;
     xisfconv_convert_options_init(&c, sizeof c);
@@ -344,8 +352,7 @@ xisfconv_convert_options conversionOptions(const Options& opt, xisfconv_format f
     c.stretch = opt.stretch;
     c.sample_format = opt.bits ? *opt.bits : XISFCONV_SAMPLE_AS_STORED;
     c.image = opt.imageIndex ? *opt.imageIndex : XISFCONV_ALL_IMAGES;
-    c.codec = !opt.compress ? XISFCONV_CODEC_NONE
-                            : opt.codec == "zlib" ? XISFCONV_CODEC_ZLIB : opt.codec == "zstd" ? XISFCONV_CODEC_ZSTD : XISFCONV_CODEC_DEFAULT;
+    c.codec = !opt.compress ? XISFCONV_CODEC_NONE : codecOption(opt.codec, XISFCONV_CODEC_DEFAULT);
     c.checksum = checksumOption(opt.checksum);
     c.subblock_size = opt.subblockSize;
     c.row_order = !opt.rowOrderGiven ? XISFCONV_ROWS_DEFAULT : opt.bottomUp ? XISFCONV_ROWS_BOTTOM_UP : XISFCONV_ROWS_TOP_DOWN;
@@ -552,7 +559,7 @@ void rewriteXisfInput(const Library& lib, const std::string& input, const Option
         codec = "none";
     } else if (opt.compress) {
         codec = !opt.codec.empty() ? opt.codec : (zstdAvailable() ? "zstd" : "zlib");
-        r.codec = codec == "zstd" ? XISFCONV_CODEC_ZSTD : XISFCONV_CODEC_ZLIB;
+        r.codec = codecOption(codec, XISFCONV_CODEC_ZLIB);
     }
     r.checksum = opt.checksumNone ? XISFCONV_CHECKSUM_NONE : opt.checksum.empty() ? XISFCONV_CHECKSUM_KEEP : checksumOption(opt.checksum);
     r.image = opt.imageIndex ? *opt.imageIndex : XISFCONV_ALL_IMAGES;
@@ -727,7 +734,9 @@ bool parseArgs(int argc, char** argv, Options& opt, int& exitCode) {
         else if (a == "--top-down") { opt.bottomUp = false; opt.rowOrderGiven = true; }
         else if (a == "--codec") {
             const std::string v = toLower(need(i, a));
-            if (v != "zlib" && v != "zstd" && v != "none") throw Error("unknown codec '" + v + "' (use zlib, zstd or none)");
+            if (v != "zlib" && v != "zstd" && v != "lz4" && v != "lz4hc" && v != "none") {
+                throw Error("unknown codec '" + v + "' (use zlib, zstd, lz4, lz4hc or none)");
+            }
             if (v == "zstd" && !zstdAvailable()) throw Error("this build has no Zstandard support; use --codec zlib");
             opt.codecNone = v == "none";
             opt.codec = opt.codecNone ? std::string() : v;

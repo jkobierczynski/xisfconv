@@ -363,11 +363,13 @@ def test_property_types_and_format(tmp_path):
         with xisfconv.open(name) as file:
             properties = file[0].properties
             assert list(properties) == list("ABCDEFG")
-            assert same(properties["A"], np.array([[1, 2, 3], [4, 5, 6]], float))
+            # every one in the type of its elements
+            assert same(properties["A"], np.array([[1, 2, 3], [4, 5, 6]], np.uint8))
             assert same(properties["B"], np.array([1.5, -2.5])) and same(properties["C"], np.array([[1.0, 2.0], [3.0, 4.0]]))
-            assert same(properties["D"], np.array([7.0, 8.0, 9.0]))
-            assert same(properties["E"], np.array([10.0, 20.0, 30.0]))     # the block says how long it is
-            assert properties["F"] is None and properties.type("F") == "C32Vector"   # complex numbers are not read as numbers
+            assert same(properties["D"], np.array([7, 8, 9], np.uint8))
+            assert same(properties["E"], np.array([10, 20, 30], np.uint16))     # the block says how long it is
+            assert properties.type("F") == "C32Vector" and properties["F"].dtype == np.complex64
+            assert properties["F"].tolist() == [1 + 2j]
             assert properties["G"] == 0.25 and properties.comment("G") == "a quarter"
             assert properties.format("G") == "%.3f" and properties.format("A") == ""
             with pytest.raises(KeyError):

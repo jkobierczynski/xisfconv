@@ -271,8 +271,9 @@ std::pair<double, double> floatBounds(const FitsImage& img, const ConvertOptions
 FitsWriteOptions fitsStorage(const ConvertOptions& opt, const std::string& outPath) {
     FitsWriteOptions storage;
     if (opt.compress) {
-        if (opt.codec == "zstd") {
-            throw Error("FITS has no Zstandard compression; use --compress for tile compression (RICE_1, and GZIP_2 for "
+        if (opt.codec == "zstd" || opt.codec == "lz4" || opt.codec == "lz4hc") {
+            throw Error(std::string("FITS has no ") + (opt.codec == "zstd" ? "Zstandard" : "LZ4") +
+                        " compression; use --compress for tile compression (RICE_1, and GZIP_2 for "
                         "floating point), or --codec zlib for GZIP_2 alone", ErrorKind::Argument);
         }
         storage.tiles = opt.codec == "zlib" ? FitsTiles::Gzip : FitsTiles::Default;
@@ -280,6 +281,16 @@ FitsWriteOptions fitsStorage(const ConvertOptions& opt, const std::string& outPa
         storage.tiles = FitsTiles::Default;
     }
     return storage;
+}
+
+// The codec of ASDF output: zlib if none is named.
+std::string asdfCodec(const ConvertOptions& opt) {
+    if (!opt.compress) return {};
+    if (opt.codec == "lz4" || opt.codec == "lz4hc") {
+        throw Error("ASDF output is compressed with zlib or zstd; LZ4 is written to XISF only (--codec zlib, --codec zstd)",
+                    ErrorKind::Argument);
+    }
+    return opt.codec.empty() ? "zlib" : opt.codec;
 }
 
 }  // namespace
@@ -397,12 +408,16 @@ std::vector<Property> carriedProperties(XisfFile& file, size_t index, bool verif
     return properties;
 }
 
-void flipKeywordRows(std::vector<FitsKeyword>& keywords, uint64_t height) {
+void flipBayerRows(std::vector<FitsKeyword>& keywords, uint64_t height) {
     if (FitsKeyword* bp = findKeyword(keywords, "BAYERPAT")) {
         const std::string pattern = fitsUnquote(bp->value);
         if (pattern.size() == 4) bp->value = fitsString(flipPatternRows(pattern, 2, 2, height));
         else warn("cannot adjust BAYERPAT " + bp->value + " for the changed row order; check it manually");
     }
+}
+
+void flipKeywordRows(std::vector<FitsKeyword>& keywords, uint64_t height) {
+    flipBayerRows(keywords, height);
     flipWcsRowOrder(keywords, height);
 }
 
@@ -410,6 +425,7 @@ void convertXisfFile(const std::string& input, const std::string& outPath, Forma
     if (format == Format::Xisf) throw Error("XISF to XISF is a rewrite, not a conversion", ErrorKind::Argument);
     downsampleIsForPictures(opt, format);
     const FitsWriteOptions fitsOptions = format == Format::Fits ? fitsStorage(opt, outPath) : FitsWriteOptions();
+    if (format == Format::Asdf) asdfCodec(opt);   // (said before anything is read)
     XisfFile file(input);
 
     std::vector<size_t> indices;
@@ -547,7 +563,7 @@ void convertXisfFile(const std::string& input, const std::string& outPath, Forma
             if (opt.properties) metadata = carriedProperties(file, XisfFile::kFileProperties, opt.verify);
             if (format == Format::Asdf) {
                 AsdfWriteOptions aopt;
-                if (opt.compress) aopt.codec = opt.codec.empty() ? "zlib" : opt.codec;
+                aopt.codec = asdfCodec(opt);
                 aopt.metadata = std::move(metadata);
                 writeAsdf(tmpPath, hdus, aopt);
             } else {
@@ -609,6 +625,7 @@ void convertFitsOrAsdfFile(const std::string& input, InputFormat kind, const std
                            const ConvertOptions& opt) {
     if (kind == InputFormat::Xisf) throw Error("not a FITS or ASDF file", ErrorKind::Argument);
     if (format == Format::Fits) fitsStorage(opt, outPath);   // an option that does not apply is reported before the file is read
+    if (format == Format::Asdf) asdfCodec(opt);
     const bool asdfInput = kind == InputFormat::Asdf;
     const char* inputName = asdfInput ? "ASDF" : "FITS";
     const bool exporting = format == Format::Tiff || format == Format::Png;
@@ -669,6 +686,7 @@ void writeImageSet(FitsFile& fits, const ImageSetOrigin& source, const std::stri
     const std::string& input = source.input;
     if (fits.images.empty()) throw Error("no images to write", ErrorKind::Argument);
     const FitsWriteOptions fitsOptions = format == Format::Fits ? fitsStorage(opt, outPath) : FitsWriteOptions();
+    if (format == Format::Asdf) asdfCodec(opt);   // (said before anything is read)
 
     std::vector<size_t> indices;
     if (opt.imageIndex) {
@@ -858,7 +876,7 @@ void writeImageSet(FitsFile& fits, const ImageSetOrigin& source, const std::stri
         try {
             if (format == Format::Asdf) {
                 AsdfWriteOptions aopt;
-                if (opt.compress) aopt.codec = opt.codec.empty() ? "zlib" : opt.codec;
+                aopt.codec = asdfCodec(opt);
                 if (opt.properties) aopt.metadata = std::move(fits.properties);
                 writeAsdf(tmpPath, hdus, aopt);
             } else {
@@ -886,20 +904,23 @@ void writeImageSet(FitsFile& fits, const ImageSetOrigin& source, const std::stri
         // among them describes the image as it was: it is the solution still if the WCS keywords
         // (which were written from it, or with it) are the same and the rows are where they were.
         const bool carried = opt.properties && !img.properties.empty();
-        const bool sameWcs = carried && topDown == img.topDown &&
-                             wcsDigest(img.keywords, px.width, px.height, !img.topDown) == img.wcsDigest;
+        bool sameWcs = carried && topDown == img.topDown &&
+                       wcsDigest(img.keywords, px.width, px.height, !img.topDown) == img.wcsDigest;
+        if (carried && img.propertiesGiven) {
+            // The caller's own properties: a solution among them stands as it is given. Without
+            // one, a solution is made from the WCS keywords as for an image without properties.
+            bool solution = false;
+            for (const auto& p : img.properties) solution = solution || isSolutionProperty(p.id);
+            sameWcs = solution || !opt.wcs;
+        }
         if (!topDown) {
             flipVertical(px);
-            if (FitsKeyword* bp = findKeyword(img.keywords, "BAYERPAT")) {
-                const std::string pattern = fitsUnquote(bp->value);
-                if (pattern.size() == 4) bp->value = fitsString(flipPatternRows(pattern, 2, 2, px.height));
-                else warn("cannot adjust BAYERPAT " + bp->value + " for the changed row order; check it manually");
-            }
-        } else {
-            // PixInsight interprets WCS keywords in the FITS bottom-up convention even though XISF
-            // rows are top-down, so keywords describing top-down rows are converted.
-            flipWcsRowOrder(img.keywords, px.height);
+            flipBayerRows(img.keywords, px.height);
         }
+        // PixInsight interprets WCS keywords in the FITS bottom-up convention even though XISF
+        // rows are top-down, so keywords describing top-down rows are converted. (Those of an
+        // image handed over in memory may describe the other order than its pixels have.)
+        if (img.wcsTopDown ? *img.wcsTopDown : topDown) flipWcsRowOrder(img.keywords, px.height);
 
         XisfOutImage o;
         o.pixels = &px;
@@ -964,7 +985,16 @@ void writeImageSet(FitsFile& fits, const ImageSetOrigin& source, const std::stri
                     continue;
                 }
                 bool again = false;
-                for (size_t k = 0; k < made && !again; ++k) again = o.properties[k].id == p.id;
+                for (size_t k = 0; k < made && !again; ++k) {
+                    again = o.properties[k].id == p.id;
+                    // (the reference system and the equinox belong to the solution that is made)
+                    if (again && img.propertiesGiven && !p.array && o.properties[k].text != p.text) {
+                        double made_ = 0, given = 0;   // (2000 and 2000.0 are one number)
+                        if (parseDouble(o.properties[k].text, made_) && parseDouble(p.text, given) && made_ == given) continue;
+                        warn(label + ": property " + p.id + " is written as the WCS keywords have it (" + o.properties[k].text +
+                             "), not as it was given (" + p.text + "): the astrometric solution is made from them");
+                    }
+                }
                 if (again) continue;
                 o.properties.push_back(std::move(p));
                 ++restored;
@@ -998,6 +1028,9 @@ void writeImageSet(FitsFile& fits, const ImageSetOrigin& source, const std::stri
     if (opt.compress) wopt.codec = !opt.codec.empty() ? opt.codec : (zstdAvailable() ? "zstd" : "zlib");
     wopt.checksum = opt.checksum;
     wopt.subblockSize = opt.subblockSize;
+    wopt.level = opt.level;
+    wopt.shuffle = opt.shuffle;
+    wopt.creatorApplication = opt.creatorApplication;
     if (opt.properties) wopt.metadata = std::move(fits.properties);
 
     try {

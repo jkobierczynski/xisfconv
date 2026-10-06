@@ -162,6 +162,7 @@ XisfProperty XisfFile::parseProperty(const xml::Node& node) {
     p.node = &node;
     if (const std::string* v = node.attr("value")) {
         p.value = *v;
+        p.exactText = p.type == "String" && !textFitsElement(*v);
     } else if (!p.location.empty()) {
         if (p.type == "String") {
             try {
@@ -184,6 +185,7 @@ XisfProperty XisfFile::parseProperty(const xml::Node& node) {
         }
     } else {
         p.value = node.text;  // String properties may store their value as character data
+        p.exactText = p.type == "String" && node.crReference;
     }
     return p;
 }
@@ -483,6 +485,10 @@ Property XisfFile::loadProperty(const XisfProperty& x, bool verify) {
     if (!x.hasBlockData) {
         if (known) throw Error("a " + x.type + " without a data block");
         p.text = x.value;
+        // A carriage return the header writes as a character reference is one for every reader.
+        // Written into a header again as it is, an XML reader would read CR LF as a line feed;
+        // in a data block nothing is read into the text.
+        p.block = x.exactText;
         return p;
     }
     if (!x.node) throw Error("its data block was not found");
@@ -536,6 +542,38 @@ uint64_t XisfFile::declaredBlockSize(const xml::Node& element) const {
     } catch (const Error&) {
         return stored;
     }
+}
+
+XisfFile::PropertyStorage XisfFile::propertyStorage(const XisfProperty& x) const {
+    if (x.node) {
+        for (const auto& child : x.node->children)
+            if (child->name != "Data") return PropertyStorage::Unread;
+    }
+    PropertyElement element;
+    const bool known = propertyElement(x.type, element);
+    if (x.type == "String" && !x.location.empty() && x.node && !x.node->attr("value")) {
+        return x.hasBlockData ? PropertyStorage::Unread : PropertyStorage::TextBlock;   // (unread: the block could not be read)
+    }
+    if (!x.hasBlockData) return known ? PropertyStorage::Unread : x.exactText ? PropertyStorage::TextBlock : PropertyStorage::Header;
+    return known && x.node ? PropertyStorage::Array : PropertyStorage::Unread;
+}
+
+Property XisfFile::loadPropertyCounted(const XisfProperty& x, bool verify) {
+    const bool counted = counted_.count(&x) != 0;
+    const uint64_t declared = x.node && !x.location.empty() ? declaredBlockSize(*x.node) : x.value.size();
+    if (!counted) {
+        const uint64_t budget = propertyBudget(fileSize_);
+        if (declared > budget || countedBytes_ > budget - declared) {
+            throw Error("the properties of this file declare more data than a file of its size can hold (" +
+                        std::to_string(declared) + " bytes on top of " + std::to_string(countedBytes_) + ")");
+        }
+    }
+    Property p = loadProperty(x, verify);
+    if (!counted) {
+        counted_.insert(&x);
+        countedBytes_ += std::max<uint64_t>(declared, p.array ? p.data.size() : p.text.size());
+    }
+    return p;
 }
 
 std::vector<Property> XisfFile::loadProperties(size_t imageIndex, bool verify) {

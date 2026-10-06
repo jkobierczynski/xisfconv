@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <fstream>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -22,6 +23,10 @@ struct XisfProperty {
     std::string comment;
     std::string format;
     bool hasBlockData = false;  // vector/matrix (or unread) data stored in a data block
+    // A String in the header whose text has a carriage return that is meant (written as a
+    // character reference), or one in a value attribute that would not come back from an
+    // element as it is: see Property::block.
+    bool exactText = false;
     std::string location;
     const xml::Node* node = nullptr;
 };
@@ -142,6 +147,15 @@ public:
     // A property with its value: the content of its data block read, decompressed and put in
     // little-endian order. Throws if the block cannot be read or does not fit the shape.
     Property loadProperty(const XisfProperty& property, bool verifyChecksum);
+    // The same for a caller that reads the properties one by one, in any order and as often as
+    // it likes: what they declare together stays within propertyBudget, each counted once. One
+    // that would go beyond it is not read (the error says so).
+    Property loadPropertyCounted(const XisfProperty& property, bool verifyChecksum);
+    // How a property is stored, without reading it: a value in the header, a String that is
+    // kept as a data block (Property::block), a vector or a matrix, or something that is not
+    // read (a table, a block of a type without a name here, a text whose block is damaged).
+    enum class PropertyStorage { Header, TextBlock, Array, Unread };
+    PropertyStorage propertyStorage(const XisfProperty& property) const;
     // All properties of an image, or (kFileProperties) of the file. One that cannot be read is
     // left out with a warning.
     static constexpr size_t kFileProperties = static_cast<size_t>(-1);
@@ -162,6 +176,8 @@ private:
     std::vector<XisfImage> images_;
     std::vector<XisfProperty> fileProperties_;
     uint64_t propertyBytes_ = 0;   // what loadProperties has loaded so far (see propertyBudget)
+    uint64_t countedBytes_ = 0;    // the same for loadPropertyCounted,
+    std::set<const XisfProperty*> counted_;   // and the properties that are in that sum
     uint64_t stringBytes_ = 0;     // what the String properties in data blocks hold that were read when the file was opened
     uint64_t declaredBlockSize(const xml::Node& element) const;
 

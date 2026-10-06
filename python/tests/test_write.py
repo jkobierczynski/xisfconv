@@ -419,8 +419,10 @@ def test_what_cannot_be_written(tmp_path):
         xisfconv.write(path, good, format="jpeg")
     with pytest.raises(xisfconv.ArgumentError):
         xisfconv.write(tmp_path / "no.extension", good)
-    with pytest.raises(xisfconv.UnsupportedError):
-        xisfconv.write(path, good, codec="lz4")           # read, not written
+    with pytest.raises(xisfconv.ArgumentError, match="XISF only"):
+        xisfconv.write(tmp_path / "no.asdf", good, codec="lz4")
+    with pytest.raises(xisfconv.ArgumentError, match="LZ4"):
+        xisfconv.write(tmp_path / "no.fits", good, codec="lz4hc")
     with pytest.raises(TypeError):
         xisfconv.write(path, good, keywords={"OBJECT": [1, 2]})
     with pytest.raises(ValueError):

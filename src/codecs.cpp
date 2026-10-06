@@ -161,7 +161,7 @@ std::vector<uint8_t> lz4BlockDecompress(const uint8_t* src, size_t srcSize, size
             } while (b == 255);
         }
         if (litLen > static_cast<size_t>(iend - ip) || litLen > static_cast<size_t>(oend - op)) corrupt();
-        std::memcpy(op, ip, litLen);
+        if (litLen) std::memcpy(op, ip, litLen);   // (a block of nothing has no memory to copy to)
         op += litLen;
         ip += litLen;
         if (ip >= iend) break;  // last sequence carries literals only
@@ -280,6 +280,217 @@ std::vector<uint8_t> zstdCompress(const uint8_t* src, size_t srcSize, int level)
     (void)level;
     throw Unsupported("this build has no Zstandard support (use --codec zlib, or rebuild with libzstd)");
 #endif
+}
+
+// ---------------------------------------------------------------- LZ4 compression
+// A block is a row of sequences: a token (the length of the literals, the length of the match
+// less 4), the literals, the distance back to the match (1 to 65535, two bytes) and what of the
+// lengths did not fit the token. The last sequence is literals only. Three rules of the format
+// keep a decoder from reading past the end: the last 5 bytes are literals, the last match
+// starts at least 12 bytes before the end, and so a block of less than 13 bytes has no match.
+
+namespace {
+
+constexpr size_t kLz4MinMatch = 4, kLz4LastLiterals = 5, kLz4MatchStartLimit = 12, kLz4Window = 65535;
+
+inline uint32_t lz4Read32(const uint8_t* p) {
+    uint32_t v;
+    std::memcpy(&v, p, 4);
+    return v;   // (in the order of the host: it is compared and hashed, never written)
+}
+
+// How many bytes are the same at `a` and at `b`, up to `limit`.
+inline size_t lz4Same(const uint8_t* a, const uint8_t* b, size_t limit) {
+    size_t n = 0;
+    while (n + 8 <= limit) {
+        uint64_t x, y;
+        std::memcpy(&x, a + n, 8);
+        std::memcpy(&y, b + n, 8);
+        if (x != y) break;
+        n += 8;
+    }
+    while (n < limit && a[n] == b[n]) ++n;
+    return n;
+}
+
+void lz4Length(std::vector<uint8_t>& out, size_t rest) {
+    while (rest >= 255) {
+        out.push_back(255);
+        rest -= 255;
+    }
+    out.push_back(static_cast<uint8_t>(rest));
+}
+
+// matchLength 0: the last sequence, literals only.
+void lz4Sequence(std::vector<uint8_t>& out, const uint8_t* literals, size_t literalCount, size_t distance, size_t matchLength) {
+    const size_t extra = matchLength ? matchLength - kLz4MinMatch : 0;
+    out.push_back(static_cast<uint8_t>((std::min<size_t>(literalCount, 15) << 4) | std::min<size_t>(extra, 15)));
+    if (literalCount >= 15) lz4Length(out, literalCount - 15);
+    out.insert(out.end(), literals, literals + literalCount);
+    if (!matchLength) return;
+    out.push_back(static_cast<uint8_t>(distance));
+    out.push_back(static_cast<uint8_t>(distance >> 8));
+    if (extra >= 15) lz4Length(out, extra - 15);
+}
+
+// One table of the last place each hash was seen at, one look per position.
+void lz4Fast(const uint8_t* src, size_t n, std::vector<uint8_t>& out) {
+    size_t anchor = 0;   // the first byte that is not written yet
+    if (n > kLz4MatchStartLimit) {
+        std::vector<uint32_t> table(size_t(1) << 16, 0);   // a position + 1; 0: none
+        const size_t matchEnd = n - kLz4LastLiterals, lastStart = n - kLz4MatchStartLimit;
+        size_t ip = 0;
+        size_t misses = 0;   // looks since the last match
+        while (ip <= lastStart) {
+            const uint32_t word = lz4Read32(src + ip);
+            const uint32_t hash = (word * 2654435761u) >> 16;
+            const size_t seen = table[hash];
+            table[hash] = static_cast<uint32_t>(ip + 1);
+            if (seen && ip - (seen - 1) <= kLz4Window && lz4Read32(src + seen - 1) == word) {
+                size_t match = seen - 1, start = ip;
+                size_t length = kLz4MinMatch + lz4Same(src + match + kLz4MinMatch, src + ip + kLz4MinMatch, matchEnd - ip - kLz4MinMatch);
+                while (start > anchor && match > 0 && src[start - 1] == src[match - 1]) {
+                    --start;
+                    --match;
+                    ++length;
+                }
+                lz4Sequence(out, src + anchor, start - anchor, start - match, length);
+                ip = anchor = start + length;
+                misses = 0;
+                continue;
+            }
+            // Longer steps through what does not compress: one byte more for every 64 looks
+            // that found nothing. (The step must not grow with the distance: it would be so
+            // long after some megabytes of noise that what compresses behind them is missed.)
+            ip += 1 + (misses++ >> 6);
+        }
+    }
+    lz4Sequence(out, src + anchor, n - anchor, 0, 0);
+}
+
+// Every position is kept in a chain of the positions with the same hash, and the chain is
+// followed for the longest match; a match is put off by a byte if the next position has a
+// longer one.
+void lz4Chains(const uint8_t* src, size_t n, int effort, std::vector<uint8_t>& out) {
+    size_t anchor = 0;
+    if (n > kLz4MatchStartLimit) {
+        const int tries = effort >= 12 ? 4096 : effort >= 3 ? 1 << (effort - 1) : effort + 1;
+        std::vector<uint32_t> head(size_t(1) << 16, 0);    // the last position with a hash, + 1
+        std::vector<uint16_t> back(size_t(1) << 16, 0);    // from a position to the one before it in its chain; 0: none
+        const size_t matchEnd = n - kLz4LastLiterals, lastStart = n - kLz4MatchStartLimit;
+        size_t next = 0;   // the first position that is not in the chains yet
+        auto hashAt = [&](size_t p) { return (lz4Read32(src + p) * 2654435761u) >> 16; };
+        auto insertUpTo = [&](size_t end) {
+            for (; next < end; ++next) {
+                const uint32_t hash = hashAt(next);
+                const size_t distance = head[hash] ? next + 1 - head[hash] : 0;
+                back[next & 0xFFFF] = static_cast<uint16_t>(distance <= kLz4Window ? distance : 0);
+                head[hash] = static_cast<uint32_t>(next + 1);
+            }
+        };
+        // The longest match for position p (which is at most lastStart): its length, 0 if none.
+        auto longest = [&](size_t p, size_t& match) {
+            insertUpTo(p);
+            const size_t limit = matchEnd - p;
+            const uint32_t word = lz4Read32(src + p);
+            size_t best = 0;
+            size_t candidate = head[hashAt(p)];
+            for (int left = tries; candidate && left > 0; --left) {
+                const size_t at = candidate - 1;
+                if (p - at > kLz4Window) break;
+                if (lz4Read32(src + at) == word && (best < kLz4MinMatch || src[at + best] == src[p + best])) {
+                    const size_t length = kLz4MinMatch + lz4Same(src + at + kLz4MinMatch, src + p + kLz4MinMatch, limit - kLz4MinMatch);
+                    if (length > best) {
+                        best = length;
+                        match = at;
+                        if (best >= limit) break;   // there is no longer one
+                    }
+                }
+                const size_t distance = back[at & 0xFFFF];
+                if (!distance) break;
+                candidate -= distance;
+            }
+            return best;
+        };
+        size_t ip = 0;
+        while (ip <= lastStart) {
+            size_t match = 0;
+            size_t length = longest(ip, match);
+            if (!length) {
+                ++ip;
+                continue;
+            }
+            while (ip + 1 <= lastStart) {
+                size_t later = 0;
+                const size_t longer = longest(ip + 1, later);
+                if (longer <= length) break;
+                ++ip;
+                length = longer;
+                match = later;
+            }
+            size_t start = ip;
+            while (start > anchor && match > 0 && src[start - 1] == src[match - 1]) {
+                --start;
+                --match;
+                ++length;
+            }
+            lz4Sequence(out, src + anchor, start - anchor, start - match, length);
+            ip = anchor = start + length;
+        }
+    }
+    lz4Sequence(out, src + anchor, n - anchor, 0, 0);
+}
+
+}  // namespace
+
+std::vector<uint8_t> lz4BlockCompress(const uint8_t* src, size_t srcSize, int effort) {
+    if (srcSize > kLz4MaxInput) throw Error("lz4: a block of more than " + std::to_string(kLz4MaxInput) + " bytes");
+    std::vector<uint8_t> out;
+    out.reserve(srcSize / 2 + 64);
+    if (effort <= 0) lz4Fast(src, srcSize, out);
+    else lz4Chains(src, srcSize, std::min(effort, 12), out);
+    return out;
+}
+
+bool isXisfWriteCodec(const std::string& codec) {
+    return codec == "zlib" || codec == "lz4" || codec == "lz4hc" || codec == "zstd";
+}
+
+bool xisfCodecLevels(const std::string& codec, int& lowest, int& highest) {
+    lowest = 1;
+    if (codec == "zlib") highest = 9;
+    else if (codec == "lz4hc") highest = 12;
+    else if (codec == "zstd") {
+#ifdef XISFCONV_HAVE_ZSTD
+        highest = ZSTD_maxCLevel();
+#else
+        highest = 22;
+#endif
+    } else return false;
+    return true;
+}
+
+std::vector<uint8_t> xisfCompress(const std::string& codec, const uint8_t* src, size_t srcSize, int level) {
+    if (level != 0) {
+        int lowest = 0, highest = 0;
+        if (!xisfCodecLevels(codec, lowest, highest)) {
+            throw Error("the codec " + codec + " has no compression levels", ErrorKind::Argument);
+        }
+        if (level < lowest || level > highest) {
+            throw Error("compression level " + std::to_string(level) + ": " + codec + " has the levels " + std::to_string(lowest) +
+                        " to " + std::to_string(highest), ErrorKind::Argument);
+        }
+    }
+    if (codec == "zlib") return zlibCompress(src, srcSize, level ? level : 6);
+    if (codec == "zstd") return zstdCompress(src, srcSize, level ? level : 3);
+    if (codec == "lz4") return lz4BlockCompress(src, srcSize, 0);
+    if (codec == "lz4hc") return lz4BlockCompress(src, srcSize, level ? level : 9);
+    throw Error("unsupported XISF compression codec '" + codec + "' (use zlib, lz4, lz4hc or zstd)", ErrorKind::Argument);
+}
+
+uint64_t xisfSubblockSize(const std::string& codec, uint64_t wanted) {
+    wanted = std::max<uint64_t>(1, wanted);
+    return codec == "lz4" || codec == "lz4hc" ? std::min(wanted, kLz4MaxInput) : wanted;
 }
 
 // ---------------------------------------------------------------- byte shuffling

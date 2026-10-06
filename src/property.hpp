@@ -26,7 +26,13 @@ struct Property {
     // A String that the XISF file keeps in a data block, not as text in its header: `text` is
     // that block, byte for byte, and an XISF file that is written keeps it in a block again.
     // (What a reader makes of line ends and of blanks in the header is its own matter; a block
-    // is what it is.)
+    // is what it is.) Also set for a text that would not come back from a header as it is
+    // meant: one with a carriage return that the header writes as a character reference (as
+    // text it would be written as such, and an XML reader would read CR LF as a line feed),
+    // and one of a value attribute or of a program that does not fit an element
+    // (textFitsElement). A text of a header that is not set so is written into a header again
+    // as it is, with whatever line ends and blanks it has: the same bytes, and so the same
+    // text for each reader as before.
     bool block = false;
     // Written into the header of an XISF file whatever its size: the properties this library
     // makes itself (the astrometric solution from WCS keywords), which PixInsight was seen to
@@ -56,6 +62,15 @@ bool isMatrixPropertyType(const std::string& type);
 // wrong, or an empty string. (Nothing can be said about an unknown type.)
 std::string propertyProblem(const Property& property);
 
+// What is wrong with the value of a property that is not a vector or a matrix, as the text
+// XISF writes it with; empty if nothing is. Boolean (true, false), the integers and floating
+// point numbers of 8 to 64 bits under their names of the specification (Int32, UInt8, Float64;
+// also Byte, Short, UShort, Int, UInt, Float and Double), each a number the type holds and
+// nothing around it, Complex32 and Complex64 as "(re,im)", String (UTF-8) and TimePoint (a
+// date, or a date and a time, of ISO 8601). Any other type is a problem: this is for values
+// that are given, not for those that are carried.
+std::string scalarPropertyProblem(const std::string& type, const std::string& text);
+
 // The file-level properties that describe how one particular XISF file was made and is stored:
 // XISF:CreationTime, XISF:CreatorApplication, XISF:CreatorModule, XISF:CreatorOS,
 // XISF:BlockAlignmentSize, XISF:MaxInlineBlockSize, XISF:CompressionCodecs, XISF:CompressionLevel.
@@ -71,6 +86,13 @@ bool isValidUtf8(const std::string& text);
 // control characters other than tab and line breaks (which are written as character
 // references), and without the two code points XML excludes.
 bool isXmlText(const std::string& text);
+
+// True if a text that is given (by a program, or by a value attribute) can be written as the
+// content of an XML element and come back as it is from every reader: text that XML can hold,
+// without white space at its ends, which a reader may take for layout, and without a carriage
+// return, which an XML reader turns into a line feed or drops. A text that does not fit is
+// kept as a data block (Property::block).
+bool textFitsElement(const std::string& text);
 
 const Property* findProperty(const std::vector<Property>& properties, const std::string& id);
 

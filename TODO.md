@@ -19,6 +19,10 @@ in `DEVELOPMENT.md`.
 - [x] Downsampling (`--bin`, `--resize`) for TIFF and PNG export, and a thumbnailer entry with
       the file types, so that Linux file managers show previews of XISF, FITS and ASDF files
       (0.14.0)
+- [x] Python: the interface of the `xisf` package (`from xisfconv.xisf import XISF`), so that
+      programs written for it run on the library; XISF properties written from Python values and
+      from the C API, vectors and matrices read in the type of their elements; LZ4 and LZ4HC
+      written to XISF, with a compression level (0.15.0)
 - [ ] More platforms and packaging: Linux arm64 and Intel macOS release builds; Homebrew formula,
       AUR package, winget manifest; man page
 
@@ -69,12 +73,19 @@ Open checks of the Python package:
 
 Later, each when it is needed:
 
-- [ ] Library and Python: write XISF properties from the caller's values (`xisfconv_image` and
-      `write` take none yet; `convert` carries those of a file since 0.13.0); read vectors and
-      matrices in their own element type instead of as float64, complex ones included; read and
-      write an image in pieces instead of as a whole (which would also let Ctrl-C stop the reading
-      or writing of one large image: it is one step now); wheels for musllinux and Intel macOS;
-      type stubs.
+- [ ] Library and Python: read and write an image in pieces instead of as a whole (which would
+      also let Ctrl-C stop the reading or writing of one large image: it is one step now); wheels
+      for musllinux and Intel macOS; type stubs.
+- [ ] A compression level and byte shuffling off for conversions and rewrites, and for the tool
+      (`--level`): the writer of images from memory has both since 0.15.0.
+- [ ] `xisfconv.xisf`: the resolution, the ICC profile and the thumbnail of an image, which the
+      `xisf` package leaves out as well; table properties.
+- [ ] Write LZ4 blocks to ASDF (its own layout of chunks, which is read).
+- [ ] Hand a data block of a property type without a name over the API as its bytes, so that
+      `read_image` and `write` carry it as a conversion does; and tables.
+- [ ] XML attribute values as XML normalizes them (a line break written as such inside an
+      attribute is a blank), and a header text with both literal and referenced carriage returns
+      written back as it was.
 
 - [ ] A CMake package for the static library (the dependencies have to be described to the consumer).
 - [ ] Library messages without the tool's option names.
@@ -91,4 +102,9 @@ Open check:
       runs it in a sandbox), and in one of Nemo, Caja and Thunar
 - [ ] Open in PixInsight an XISF file that came back from FITS with its properties: it should
       report the astrometric solution of the original and show the processing history
+- [ ] Open in PixInsight an XISF file written with `--codec lz4` and one with `--codec lz4hc`,
+      and a plate-solved frame that was read and written again through `xisfconv.xisf` (0.15.0)
+- [ ] Check in PixInsight that a String property stored as `location="inline:base64"` is read: a
+      new text with a carriage return or with white space at its ends is written that way
+      (0.15.0). (PixInsight writes long Strings as attached blocks itself, when it compresses.)
 - [ ] Confirm the tag-release job on macOS and Windows publishes working binaries
