@@ -270,7 +270,7 @@ bool wcsToAstrometricSolution(const std::vector<FitsKeyword>& kw, uint64_t width
             return false;
         }
     }
-    double crval1, crval2, crpix1, crpix2;
+    double crval1 = 0, crval2 = 0, crpix1 = 0, crpix2 = 0;
     if (!cardNumber(kw, "CRVAL1", crval1) || !cardNumber(kw, "CRVAL2", crval2) ||
         !cardNumber(kw, "CRPIX1", crpix1) || !cardNumber(kw, "CRPIX2", crpix2)) {
         summary = "WCS keywords are incomplete (CRVAL/CRPIX)";
@@ -283,7 +283,7 @@ bool wcsToAstrometricSolution(const std::vector<FitsKeyword>& kw, uint64_t width
     bool hasCd = false;
     for (int i = 0; i < 4; ++i) hasCd = cardNumber(kw, cdNames[i], cd[i]) || hasCd;
     if (!hasCd) {
-        double cdelt1, cdelt2;
+        double cdelt1 = 0, cdelt2 = 0;
         if (!cardNumber(kw, "CDELT1", cdelt1) || !cardNumber(kw, "CDELT2", cdelt2)) {
             summary = "WCS keywords are incomplete (no CD matrix or CDELT)";
             return false;

@@ -34,6 +34,11 @@ try:
 except ImportError:  # pragma: no cover
     HAVE_ASDF = False
 
+# astropy does not map files into memory here: Windows refuses to replace a file that is still
+# mapped, and several tests write a file again after reading it. (Linux and Wine allow it, so only
+# a real Windows run shows a test that forgot.)
+fits.conf.use_memmap = False
+
 if len(sys.argv) < 2:
     sys.exit(__doc__)
 LIB_PATH = os.path.abspath(sys.argv[1])

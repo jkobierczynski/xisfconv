@@ -2,7 +2,7 @@
 
 What was decided while building xisfconv, and why. The README says what the program does and
 `TODO.md` what is planned; this file records the choices behind both, so that they are not
-reopened by accident. State: version 0.14.0, 6 October 2026.
+reopened by accident. State: version 0.14.1, 6 October 2026.
 
 ## Purpose and scope
 
@@ -620,8 +620,17 @@ Built in 0.11.0, in `python/`. What was decided:
   was not called one on Windows, where a directory cannot be opened at all, and a test replaced a
   file that astropy still had mapped into memory. The first Windows run of 0.13.0 failed on the
   same thing again, in a new test: Wine lets a mapped file be replaced, Windows does not. Tests
-  that write a file again after astropy read it open it with `memmap=False`.) The wheels for macOS and Windows have only CI
-  to prove them.
+  that write a file again after astropy read it open it with `memmap=False`, and since 0.14.1 the
+  two test scripts switch astropy's mapping off altogether.) The wheels for macOS and Windows have
+  only CI to prove them.
+- MinGW is not the compiler of the Windows build: CI uses Microsoft's, and that one is not at hand
+  here either. 0.14.0 did not compile there: `if constexpr (isFloat)` inside a lambda, with
+  `isFloat` a `constexpr` variable of the function template around it, is "not a constant" for
+  MSVC (error C2131), though GCC, clang and MinGW take it. Since 0.14.1 the condition is written
+  out where it is used (`if constexpr (std::is_floating_point<T>::value)`); a compile-time
+  condition inside a lambda names the type, never a local of the enclosing function. The same
+  release gives a starting value to the variables that MSVC called potentially uninitialized in
+  `src/wcs.cpp` (warning C4701; they were always set before use).
 - CI builds and runs the suite on Linux, macOS and Windows.
 
 ## How changes are made

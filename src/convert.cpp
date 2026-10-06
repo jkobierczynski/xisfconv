@@ -328,7 +328,8 @@ std::vector<Span> spans(uint64_t from, uint64_t to) {
 
 template <class T>
 void downsamplePlane(const T* src, uint64_t stride, T* dst, const std::vector<Span>& columns, const std::vector<Span>& rows) {
-    constexpr bool isFloat = std::is_floating_point<T>::value;
+    // (the type is asked for where it is needed: a constant of this function is not one inside the lambda
+    // below for every compiler)
     const size_t outW = columns.size();
     // one row of the image, made as narrow as the picture: the sums, and the shares that went into them
     std::vector<double> rowSum(outW), rowShare(outW), sum(outW), share(outW);
@@ -342,7 +343,7 @@ void downsamplePlane(const T* src, uint64_t stride, T* dst, const std::vector<Sp
             for (uint64_t k = 0; k < c.count; ++k) {
                 const double part = k == 0 ? c.firstShare : k + 1 == c.count ? c.lastShare : 1.0;
                 const T v = line[c.first + k];
-                if constexpr (isFloat) {
+                if constexpr (std::is_floating_point<T>::value) {
                     if (!std::isfinite(v)) continue;
                 }
                 s += static_cast<double>(v) * part;
@@ -367,7 +368,7 @@ void downsamplePlane(const T* src, uint64_t stride, T* dst, const std::vector<Sp
         }
         T* out = dst + r * outW;
         for (size_t j = 0; j < outW; ++j) {
-            if constexpr (isFloat) {
+            if constexpr (std::is_floating_point<T>::value) {
                 double mean = share[j] > 0 ? sum[j] / share[j] : std::numeric_limits<double>::quiet_NaN();
                 if (share[j] > 0 && !std::isfinite(sum[j])) {
                     // The sum of finite samples went beyond what a double holds (samples near its
