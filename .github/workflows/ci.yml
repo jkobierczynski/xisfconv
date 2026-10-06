@@ -160,6 +160,8 @@ jobs:
           pkg="xisfconv-${GITHUB_REF_NAME#v}-${{ matrix.name }}"
           mkdir -p "dist/$pkg"
           cp "${{ steps.bin.outputs.path }}" README.md LICENSE COPYING.LESSER THIRD-PARTY-NOTICES.md "dist/$pkg/"
+          # previews in the file manager: the thumbnailer entry and the file types (see the README)
+          if [ "$RUNNER_OS" = "Linux" ]; then cp -r desktop "dist/$pkg/"; fi
           cd dist
           if [ "$RUNNER_OS" = "Windows" ]; then 7z a -tzip "$pkg.zip" "$pkg" > /dev/null
           else tar czf "$pkg.tar.gz" "$pkg"; fi

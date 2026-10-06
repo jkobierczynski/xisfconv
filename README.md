@@ -16,6 +16,7 @@ xisfconv -t tiff -c -b u16 *.xisf -d export/  # batch to 16-bit Deflate TIFFs
 xisfconv -t tiff -s -b u8 integration.xisf     # stretched 8-bit TIFF for GIMP
 xisfconv -t png -s -b u8 integration.xisf      # stretched 8-bit PNG for the web
 xisfconv -t png -s -b u8 light_0001.fits       # quick look at a raw FITS frame
+xisfconv -t png -s -b u8 --resize 1024 *.xisf  # previews, the longest side 1024 pixels
 xisfconv -c --in-place *.xisf                 # recompress XISF files with zstd, replacing them
 xisfconv --verify ~/astro/2026                # check every XISF, FITS and ASDF file below a folder
 xisfconv --info light_0001.xisf               # geometry, codecs, FITS keywords, properties
@@ -369,6 +370,58 @@ xisfconv --info light_0001.xisf               # geometry, codecs, FITS keywords,
 - The stretch is for display and export only: don't feed stretched FITS back into calibration or
   photometry.
 
+**Smaller pictures** (`--bin <n>`, `--resize <size>`, for TIFF and PNG output)
+- `--bin 2` makes one pixel of every 2 x 2 (`--bin 3` of 3 x 3, and so on): their mean. Columns
+  and rows that do not fill a block, at the right and at the bottom, are left out (an image
+  narrower or lower than one block counts as one block there).
+- `--resize 1024` makes the longest side 1024 pixels; `--resize 1024x768` fits the picture into
+  that box, its proportions kept; `--resize 50%` halves width and height. A picture is never
+  larger than the image: an image that is small enough already is written as it is.
+- Every pixel of the picture is the mean of the part of the image it covers, each pixel of the
+  image counted by the share of it that is covered. No pixel is left out or counted twice, so
+  nothing shimmers or rings, stars do not vanish between samples, and the noise goes down as it
+  would with larger pixels. For whole ratios that is binning. Integers are rounded to the nearest
+  value; floating point samples that are not numbers (NaN, Inf) are left out of the mean. (The
+  sums are 64-bit floating point, so a mean of 64-bit samples is right to their last bit or two.)
+- The picture is made of the image as it is stored, and a `--stretch` is applied to the picture:
+  the mean of linear data is what a sensor with larger pixels would have recorded, and the
+  auto-STF is computed for the picture that is written. (It is a little deeper than the stretch
+  of the full image, because the picture has less noise.) It is also why a preview of a large
+  frame takes no longer than reading it.
+- With both options the blocks of `--bin` come first, and `--resize` is of the binned image. The
+  resolution a TIFF or PNG file states (pixels per inch) follows the size.
+- They are for pictures. FITS, ASDF and XISF output keep their pixels, and the options are
+  refused there: with a smaller image the WCS, the astrometric solution and the colour filter
+  pattern would all have to change with it.
+
+**Previews in the file manager** (Linux)
+- `desktop/xisfconv.thumbnailer` tells the file managers that use thumbnailer entries (GNOME
+  Files, Nemo, Caja, Thunar, PCManFM) to make their previews of XISF, FITS (also `.fits.fz`) and
+  ASDF files with xisfconv: a stretched 8-bit PNG of the first image, as large as the file
+  manager asks for. `desktop/xisfconv.xml` teaches the desktop the file types it does not know
+  (XISF and ASDF; FITS it knows, and recognizes a `.fits.fz` file by how it begins).
+- `sudo cmake --install build` puts both in place (`share/thumbnailers`, `share/mime/packages`);
+  then `sudo update-mime-database /usr/local/share/mime`. With a downloaded binary:
+
+  ```
+  sudo install -m 755 xisfconv /usr/local/bin/
+  mkdir -p ~/.local/share/thumbnailers ~/.local/share/mime/packages
+  cp desktop/xisfconv.thumbnailer ~/.local/share/thumbnailers/
+  cp desktop/xisfconv.xml ~/.local/share/mime/packages/
+  update-mime-database ~/.local/share/mime
+  rm -rf ~/.cache/thumbnails/fail        # forget the files that had no preview before
+  ```
+- The program itself has to be under `/usr` (`/usr/local/bin` is): GNOME runs thumbnailers in a
+  sandbox that sees the system and not your home directory, so a copy in `~/bin` or
+  `~/.local/bin` makes no previews there.
+- File managers make no previews of files above a size they set, and astronomical images are
+  often larger: raise the limit. Nemo and Caja have it in their preferences; for GNOME Files it
+  is a setting, in megabytes: `gsettings set org.gnome.nautilus.preferences thumbnail-limit 4096`.
+- KDE's Dolphin makes its previews with plugins of its own and does not read thumbnailer entries.
+- The entry is one line, and what it runs can be tried by hand:
+  `xisfconv -q -f -t png -s -b u8 --resize 256 -o preview.png image.xisf`. On the 62 MB test
+  frame (4656 x 3520, 32-bit floating point) that takes a tenth of a second.
+
 **Sample conversion** (`-b u8|u16|u32|f32|f64`)
 - integer → integer: rescaled over the full range (65535 → 255)
 - integer → float: normalized to [0,1]
@@ -423,6 +476,9 @@ xisfconv [options] <file>...      # any of XISF, FITS, ASDF -> any other of them
                               TIFF: Deflate with predictor; XISF: zstd + byte shuffling; ASDF: zlib
                               XISF -> XISF: every attached data block
   -s, --stretch[=mode]        screen stretch for viewing: auto (default), linked, unlinked, stf
+      --bin <n>               TIFF and PNG: a smaller picture, n x n pixels averaged into one
+      --resize <size>         TIFF and PNG: a smaller picture: 256 (the longest side), 1024x768 (a box
+                              to fit) or 50%; never larger than the image; made before a stretch
       --top-down              from XISF: keep XISF's top-down row order in FITS/ASDF (default: bottom-up)
                               from FITS/ASDF: the rows are stored top-down
       --bottom-up             from FITS/ASDF: the rows are stored bottom-up, whatever ROWORDER says
@@ -532,7 +588,7 @@ What to know:
   so the header maps directly to Python's `ctypes` or `cffi`, Rust's bindgen and Perl's
   FFI::Platypus. The Python package in `python/` is built that way, on `ctypes`.
 - **Stability.** Version 0.x: the API may still change between releases, and the shared library's
-  version changes with each of them (`libxisfconv.so.0.13`).
+  version changes with each of them (`libxisfconv.so.0.14`).
 - **Messages** are the tool's and some name its options (`--force`, `--bounds`): the option names
   say which setting is meant.
 - The CMake package (`find_package(xisfconv)`) is installed with the shared library; a static
@@ -705,6 +761,12 @@ was made from: for every sample format, gray and RGB, both row orders and a set 
 `--stretch` and `--compress` combinations the pixels must be identical, and separate cases cover
 ADU-scaled floats, signed data, NaN pixels, cubes and several HDUs.
 
+`--bin` and `--resize` are checked against the mean written out in the test script with exact
+fractions: for every sample format, gray and colour, whole and odd ratios, from XISF, FITS and ASDF,
+with NaN and Inf among the samples. A stretched picture must be, pixel for pixel, what the binned
+image gives with the same options. The thumbnailer entry is read as a file manager reads it and its
+command is run for each format and size; the file types are checked with `update-mime-database`.
+
 XISF → XISF is checked with a reader in the test script that knows nothing of xisfconv: for source
 files in every codec, with and without checksums and subblocks, and for every option set, all data
 blocks of the output must decode to the bytes of the input, the header must be the same text once
@@ -764,6 +826,9 @@ compared with PyYAML on random documents in all of PyYAML's output styles.
   as it was (the processing history does not mention the stretch).
 - Files with XISF properties read by xisfconv 0.12 or older: the tables of a FITS file are
   reported as skipped HDUs, and the matrices in an ASDF tree are taken for images.
+- `--bin` and `--resize` make TIFF and PNG pictures only. The previews are made from the pixels;
+  a thumbnail that PixInsight stored in an XISF file is not used. The thumbnailer entry has been
+  run as a command, not yet inside a file manager.
 - FITS input: tables are not read, other than those of the XISF properties; BLANK pixels of
   integer images are kept as ordinary values. Tile-compressed images: `HCOMPRESS_1` is not read.
 - Tile-compressed FITS is written without loss only (`RICE_1`, `GZIP_2`), a row per tile: no
@@ -797,7 +862,7 @@ Bump the version in `include/xisfconv.h` (CMake reads it from there), commit, th
 tag:
 
 ```
-git tag v0.13.0 && git push origin v0.13.0
+git tag v0.14.0 && git push origin v0.14.0
 ```
 
 CI builds and tests all three platforms and, only if every one passes, publishes a GitHub release with

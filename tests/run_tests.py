@@ -3749,7 +3749,9 @@ def property_zoo():
 
 
 def test_property_round_trip():
-    """XISF -> FITS or ASDF -> XISF: every property comes back with its type, value, comment and format."""
+    """XISF -> FITS or ASDF -> XISF: every property comes back with its type, value, comment and format.
+    (astropy reads the FITS files here with memmap=False: a table that stays mapped into memory keeps
+    Windows from replacing the file, and the files are written again and again.)"""
     import warnings
     d = os.path.join(TMP, "properties")
     os.makedirs(d, exist_ok=True)
@@ -3864,7 +3866,7 @@ def test_property_round_trip():
     f = os.path.join(d, "a.fits")
     run(src, "-o", f, "-f", "-q")
     fits_planes(f)   # fitsverify, and astropy's own verification
-    with fits.open(f) as hdul:
+    with fits.open(f, memmap=False) as hdul:
         names = [(h.name, h.ver) for h in hdul]
         check(names == [("first", 1), ("XISF_PROPERTIES", 1), ("second", 1), ("third", 1), ("XISF_PROPERTIES", 3), ("XISF_METADATA", 1)],
               f"FITS: a table behind each image that has properties, and one for the file: {names}")
@@ -4032,7 +4034,7 @@ def test_property_round_trip():
 
     # ---- --no-properties
     run(src, "-o", f, "-f", "-q", "--no-properties")
-    with fits.open(f) as hdul:
+    with fits.open(f, memmap=False) as hdul:
         check([h.name for h in hdul] == ["first", "second", "third"], "--no-properties: XISF -> FITS writes the images alone")
     run(src, "-o", a, "-f", "-q", "--no-properties")
     check(b"\nxisf:" not in open(a, "rb").read(), "--no-properties: XISF -> ASDF writes no xisf key")
@@ -4044,7 +4046,7 @@ def test_property_round_trip():
     check(b"\nxisf:" not in open(a, "rb").read(), "--no-properties: FITS -> ASDF does not take them along")
     run(src, "-o", a, "-f", "-q")
     run(a, "-o", f, "-f", "-q", "--no-properties")
-    with fits.open(f) as hdul:
+    with fits.open(f, memmap=False) as hdul:
         check(len(hdul) == 3, "--no-properties: ASDF -> FITS does not take them along")
     # a file of another program: nothing changes for it
     plain = os.path.join(d, "plain.fits")
@@ -4100,7 +4102,7 @@ def test_property_round_trip():
     open(os.path.join(d, "cut.fits"), "wb").write(raw[:rows_at + 5760])
     r = run(os.path.join(d, "cut.fits"), "-o", X, "-f", expect_ok=False)
     check(r.returncode != 0 and "truncated" in r.stderr, f"a file that ends in the middle of a table is a truncated file: {r.stderr.strip()[-160:]}")
-    with fits.open(f) as hdul:
+    with fits.open(f, memmap=False) as hdul:
         foreign = fits.BinTableHDU.from_columns([fits.Column(name="ID", format="8A", array=np.array(["x"])),
                                                  fits.Column(name="FLUX", format="D", array=np.array([1.5]))], name="CATALOG")
         fits.HDUList([hdul[0], foreign, hdul[1]]).writeto(os.path.join(d, "foreign.fits"), overwrite=True)
@@ -4190,7 +4192,7 @@ def test_property_round_trip():
               (e1 + e2).count("Odd:Control: its comment") == 1 and (e1 + e2).count("Odd:Value: its value") == 1,
               f"{kind} -> XISF: a character XML cannot hold is replaced, and a warning says so once: {e2[-300:]}")
         if kind == "asdf" and HAVE_ASDF:
-            with asdf.open(mid) as af:
+            with asdf.open(mid, memmap=False) as af:
                 p = af["xisf"]["images"][0]["properties"]
                 check(list(p) == ["Good", "Odd:Comment", "Odd:Control", "Odd:Value", "Last"] and p["Odd:Control"]["comment"] == "bell\x07here" and
                       p["Odd:Value"]["value"] == "escape\x1bd", "the asdf library reads such a tree, control characters included")
@@ -4232,7 +4234,7 @@ def test_property_round_trip():
     write_xisf_blocks(greedy, template, blocks)
     started = time.time()
     r = run(greedy, "-o", os.path.join(d, "greedy.fits"), "-f")
-    with fits.open(os.path.join(d, "greedy.fits")) as hdul:
+    with fits.open(os.path.join(d, "greedy.fits"), memmap=False) as hdul:
         check(len(hdul) == 1 and r.stderr.count("is left out") == 40 and time.time() - started < 20,
               f"XISF: properties that declare 1.5 GB each in a file of a few kilobytes are left out without being read: {time.time() - started:.1f} s")
 
@@ -4304,7 +4306,7 @@ def test_property_round_trip():
     changed = os.path.join(d, "solved_changed.fits")
 
     def edit(label, change, want, message):
-        with fits.open(mid) as hdul:
+        with fits.open(mid, memmap=False) as hdul:
             change(hdul)
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
@@ -4379,6 +4381,327 @@ def test_property_round_trip():
     check(any(p["id"].startswith(P) for p in xisf_properties(X)[0][0]), "while the same keywords alone are made into a solution, as before")
 
 
+# ---------------------------------------------------------------- smaller pictures and the thumbnailer
+
+def area_weights(n, m, use=None):
+    """The share of each of the first `use` pixels of n that each of m pixels covers: an m x n matrix,
+    computed with fractions, so that nothing here rounds the way xisfconv might."""
+    from fractions import Fraction
+    use = n if use is None else use
+    w = np.zeros((m, n))
+    for j in range(m):
+        a, b = Fraction(j * use, m), Fraction((j + 1) * use, m)
+        for i in range(int(a), min(use, int(b) + 1)):
+            share = min(b, i + 1) - max(a, i)
+            if share > 0:
+                w[j, i] = float(share)
+    return w
+
+
+def reference_picture(plane, out_h, out_w, use_h=None, use_w=None):
+    """The mean of the pixels each pixel of the picture covers (float64), NaN and Inf left out."""
+    wy, wx = area_weights(plane.shape[0], out_h, use_h), area_weights(plane.shape[1], out_w, use_w)
+    a = plane.astype(np.float64)
+    good = np.isfinite(a)
+    total = wy @ np.where(good, a, 0.0) @ wx.T
+    share = wy @ good.astype(np.float64) @ wx.T
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.where(share > 0, total / share, np.nan)
+
+
+def picture_matches(got, plane, out_h, out_w, use_h=None, use_w=None):
+    """True if `got` is the reference picture: integers rounded to the nearest (either neighbour where the
+    mean is half way), floating point to the precision of its type."""
+    ref = reference_picture(plane, out_h, out_w, use_h, use_w)
+    if got.shape != ref.shape:
+        return False
+    if np.issubdtype(got.dtype, np.integer):
+        g = got.astype(np.float64)
+        slack = 0.5 + 1e-9 * np.maximum(1.0, np.abs(ref))
+        if got.dtype.itemsize == 8:
+            slack = slack + np.abs(ref) * 2.0 ** -51      # a double holds 53 bits of a 64-bit sample
+        return bool(np.all(np.abs(g - ref) <= slack))
+    eps = 4 * np.finfo(got.dtype).eps
+    return bool(np.array_equal(np.isnan(got), np.isnan(ref)) and
+                np.allclose(got[np.isfinite(ref)], ref[np.isfinite(ref)], rtol=eps, atol=eps * 1e-3))
+
+
+def test_downsampling_and_thumbnailer():
+    """--bin and --resize for TIFF and PNG output, and the thumbnailer entry that uses them."""
+    import configparser
+    import shlex
+    d = os.path.join(TMP, "smaller")
+    os.makedirs(d, exist_ok=True)
+    H, W = 23, 31   # no multiple of 2, 3 or 4
+    out = os.path.join(d, "out.tif")
+
+    def png(path):
+        return decode_png(path)[0]
+
+    def pages(path, *flags, name="out.tif"):
+        target = os.path.join(d, name)
+        r = run(path, "-o", target, "-f", *flags)
+        return [p if p.ndim == 3 else p[..., None] for p in tiff_array(target)], r
+
+    def expect(label, got, source, out_h, out_w, use_h=None, use_w=None):
+        ok = got.shape == (out_h, out_w, source.shape[2]) and got.dtype == source.dtype and all(
+            picture_matches(got[..., c], source[..., c], out_h, out_w, use_h, use_w) for c in range(source.shape[2]))
+        check(ok, f"{label}: {got.shape} {got.dtype}")
+
+    # ---- every sample type, gray and colour, from XISF
+    for dtype in (np.uint8, np.uint16, np.uint32, np.uint64, np.float32, np.float64):
+        for channels in (1, 3):
+            a = test_image(dtype, H, W, channels, 91)
+            name = np.dtype(dtype).name
+            p = os.path.join(d, f"s_{name}_{channels}.xisf")
+            write_xisf(p, [image_entry(a, codec="zlib", shuffle_item=np.dtype(dtype).itemsize)])
+            got, r = pages(p, "--bin", "2")
+            expect(f"--bin 2, {name} x{channels}", got[0], a, 11, 15, 22, 30)
+            check("23 pixels averaged to 15 x 11" in r.stderr.replace(f"{W} x ", "") and "1 column(s) and 1 row(s)" in r.stderr,
+                  f"--bin 2: the note says what became of the image: {r.stderr.strip()[-200:]}")
+            got, _ = pages(p, "--bin", "3")
+            expect(f"--bin 3, {name} x{channels}", got[0], a, 7, 10, 21, 30)
+            got, _ = pages(p, "--resize", "10")
+            expect(f"--resize 10 (the longest side), {name} x{channels}", got[0], a, 7, 10)
+            got, _ = pages(p, "--resize", "40%")
+            expect(f"--resize 40%, {name} x{channels}", got[0], a, 9, 12)
+    a = test_image(np.uint16, H, W, 1, 92)
+    p = os.path.join(d, "gray.xisf")
+    write_xisf(p, [image_entry(a)])
+    pages(p)
+    plain = open(out, "rb").read()
+    # an exact case, written out: 2 x 2 blocks of 16-bit integers
+    blocks = a[:22, :30, 0].astype(np.float64).reshape(11, 2, 15, 2).mean(axis=(1, 3))
+    got, _ = pages(p, "--bin", "2")
+    check(np.array_equal(got[0][..., 0], np.floor(blocks + 0.5).astype(np.uint16)), "--bin 2 is the mean of every 2 x 2 pixels, rounded to the nearest")
+
+    # ---- the forms of --resize, and what they do not do
+    for spec, (oh, ow) in (("12x5", (5, 7)), ("5x12", (4, 5)), ("31x23", (H, W)), ("16", (12, 16)), ("1", (1, 1)), ("100%", (H, W)),
+                           ("50%", (12, 16)), ("3.3%", (1, 1)), ("1X200", (1, 1)), ("200x1", (1, 1))):
+        got, _ = pages(p, "--resize", spec)
+        expect(f"--resize {spec}", got[0], a, oh, ow)
+    for flags in (["--resize", "100"], ["--resize", "400x300"], ["--bin", "1"], ["--resize", "31"], ["--resize", "100%"]):
+        _, r = pages(p, *flags)
+        check(open(out, "rb").read() == plain and "averaged" not in r.stderr, f"{flags}: a picture is never larger than the image; the file is the one without the option")
+    got, _ = pages(p, "--bin", "50")
+    check(got[0].shape == (1, 1, 1) and abs(float(got[0][0, 0, 0]) - a.astype(np.float64).mean()) <= 0.5, "--bin 50 of a small image is one pixel: its mean")
+    got, _ = pages(p, "--bin", "2", "--resize", "5")
+    expect("--bin 2 --resize 5: the blocks of the bin, then the size", got[0], a, 4, 5, 22, 30)
+    got, _ = pages(p, "--resize", "50%", "--resize", "6")
+    expect("of two --resize the last one counts", got[0], a, 4, 6)
+    for flags, message in ((["--bin", "0"], "--bin expects"), (["--bin", "two"], "--bin expects"), (["--bin", "-2"], "--bin expects"),
+                           (["--resize", "0"], "--resize expects"), (["--resize", "10x"], "--resize expects"),
+                           (["--resize", "x10"], "--resize expects"), (["--resize", "0x10"], "--resize expects"),
+                           (["--resize", "150%"], "--resize expects"), (["--resize", "0%"], "--resize expects"),
+                           (["--resize", "%"], "--resize expects"), (["--resize", "big"], "--resize expects"),
+                           (["--resize", "-5"], "--resize expects"), (["--resize", "10x10x10"], "--resize expects")):
+        r = run(p, "-o", out, "-f", *flags, expect_ok=False)
+        check(r.returncode != 0 and message in r.stderr, f"{flags} is refused: {r.stderr.strip()[-120:]}")
+    f_in = os.path.join(d, "gray.fits")
+    run(p, "-o", f_in, "-f", "-q")
+    for source, target in ((p, "x.fits"), (p, "x.asdf"), (p, "x.xisf"), (p, "x.fits.fz"), (f_in, "y.xisf"), (f_in, "y.asdf"), (f_in, "y.fits.fz")):
+        for flags in (["--bin", "2"], ["--resize", "10"], ["--resize", "50%"], ["--resize", "100%"], ["--resize", "5000"]):
+            r = run(source, "-o", os.path.join(d, target), "-f", *flags, expect_ok=False)
+            check(r.returncode != 0 and "TIFF and PNG" in r.stderr and not os.path.exists(os.path.join(d, target)),
+                  f"{flags} for {target} from {os.path.basename(source)} is refused: an image that is data keeps its pixels")
+
+    # ---- floating point samples that are no numbers are left out of the mean
+    holes = test_image(np.float32, 12, 16, 1, 93)[..., 0].astype(np.float32)
+    holes[0:4, 0:4] = np.nan           # two blocks of 4 x 4 ... no: one whole block of 4 x 4
+    holes[5, 9] = np.nan               # one pixel of a block
+    holes[8:10, 12:16] = np.inf        # half a block
+    hf = os.path.join(d, "holes.fits")
+    fits.PrimaryHDU(holes[::-1]).writeto(hf, overwrite=True)   # (stored bottom-up: `holes` is the picture from the top)
+    got, r = pages(hf, "--bin", "4", "--bounds", "0:1")
+    ref = reference_picture(holes, 3, 4)
+    check(got[0].shape == (3, 4, 1) and np.isnan(got[0][0, 0, 0]) and np.isnan(ref[0, 0]) and np.isfinite(got[0][1:, :, 0]).all() and
+          np.isfinite(got[0][0, 1:, 0]).all() and picture_matches(got[0][..., 0], holes, 3, 4),
+          "NaN and Inf are left out of the mean; a pixel that covers nothing else is NaN")
+    check("NaN/Inf" in r.stderr, "and the warning about them stays, as the picture has one")
+    holes[0:4, 0:4] = 0.25
+    fits.PrimaryHDU(holes[::-1]).writeto(hf, overwrite=True)
+    got, r = pages(hf, "--bin", "4", "--bounds", "0:1")
+    check(np.isfinite(got[0]).all() and "NaN/Inf" not in r.stderr and "NaN/Inf" in pages(hf, "--bounds", "0:1")[1].stderr,
+          "a picture in which none is left gets no warning about them (the image as it is does)")
+    # samples at the edge of what the sums can hold: the mean of equal values is that value
+    for dtype, value in ((np.uint64, 2 ** 52 + 1), (np.uint64, 2 ** 53 - 1), (np.uint64, 2 ** 64 - 1), (np.uint32, 2 ** 32 - 1),
+                         (np.float64, 1e308), (np.float64, -1.7e308), (np.float32, 3.4e38), (np.float64, 5e-324)):
+        flat = np.full((6, 9, 1), value, dtype)
+        fx = os.path.join(d, "flat.xisf")
+        write_xisf(fx, [image_entry(flat)])
+        for flags in (["--bin", "3"], ["--resize", "4"]):
+            got, _ = pages(fx, *flags)
+            # (the sums are doubles: a mean of 64-bit samples is right to their last bit or two)
+            stored = float(np.dtype(dtype).type(value))
+            off = np.abs(got[0].astype(np.float64) - stored).max()
+            slack = abs(stored) * 2.0 ** -51 if np.dtype(dtype).itemsize == 8 else 0.0
+            check(got[0].dtype == dtype and np.isfinite(got[0].astype(np.float64)).all() and off <= slack,
+                  f"{flags}: a flat image of {value!r} ({np.dtype(dtype).name}) stays {value!r}: {got[0].ravel()[:2]}")
+
+    # ---- FITS and ASDF input: the picture is that of the image the right way up
+    odd = test_image(np.uint16, H, W, 1, 94)
+    of = os.path.join(d, "odd.fits")
+    fits.PrimaryHDU(odd[::-1, :, 0]).writeto(of, overwrite=True)
+    oa = os.path.join(d, "odd.asdf")
+    run(of, "-o", oa, "-f", "-q")
+    for source in (of, oa):
+        got, _ = pages(source, "--bin", "2")
+        expect(f"--bin 2 from {os.path.splitext(source)[1][1:].upper()}: the rows left out are the last of the picture", got[0], odd, 11, 15, 22, 30)
+        got, _ = pages(source, "--resize", "9x9")
+        expect(f"--resize 9x9 from {os.path.splitext(source)[1][1:].upper()}", got[0], odd, 7, 9)
+    top = os.path.join(d, "top.fits")
+    fits.PrimaryHDU(odd[..., 0], header=fits.Header([("ROWORDER", "TOP-DOWN")])).writeto(top, overwrite=True)
+    got, _ = pages(top, "--bin", "2")
+    expect("--bin 2 from a FITS file with its rows top-down", got[0], odd, 11, 15, 22, 30)
+
+    # ---- several images: every page; a cube that is no colour image: every plane
+    b = test_image(np.float32, 10, 14, 3, 95)
+    two = os.path.join(d, "two.xisf")
+    write_xisf(two, [with_id(image_entry(a), "one"), with_id(image_entry(b), "two")])
+    got, _ = pages(two, "--bin", "2")
+    check(len(got) == 2, "two images, two pages")
+    expect("the first page", got[0], a, 11, 15, 22, 30)
+    expect("the second page", got[1], b, 5, 7)
+    cube = np.stack([test_image(np.uint16, 8, 10, 1, 96 + k)[..., 0] for k in range(5)])
+    cf = os.path.join(d, "cube.fits")
+    fits.PrimaryHDU(cube[:, ::-1, :]).writeto(cf, overwrite=True)
+    got, _ = pages(cf, "--resize", "50%")
+    check(len(got) == 5 and all(picture_matches(got[k][..., 0], cube[k], 4, 5) for k in range(5)), "the planes of a cube become smaller pages")
+
+    # ---- a stretch is applied to the picture, not the other way round
+    sky = astro_image(120, 180, 3, 97)
+    sx = os.path.join(d, "sky.xisf")
+    write_xisf(sx, [image_entry(sky)])
+    binned = np.stack([reference_picture(sky[..., c], 40, 60) for c in range(3)], axis=-1).astype(np.float32)
+    bx = os.path.join(d, "sky_binned.xisf")
+    write_xisf(bx, [image_entry(binned)])
+    for kind, flags in (("png", ["-s", "-b", "u8"]), ("png", ["--stretch=unlinked", "-b", "u16"]), ("tif", ["-s"]), ("png", [])):
+        small, same = os.path.join(d, "sky_small." + kind), os.path.join(d, "sky_same." + kind)
+        r = run(sx, "-o", small, "-f", "--bin", "3", *flags)
+        run(bx, "-o", same, "-f", "-q", *flags)
+        g1 = png(small) if kind == "png" else tiff_array(small)[0]
+        g2 = png(same) if kind == "png" else tiff_array(same)[0]
+        check(g1.shape[:2] == (40, 60) and np.array_equal(g1, g2),
+              f"--bin 3 {flags} -> {kind}: the picture is what the binned image gives with the same options")
+        if "-s" in flags:
+            check(r.stderr.index("averaged to") < r.stderr.index("auto-STF"), "the notes come in the order of the work: averaged, then stretched")
+    ff = os.path.join(d, "sky.fits")
+    run(sx, "-o", ff, "-f", "-q")
+    small, same = os.path.join(d, "sky_small_f.png"), os.path.join(d, "sky_same_f.png")
+    run(ff, "-o", small, "-f", "-q", "--bin", "3", "-s", "-b", "u8")
+    run(bx, "-o", os.path.join(d, "sky_binned.fits"), "-f", "-q")
+    run(os.path.join(d, "sky_binned.fits"), "-o", same, "-f", "-q", "-s", "-b", "u8")
+    check(np.array_equal(png(small), png(same)), "and so it is from FITS")
+
+    # ---- an alpha channel is averaged like the others; the resolution follows the size
+    rgba = test_image(np.uint8, 12, 16, 4, 98)
+    ax = os.path.join(d, "rgba.xisf")
+    entry = image_entry(rgba, color="RGB", children='<Resolution horizontal="300" vertical="300" unit="inch"/>')
+    write_xisf(ax, [entry])
+    ap = os.path.join(d, "rgba.png")
+    run(ax, "-o", ap, "-f", "-q", "--bin", "2")
+    got = png(ap)
+    check(got.shape == (6, 8, 4) and all(picture_matches(got[..., c], rgba[..., c], 6, 8) for c in range(4)), "RGB with alpha -> PNG, --bin 2")
+    run(ax, "-o", out, "-f", "-q", "--bin", "2")
+    with tifffile.TiffFile(out) as t:
+        check(t.pages[0].tags["XResolution"].value == (150, 1) and t.pages[0].tags["YResolution"].value == (150, 1),
+              f"half the pixels per inch, so that the picture is as large on paper: {t.pages[0].tags['XResolution'].value}")
+    # (each side by itself, and counted from the part of the image that is used)
+    uneven = image_entry(test_image(np.uint8, 23, 31, 1, 98), children='<Resolution horizontal="300" vertical="150" unit="inch"/>')
+    ux = os.path.join(d, "uneven.xisf")
+    write_xisf(ux, [uneven])
+    for flags, (xres, yres) in ((["--bin", "2"], (150.0, 75.0)), (["--bin", "40"], (300 / 31, 150 / 23)), (["--resize", "10"], (300 * 10 / 31, 150 * 7 / 23))):
+        run(ux, "-o", out, "-f", "-q", *flags)
+        with tifffile.TiffFile(out) as t:
+            x, y = (t.pages[0].tags[k].value for k in ("XResolution", "YResolution"))
+            check(abs(x[0] / x[1] - xres) < 1e-3 and abs(y[0] / y[1] - yres) < 1e-3,
+                  f"{flags}: {x[0] / x[1]:.3f} x {y[0] / y[1]:.3f} pixels per inch, for {xres:.3f} x {yres:.3f}")
+
+    # ---- the thumbnailer entry: the command a file manager runs
+    desktop = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "desktop")
+    entry = configparser.ConfigParser(interpolation=None)
+    entry.optionxform = str
+    entry.read(os.path.join(desktop, "xisfconv.thumbnailer"), encoding="utf-8")
+    check(entry.sections() == ["Thumbnailer Entry"] and set(entry["Thumbnailer Entry"]) == {"TryExec", "Exec", "MimeType"},
+          f"the thumbnailer entry has its three keys: {dict(entry['Thumbnailer Entry']) if entry.sections() else None}")
+    command = shlex.split(entry["Thumbnailer Entry"]["Exec"])
+    check(command[0] == entry["Thumbnailer Entry"]["TryExec"] == "xisfconv" and command.count("%s") == 1 and command.count("%i") == 1 and
+          command.count("%o") == 1 and command[-2:] == ["--", "%i"],
+          f"it names the program, the size, the output and, as the last word and after '--', the input: {command}")
+    types = entry["Thumbnailer Entry"]["MimeType"]
+    check(types.endswith(";") and {"image/x-xisf", "application/fits", "image/fits", "application/x-asdf"} <= set(types.split(";")),
+          f"and the file types: {types}")
+
+    def thumbnail(source, size, name="thumb.png"):
+        target = os.path.join(d, name)
+        if os.path.exists(target):
+            os.remove(target)
+        args = [EXE] + [str(size) if c == "%s" else source if c == "%i" else target if c == "%o" else c for c in command[1:]]
+        r = subprocess.run(args, capture_output=True, text=True)
+        return (png(target) if r.returncode == 0 and os.path.exists(target) else None), r
+
+    big = astro_image(300, 450, 3, 99)
+    bigx = os.path.join(d, "big.xisf")
+    write_xisf(bigx, [image_entry(big, codec="zlib", shuffle_item=4)])
+    sources = {"XISF": bigx}
+    for label, name, flags in (("FITS", "big.fits", []), ("tile-compressed FITS", "big.fits.fz", []), ("ASDF", "big.asdf", [])):
+        sources[label] = os.path.join(d, name)
+        run(bigx, "-o", sources[label], "-f", "-q", *flags)
+    reference = None
+    for label, source in sources.items():
+        for size in (128, 256):
+            got, r = thumbnail(source, size)
+            check(got is not None and got.shape == (round(300 * size / 450), size, 3) and got.dtype == np.uint8 and r.stdout == "" and r.stderr == "",
+                  f"thumbnail of {label}, {size} pixels: {None if got is None else got.shape} {r.stderr.strip()[-200:]}")
+            if got is not None and size == 256:
+                # a picture of the sky: dark, not black, with stars, and the same from every format
+                check(40 < np.median(got) < 90 and got.max() == 255, f"thumbnail of {label}: stretched for viewing (median {np.median(got)})")
+                reference = got if reference is None else reference
+                check(np.array_equal(got, reference), f"thumbnail of {label}: the picture the XISF file gives")
+    got, r = thumbnail(bigx, 1024)
+    check(got is not None and got.shape == (300, 450, 3), "an image smaller than the thumbnail asked for is not made larger")
+    got, r = thumbnail(bigx, 128, name="thumbnail-without-extension")
+    check(got is not None and got.shape == (85, 128, 3), "the output is PNG whatever its name")
+    got, r = thumbnail(two, 16)
+    check(got is not None and got.shape == (12, 16, 1), "a file with several images: the first one")
+    got, r = thumbnail(os.path.join(d, "none.xisf"), 128)
+    check(got is None and r.returncode != 0, "a file that is not there: no thumbnail, and an exit status that says so")
+    open(os.path.join(d, "garbage.xisf"), "wb").write(b"XISF0100" + bytes(100))
+    got, r = thumbnail(os.path.join(d, "garbage.xisf"), 128)
+    check(got is None and r.returncode != 0 and not os.path.exists(os.path.join(d, "thumb.png.part")), "a damaged file: no thumbnail and nothing left behind")
+
+    # ---- the file types the entry names
+    import xml.etree.ElementTree as ET
+    ns = "{http://www.freedesktop.org/standards/shared-mime-info}"
+    root = ET.parse(os.path.join(desktop, "xisfconv.xml")).getroot()
+    defined = {t.get("type"): t for t in root.findall(ns + "mime-type")}
+    check(root.tag == ns + "mime-info" and set(defined) == {"image/x-xisf", "application/x-asdf"} and
+          set(defined) <= set(types.split(";")), f"the file types the desktop does not know are defined: {sorted(defined)}")
+    globs = {name: sorted(g.get("pattern") for g in t.findall(ns + "glob")) for name, t in defined.items()}
+    check(globs == {"image/x-xisf": ["*.xisf"], "application/x-asdf": ["*.asdf"]}, f"by the names of the files: {globs}")
+    for name, path in (("image/x-xisf", bigx), ("application/x-asdf", sources["ASDF"])):
+        match = defined[name].find(ns + "magic").find(ns + "match")
+        value = match.get("value").encode()
+        head = open(path, "rb").read(64)
+        check(match.get("type") == "string" and match.get("offset") == "0" and head.startswith(value),
+              f"and {name} by how such a file begins: {value}")
+        for inner in match.findall(ns + "match"):   # what has to follow, somewhere in a range of offsets
+            first, last = (int(v) for v in inner.get("offset").split(":"))
+            at = head.find(inner.get("value").encode())
+            check(first <= at <= last, f"{name}: {inner.get('value')!r} follows at offset {at}, within {first}..{last}")
+    if shutil.which("update-mime-database"):
+        base = os.path.join(d, "share", "mime")
+        os.makedirs(os.path.join(base, "packages"), exist_ok=True)
+        shutil.copy(os.path.join(desktop, "xisfconv.xml"), os.path.join(base, "packages"))
+        r = subprocess.run(["update-mime-database", base], capture_output=True, text=True)
+        listed = open(os.path.join(base, "globs2")).read() if os.path.exists(os.path.join(base, "globs2")) else ""
+        check(r.returncode == 0 and "image/x-xisf:*.xisf" in listed and "application/x-asdf:*.asdf" in listed and
+              os.path.exists(os.path.join(base, "image", "x-xisf.xml")),
+              f"update-mime-database takes the file: {r.stderr.strip()[-200:]}")
+    else:
+        skipped.append("the file types through update-mime-database")
+
+
 if __name__ == "__main__":
     print("xisfconv:", EXE)
     print(subprocess.run([EXE, "--version"], capture_output=True, text=True).stdout.strip())
@@ -4396,7 +4719,8 @@ if __name__ == "__main__":
               test_fits_to_xisf_formats, test_fits_to_xisf_metadata, test_fits_to_xisf_bounds_bits_hdus,
               test_xisf_fits_xisf_roundtrip, test_asdf_yaml, test_asdf_hand_written, test_asdf_output,
               test_asdf_python_files, test_asdf_roundtrips, test_export_from_fits_and_asdf, test_xisf_rewrite,
-              test_verify, test_fits_tile_compressed, test_fits_tile_writing, test_property_round_trip):
+              test_verify, test_fits_tile_compressed, test_fits_tile_writing, test_property_round_trip,
+              test_downsampling_and_thumbnailer):
         try:
             t()
         except Exception as e:  # noqa: BLE001

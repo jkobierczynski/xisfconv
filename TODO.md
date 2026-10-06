@@ -16,8 +16,9 @@ in `DEVELOPMENT.md`.
 - [x] Lossless property round trip: every XISF property goes along to FITS (a table behind each
       image) and ASDF (the tree) with its type and exact value, and is restored on the way back,
       the astrometric solution as PixInsight wrote it (0.13.0)
-- [ ] Downsampling (`--resize` / `--bin`) for TIFF and PNG export, and a `.thumbnailer` entry so Linux
-      file managers show previews of `.xisf` and `.fits` files
+- [x] Downsampling (`--bin`, `--resize`) for TIFF and PNG export, and a thumbnailer entry with
+      the file types, so that Linux file managers show previews of XISF, FITS and ASDF files
+      (0.14.0)
 - [ ] More platforms and packaging: Linux arm64 and Intel macOS release builds; Homebrew formula,
       AUR package, winget manifest; man page
 
@@ -33,6 +34,10 @@ Smaller items, each closing a limitation listed in the README:
 - [ ] Read HCOMPRESS_1 tile compression
 - [ ] Tile-compressed FITS output: quantized floating point as an option (lossy, fpack's default
       for floats and much smaller), a choice of tile shape
+- [ ] Previews: use the thumbnail an XISF file holds when it has one (no pixels to read); a
+      plugin for KDE's Dolphin; a look at what Windows Explorer and macOS Quick Look need
+- [ ] `--bin` for FITS, ASDF and XISF output: with the WCS, the astrometric solution, the pixel
+      size keywords and the colour filter pattern changed to match
 - [ ] Take the rest of an XISF image along to FITS and ASDF the way the properties go: the saved
       screen stretch, the resolution, the ICC profile, the thumbnail and the image attributes
       that no keyword says
@@ -82,6 +87,8 @@ Later, each when it is needed:
 
 Open check:
 
+- [ ] Install the thumbnailer on a desktop and look at a folder of frames: in GNOME Files (which
+      runs it in a sandbox), and in one of Nemo, Caja and Thunar
 - [ ] Open in PixInsight an XISF file that came back from FITS with its properties: it should
       report the astrometric solution of the original and show the processing history
 - [ ] Confirm the tag-release job on macOS and Windows publishes working binaries

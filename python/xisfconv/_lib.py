@@ -15,7 +15,7 @@ from ctypes import (CFUNCTYPE, POINTER, Structure, c_char, c_char_p, c_double, c
 
 # The library version this module was written for. In 0.x every release may change the layout
 # of the structures, so another library is refused.
-API_VERSION = (0, 13)
+API_VERSION = (0, 14)
 
 # ------------------------------------------------------------------------------------------
 # Constants of xisfconv.h
@@ -183,6 +183,12 @@ class ConvertOptions(Structure):
         ("lower_bound", c_double),
         ("upper_bound", c_double),
         ("properties", c_int32),
+        ("reserved", c_int32),
+        ("fit_width", c_uint64),
+        ("fit_height", c_uint64),
+        ("scale", c_double),
+        ("bin", c_int32),
+        ("reserved2", c_int32),
     ]
 
 

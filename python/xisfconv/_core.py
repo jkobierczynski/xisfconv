@@ -9,6 +9,7 @@ import atexit
 import ctypes
 import logging
 import math
+import numbers
 import operator
 import os
 import re
@@ -177,6 +178,9 @@ _OPTION_WORDS = [
     ("--image", "image"),
     ("--top-down", 'row_order="top-down"'),
     ("--no-properties", "properties=False"),
+    ("--bin and --resize", "bin, resize and scale"),
+    ("--bin", "bin"),
+    ("--resize", "resize"),
     ("--no-verify", "verify=False"),
     ("add --in-place to replace it", "use rewrite_in_place() to replace it"),
     ("or directory with -o or -d", ""),
@@ -2077,9 +2081,36 @@ def write(path, images, *, format=None, codec=None, checksum=None, stored_row_or
 # ------------------------------------------------------------------------------------------
 
 
+def _smaller(bin, resize, scale):   # noqa: A002
+    """bin, fit_width, fit_height and scale of the conversion options."""
+    if isinstance(bin, bool) or not isinstance(bin, numbers.Integral) or not 1 <= bin <= 1000000:
+        raise ValueError("bin expects a number of pixels, 1 or more (2 makes one pixel of 2 x 2), not %r" % (bin,))
+    width = height = 0
+    if resize is not None:
+        if isinstance(resize, numbers.Integral) and not isinstance(resize, bool):
+            box = (resize, resize)
+        elif isinstance(resize, (tuple, list, np.ndarray)):
+            box = tuple(np.asarray(resize).tolist()) if isinstance(resize, np.ndarray) else tuple(resize)
+        else:
+            box = ()
+        whole = len(box) == 2 and all(isinstance(side, numbers.Integral) and not isinstance(side, bool) and 0 < side < 2 ** 63
+                                      for side in box)
+        if whole:
+            width, height = box
+        else:
+            raise ValueError("resize expects the longest side in pixels (256) or a box to fit, (width, height), not %r"
+                             % (resize,))
+    if scale is None:
+        scale = 0.0
+    elif isinstance(scale, bool) or not isinstance(scale, numbers.Real) or not 0 < scale <= 1:
+        raise ValueError("scale expects a fraction of the image, above 0 and up to 1 (0.5 halves width and height), not %r"
+                         % (scale,))
+    return int(bin), int(width), int(height), float(scale)
+
+
 def convert(input, output, *, format=None, sample_format=None, image=None, stretch=None, codec=None, checksum=None,
             subblock_size=None, row_order=None, property_keywords=True, wcs=True, sip_order=3, verify=True, bounds=None,
-            overwrite=False, progress=None, properties=True):   # noqa: A002 - the names of the command line
+            overwrite=False, progress=None, properties=True, bin=1, resize=None, scale=None):   # noqa: A002 - the names of the command line
     """Converts a file, as the command line tool does: XISF to FITS, ASDF, TIFF or PNG; FITS
     and ASDF to XISF, to each other, or to TIFF or PNG; FITS to FITS to pack a file
     (``codec=True``: tile-compressed) or to unpack one. (XISF to XISF is :func:`rewrite`.)
@@ -2122,6 +2153,14 @@ def convert(input, output, *, format=None, sample_format=None, image=None, stret
         wrote it, as long as the WCS keywords of the file are still the ones it was written
         with (else the solution is made from the keywords). False leaves the properties out,
         and leaves alone those a FITS or ASDF file carries.
+    bin, resize, scale
+        A smaller picture, for TIFF and PNG output (``--bin``, ``--resize``). ``bin=2`` makes
+        one pixel of every 2 x 2. ``resize=256`` makes the longest side 256 pixels,
+        ``resize=(1024, 768)`` fits the picture into that width and height, its proportions
+        kept. ``scale=0.5`` halves width and height. Every pixel of the picture is the mean
+        of the pixels it covers, taken of the image as it is stored: before a stretch. A
+        picture is never larger than the image. With ``bin`` and one of the others the
+        blocks come first; with ``resize`` and ``scale`` the picture is the smaller of the two.
     """
     options = _lib.struct(_lib.ConvertOptions, _library.xisfconv_convert_options_init)
     options.output_format = _output_format(format)
@@ -2140,6 +2179,7 @@ def convert(input, output, *, format=None, sample_format=None, image=None, stret
     options.use_bounds, options.lower_bound, options.upper_bound = _bounds(bounds)
     options.overwrite = int(bool(overwrite))
     options.properties = int(bool(properties))
+    options.bin, options.fit_width, options.fit_height, options.scale = _smaller(bin, resize, scale)
     context = _Context.borrow()
     with context.lock:
         context.about(input, other=output)

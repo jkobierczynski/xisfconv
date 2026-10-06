@@ -3,6 +3,7 @@
 // Copyright (C) 2026 Jurgen Kobierczynski
 #include "xisfconv.h"
 
+#include <cstddef>
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -1494,6 +1495,13 @@ xisfconv_status xisfconv_wcs_flip_rows(xisfconv_keywords* kw, uint64_t image_hei
 // Converting
 // ------------------------------------------------------------------------------------------
 
+// The fields that came after 0.13 begin where that layout ended, padding included: a program
+// built against it hands over its whole struct, and what its padding holds is nobody's business.
+static_assert(sizeof(void*) != 8 || (offsetof(xisfconv_convert_options, reserved) == 100 &&
+                                     offsetof(xisfconv_convert_options, fit_width) == 104 &&
+                                     offsetof(xisfconv_convert_options, reserved2) + 4 == sizeof(xisfconv_convert_options)),
+              "xisfconv_convert_options: a field where an older layout had padding, or padding at the end");
+
 void xisfconv_convert_options_init(xisfconv_convert_options* options, size_t struct_size) {
     xisfconv_convert_options defaults;
     std::memset(static_cast<void*>(&defaults), 0, sizeof defaults);
@@ -1511,6 +1519,7 @@ void xisfconv_convert_options_init(xisfconv_convert_options* options, size_t str
     defaults.verify_checksums = 1;
     defaults.upper_bound = 1;
     defaults.properties = 1;
+    defaults.bin = 1;
     initStruct(options, struct_size, defaults);
 }
 
@@ -1542,6 +1551,12 @@ xisfconv_status xisfconv_convert(xisfconv_context* ctx, const char* input, const
         c.sipOrder = o.sip_order;
         c.force = o.overwrite != 0;
         c.properties = o.properties != 0;
+        if (o.bin < 1) fail(XISFCONV_ERR_ARGUMENT, "--bin expects a number of pixels, 1 or more");
+        if (!(o.scale >= 0 && o.scale <= 1)) fail(XISFCONV_ERR_ARGUMENT, "--resize expects a size in pixels or a percentage up to 100%");
+        c.downsample.bin = static_cast<uint64_t>(o.bin);
+        c.downsample.fitWidth = o.fit_width;
+        c.downsample.fitHeight = o.fit_height;
+        c.downsample.scale = o.scale;
         const Format format = outputFormat(o.output_format, output);
         mustBeReadable(input);
         const InputFormat kind = detectInputFormat(input);

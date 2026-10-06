@@ -240,6 +240,14 @@ if(BUILD_SHARED_LIBS AND NOT WIN32)
 endif()
 install(TARGETS xisfconv RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
+# Previews in the file managers of the freedesktop world: the entry that names the program, and
+# the file types (shared-mime-info knows FITS, not XISF and ASDF). Whoever installs runs
+# update-mime-database on <prefix>/share/mime afterwards; packages do that with a trigger.
+if(UNIX AND NOT APPLE)
+  install(FILES desktop/xisfconv.thumbnailer DESTINATION ${CMAKE_INSTALL_DATADIR}/thumbnailers)
+  install(FILES desktop/xisfconv.xml DESTINATION ${CMAKE_INSTALL_DATADIR}/mime/packages)
+endif()
+
 # The library, its header and a pkg-config file. The CMake package comes with the shared library.
 set(_export "")
 if(BUILD_SHARED_LIBS)

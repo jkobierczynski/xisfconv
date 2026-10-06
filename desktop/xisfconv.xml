@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  File types for the desktop (shared-mime-info): XISF and ASDF, which it does not know. (FITS it
+  knows, tile-compressed files included: by how they begin.) Installed to
+  <prefix>/share/mime/packages/, or copied to ~/.local/share/mime/packages/; then
+  update-mime-database <prefix>/share/mime.
+  SPDX-License-Identifier: LGPL-3.0-or-later
+-->
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="image/x-xisf">
+    <comment>XISF image</comment>
+    <comment xml:lang="nl">XISF-afbeelding</comment>
+    <acronym>XISF</acronym>
+    <expanded-acronym>Extensible Image Serialization Format</expanded-acronym>
+    <magic priority="60">
+      <match type="string" value="XISF0100" offset="0"/>
+    </magic>
+    <glob pattern="*.xisf"/>
+  </mime-type>
+  <mime-type type="application/x-asdf">
+    <comment>ASDF data</comment>
+    <comment xml:lang="nl">ASDF-gegevens</comment>
+    <acronym>ASDF</acronym>
+    <expanded-acronym>Advanced Scientific Data Format</expanded-acronym>
+    <!-- "#ASDF 1.0.0" and on the next line "#ASDF_STANDARD 1.5.0": a note that merely begins
+         with "#ASDF " is not one -->
+    <magic priority="60">
+      <match type="string" value="#ASDF " offset="0">
+        <match type="string" value="#ASDF_STANDARD " offset="10:24"/>
+      </match>
+    </magic>
+    <glob pattern="*.asdf"/>
+  </mime-type>
+</mime-info>

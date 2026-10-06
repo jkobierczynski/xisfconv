@@ -538,6 +538,52 @@ static void test_convert_rewrite_verify(xisfconv_context *ctx) {
     CHECK(!file_exists(path_of("five.fits")) && !file_exists(path_of("five.fits.part")) && !file_exists(path_of("m.fits")),
           "failed conversions leave no files");
 
+    /* a smaller picture: for TIFF and PNG */
+    xisfconv_convert_options_init(&co, sizeof co);
+    CHECK(co.bin == 1 && co.fit_width == 0 && co.fit_height == 0 && co.scale == 0, "no smaller picture unless one is asked for");
+    co.overwrite = 1;
+    CHECK(xisfconv_convert(ctx, path_of("gray.xisf"), path_of("full.tif"), &co) == XISFCONV_OK, "the image as a TIFF file");
+    co.bin = 2;
+    CHECK(xisfconv_convert(ctx, path_of("gray.xisf"), path_of("small.tif"), &co) == XISFCONV_OK &&
+              file_size(path_of("small.tif")) < file_size(path_of("full.tif")),
+          "bin = 2 makes a smaller one");
+    CHECK(xisfconv_convert(ctx, path_of("gray.xisf"), path_of("small.fits"), &co) == XISFCONV_ERR_ARGUMENT &&
+              strstr(xisfconv_error_message(ctx), "TIFF and PNG") && !file_exists(path_of("small.fits")),
+          "which is for pictures, not for FITS");
+    co.bin = 0;
+    CHECK(xisfconv_convert(ctx, path_of("gray.xisf"), path_of("small.tif"), &co) == XISFCONV_ERR_ARGUMENT, "bin = 0");
+    co.bin = -3;
+    CHECK(xisfconv_convert(ctx, path_of("gray.xisf"), path_of("small.tif"), &co) == XISFCONV_ERR_ARGUMENT, "a negative bin");
+    co.bin = 1;
+    co.scale = 1.5;
+    CHECK(xisfconv_convert(ctx, path_of("gray.xisf"), path_of("small.tif"), &co) == XISFCONV_ERR_ARGUMENT, "a scale above 1");
+    co.scale = -0.5;
+    CHECK(xisfconv_convert(ctx, path_of("gray.xisf"), path_of("small.tif"), &co) == XISFCONV_ERR_ARGUMENT, "a negative scale");
+    co.scale = 0.5;
+    CHECK(xisfconv_convert(ctx, path_of("gray.xisf"), path_of("half.png"), &co) == XISFCONV_OK &&
+              file_size(path_of("half.png")) < file_size(path_of("conv.unknown")) + 4096,
+          "scale = 0.5 as PNG");
+    co.scale = 0;
+    co.fit_width = 2;
+    co.fit_height = 1000000;
+    CHECK(xisfconv_convert(ctx, path_of("gray.xisf"), path_of("fit.tif"), &co) == XISFCONV_OK &&
+              file_size(path_of("fit.tif")) < file_size(path_of("small.tif")),
+          "a box to fit");
+    co.fit_width = (uint64_t)-1;
+    co.fit_height = (uint64_t)-1;
+    CHECK(xisfconv_convert(ctx, path_of("gray.xisf"), path_of("same.tif"), &co) == XISFCONV_OK &&
+              file_size(path_of("same.tif")) == file_size(path_of("full.tif")),
+          "a box larger than the image leaves it as it is");
+    /* a caller built against the header of 0.13: its options end before these fields, and what was
+       padding at their end then (the field `reserved` now) holds whatever it holds */
+    co.bin = 0;
+    co.reserved = -559038737;
+    co.struct_size = offsetof(xisfconv_convert_options, fit_width);
+    CHECK(sizeof(void *) != 8 || co.struct_size == 104, "the options of 0.13 were 104 bytes");
+    CHECK(xisfconv_convert(ctx, path_of("gray.xisf"), path_of("older.tif"), &co) == XISFCONV_OK &&
+              file_size(path_of("older.tif")) == file_size(path_of("full.tif")),
+          "options of the shorter layout of 0.13 ask for no smaller picture");
+
     /* rewrite */
     xisfconv_rewrite_options_init(&ro, sizeof ro);
     xisfconv_rewrite_result_init(&rr, sizeof rr);

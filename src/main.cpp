@@ -142,6 +142,9 @@ struct Options {
     uint64_t subblockSize = 1u << 30;
     bool propertyKeywords = true;
     bool properties = true;      // take XISF properties along to FITS and ASDF, and use those such a file carries
+    uint64_t bin = 1;            // TIFF and PNG output: n x n pixels become one
+    uint64_t fitWidth = 0, fitHeight = 0;   // ... the picture fits that many pixels
+    double scale = 0;            // ... the picture is that fraction of the image
     bool verify = true;
     bool wcs = true;
     int sipOrder = 3;
@@ -192,6 +195,12 @@ void usage(std::ostream& os) {
           "                                stf      only the STF saved in the file\n"
           "                              (TIFF: stretched float data becomes 16-bit unless --bits is given;\n"
           "                              FITS and ASDF input: for TIFF and PNG output, auto means linked)\n"
+          "      --bin <n>               TIFF and PNG output: a smaller picture, n x n pixels averaged into one\n"
+          "      --resize <size>         TIFF and PNG output: a smaller picture, the pixels it covers averaged:\n"
+          "                                256        its longest side is 256 pixels\n"
+          "                                1024x768   it fits a box of that size, its proportions kept\n"
+          "                                50%        half the width and half the height\n"
+          "                              (never larger than the image; made before a stretch is applied)\n"
           "      --top-down              XISF input: keep XISF's top-down row order in FITS and ASDF output\n"
           "                              (ROWORDER='TOP-DOWN') instead of the FITS convention, bottom-up\n"
           "                              FITS and ASDF input: the rows are stored top-down\n"
@@ -347,6 +356,10 @@ xisfconv_convert_options conversionOptions(const Options& opt, xisfconv_format f
     }
     c.property_keywords = opt.propertyKeywords;
     c.properties = opt.properties;
+    c.bin = static_cast<int32_t>(opt.bin);
+    c.fit_width = opt.fitWidth;
+    c.fit_height = opt.fitHeight;
+    c.scale = opt.scale;
     c.verify_checksums = opt.verify;
     c.wcs = opt.wcs;
     c.sip_order = opt.sipOrder;
@@ -527,6 +540,9 @@ void rewriteXisfInput(const Library& lib, const std::string& input, const Option
     if (opt.bits || opt.stretch != XISFCONV_STRETCH_NONE) {
         throw Error("XISF -> XISF changes how the data blocks are stored and leaves the pixels as they are; "
                     "--bits and --stretch do not apply (convert to FITS, TIFF or PNG for those)");
+    }
+    if (opt.bin > 1 || opt.fitWidth || opt.fitHeight || opt.scale > 0) {
+        throw Error("--bin and --resize make a smaller picture: they are for TIFF and PNG output");
     }
     xisfconv_rewrite_options r;
     xisfconv_rewrite_options_init(&r, sizeof r);
@@ -738,6 +754,33 @@ bool parseArgs(int argc, char** argv, Options& opt, int& exitCode) {
             const std::string v = need(i, a);
             if (!parseUInt64(v, n) || n == 0) throw Error("invalid subblock size");
             opt.subblockSize = n;
+        }
+        else if (a == "--bin") {
+            uint64_t n;
+            const std::string v = need(i, a);
+            if (!parseUInt64(v, n) || n == 0 || n > 1000000) throw Error("--bin expects a number of pixels, 1 or more (2 makes one pixel of 2 x 2)");
+            opt.bin = n;
+        } else if (a == "--resize") {
+            // 256: the longest side; 1024x768: a box; 50%: of the width and of the height
+            const std::string v = toLower(trim(need(i, a)));
+            const char* expects = "--resize expects the longest side in pixels (256), a box to fit (1024x768) or a percentage (50%)";
+            uint64_t w = 0, h = 0;
+            double percent = 0;
+            const size_t x = v.find('x');
+            if (!v.empty() && v.back() == '%') {
+                if (!parseDouble(v.substr(0, v.size() - 1), percent) || !(percent > 0 && percent <= 100)) throw Error(expects);
+                opt.scale = percent / 100;
+                opt.fitWidth = opt.fitHeight = 0;
+            } else if (x != std::string::npos) {
+                if (!parseUInt64(v.substr(0, x), w) || !parseUInt64(v.substr(x + 1), h) || w == 0 || h == 0) throw Error(expects);
+                opt.fitWidth = w;
+                opt.fitHeight = h;
+                opt.scale = 0;
+            } else {
+                if (!parseUInt64(v, w) || w == 0) throw Error(expects);
+                opt.fitWidth = opt.fitHeight = w;
+                opt.scale = 0;
+            }
         }
         else if (a == "--no-property-keywords") opt.propertyKeywords = false;
         else if (a == "--no-properties") opt.properties = false;

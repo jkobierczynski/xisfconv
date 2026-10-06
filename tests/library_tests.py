@@ -95,7 +95,8 @@ class ConvertOptions(C.Structure):
     _fields_ = [("struct_size", size_t), ("output_format", i32), ("sample_format", i32), ("image", size_t), ("stretch", i32),
                 ("codec", i32), ("checksum", i32), ("subblock_size", u64), ("row_order", i32), ("property_keywords", i32),
                 ("wcs", i32), ("sip_order", i32), ("verify_checksums", i32), ("use_bounds", i32), ("overwrite", i32),
-                ("lower_bound", f64), ("upper_bound", f64), ("properties", i32)]
+                ("lower_bound", f64), ("upper_bound", f64), ("properties", i32), ("reserved", i32), ("fit_width", u64),
+                ("fit_height", u64), ("scale", f64), ("bin", i32), ("reserved2", i32)]
 
 
 class WriteOptions(C.Structure):
@@ -705,6 +706,63 @@ def test_read_xisf():
                     check(same(f.read(rows=ROWS_BOTTOM_UP), np.moveaxis(a, -1, 0)[:, ::-1, :]), "XISF: bottom-up on request")
 
 
+def test_smaller_pictures():
+    """bin, fit_width/fit_height and scale of the conversion options, against the mean taken with NumPy."""
+    rng = np.random.default_rng(41)
+    h, w = 24, 36
+    for dtype in (np.uint16, np.float32):
+        a = (rng.random((h, w, 3)) * (60000 if dtype == np.uint16 else 1)).astype(dtype)
+        src = os.path.join(TMP, "full.xisf")
+        XISF.write(src, a, xisf_metadata={})
+
+        def picture(target="small.tif", **options):
+            co = ConvertOptions()
+            convert_options_init(C.byref(co), C.sizeof(co))
+            co.overwrite = 1
+            for key, value in options.items():
+                setattr(co, key, value)
+            st = convert(ctx, enc(src), enc(os.path.join(TMP, target)), C.byref(co))
+            return st, (tifffile.imread(os.path.join(TMP, target)) if st == OK and target.endswith(".tif") else None)
+
+        def mean(n, m):   # n x m pixels become one
+            v = a.astype(np.float64).reshape(h // n, n, w // m, m, 3).mean(axis=(1, 3))
+            return np.floor(v + 0.5).astype(dtype) if dtype == np.uint16 else v.astype(dtype)
+
+        name = np.dtype(dtype).name
+        st, got = picture(bin=2)
+        check(st == OK and got.dtype == dtype and np.array_equal(got, mean(2, 2)), f"{name}: bin = 2 is the mean of 2 x 2 pixels: {err()}")
+        st, got = picture(bin=4)
+        check(st == OK and np.array_equal(got, mean(4, 4)), f"{name}: bin = 4")
+        st, got = picture(scale=0.25)
+        check(st == OK and np.array_equal(got, mean(4, 4)), f"{name}: scale = 0.25 is the same picture")
+        st, got = picture(fit_width=12, fit_height=1000)
+        check(st == OK and np.array_equal(got, mean(3, 3)), f"{name}: fit_width = 12 makes 36 x 24 pixels 12 x 8")
+        st, got = picture(fit_width=1000, fit_height=6)
+        check(st == OK and np.array_equal(got, mean(4, 4)), f"{name}: fit_height = 6 makes them 9 x 6")
+        st, got = picture(fit_width=18, fit_height=6, scale=0.5, bin=2)
+        check(st == OK and got.shape == (6, 9, 3), f"{name}: all of them together: the smallest ({None if got is None else got.shape})")
+        st, got = picture(fit_width=500, fit_height=500, scale=1.0, bin=1)
+        check(st == OK and np.array_equal(got, a), f"{name}: nothing that asks for a smaller picture leaves the image as it is")
+        st, got = picture(reserved=12345, reserved2=-7)
+        check(st == OK and np.array_equal(got, a), f"{name}: the reserved fields are not looked at")
+        st, _ = picture(target="small.fits", scale=1.0)
+        check(st == ERR_ARGUMENT, f"{name}: scale = 1 asks for a picture too, which FITS is not")
+        for target in ("small.fits", "small.asdf", "small.fits.fz"):
+            st, _ = picture(target=target, bin=2)
+            check(st == ERR_ARGUMENT and "TIFF and PNG" in err() and not os.path.exists(os.path.join(TMP, target)),
+                  f"{name}: bin = 2 for {target} is an argument error: {err()}")
+        for options in ({"bin": 0}, {"bin": -1}, {"scale": 1.01}, {"scale": -0.1}, {"scale": float("nan")}):
+            st, _ = picture(**options)
+            check(st == ERR_ARGUMENT, f"{name}: {options} is an argument error: {err()}")
+    # a stretched picture: PNG, 8 bits
+    co = ConvertOptions()
+    convert_options_init(C.byref(co), C.sizeof(co))
+    co.overwrite, co.fit_width, co.fit_height, co.stretch, co.sample_format = 1, 9, 9, 1, UINT8
+    check(convert(ctx, enc(src), enc(os.path.join(TMP, "thumb.png")), C.byref(co)) == OK, f"a thumbnail: {err()}")
+    with Image.open(os.path.join(TMP, "thumb.png")) as picture:
+        check(picture.size == (9, 6) and picture.mode == "RGB", f"PNG, 9 x 6 pixels: {picture.size} {picture.mode}")
+
+
 def properties_of(f, image=0):
     """[(id, type, value, comment)] through the library: the value is text, or an array for vectors and matrices."""
     out = []
@@ -768,7 +826,7 @@ def test_carried_properties():
             check(same_properties(properties_of(f), first) and same_properties(properties_of(f, FILE_PROPERTIES), note),
                   f"{label}: the library reads the properties the file carries, those of the image and of the file")
         if kind == "fits":
-            with fits.open(mid) as hdul:
+            with fits.open(mid, memmap=False) as hdul:   # (not mapped: the file is written again below)
                 table = hdul["XISF_PROPERTIES"].data
                 row = {r["ID"]: r for r in table}["Lab:Matrix"]
                 check(row["TYPE"] == "F64Matrix" and row["BLOCK"] and (row["ROWS"], row["COLUMNS"]) == (3, 4) and
@@ -779,7 +837,7 @@ def test_carried_properties():
                       f"{label}: and the text, as UTF-8")
                 check([r["ID"] for r in hdul["XISF_METADATA"].data] == ["Note:Author"], f"{label}: the property of the file has its own table")
         elif HAVE_ASDF:
-            with asdf.open(mid) as af:
+            with asdf.open(mid, memmap=False) as af:
                 tree = af["xisf"]["images"][0]["properties"]
                 check(np.array_equal(np.asarray(tree["Lab:Matrix"]["value"]), matrix) and tree["Lab:Flag"]["value"] is True and
                       tree["Instrument:Camera:Gain"]["value"] == 120 and tree["Observation:Object:Name"]["value"] == "NGC 7000 \u2604 <north> & co" and
@@ -1274,7 +1332,7 @@ if __name__ == "__main__":
     print("xisfconv:", EXE or "(not given: the comparison with the tool's --stretch is skipped)")
     print("asdf + asdf-astropy:", "yes" if HAVE_ASDF else "no")
     for t in (test_write_fits, test_write_fits_tile_compressed, test_write_xisf, test_write_asdf, test_write_tiff_png, test_writer_arguments, test_read_fits,
-              test_read_xisf, test_carried_properties, test_wcs, test_wcs_forms, test_stretch, test_odd_files, test_locale, test_progress_and_cancel,
+              test_read_xisf, test_smaller_pictures, test_carried_properties, test_wcs, test_wcs_forms, test_stretch, test_odd_files, test_locale, test_progress_and_cancel,
               test_kept_messages_and_cancel_from_another_thread, test_threads, test_silence):
         try:
             t()

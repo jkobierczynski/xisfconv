@@ -246,4 +246,192 @@ void flipVertical(PixelBuffer& px) {
     }
 }
 
+DownsampledSize downsampledSize(const Downsample& how, uint64_t width, uint64_t height) {
+    DownsampledSize out;
+    out.useWidth = out.width = width;
+    out.useHeight = out.height = height;
+    if (width == 0 || height == 0) return out;
+    const uint64_t bin = std::max<uint64_t>(1, how.bin);
+    // (an image smaller than one block is one block)
+    uint64_t w = std::max<uint64_t>(1, width / bin), h = std::max<uint64_t>(1, height / bin);
+    out.useWidth = std::min(width, w * bin);
+    out.useHeight = std::min(height, h * bin);
+    double factor = how.scale > 0 && how.scale < 1 ? how.scale : 1.0;
+    if (how.fitWidth && static_cast<double>(w) * factor > static_cast<double>(how.fitWidth)) {
+        factor = static_cast<double>(how.fitWidth) / static_cast<double>(w);
+    }
+    if (how.fitHeight && static_cast<double>(h) * factor > static_cast<double>(how.fitHeight)) {
+        factor = static_cast<double>(how.fitHeight) / static_cast<double>(h);
+    }
+    if (factor < 1) {
+        auto scaled = [&](uint64_t n, uint64_t limit) {
+            uint64_t v = static_cast<uint64_t>(std::floor(static_cast<double>(n) * factor + 0.5));
+            v = std::max<uint64_t>(1, std::min(v, n));
+            return limit ? std::min(v, limit) : v;
+        };
+        w = scaled(w, how.fitWidth);
+        h = scaled(h, how.fitHeight);
+    }
+    out.width = w;
+    out.height = h;
+    out.changes = out.width != width || out.height != height;
+    return out;
+}
+
+namespace {
+
+// The pixels of the image that one pixel of the picture covers along one axis, and the share
+// of the first and of the last of them (the ones between are covered whole).
+struct Span {
+    uint64_t first = 0, count = 1;
+    double firstShare = 1, lastShare = 1;
+};
+
+std::vector<Span> spans(uint64_t from, uint64_t to) {
+    std::vector<Span> out(static_cast<size_t>(to));
+    // [j, j + 1) of the picture is [j * from / to, (j + 1) * from / to) of the image. Counted in
+    // whole numbers of 1 / to of a pixel, so that every share is exact but for the one division
+    // that makes it a double: a whole ratio gives shares of exactly 1.
+    const bool exact = from <= 0xFFFFFFFFull && to <= 0xFFFFFFFFull;
+    for (uint64_t j = 0; j < to; ++j) {
+        Span& s = out[static_cast<size_t>(j)];
+        if (exact) {
+            const uint64_t a = j * from, b = (j + 1) * from;   // in units of 1 / to
+            const uint64_t first = a / to, last = (b - 1) / to;
+            s.first = first;
+            s.count = last - first + 1;
+            if (s.count == 1) {
+                s.firstShare = s.lastShare = static_cast<double>(b - a) / static_cast<double>(to);
+            } else {
+                s.firstShare = static_cast<double>((first + 1) * to - a) / static_cast<double>(to);
+                s.lastShare = static_cast<double>(b - last * to) / static_cast<double>(to);
+            }
+            continue;
+        }
+        // (no image is that large; the same in floating point)
+        const double a = static_cast<double>(j) * static_cast<double>(from) / static_cast<double>(to);
+        const double b = static_cast<double>(j + 1) * static_cast<double>(from) / static_cast<double>(to);
+        uint64_t first = std::min<uint64_t>(from - 1, static_cast<uint64_t>(std::floor(a)));
+        uint64_t last = std::min<uint64_t>(from - 1, static_cast<uint64_t>(std::ceil(b)) - 1);
+        if (last < first) last = first;
+        s.first = first;
+        s.count = last - first + 1;
+        if (s.count == 1) {
+            s.firstShare = s.lastShare = std::max(b - a, 0.0);
+        } else {
+            s.firstShare = std::min(1.0, std::max(0.0, static_cast<double>(first + 1) - a));
+            s.lastShare = std::min(1.0, std::max(0.0, b - static_cast<double>(last)));
+        }
+    }
+    return out;
+}
+
+template <class T>
+void downsamplePlane(const T* src, uint64_t stride, T* dst, const std::vector<Span>& columns, const std::vector<Span>& rows) {
+    constexpr bool isFloat = std::is_floating_point<T>::value;
+    const size_t outW = columns.size();
+    // one row of the image, made as narrow as the picture: the sums, and the shares that went into them
+    std::vector<double> rowSum(outW), rowShare(outW), sum(outW), share(outW);
+    uint64_t reduced = std::numeric_limits<uint64_t>::max();   // the row of the image that rowSum holds
+    auto reduce = [&](uint64_t y) {
+        if (y == reduced) return;   // (the last row of one pixel of the picture is often the first of the next)
+        const T* line = src + y * stride;
+        for (size_t j = 0; j < outW; ++j) {
+            const Span& c = columns[j];
+            double s = 0, w = 0;
+            for (uint64_t k = 0; k < c.count; ++k) {
+                const double part = k == 0 ? c.firstShare : k + 1 == c.count ? c.lastShare : 1.0;
+                const T v = line[c.first + k];
+                if constexpr (isFloat) {
+                    if (!std::isfinite(v)) continue;
+                }
+                s += static_cast<double>(v) * part;
+                w += part;
+            }
+            rowSum[j] = s;
+            rowShare[j] = w;
+        }
+        reduced = y;
+    };
+    for (size_t r = 0; r < rows.size(); ++r) {
+        const Span& rowSpan = rows[r];
+        std::fill(sum.begin(), sum.end(), 0.0);
+        std::fill(share.begin(), share.end(), 0.0);
+        for (uint64_t k = 0; k < rowSpan.count; ++k) {
+            const double part = k == 0 ? rowSpan.firstShare : k + 1 == rowSpan.count ? rowSpan.lastShare : 1.0;
+            reduce(rowSpan.first + k);
+            for (size_t j = 0; j < outW; ++j) {
+                sum[j] += rowSum[j] * part;
+                share[j] += rowShare[j] * part;
+            }
+        }
+        T* out = dst + r * outW;
+        for (size_t j = 0; j < outW; ++j) {
+            if constexpr (isFloat) {
+                double mean = share[j] > 0 ? sum[j] / share[j] : std::numeric_limits<double>::quiet_NaN();
+                if (share[j] > 0 && !std::isfinite(sum[j])) {
+                    // The sum of finite samples went beyond what a double holds (samples near its
+                    // largest value): this pixel again, every sample divided before it is added.
+                    mean = 0;
+                    for (uint64_t ky = 0; ky < rowSpan.count; ++ky) {
+                        const double py = ky == 0 ? rowSpan.firstShare : ky + 1 == rowSpan.count ? rowSpan.lastShare : 1.0;
+                        const T* line = src + (rowSpan.first + ky) * stride;
+                        const Span& c = columns[j];
+                        for (uint64_t kx = 0; kx < c.count; ++kx) {
+                            const double px = kx == 0 ? c.firstShare : kx + 1 == c.count ? c.lastShare : 1.0;
+                            const T v = line[c.first + kx];
+                            if (std::isfinite(v)) mean += static_cast<double>(v) * (px * py / share[j]);
+                        }
+                    }
+                }
+                out[j] = static_cast<T>(mean);
+            } else {
+                // (from 2^52 on a double is a whole number, and adding a half would round it up)
+                double v = share[j] > 0 ? sum[j] / share[j] : 0.0;
+                if (v < 4503599627370496.0) v = std::floor(v + 0.5);
+                out[j] = v >= maxValue<T>() ? std::numeric_limits<T>::max() : v <= 0 ? T(0) : static_cast<T>(v);
+            }
+        }
+    }
+}
+
+}  // namespace
+
+void downsample(PixelBuffer& px, const DownsampledSize& size) {
+    if (!size.changes || size.width == 0 || size.height == 0 || px.width == 0 || px.height == 0) return;
+    if (size.useWidth > px.width || size.useHeight > px.height || size.width > size.useWidth || size.height > size.useHeight) {
+        throw Error("a picture cannot be larger than the image it is made of");
+    }
+    const size_t sb = sampleBytes(px.format);
+    const std::vector<Span> columns = spans(size.useWidth, size.width), rows = spans(size.useHeight, size.height);
+    const size_t outPlane = static_cast<size_t>(size.width) * static_cast<size_t>(size.height);
+    std::vector<uint8_t> out(outPlane * static_cast<size_t>(px.channels) * sb);
+    const size_t inPlane = static_cast<size_t>(px.planeSamples());
+    for (uint64_t c = 0; c < px.channels; ++c) {
+        const uint8_t* src = px.data.data() + static_cast<size_t>(c) * inPlane * sb;
+        uint8_t* dst = out.data() + static_cast<size_t>(c) * outPlane * sb;
+        switch (px.format) {
+            case SampleFormat::UInt8: downsamplePlane(src, px.width, dst, columns, rows); break;
+            case SampleFormat::UInt16:
+                downsamplePlane(reinterpret_cast<const uint16_t*>(src), px.width, reinterpret_cast<uint16_t*>(dst), columns, rows);
+                break;
+            case SampleFormat::UInt32:
+                downsamplePlane(reinterpret_cast<const uint32_t*>(src), px.width, reinterpret_cast<uint32_t*>(dst), columns, rows);
+                break;
+            case SampleFormat::UInt64:
+                downsamplePlane(reinterpret_cast<const uint64_t*>(src), px.width, reinterpret_cast<uint64_t*>(dst), columns, rows);
+                break;
+            case SampleFormat::Float32:
+                downsamplePlane(reinterpret_cast<const float*>(src), px.width, reinterpret_cast<float*>(dst), columns, rows);
+                break;
+            case SampleFormat::Float64:
+                downsamplePlane(reinterpret_cast<const double*>(src), px.width, reinterpret_cast<double*>(dst), columns, rows);
+                break;
+        }
+    }
+    px.data.swap(out);
+    px.width = size.width;
+    px.height = size.height;
+}
+
 }  // namespace xisfconv

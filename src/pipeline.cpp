@@ -120,6 +120,34 @@ void addPropertyKeywords(const XisfFile& file, size_t index, std::vector<FitsKey
     }
 }
 
+// --bin and --resize make a picture to look at; an image that is data keeps its pixels.
+void downsampleIsForPictures(const ConvertOptions& opt, Format format) {
+    if (opt.downsample.any() && format != Format::Tiff && format != Format::Png) {
+        throw Error("--bin and --resize make a smaller picture: they are for TIFF and PNG output", ErrorKind::Argument);
+    }
+}
+
+// Makes the image the picture that was asked for, if one was. Returns what happened, for the
+// notes, and how many pixels of the picture there are for one of the image in width and in
+// height (what a resolution in pixels per inch is to be multiplied by).
+std::string makeSmaller(PixelBuffer& px, const Downsample& how, double& perPixelX, double& perPixelY) {
+    const uint64_t fullWidth = px.width, fullHeight = px.height;
+    perPixelX = perPixelY = 1;
+    if (!how.any()) return {};
+    const DownsampledSize size = downsampledSize(how, px.width, px.height);
+    if (!size.changes) return {};
+    downsample(px, size);
+    perPixelX = static_cast<double>(size.width) / static_cast<double>(size.useWidth);
+    perPixelY = static_cast<double>(size.height) / static_cast<double>(size.useHeight);
+    std::string note = std::to_string(fullWidth) + " x " + std::to_string(fullHeight) + " pixels averaged to " +
+                       std::to_string(px.width) + " x " + std::to_string(px.height);
+    if (size.useWidth != fullWidth || size.useHeight != fullHeight) {
+        note += " (" + std::to_string(fullWidth - size.useWidth) + " column(s) and " + std::to_string(fullHeight - size.useHeight) +
+                " row(s) at the right and the bottom do not fill a block of " + std::to_string(how.bin) + " and are left out)";
+    }
+    return note;
+}
+
 std::string countOf(size_t n, const char* one, const char* many) { return std::to_string(n) + " " + (n == 1 ? one : many); }
 
 std::string stretchDescription(const std::string& how, const std::vector<StretchParams>& params) {
@@ -380,6 +408,7 @@ void flipKeywordRows(std::vector<FitsKeyword>& keywords, uint64_t height) {
 
 void convertXisfFile(const std::string& input, const std::string& outPath, Format format, const ConvertOptions& opt) {
     if (format == Format::Xisf) throw Error("XISF to XISF is a rewrite, not a conversion", ErrorKind::Argument);
+    downsampleIsForPictures(opt, format);
     const FitsWriteOptions fitsOptions = format == Format::Fits ? fitsStorage(opt, outPath) : FitsWriteOptions();
     XisfFile file(input);
 
@@ -413,11 +442,18 @@ void convertXisfFile(const std::string& input, const std::string& outPath, Forma
 
     std::vector<PixelBuffer> buffers;
     std::vector<std::string> stretchNotes;  // HISTORY text per converted image
+    std::vector<std::pair<double, double>> shrunk;   // pixels of each picture per pixel of its image, in width and height
     buffers.reserve(indices.size());
     for (size_t idx : indices) {
         progress("reading", buffers.size(), indices.size());
         const XisfImage& img = file.images()[idx];
         PixelBuffer px = file.readPixels(idx, opt.verify);
+        // A smaller picture is made of the image as it is stored: the mean of linear data is
+        // what larger pixels would have recorded. A stretch comes after, on the picture.
+        double perPixelX = 1, perPixelY = 1;
+        const std::string smaller = makeSmaller(px, opt.downsample, perPixelX, perPixelY);
+        if (!smaller.empty()) info("image " + std::to_string(idx) + ": " + smaller);
+        shrunk.emplace_back(perPixelX, perPixelY);
         if (opt.stretch != Stretch::None) {
             const size_t colorChannels = img.colorSpace == "Gray" ? 1 : 3;
             std::vector<StretchParams> params;
@@ -536,8 +572,9 @@ void convertXisfFile(const std::string& input, const std::string& outPath, Forma
                     }
                 }
                 if (img.resolution.present) {
-                    page.xResolution = img.resolution.horizontal;
-                    page.yResolution = img.resolution.vertical;
+                    // (fewer pixels per inch, so that the picture is as large on paper as the image)
+                    page.xResolution = img.resolution.horizontal * shrunk[n].first;
+                    page.yResolution = img.resolution.vertical * shrunk[n].second;
                     page.resolutionInCm = img.resolution.unit == "cm";
                 }
                 page.description = img.id;
@@ -557,7 +594,7 @@ void convertXisfFile(const std::string& input, const std::string& outPath, Forma
                 }
             }
             if (img.resolution.present) {
-                png.pixelsPerMeter = img.resolution.horizontal / (img.resolution.unit == "cm" ? 0.01 : 0.0254);
+                png.pixelsPerMeter = img.resolution.horizontal * shrunk[0].first / (img.resolution.unit == "cm" ? 0.01 : 0.0254);
             }
             writePng(tmpPath, png);
         }
@@ -582,6 +619,7 @@ void convertFitsOrAsdfFile(const std::string& input, InputFormat kind, const std
         throw Error(std::string("--stretch is for viewing: from ") + inputName + " input it is available for TIFF and PNG output",
                     ErrorKind::Argument);
     }
+    downsampleIsForPictures(opt, format);
     if (opt.stretch == Stretch::Stored) {
         throw Error(std::string(inputName) + " files carry no saved STF; use --stretch, --stretch=linked or --stretch=unlinked",
                     ErrorKind::NotFound);
@@ -668,6 +706,16 @@ void writeImageSet(FitsFile& fits, const ImageSetOrigin& source, const std::stri
             const std::string label = "image " + std::to_string(idx);
             const bool topDown = opt.rowOrderGiven ? !opt.bottomUp : img.topDown;
             if (!topDown) flipVertical(px);
+            double perPixelX = 1, perPixelY = 1;
+            const std::string smaller = makeSmaller(px, opt.downsample, perPixelX, perPixelY);   // before a stretch, as from XISF
+            if (!smaller.empty() && img.hasNaN) {
+                // what was no number is left out of the means: is there still a pixel that is none?
+                const double low = img.dataMin, high = img.dataMax;   // (the range stays that of the image)
+                img.hasNaN = false;
+                updateFloatRange(img);
+                img.dataMin = low;
+                img.dataMax = high;
+            }
             const SampleFormat stored = px.format;
             const bool wasFloat = isFloat(stored);
             std::string rangeNote;
@@ -711,6 +759,7 @@ void writeImageSet(FitsFile& fits, const ImageSetOrigin& source, const std::stri
                 if (!rangeNote.empty()) line += "; " + rangeNote;
                 if (scaled) line += "; float samples scaled to 0..1";
                 info(line);
+                if (!smaller.empty()) info(label + ": " + smaller);
                 if (!stretchNote.empty()) info(label + ": " + stretchNote);
                 if (format == Format::Png && wasFloat && opt.stretch == Stretch::None) {
                     info("linear data may look dark in PNG; add --stretch for a viewable image");

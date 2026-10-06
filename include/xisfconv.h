@@ -52,7 +52,7 @@
 #include <stdint.h>
 
 #define XISFCONV_VERSION_MAJOR 0
-#define XISFCONV_VERSION_MINOR 13
+#define XISFCONV_VERSION_MINOR 14
 #define XISFCONV_VERSION_PATCH 0
 
 #if defined(XISFCONV_STATIC)
@@ -674,6 +674,28 @@ typedef struct xisfconv_convert_options {
      * it was carried, and is made from the WCS keywords otherwise (with wcs = 1). From FITS to
      * ASDF and back, and from FITS to FITS, they are written along as they are. */
     int32_t properties;
+    int32_t reserved;                     /* not used (padding in the layout of 0.13) */
+
+    /* A smaller picture, for TIFF and PNG output (XISFCONV_ERR_ARGUMENT for the other formats).
+     * (Since 0.14.) Every pixel of the picture is the mean of the pixels of the image it
+     * covers, taken of the image as it is stored: before a stretch, and before sample_format.
+     * A picture is never larger than the image; if nothing here asks for a smaller one, the
+     * image is written as it is.
+     *   fit_width, fit_height
+     *               --resize: the picture is to fit that many pixels, its proportions kept;
+     *               0 (default) sets no limit for that side.
+     *   scale       --resize n%: the picture is that fraction of the image in width and height,
+     *               above 0 and up to 1; 0 (default): not asked for.
+     *   bin         --bin: n x n pixels become one (default 1). What is left over at the right
+     *               and at the bottom of the image is dropped (an image smaller than one block
+     *               is one block).
+     * With bin and one of the others, the blocks come first: fit and scale are of the binned
+     * image. With fit and scale, the picture is the smaller of the two. */
+    uint64_t fit_width;
+    uint64_t fit_height;
+    double scale;
+    int32_t bin;
+    int32_t reserved2;                    /* not used */
 } xisfconv_convert_options;
 
 XISFCONV_API void xisfconv_convert_options_init(xisfconv_convert_options *options, size_t struct_size);

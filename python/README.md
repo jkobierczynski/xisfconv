@@ -74,10 +74,15 @@ What the command line tool does, with the same options:
 ```python
 xisfconv.convert("m31.xisf", "m31.fits")                        # any pair of the formats
 xisfconv.convert("m31.xisf", "preview.png", stretch="auto")     # PixInsight's auto-STF
+xisfconv.convert("m31.xisf", "small.png", stretch="auto", sample_format="uint8", resize=512)
 xisfconv.rewrite("m31.xisf", "smaller.xisf", codec="zstd", checksum="sha256")
 xisfconv.rewrite_in_place("m31.xisf", codec="zstd")             # read back and compared first
 report = xisfconv.verify("m31.xisf")                            # report.verdict, report.problems
 ```
+
+`bin=2`, `resize=512` (the longest side), `resize=(1024, 768)` (a box to fit) and `scale=0.5` make
+a smaller TIFF or PNG picture: every pixel the mean of the pixels it covers, taken before a
+stretch.
 
 `progress=` takes a function `progress(stage, done, total)`. It is called between the steps of
 the work, in the thread that made the call. A rewrite and a verification have a step per data

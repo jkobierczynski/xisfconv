@@ -2,7 +2,7 @@
 
 What was decided while building xisfconv, and why. The README says what the program does and
 `TODO.md` what is planned; this file records the choices behind both, so that they are not
-reopened by accident. State: version 0.13.0, 6 October 2026.
+reopened by accident. State: version 0.14.0, 6 October 2026.
 
 ## Purpose and scope
 
@@ -152,6 +152,30 @@ These are the choices a user could otherwise be surprised by. Each has an option
 - **Stretch** is for viewing: PixInsight's STF maths, the saved STF if there is one, else a linked
   auto-STF. It is available for TIFF, PNG and, from XISF, FITS and ASDF output, and is recorded in
   a HISTORY card.
+- **A smaller picture is the mean of what it covers** (`--bin`, `--resize`, 0.14.0). One method
+  for every ratio: each pixel of the picture is the mean of the part of the image it covers,
+  the pixels at its edges counted by the share that is covered. For whole ratios that is binning,
+  and the shares are computed so that they are exactly 1 there. Sharper filters (Lanczos,
+  bicubic) were not taken: they ring around stars and make values the data never had, and for
+  a picture that is a fraction of the image the mean is what looks right anyway. Nothing is
+  made larger. The picture is made of the image as stored and stretched afterwards, because
+  the mean of linear data is a measurement (what larger pixels would have recorded) and the
+  mean of stretched data is not; it also means that the statistics of the auto-STF are taken
+  of a small picture. The options are for TIFF and PNG: binned data in FITS or XISF would need
+  its WCS, its solution properties, XPIXSZ, XBINNING and the colour filter pattern changed
+  with it, which is a feature of its own (`TODO.md`).
+- **The thumbnailer is the tool with its ordinary options**, spelled out in the entry
+  (`--quiet --force --to png --stretch --bits u8 --resize %s --output %o %i`). There is no
+  thumbnail mode: what a file manager shows can be reproduced on a command line, and there is
+  nothing to test that the options are not tested for already. The entry names several
+  spellings of the XISF type, since the format has no registered one; the package defines
+  `image/x-xisf` and `application/x-asdf` by name and by the first bytes of a file, and adds
+  `*.fits.fz` to the FITS type of the desktop. GNOME runs thumbnailers in a sandbox that sees
+  `/usr` and nothing of the home directory: the entry may be installed for one user, the
+  program may not.
+  The shares are counted in whole numbers (of 1 / width of the picture) and divided once, and
+  the sums are doubles: the same on every processor, exact for the sample types pictures are
+  made of, and right to the last bit or two for 64-bit samples.
 - **Verification outcomes** are OK, NOT FULLY CHECKED (a part this build cannot check, named) and
   FAILED. Only FAILED sets exit status 1.
 
@@ -301,7 +325,7 @@ and built in 0.10.0. What remains is in `TODO.md`.
 - Writing images from memory and the stretch on buffers are in the first release, for all five
   output formats: saving an array as XISF is what Python users cannot get elsewhere.
 - Version 0.x with no ABI promise until two bindings have used the API. The shared library version
-  changes with every 0.x release (`libxisfconv.so.0.13`), so that a binding built for another
+  changes with every 0.x release (`libxisfconv.so.0.14`), so that a binding built for another
   release fails to load.
 - Bindings: Python first (NumPy arrays; it can register `xisf` with astropy's I/O registry), then
   Rust and Perl when someone asks for them.
@@ -315,6 +339,10 @@ Choices made while building the API:
   bindgen and FFI::Platypus, and lets a program built against an older header run with a newer
   library. For that to hold the `_init` functions take the size the caller compiled with: an
   init that filled the library's idea of the struct would write behind an older program's.
+  And a struct ends without padding: `xisfconv_convert_options` of 0.13 ended in four bytes of
+  it, the first new field of 0.14 landed there, and an older program hands those bytes over
+  with whatever they hold. They are a field named `reserved` now, which nothing reads; new
+  fields begin behind it, and a `static_assert` keeps the next one from doing the same.
 - **One context, reference-counted.** Error text, message handler and progress handler live in a
   context. Files, reports, keyword lists and writers keep it alive, so a garbage collector may free
   them in any order.
@@ -557,7 +585,7 @@ Built in 0.11.0, in `python/`. What was decided:
 
 ## Testing
 
-- `tests/run_tests.py` drives the built program (5086 checks at 0.13.0). The Python packages it
+- `tests/run_tests.py` drives the built program (5283 checks at 0.14.0). The Python packages it
   needs are listed at its top; the `asdf` packages and the external tools (`tiffcp`, `fitsverify`,
   `pngcheck`, `fpack`/`funpack`) are used when installed and their checks skipped when not.
 - Every format is checked against an implementation that shares no code with xisfconv: astropy
@@ -579,7 +607,7 @@ Built in 0.11.0, in `python/`. What was decided:
   lifetimes, callbacks), a Python script that calls the API through ctypes and compares what the
   library writes and reads with astropy, the `xisf` package, asdf, tifffile and Pillow, and a
   program that reads all there is of any file, which is what gets fuzzed.
-- The Python package is tested with pytest (`python/tests`, 292 tests at 0.13.0): the same
+- The Python package is tested with pytest (`python/tests`, 293 tests at 0.14.0): the same
   comparisons with other software, made through the package, run from the source tree and from the
   installed wheel on Python 3.10 to 3.14, with the oldest NumPy and astropy the package allows and
   with the newest, and under AddressSanitizer.
@@ -590,7 +618,9 @@ Built in 0.11.0, in `python/`. What was decided:
   its tests run with a Windows build of Python under Wine against the MinGW build of the library.
   (The first CI runs of 0.11.0 failed on what this would have shown: a directory given as input
   was not called one on Windows, where a directory cannot be opened at all, and a test replaced a
-  file that astropy still had mapped into memory.) The wheels for macOS and Windows have only CI
+  file that astropy still had mapped into memory. The first Windows run of 0.13.0 failed on the
+  same thing again, in a new test: Wine lets a mapped file be replaced, Windows does not. Tests
+  that write a file again after astropy read it open it with `memmap=False`.) The wheels for macOS and Windows have only CI
   to prove them.
 - CI builds and runs the suite on Linux, macOS and Windows.
 

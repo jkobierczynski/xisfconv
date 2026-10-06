@@ -63,6 +63,55 @@ def test_convert_to_fits_asdf_tiff_png(tmp_path, light):
     assert same(tifffile.imread(tmp_path / "named.dat"), data)
 
 
+
+def test_convert_to_a_smaller_picture(tmp_path, light):
+    """bin, resize and scale: the mean of the pixels a pixel of the picture covers."""
+    tifffile = pytest.importorskip("tifffile")
+    path, data = light                       # 30 rows, 44 columns, 3 channels
+
+    def mean(rows, columns):                 # that many pixels become one
+        return data.astype(np.float64).reshape(30 // rows, rows, 44 // columns, columns, 3).mean(axis=(1, 3)).astype(np.float32)
+
+    def picture(**options):
+        xisfconv.convert(path, tmp_path / "small.tif", overwrite=True, **options)
+        return tifffile.imread(tmp_path / "small.tif")
+
+    assert same(picture(bin=2), mean(2, 2))
+    assert same(picture(bin=np.int64(2)), mean(2, 2))
+    assert same(picture(scale=0.5), mean(2, 2))
+    assert same(picture(resize=22), mean(2, 2))            # the longest side
+    assert same(picture(resize=(1000, 15)), mean(2, 2))    # a box: width, height
+    assert same(picture(resize=(11, 1000)), picture(resize=11))
+    assert picture(resize=11).shape == (8, 11, 3)          # 30 * 11 / 44 = 7.5, rounded
+    assert picture(bin=4).shape == (7, 11, 3)              # two rows are left over
+    assert same(picture(bin=4), data[:28].astype(np.float64).reshape(7, 4, 11, 4, 3).mean(axis=(1, 3)).astype(np.float32))
+    assert same(picture(resize=500), data) and same(picture(scale=1), data) and same(picture(bin=1), data)
+    assert same(picture(resize=[22, 22]), mean(2, 2)) and same(picture(resize=np.array([22, 22])), mean(2, 2))
+    assert picture(bin=2, scale=0.5).shape == (8, 11, 3)    # the blocks first, then half of that: 7.5 rows, rounded
+    # before a stretch: the picture of the binned image
+    xisf_write(tmp_path / "binned.xisf", mean(2, 2))
+    xisfconv.convert(path, tmp_path / "a.tif", bin=2, stretch="linked")
+    xisfconv.convert(tmp_path / "binned.xisf", tmp_path / "b.tif", stretch="linked")
+    assert same(tifffile.imread(tmp_path / "a.tif"), tifffile.imread(tmp_path / "b.tif"))
+    PIL = pytest.importorskip("PIL.Image")
+    xisfconv.convert(path, tmp_path / "thumb.png", resize=16, stretch="auto", sample_format="uint8")
+    with PIL.open(tmp_path / "thumb.png") as thumb:
+        assert thumb.size == (16, 11) and thumb.mode == "RGB"
+    # pictures only
+    for name in ("x.fits", "x.asdf"):
+        with pytest.raises(ValueError, match="bin, resize and scale make a smaller picture") as refused:
+            xisfconv.convert(path, tmp_path / name, bin=2)
+        assert "--" not in str(refused.value) and not (tmp_path / name).exists()
+    for options in ({"bin": 0}, {"bin": -2}, {"bin": 1.5}, {"bin": True}, {"bin": None}, {"bin": "2"}, {"resize": 0}, {"resize": -5},
+                    {"resize": 2.5}, {"resize": (10,)}, {"resize": (10, 0)}, {"resize": (10, 10, 10)}, {"resize": "10x10"},
+                    {"resize": True}, {"resize": iter([10, 10])}, {"resize": (x for x in (-5, 3))}, {"resize": {5: 1, 6: 2}},
+                    {"resize": b"\x05\x06"}, {"resize": (2 ** 70, 1)}, {"resize": (10.0, 10)}, {"scale": 0}, {"scale": 1.5}, {"scale": -0.5}, {"scale": float("nan")}, {"scale": "half"},
+                    {"scale": True}):
+        with pytest.raises(ValueError, match="expects"):
+            xisfconv.convert(path, tmp_path / "bad.tif", **options)
+        assert not (tmp_path / "bad.tif").exists()
+
+
 def test_convert_from_fits_and_back(tmp_path):
     pytest.importorskip("xisf")
     data = sample("uint16", (3, 20, 30))

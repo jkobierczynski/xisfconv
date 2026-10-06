@@ -38,4 +38,32 @@ void normalizeFloat(PixelBuffer& px, double lower, double upper);
 // Reverses the row order of every channel plane.
 void flipVertical(PixelBuffer& px);
 
+// A smaller picture of an image, for TIFF and PNG export.
+struct Downsample {
+    uint64_t bin = 1;                       // n x n pixels become one; what is left over at the right and the bottom is dropped
+    uint64_t fitWidth = 0, fitHeight = 0;   // the picture is to fit this many pixels (0: no limit), its proportions kept
+    double scale = 0;                       // the picture is this fraction of the image in width and height (0: not asked for)
+    // True if a smaller picture was asked for (also if the image turns out to be small enough as it is).
+    bool any() const { return bin > 1 || fitWidth || fitHeight || scale > 0; }
+};
+
+// What a Downsample makes of an image of a given size: the part of the image that is used (all
+// of it, but for what binning leaves over) and the size of the result. A picture is never
+// larger than the image.
+struct DownsampledSize {
+    uint64_t useWidth = 0, useHeight = 0;
+    uint64_t width = 0, height = 0;
+    bool changes = false;   // false: the image stays as it is
+};
+DownsampledSize downsampledSize(const Downsample& how, uint64_t width, uint64_t height);
+
+// Replaces the image by the picture of that size. Every pixel of the picture is the mean of
+// the part of the image it covers, each pixel of the image counted by the share of it that is
+// covered: no pixel is left out or counted twice, so the mean of the image stays what it is
+// and nothing is sharpened or rings. Binning is the case where every share is a whole pixel.
+// Integers are rounded to the nearest value. Floating point samples that are not finite are
+// left out of the mean; a pixel that covers no finite sample is NaN. The sums are doubles: a
+// mean of 64-bit samples, integers or floating point, is right to their last bit or two.
+void downsample(PixelBuffer& px, const DownsampledSize& size);
+
 }  // namespace xisfconv

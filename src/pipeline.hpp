@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "common.hpp"
+#include "convert.hpp"
 #include "fitsread.hpp"
 #include "xisf.hpp"
 #include "xisfrewrite.hpp"
@@ -43,6 +44,7 @@ struct ConvertOptions {
     bool wcs = true;                        // translate the astrometric solution
     int sipOrder = 3;                       // from XISF: order of the SIP fit (0 = linear only)
     bool force = false;                     // overwrite an existing output
+    Downsample downsample;                  // TIFF and PNG output: a smaller picture (--bin, --resize)
     bool properties = true;                 // from XISF to FITS and ASDF: take the XISF properties along; from FITS
                                             //   and ASDF: use the properties a file carries (see carriedProperties)
 };
