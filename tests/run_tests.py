@@ -3180,6 +3180,400 @@ def test_fits_tile_compressed():
                       f"fpack {' '.join(o) or '(default)'} {np.dtype(dtype).name} {shape}: equals funpack's output")
 
 
+def raw_tiles(path, hdu=1):
+    """The binary table of a tile-compressed image as it is stored: its header and the compressed tiles."""
+    with fits.open(path, disable_image_compression=True) as h:
+        table = h[hdu]
+        return table.header.copy(), [np.asarray(x, dtype=np.uint8).tobytes() for x in table.data["COMPRESSED_DATA"]]
+
+
+def fits_units(path):
+    """The HDUs of a FITS file as they are stored: (cards, data unit bytes) each."""
+    raw = open(path, "rb").read()
+    units, pos = [], 0
+    while pos < len(raw):
+        cards = []
+        while True:
+            block = raw[pos:pos + 2880]
+            pos += 2880
+            cards += [block[i:i + 80].decode("ascii") for i in range(0, 2880, 80)]
+            if any(c.startswith("END" + " " * 77) for c in cards[-36:]):
+                break
+        cards = cards[:next(i for i, c in enumerate(cards) if c.startswith("END" + " " * 77))]
+        value = {c[:8].strip(): c[10:30].strip() for c in cards if c[8:10] == "= "}
+        size = abs(int(value["BITPIX"])) // 8 * (int(value.get("PCOUNT", 0)) + (
+            int(np.prod([int(value[f"NAXIS{i + 1}"]) for i in range(int(value["NAXIS"]))])) if int(value["NAXIS"]) else 0))
+        units.append((cards, raw[pos:pos + size]))
+        pos += (size + 2879) // 2880 * 2880
+    return units
+
+
+STORAGE_CARDS = ("SIMPLE", "XTENSION", "BITPIX", "NAXIS", "NAXIS1", "NAXIS2", "NAXIS3", "EXTEND", "PCOUNT", "GCOUNT",
+                 "BZERO", "BSCALE", "CHECKSUM", "DATASUM")
+
+
+def test_fits_tile_writing():
+    """Writing tile-compressed FITS (-c). The references: the plain FITS file the same input
+    gives, from which astropy must read the same pixels and cards; astropy's (CFITSIO's) Rice
+    encoder and fpack, which must produce the same bytes; Python's gzip for the GZIP tiles;
+    funpack, which must restore the plain file; fitsverify; and xisfconv's own reader."""
+    import gzip
+    import warnings
+    d = os.path.join(TMP, "fzw")
+    os.makedirs(d, exist_ok=True)
+    rng = np.random.default_rng(1203)
+
+    def image(dtype, shape, kind="smooth"):
+        """HxWxC. smooth: compressible; random: every block is stored plain; steps: the
+        differences of neighbours wrap around; flat: all differences are zero."""
+        if np.issubdtype(dtype, np.floating):
+            a = np.sin(np.indices(shape).sum(0) / 9.0) * 0.4 + 0.5 + rng.normal(0, 0.01, shape)
+            if kind == "random":
+                a = rng.normal(0, 1e6, shape)
+            a = a.astype(dtype)
+            a.flat[0], a.flat[-1] = np.pi / 4, -0.0
+            return a
+        info = np.iinfo(dtype)
+        if kind == "random":
+            return rng.integers(0, info.max, shape, dtype=dtype, endpoint=True)
+        if kind == "steps":
+            return np.where(np.indices(shape).sum(0) % 3 == 0, np.full(shape, info.max, dtype), (np.indices(shape)[1] % 3).astype(dtype))
+        if kind == "flat":
+            return np.full(shape, info.max // 3, dtype)
+        a = ((np.indices(shape).sum(0) * 5 + rng.integers(0, 12, shape)) % (min(int(info.max), 2 ** 40) + 1)).astype(dtype)
+        a.flat[0], a.flat[1 % a.size] = info.max, 0
+        return a
+
+    def fitsverify(path):
+        r = subprocess.run(["fitsverify", "-q", path], capture_output=True, text=True)
+        return r.stdout.strip().replace(path, "").replace(" ,", ",")
+
+    def checked(path, label, like=None):
+        """fitsverify has nothing to say, or (`like`: the plain file) what it says about the plain
+        file: a keyword without a value earns a warning in both."""
+        if HAVE_FITSVERIFY:
+            verdict = fitsverify(path)
+            check("verification OK" in verdict or (like is not None and verdict.split(":")[-1] == fitsverify(like).split(":")[-1]),
+                  f"{label}: fitsverify: {verdict[:200]}")
+        check(os.path.getsize(path) % 2880 == 0 and not os.path.exists(path + ".part"), f"{label}: whole blocks, no .part file")
+        r = run("--verify", path, expect_ok=False)
+        check(r.returncode == 0 and ": OK (FITS" in r.stdout, f"{label}: --verify: {r.stdout.strip()[:160]}")
+
+    def compare_files(label, plain, packed, algorithms):
+        """`packed` holds the images of `plain`, tile-compressed with `algorithms` (one per image)."""
+        checked(packed, label, plain)
+        units = fits_units(plain)
+        stored_plain = [a is None for a in algorithms]   # 64-bit integers are not compressed
+        first = 0 if stored_plain[0] else 1              # the HDU of the first image
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with fits.open(plain) as hp, fits.open(packed) as hc:
+                check(len(hc) == len(hp) + first and (first == 0 or (hc[0].data is None and hc[0].header["NAXIS"] == 0)),
+                      f"{label}: {'an empty primary HDU, then ' if first else ''}{len(hp)} image(s)")
+                for i, algorithm in enumerate(algorithms):
+                    a, b = np.array(hp[i].data), np.array(hc[i + first].data)
+                    check(type(hc[i + first]).__name__ == ("CompImageHDU" if algorithm else "ImageHDU" if i + first else "PrimaryHDU") and
+                          a.shape == b.shape and a.dtype.newbyteorder("=") == b.dtype.newbyteorder("=") and a.tobytes() == b.astype(a.dtype).tobytes(),
+                          f"{label}: astropy reads image {i} with the pixels of the plain file ({a.dtype}, {a.shape}, {algorithm or 'not compressed'})")
+                    mine = [c.image for c in hp[i].header.cards if c.keyword not in STORAGE_CARDS]
+                    theirs = [c.image for c in hc[i + first].header.cards if c.keyword not in STORAGE_CARDS and
+                              not (c.keyword == "EXTNAME" and c.value == "COMPRESSED_IMAGE")]
+                    check(mine == theirs, f"{label}: image {i} has the cards of the plain file: {set(mine) ^ set(theirs)}")
+            for i, algorithm in enumerate(algorithms):
+                if algorithm is None:
+                    continue
+                header, tiles = raw_tiles(packed, i + first)
+                cards, data = units[i]
+                value = {c[:8].strip(): c[10:30].strip() for c in cards if c[8:10] == "= "}
+                width, sample = int(value["NAXIS1"]), abs(int(value["BITPIX"])) // 8
+                rows = [data[k:k + width * sample] for k in range(0, len(data), width * sample)]
+                check(header["ZCMPTYPE"] == algorithm and header["NAXIS2"] == len(rows) == len(tiles) and
+                      header["PCOUNT"] == sum(map(len, tiles)) and header["TFORM1"] == f"1PB({max(map(len, tiles))})" and
+                      header["ZTILE1"] == width and header["ZTILE2"] == 1 and header.get("ZTILE3", 1) == 1 and
+                      ("ZSIMPLE" in header) == (i == 0) and (header.get("ZTENSION") == "IMAGE") == (i > 0) and
+                      (header.get("ZPCOUNT"), header.get("ZGCOUNT")) == ((0, 1) if i else (None, None)) and
+                      header.get("ZQUANTIZ") == ("NONE" if int(value["BITPIX"]) < 0 else None),
+                      f"{label}: image {i}: {algorithm}, a tile per row, sizes as stored "
+                      f"({header['ZCMPTYPE']}, {header['NAXIS2']} rows, PCOUNT {header['PCOUNT']}, {header['TFORM1']})")
+                if algorithm == "RICE_1":
+                    # the same bytes as astropy's encoder, which is CFITSIO's
+                    check(header["ZNAME1"] == "BLOCKSIZE" and header["ZVAL1"] == 32 and header["ZNAME2"] == "BYTEPIX" and
+                          header["ZVAL2"] == sample, f"{label}: image {i}: Rice parameters")
+                    ref = os.path.join(d, "ref.fits.fz")
+                    with fits.open(plain) as hp:
+                        fits.HDUList([fits.PrimaryHDU(), fits.CompImageHDU(np.array(hp[i].data), compression_type="RICE_1")]).writeto(ref, overwrite=True)
+                    theirs, their_tiles = raw_tiles(ref)
+                    if theirs["ZVAL2"] == sample and theirs["ZTILE1"] == width and theirs.get("ZTILE2", 1) == 1:
+                        check(tiles == their_tiles, f"{label}: image {i}: the Rice-coded tiles are astropy's, byte for byte "
+                              f"({sum(a == b for a, b in zip(tiles, their_tiles))} of {len(tiles)})")
+                    else:  # pragma: no cover
+                        skipped.append("Rice tiles against astropy's encoder (it chose other parameters)")
+                else:
+                    # gzip streams that Python's gzip decodes to the rows, bytes regrouped by significance
+                    ok = True
+                    for tile, row in zip(tiles, rows):
+                        plain_bytes = np.frombuffer(gzip.decompress(tile), np.uint8)
+                        if algorithm == "GZIP_2":
+                            plain_bytes = plain_bytes.reshape(sample, -1).T
+                        ok = ok and plain_bytes.tobytes() == row and tile[:4] == b"\x1f\x8b\x08\x00" and tile[4:8] == b"\0\0\0\0" and tile[9] == 255
+                    check(ok, f"{label}: image {i}: every tile is a gzip stream of its row, with nothing in its header that "
+                          "depends on the system or the time")
+        # CFITSIO: funpack restores the plain file
+        if HAVE_FPACK:
+            restored = os.path.join(d, "funpacked.fits")
+            if os.path.exists(restored):
+                os.remove(restored)
+            r = subprocess.run(["funpack", "-O", restored, packed], capture_output=True, text=True)
+            if r.returncode:
+                check(False, f"{label}: funpack: {r.stderr.strip()[:200]}")
+            else:
+                theirs = [([c for c in cards if c[:8].strip() not in ("CHECKSUM", "DATASUM")], data) for cards, data in fits_units(restored)]
+                check(theirs == units, f"{label}: funpack restores the plain file, cards and data")
+        # and xisfconv itself
+        back = os.path.join(d, "unpacked.fits")
+        r = run(packed, "-o", back, "-f", "-q", "-t", "fits", expect_ok=False)
+        if all(stored_plain):
+            check(r.returncode != 0 and "already a FITS file" in r.stderr, f"{label}: nothing in it is compressed: a plain FITS file")
+        else:
+            check(r.returncode == 0 and [data for _, data in fits_units(back)] == [data for _, data in units],
+                  f"{label}: xisfconv unpacks it to the same data: {r.stderr.strip()[:120]}")
+
+    def expected(dtype, codec):
+        if dtype == np.uint64:
+            return None   # stays a plain image
+        if codec == "zlib" or dtype in (np.float32, np.float64):
+            return "GZIP_1" if dtype == np.uint8 else "GZIP_2"
+        return "RICE_1"
+
+    src = os.path.join(d, "in.xisf")
+    plain = os.path.join(d, "plain.fits")
+    packed = os.path.join(d, "packed.fits.fz")
+
+    # every sample type, gray and RGB, both codecs; widths around the Rice block size of 32 pixels
+    for dtype in (np.uint8, np.uint16, np.uint32, np.uint64, np.float32, np.float64):
+        for shape in ((37, 53, 1), (20, 31, 3), (9, 64, 1), (6, 65, 3), (5, 1, 1), (1, 7, 1), (1, 1, 1), (3, 33, 1)):
+            write_xisf(src, [image_entry(image(dtype, shape))])
+            run(src, "-o", plain, "-f", "-q")
+            for flags in (["-c"], ["--codec", "zlib"]):
+                r = run(src, "-o", packed, "-f", *flags)
+                compare_files(f"{np.dtype(dtype).name} {shape} {' '.join(flags)}", plain, packed, [expected(dtype, flags[-1])])
+                check(("64-bit integer images are not tile-compressed" in r.stderr) == (dtype == np.uint64),
+                      f"{np.dtype(dtype).name}: a warning when an image is left uncompressed, and only then: {r.stderr.strip()[:120]}")
+    # data that does not compress, differences that wrap around, constant rows
+    for dtype in (np.uint8, np.uint16, np.uint32, np.float32):
+        for kind in ("random", "steps", "flat"):
+            write_xisf(src, [image_entry(image(dtype, (24, 131, 1), kind))])
+            run(src, "-o", plain, "-f", "-q")
+            run(src, "-o", packed, "-f", "-q", "-c")
+            compare_files(f"{np.dtype(dtype).name} {kind}", plain, packed, [expected(dtype, "")])
+            if kind == "random":
+                check(os.path.getsize(packed) <= os.path.getsize(plain) * 1.05 + 4 * 2880,
+                      f"{np.dtype(dtype).name}: data that does not compress grows by little ({os.path.getsize(plain)} -> {os.path.getsize(packed)})")
+    # Rice coding at every split position: noise of every strength, and one outlier in a quiet
+    # row (a long run of zero bits in the code); gzip on rows that do not compress at all
+    for dtype in (np.uint8, np.uint16, np.uint32):
+        bits = 8 * np.dtype(dtype).itemsize
+        rows = []
+        for k in range(bits):
+            noise = np.rint(rng.normal(0, 2.0 ** k / 3, 257)).astype(np.int64)
+            rows.append(((1 << (bits - 1)) + noise) % (1 << bits))
+            spike = np.full(257, 1000 % (1 << bits), np.int64)
+            spike[rng.integers(0, 257)] = (1 << bits) - 1 - (k % 3)
+            spike[k * 7 % 257] = k
+            rows.append(spike)
+        write_xisf(src, [image_entry(np.array(rows).astype(dtype)[:, :, None])])
+        run(src, "-o", plain, "-f", "-q")
+        run(src, "-o", packed, "-f", "-q", "-c")
+        compare_files(f"{np.dtype(dtype).name} noise of every strength and outliers", plain, packed, ["RICE_1"])
+    write_xisf(src, [image_entry(image(np.float32, (3, 5000, 1), "random"))])
+    run(src, "-o", plain, "-f", "-q")
+    run(src, "-o", packed, "-f", "-q", "-c")
+    compare_files("float32 rows of 20 kB that do not compress", plain, packed, ["GZIP_2"])
+    # floating point values of every kind come back bit for bit: NaN (also one with a payload),
+    # infinities, the negative zero, the smallest and the largest numbers
+    for dtype, bits in ((np.float32, np.uint32), (np.float64, np.uint64)):
+        a = image(dtype, (12, 40, 1))
+        tiny = np.finfo(dtype)
+        a[1, :9, 0] = [np.nan, np.inf, -np.inf, -0.0, tiny.tiny, tiny.smallest_subnormal, tiny.max, -tiny.max, tiny.eps]
+        a[2, 3, 0] = np.array([np.array(np.nan, dtype).view(bits) | 0x1234], bits).view(dtype)[0]
+        write_xisf(src, [image_entry(a)])
+        run(src, "-o", plain, "-f", "-q")
+        run(src, "-o", packed, "-f", "-q", "-c")
+        compare_files(f"{np.dtype(dtype).name} special values", plain, packed, ["GZIP_2"])
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            got = np.array(fits.getdata(packed, 1))[::-1]
+        check(got.astype(dtype).tobytes() == a[:, :, 0].tobytes(), f"{np.dtype(dtype).name}: NaN, infinities and -0.0 survive bit for bit")
+    # the same input gives the same bytes
+    first = open(packed, "rb").read()
+    run(src, "-o", packed, "-f", "-q", "-c")
+    check(open(packed, "rb").read() == first, "writing twice gives the same file")
+
+    # several images, names, keywords of every kind, top-down rows, another sample format
+    e1 = with_id(image_entry(image(np.uint16, (16, 24, 3)), children=torture_keywords(), codec="zlib"), "main")
+    e2 = with_id(image_entry(image(np.float32, (10, 12, 1)), codec="lz4"), "mask")
+    e3 = image_entry(image(np.uint8, (7, 9, 1)))
+    write_xisf(src, [e1, e2, e3])
+    for flags in ([], ["--top-down"], ["-b", "u16"], ["-i", "1"]):
+        run(src, "-o", plain, "-f", "-q", *flags)
+        run(src, "-o", packed, "-f", "-q", "-c", *flags)
+        algorithms = ["GZIP_2"] if flags == ["-i", "1"] else ["RICE_1", "RICE_1" if "-b" in flags else "GZIP_2", "RICE_1"]
+        compare_files(f"three images {' '.join(flags)}".strip(), plain, packed, algorithms)
+    header, _ = raw_tiles(packed)
+    check(header["EXTNAME"] == "mask", "an image keeps its name as EXTNAME")
+    # 64-bit integers among other images: the plain image is the primary HDU when it comes first
+    wide = with_id(image_entry(image(np.uint64, (6, 9, 1))), "wide")
+    for label, entries, algorithms in (("64-bit integers first", [wide, e1, e2], [None, "RICE_1", "GZIP_2"]),
+                                        ("64-bit integers between", [e3, wide, e1], ["RICE_1", None, "RICE_1"])):
+        write_xisf(src, entries)
+        run(src, "-o", plain, "-f", "-q")
+        r = run(src, "-o", packed, "-f", "-c")
+        compare_files(label, plain, packed, algorithms)
+        check("image 'wide' is stored as it is" in r.stderr, f"{label}: the warning names the image: {r.stderr.strip()[:160]}")
+    write_xisf(src, [e1, e2, e3])
+    run(src, "-o", packed, "-f", "-q", "-c")
+    names = [raw_tiles(packed, i)[0]["EXTNAME"] for i in (1, 2, 3)]
+    check(names == ["main", "mask", "COMPRESSED_IMAGE"], f"an image without a name is a table named COMPRESSED_IMAGE: {names}")
+    r = run(packed, "-I")
+    check(r.stdout.count("tile-compressed (RICE_1)") == 2 and "tile-compressed (GZIP_2)" in r.stdout and "COMPRESSED_IMAGE" not in r.stdout,
+          "--info shows the compression, not the name of the table")
+    # the way back to XISF is the same from the plain and from the compressed file
+    run(src, "-o", plain, "-f", "-q")
+    x1, x2 = os.path.join(d, "from_plain.xisf"), os.path.join(d, "from_packed.xisf")
+    run(plain, "-o", x1, "-f", "-q")
+    run(packed, "-o", x2, "-f", "-q")
+    for n in range(3):
+        check(xisf_keywords(x1, n) == xisf_keywords(x2, n) and np.array_equal(read_xisf_any(x1, n), read_xisf_any(x2, n)),
+              f"image {n}: plain and tile-compressed FITS convert to the same XISF image")
+    # two images without a name: both tables are called COMPRESSED_IMAGE, as in fpack's files
+    write_xisf(src, [image_entry(image(np.uint16, (5, 6, 1))), image_entry(image(np.float32, (4, 7, 1)))])
+    run(src, "-o", plain, "-f", "-q")
+    run(src, "-o", packed, "-f", "-q", "-c")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with fits.open(plain) as hp, fits.open(packed) as hc:
+            check(len(hc) == 3 and all(np.array(hp[i].data).tobytes() == np.array(hc[i + 1].data).astype(hp[i].data.dtype).tobytes() for i in (0, 1)),
+                  "two images without a name")
+    # a name too long for a card is shortened, in the plain and in the compressed file
+    long_name = "N" + "o" * 80 + "'s"
+    write_xisf(src, [with_id(image_entry(image(np.uint16, (5, 6, 1))), "L" * 90)])
+    for target, flags, hdu in ((plain, [], 0), (packed, ["-c"], 1)):
+        r = run(src, "-o", target, "-f", *flags)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with fits.open(target) as h:
+                h.verify("exception")
+                check(h[hdu].header["EXTNAME"] == "L" * 68 and "shortened to fit a FITS card" in r.stderr,
+                      f"a long image name is shortened ({'compressed' if flags else 'plain'}): {h[hdu].header['EXTNAME']!r}")
+    # Keywords that describe a compressed image are the writer's: an image that brings its own
+    # (they would be taken for the real ones) loses them in a compressed file, with a warning.
+    theirs = "".join(f'<FITSKeyword name="{name}" value="{value}" comment=""/>' for name, value in (
+        ("THEAP", "5760"), ("TSCAL1", "2.0"), ("TZERO1", "5.0"), ("ZSCALE", "2.0"), ("ZZERO", "7.0"), ("ZBLANK", "3"), ("ZNAME3", "'NOISEBIT'"),
+        ("ZTILE1", "3"), ("TFORM1", "'1PJ'"), ("ZBITPIX", "8"), ("ZNAXIS1", "5"), ("ZSIMPLE", "F"), ("ZPCOUNT", "10"), ("ZHECKSUM", "'x'"),
+        ("ZDATASUM", "'1'"), ("TFIELDS", "3"), ("ZIMAGE", "F"), ("ZCMPTYPE", "'PLIO_1'"), ("ZVAL1", "16"), ("ZQUANTIZ", "'NO_DITHER'"),
+        ("TTYPE1", "'X'"), ("OBJECT", "'M 31'"), ("ZENITH", "12.5"), ("TELESCOP", "'T'")))
+    for dtype in (np.uint16, np.float32):
+        write_xisf(src, [image_entry(image(dtype, (6, 10, 1)), children=theirs)])
+        run(src, "-o", plain, "-f", "-q")
+        r = run(src, "-o", packed, "-f", "-c")
+        checked(packed, f"{np.dtype(dtype).name} with keywords of a compressed image")
+        header, _ = raw_tiles(packed)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with fits.open(packed) as hc:
+                kept = hc[1].header
+                check(np.array(hc[1].data).astype(dtype).tobytes() == np.array(fits.getdata(plain)).astype(dtype).tobytes() and kept["OBJECT"] == "M 31" and
+                      kept["ZENITH"] == 12.5 and kept["TELESCOP"] == "T" and "ZSCALE" not in header and "THEAP" not in header and
+                      header["TFIELDS"] == 1 and header["ZBITPIX"] == (16 if dtype == np.uint16 else -32) and
+                      len([c for c in header.cards if c.keyword == "TFORM1"]) == 1 and header["ZCMPTYPE"] in ("RICE_1", "GZIP_2"),
+                      f"{np.dtype(dtype).name}: keywords of a compressed image are not taken over, the others are")
+        check(r.stderr.count("describes a tile-compressed image") == 21 and "keyword ZSCALE" in r.stderr and "ZENITH" not in r.stderr,
+              f"each of them is named in a warning, once: {r.stderr.count('describes a tile-compressed image')}")
+        if HAVE_FPACK:
+            restored = os.path.join(d, "funpacked.fits")
+            if os.path.exists(restored):
+                os.remove(restored)
+            subprocess.run(["funpack", "-O", restored, packed], capture_output=True, text=True)
+            check(os.path.exists(restored) and fits_units(restored)[0][1] == fits_units(plain)[0][1], "and funpack restores the pixels")
+    # an EXTNAME among the keywords of an image without a name is its name
+    write_xisf(src, [image_entry(image(np.uint16, (5, 6, 1)), children='<FITSKeyword name="EXTNAME" value="\'SCI\'" comment=""/>')])
+    run(src, "-o", packed, "-f", "-q", "-c")
+    cards = [c.image for c in raw_tiles(packed)[0].cards if c.keyword == "EXTNAME"]
+    check(len(cards) == 1 and "'SCI" in cards[0], f"an EXTNAME keyword is not doubled: {cards}")
+
+    # names: -c names the output image.fits.fz; a name that ends in .fz asks for compression by itself
+    sub = os.path.join(d, "names")
+    os.makedirs(sub, exist_ok=True)
+    one = os.path.join(sub, "frame.xisf")
+    write_xisf(one, [image_entry(image(np.uint16, (12, 40, 1)))])
+    r = run(one, "-c")
+    check(os.path.exists(os.path.join(sub, "frame.fits.fz")) and "frame.fits.fz" in r.stdout and not os.path.exists(os.path.join(sub, "frame.fits")),
+          f"-c writes image.fits.fz: {r.stdout.strip()}")
+    r = run(one, "-o", os.path.join(sub, "byname.fits.fz"))
+    check(raw_tiles(os.path.join(sub, "byname.fits.fz"))[0]["ZCMPTYPE"] == "RICE_1", "-o image.fits.fz is written tile-compressed without -c")
+    run(one, "-o", os.path.join(sub, "other.fz"), "-t", "fits")
+    check(raw_tiles(os.path.join(sub, "other.fz"))[0]["ZCMPTYPE"] == "RICE_1", "-o name.fz -t fits is written tile-compressed")
+    run(one, "-o", os.path.join(sub, "named.fits"), "-c")
+    check(raw_tiles(os.path.join(sub, "named.fits"))[0]["ZCMPTYPE"] == "RICE_1", "-o image.fits -c is tile-compressed under that name")
+    run(one, "-o", os.path.join(sub, "plain.fits"), "--codec", "none")
+    with fits.open(os.path.join(sub, "plain.fits")) as h:
+        check(len(h) == 1 and h[0].data is not None, "--codec none leaves FITS output plain")
+    run(one, "-o", os.path.join(sub, "none.fits.fz"), "--codec", "none")
+    check(raw_tiles(os.path.join(sub, "none.fits.fz"))[0]["ZCMPTYPE"] == "RICE_1", "but the name image.fits.fz wins over --codec none")
+    r = run(one, "-o", os.path.join(sub, "x.fts.fz"), expect_ok=False)
+    check(r.returncode == 0 and raw_tiles(os.path.join(sub, "x.fts.fz"))[0]["ZIMAGE"], ".fts.fz is a FITS name, too")
+    r = run(one, "-o", os.path.join(sub, "x.tif.fz"), expect_ok=False)
+    check(r.returncode != 0 and "cannot infer output format" in r.stderr, f"image.tif.fz is no output name: {r.stderr.strip()[:120]}")
+    r = run(one, "-o", os.path.join(sub, "z.fits"), "--codec", "zstd", expect_ok=False)
+    zstd_built = "zstd" in subprocess.run([EXE, "--version"], capture_output=True, text=True).stdout
+    check(r.returncode != 0 and ("FITS has no Zstandard compression" in r.stderr or not zstd_built) and
+          not os.path.exists(os.path.join(sub, "z.fits")) and not os.path.exists(os.path.join(sub, "z.fits.part")),
+          f"--codec zstd is refused for FITS: {r.stderr.strip()[:160]}")
+    r = run(one, "-o", os.path.join(sub, "byname.fits.fz"), "-c", expect_ok=False)
+    check(r.returncode != 0 and "already exists" in r.stderr, "an existing output is kept without --force")
+
+    # FITS -> FITS: packing a plain file, as fpack does; the tiles are fpack's
+    base = os.path.join(sub, "camera.fits")
+    a = image(np.uint16, (33, 70))
+    h = fits.PrimaryHDU(a)
+    h.header["OBJECT"] = "M 31"
+    h.header["EXPTIME"] = (120.0, "seconds")
+    fits.HDUList([h, fits.ImageHDU(image(np.uint8, (9, 11)), name="THUMB")]).writeto(base, overwrite=True)
+    r = run(base, "-t", "fits", expect_ok=False)
+    check(r.returncode != 0 and "--compress" in r.stderr, f"FITS to plain FITS is still refused, and says how to compress: {r.stderr.strip()[:200]}")
+    r = run(base, "-t", "fits", "-c", "-q")
+    out = os.path.join(sub, "camera.fits.fz")
+    check(os.path.exists(out), f"FITS -> FITS with -c writes image.fits.fz: {r.stdout.strip()}")
+    checked(out, "FITS -> tile-compressed FITS")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with fits.open(out) as hc:
+            check(len(hc) == 3 and np.array_equal(hc[1].data, a) and hc[1].data.dtype == np.uint16 and hc[1].header["OBJECT"] == "M 31" and
+                  hc[1].header["EXPTIME"] == 120.0 and hc[2].header["EXTNAME"] == "THUMB" and hc[2].data.dtype == np.uint8,
+                  "the packed file holds the images and keywords of the plain one")
+    if HAVE_FPACK:
+        ref = os.path.join(sub, "fpacked.fits.fz")
+        subprocess.run(["fpack", "-O", ref, base], check=True, capture_output=True)
+        check(all(raw_tiles(out, i)[1] == raw_tiles(ref, i)[1] for i in (1, 2)), "the tiles are those fpack writes for the same file")
+    r = run(out, "-t", "fits", "-c", "-f", expect_ok=False)
+    check(r.returncode != 0 and os.path.exists(out), f"a file is not packed onto itself: {r.stderr.strip()[:160]}")
+    again = os.path.join(sub, "again.fits.fz")
+    run(out, "-o", again, "-q", "--codec", "zlib")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with fits.open(again) as hc:
+            check(raw_tiles(again)[0]["ZCMPTYPE"] == "GZIP_2" and np.array_equal(hc[1].data, a) and np.array_equal(hc[2].data, fits.getdata(base, 1)),
+                  "a tile-compressed file is written again with another algorithm")
+    # ASDF -> tile-compressed FITS
+    asdf_file = os.path.join(sub, "frame.asdf")
+    run(one, "-o", asdf_file, "-q")
+    run(asdf_file, "-t", "fits", "-c", "-q", "-f")
+    run(one, "-o", plain, "-f", "-q")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        check(np.array_equal(fits.getdata(os.path.join(sub, "frame.fits.fz"), 1), fits.getdata(plain)), "ASDF -> tile-compressed FITS")
+
+
 if __name__ == "__main__":
     print("xisfconv:", EXE)
     print(subprocess.run([EXE, "--version"], capture_output=True, text=True).stdout.strip())
@@ -3197,7 +3591,7 @@ if __name__ == "__main__":
               test_fits_to_xisf_formats, test_fits_to_xisf_metadata, test_fits_to_xisf_bounds_bits_hdus,
               test_xisf_fits_xisf_roundtrip, test_asdf_yaml, test_asdf_hand_written, test_asdf_output,
               test_asdf_python_files, test_asdf_roundtrips, test_export_from_fits_and_asdf, test_xisf_rewrite,
-              test_verify, test_fits_tile_compressed):
+              test_verify, test_fits_tile_compressed, test_fits_tile_writing):
         try:
             t()
         except Exception as e:  # noqa: BLE001

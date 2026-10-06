@@ -8,6 +8,7 @@ NumPy arrays and works with astropy (see [Python](#python)).
 
 ```
 xisfconv M31_integration.xisf                 # -> M31_integration.fits
+xisfconv -c M31_integration.xisf              # -> M31_integration.fits.fz (tile-compressed, lossless)
 xisfconv -c light_0001.fits                   # -> light_0001.xisf (zstd-compressed)
 xisfconv -t asdf M31_integration.xisf         # -> M31_integration.asdf
 xisfconv observation.asdf                     # -> observation.xisf
@@ -42,6 +43,8 @@ xisfconv --info light_0001.xisf               # geometry, codecs, FITS keywords,
   CCD-TEMP, XPIXSZ/YPIXSZ, FOCALLEN, APTDIA, IMAGETYP, and BAYERPAT from the CFA element
   (disable with `--no-property-keywords`; existing keywords always win)
 - Additional images become IMAGE extensions (EXTNAME = XISF image id)
+- `-c` writes the images tile-compressed and without loss (`image.fits.fz`, the format of fpack):
+  see "Tile-compressed FITS" below
 - Row order: XISF stores rows top-down, FITS viewers expect the first row at the bottom. By default
   rows are flipped to the FITS convention (`ROWORDER = 'BOTTOM-UP'`) and BAYERPAT is adjusted to
   match, so the image shows the same way up as in PixInsight. `--top-down` keeps XISF's order and
@@ -151,7 +154,31 @@ xisfconv --info light_0001.xisf               # geometry, codecs, FITS keywords,
 - The image's own keywords are carried over; the keywords that describe the table and the
   compression (`ZIMAGE`, `ZCMPTYPE`, `ZTILEn`, `TFORMn`, ...) are dropped, as is the table name
   `COMPRESSED_IMAGE`. `--info` shows the algorithm.
-- Writing tile-compressed FITS is not implemented yet.
+- **Writing**: `-c` (or an output name that ends in `.fz`) writes FITS output tile-compressed,
+  from XISF, ASDF and FITS input alike; without `-o` the file is named `image.fits.fz`, as fpack
+  names it. The compression is **lossless**: `RICE_1` for integers of 8, 16 and 32 bits, `GZIP_2`
+  for floating point, where every bit of every value comes back (NaN and infinities included).
+  `--codec zlib` uses gzip for integers as well (`GZIP_2`; `GZIP_1` for 8-bit data, where the two
+  are the same). A tile is one row of the image, the default
+  of fpack and astropy, and the file is laid out as fpack lays it out: an empty primary HDU, then
+  each image as a binary table that says where it belongs (`ZSIMPLE`, `ZTENSION`).
+- The Rice-coded tiles are byte for byte those CFITSIO and astropy produce, and funpack
+  restores from the file exactly the plain FITS file xisfconv writes without `-c` (plus its own
+  `CHECKSUM` cards). A 16-bit camera frame becomes a little more than half its size, as with
+  fpack; floating point data, whose low bits are noise, shrinks by a quarter or so.
+- What is not written: quantized (lossy) floating point, which is fpack's default for floats and
+  much smaller, and `HCOMPRESS_1`. Images of 64-bit integers stay uncompressed in the file, with
+  a warning: CFITSIO neither writes nor reads them tile-compressed. Keywords that describe a
+  compressed image and its table (`TFORMn`, `ZCMPTYPE`, `ZSCALE`, ...) are the writer's: an image
+  that brings its own loses them in a compressed file, with a warning.
+- Up to 0.11, `-c` and `--codec` had no effect on FITS output. Now `xisfconv -c image.xisf`
+  writes `image.fits.fz` where it wrote `image.fits`, a name that ends in `.fz` is written
+  tile-compressed whatever `--codec` says, and `--codec zstd` with FITS output is an error:
+  FITS has no Zstandard.
+- `xisfconv -t fits -c image.fits` packs a plain FITS file, and `-t fits` unpacks one. Both are
+  conversions, not copies: xisfconv writes the images as it reads them (see "FITS → XISF" above for
+  how signed integers are mapped: with negative values they become floating point), adds a
+  `HISTORY` card and leaves tables out. To pack a FITS file exactly as it is, use fpack.
 
 **Verifying files** (`--verify <file or directory>...`)
 - Reads every file completely without converting anything and says whether it is intact. A
@@ -324,7 +351,8 @@ xisfconv [options] <file>...      # any of XISF, FITS, ASDF -> any other of them
       --in-place              XISF -> XISF: replace the input file (after reading the new one back)
   -b, --bits <fmt>            output sample format: u8, u16, u32, f32, f64 (default: as stored)
   -i, --image <n>             convert only image n (0-based); default: all images
-  -c, --compress              TIFF: Deflate with predictor; XISF: zstd + byte shuffling; ASDF: zlib
+  -c, --compress              FITS: tile compression, lossless (image.fits.fz): RICE_1, GZIP_2 for floats
+                              TIFF: Deflate with predictor; XISF: zstd + byte shuffling; ASDF: zlib
                               XISF -> XISF: every attached data block
   -s, --stretch[=mode]        screen stretch for viewing: auto (default), linked, unlinked, stf
       --top-down              from XISF: keep XISF's top-down row order in FITS/ASDF (default: bottom-up)
@@ -337,6 +365,7 @@ xisfconv [options] <file>...      # any of XISF, FITS, ASDF -> any other of them
       --no-verify             don't verify data block checksums
       --codec <zlib|zstd|none>  XISF and ASDF output: compression codec (zlib, zstd imply -c);
                               none = uncompressed (XISF -> XISF: decompress)
+                              FITS output: zlib = gzip tiles for every sample type; no zstd
       --checksum <sha1|sha256|sha512|sha3-256|sha3-512|none>
                               XISF output: checksum of the pixel data;
                               XISF -> XISF: of every attached block (none removes them)
@@ -360,7 +389,8 @@ reported and the rest are still converted (exit status 1).
 
 Everything the tool does is done by a library with a plain C API, declared in
 [`include/xisfconv.h`](include/xisfconv.h). The tool itself uses nothing else. The library reads
-XISF, FITS and ASDF images into arrays, writes arrays as XISF, FITS, ASDF, TIFF or PNG, converts and
+XISF, FITS and ASDF images into arrays, writes arrays as XISF, FITS (plain or tile-compressed),
+ASDF, TIFF or PNG, converts and
 rewrites files, verifies them, translates astrometric solutions and applies PixInsight's screen
 stretch.
 
@@ -432,7 +462,7 @@ What to know:
   so the header maps directly to Python's `ctypes` or `cffi`, Rust's bindgen and Perl's
   FFI::Platypus. The Python package in `python/` is built that way, on `ctypes`.
 - **Stability.** Version 0.x: the API may still change between releases, and the shared library's
-  version changes with each of them (`libxisfconv.so.0.11`).
+  version changes with each of them (`libxisfconv.so.0.12`).
 - **Messages** are the tool's and some name its options (`--force`, `--bounds`): the option names
   say which setting is meant.
 - The CMake package (`find_package(xisfconv)`) is installed with the shared library; a static
@@ -454,6 +484,7 @@ import xisfconv
 data = xisfconv.read("m31.xisf")                    # [height, width] or [height, width, channels]
 image = xisfconv.read_image("m31.xisf")             # with keywords, name, bounds, XISF properties
 xisfconv.write("out.xisf", data, keywords={"OBJECT": "M 31"}, codec="zstd", checksum="sha256")
+xisfconv.write("out.fits.fz", data)                 # tile-compressed FITS, lossless
 xisfconv.convert("m31.xisf", "m31.fits")            # what the command line tool does
 print(xisfconv.verify("m31.xisf").verdict)
 
@@ -485,7 +516,8 @@ Good to know:
 - Ctrl-C stops a conversion, a rewrite or a verification between its steps and leaves no partly
   written file; during the last step it takes effect when the file is complete. (A rewrite and a
   verification have a step per data block; a conversion has one per image while it reads an XISF
-  file, and writes its output in one.) The same holds for any signal whose handler raises, such as an alarm that sets a
+  file, and writes its output in one, or with a step every few megabytes when the output is
+  tile-compressed FITS.) The same holds for any signal whose handler raises, such as an alarm that sets a
   time limit. A function given as `progress=` is called between the steps, in the caller's
   thread, and stops the work by raising an exception.
 - XISF properties are read, not written. The astrometric solution of an XISF file is carried into
@@ -495,7 +527,7 @@ Good to know:
 - An image is read and written as a whole, in memory. Reading takes about twice the size of the
   image for a moment, three times for a compressed file. Writing takes once its size on top of
   the array, twice for a colour image with the channels last, and about four times when the
-  file is compressed.
+  file is compressed (not for tile-compressed FITS, which is compressed row by row).
 - `CCDData.read` hands the image to astropy's own FITS reader as a FITS file in memory, so that
   units, mask and uncertainty behave exactly as with FITS; that takes about four times the size
   of the image in memory.
@@ -568,8 +600,20 @@ each quantization and dithering method, NaN pixels) must decode to what astropy 
 bit for bit, and, where `fpack` and `funpack` are installed, files packed by fpack must decode to
 what funpack writes. For quantized floating point a difference no larger than the rounding of
 one multiplication is accepted and counted in the summary: there the other software's result
-depends on how it was compiled (see "Tile-compressed FITS" above). Damaged and truncated files, headers that contradict the table and an
-`HCOMPRESS_1` image are covered as well.
+depends on how it was compiled (see "Tile-compressed FITS" above). Damaged and truncated files,
+headers that contradict the table and an `HCOMPRESS_1` image are covered as well.
+
+Writing tile-compressed FITS is checked against the plain FITS file the same input gives: for
+every sample type, gray and colour, widths around the Rice block size, data that does not
+compress, differences that wrap around, constant rows, NaN and infinities, several images and
+keywords of every kind, astropy must read the same pixels and the same cards from both files.
+The Rice-coded tiles must be the bytes astropy's encoder (which is CFITSIO's) produces for the
+same rows, and the tiles fpack writes when a FITS file is packed; the gzip tiles are decoded
+with Python's `gzip`. funpack must restore the plain file, cards and data, fitsverify must find
+nothing it does not find in the plain file, and xisfconv must read its own file back. The
+64-bit form of the table, which is used when the compressed tiles could take more than 2 GiB,
+was written once, with tiles of 2.04 GiB, and read by astropy, funpack and xisfconv (such an
+image is too large for the test suite).
 
 TIFF and PNG export from FITS and ASDF input is checked against the export of the XISF file the input
 was made from: for every sample format, gray and RGB, both row orders and a set of `--bits`,
@@ -611,7 +655,11 @@ compared with PyYAML on random documents in all of PyYAML's output styles.
 - A PixInsight spline solution that goes XISF → FITS → XISF comes back as a spline rebuilt from the
   SIP approximation, not as the original: on the test frame the two agree to 0.5 arcsec rms.
 - FITS input: tables are not read; BLANK pixels of integer images are kept as ordinary values.
-  Tile-compressed images: `HCOMPRESS_1` is not read, and tile-compressed FITS is not written.
+  Tile-compressed images: `HCOMPRESS_1` is not read.
+- Tile-compressed FITS is written without loss only (`RICE_1`, `GZIP_2`), a row per tile: no
+  quantized floating point, no `HCOMPRESS_1`, no choice of tile shape. Images of 64-bit integers
+  are left uncompressed. Packing a FITS file (`-t fits -c`) converts it, as every other path
+  does; fpack copies it.
 - ASDF input: arrays stored inline in the tree or in another file, non-contiguous views, Fortran-ordered
   arrays, tables and structured or complex data types are skipped with a message; bzip2- and
   Blosc-compressed blocks are not read. Line breaks written as U+0085, U+2028 or U+2029 inside the
@@ -639,7 +687,7 @@ Bump the version in `include/xisfconv.h` (CMake reads it from there), commit, th
 tag:
 
 ```
-git tag v0.11.1 && git push origin v0.11.1
+git tag v0.12.0 && git push origin v0.12.0
 ```
 
 CI builds and tests all three platforms and, only if every one passes, publishes a GitHub release with

@@ -332,6 +332,8 @@ void codecFrom(xisfconv_codec codec, ConvertOptions& out) {
 
 std::optional<Format> formatFromExtension(const std::string& path) {
     const std::string e = toLower(fromPath(toPath(path).extension()));
+    // image.fits.fz: FITS, tile-compressed
+    if (e == ".fz") return formatFromExtension(fromPath(toPath(path).stem())) == Format::Fits ? std::optional<Format>(Format::Fits) : std::nullopt;
     if (e == ".fits" || e == ".fit" || e == ".fts") return Format::Fits;
     if (e == ".tif" || e == ".tiff") return Format::Tiff;
     if (e == ".png") return Format::Png;

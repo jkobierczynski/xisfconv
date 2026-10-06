@@ -400,21 +400,6 @@ TiledImage tiledImageFromHeader(const Header& hdr, const std::string& label, uin
     return t;
 }
 
-// Keywords that describe the table and the compression, not the image.
-bool isTileKeyword(const std::string& name) {
-    static const char* exact[] = {"TFIELDS", "THEAP", "ZIMAGE", "ZCMPTYPE", "ZBITPIX", "ZNAXIS", "ZMASKCMP", "ZQUANTIZ", "ZDITHER0",
-                                  "ZSIMPLE", "ZEXTEND", "ZBLOCKED", "ZTENSION", "ZPCOUNT", "ZGCOUNT", "ZHECKSUM", "ZDATASUM",
-                                  "ZBLANK", "ZSCALE", "ZZERO"};
-    for (const char* e : exact)
-        if (name == e) return true;
-    static const char* indexed[] = {"TTYPE", "TFORM", "TUNIT", "TDIM", "TNULL", "TSCAL", "TZERO", "TDISP", "ZNAXIS", "ZTILE", "ZNAME", "ZVAL"};
-    for (const char* prefix : indexed) {
-        uint64_t k;
-        if (startsWith(name, prefix) && parseUInt64(name.substr(std::strlen(prefix)), k)) return true;
-    }
-    return false;
-}
-
 std::vector<uint8_t> readBytes(std::ifstream& in, uint64_t pos, uint64_t size, const std::string& label) {
     if (size > std::numeric_limits<size_t>::max() / 2) throw Error("image too large for this platform");
     std::vector<uint8_t> raw(static_cast<size_t>(size));

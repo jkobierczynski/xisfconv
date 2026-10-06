@@ -132,7 +132,7 @@ struct Options {
     bool compress = false;
     bool bottomUp = true;  // FITS convention: first stored row is the bottom of the image
     bool rowOrderGiven = false;  // --top-down / --bottom-up given explicitly (overrides ROWORDER on FITS input)
-    std::string codec;           // XISF and ASDF output: zlib or zstd
+    std::string codec;           // XISF and ASDF output: zlib or zstd; FITS output: zlib (GZIP tiles)
     bool codecNone = false;      // --codec none: store uncompressed (XISF -> XISF: decompress)
     std::string checksum;        // XISF output: sha1, sha256, sha512, sha3-256 or sha3-512
     bool checksumNone = false;   // --checksum none (XISF -> XISF: remove checksums)
@@ -160,7 +160,8 @@ void usage(std::ostream& os) {
           "       XISF inputs are converted to FITS (default), ASDF, TIFF or PNG, or rewritten as XISF\n"
           "       with another compression or checksum (-t xisf);\n"
           "       FITS inputs to XISF (default), ASDF, TIFF or PNG; tile-compressed FITS (.fits.fz)\n"
-          "       is read like any FITS file, and -t fits writes it as a plain FITS file;\n"
+          "       is read like any FITS file, -t fits writes it as a plain FITS file, and -t fits -c\n"
+          "       writes a FITS file tile-compressed;\n"
           "       ASDF inputs to XISF (default), FITS, TIFF or PNG.\n"
           "       xisfconv --verify <file or directory>... checks files without converting them.\n\n"
           "Output:\n"
@@ -176,7 +177,10 @@ void usage(std::ostream& os) {
           "  -b, --bits <fmt>            output sample format: u8, u16, u32, f32, f64 (default: as stored)\n"
           "  -i, --image <n>             convert only image n (0-based); default: all images\n"
           "                              (FITS, ASDF: extra images become further HDUs; TIFF: extra pages)\n"
-          "  -c, --compress              TIFF: Deflate compression with predictor\n"
+          "  -c, --compress              FITS: tile compression, lossless (image.fits.fz, the format of fpack):\n"
+          "                              RICE_1 for integers, GZIP_2 for floating point. An output name\n"
+          "                              that ends in .fz is written this way with or without -c\n"
+          "                              TIFF: Deflate compression with predictor\n"
           "                              XISF: compress the pixel data (zstd, or zlib without libzstd);\n"
           "                              XISF -> XISF: all attached data blocks\n"
           "                              ASDF: compress the pixel data (zlib)\n"
@@ -202,10 +206,12 @@ void usage(std::ostream& os) {
           "                              if the data fits, else 0:65535 if it fits, else minimum:maximum)\n"
           "      --no-verify             don't verify data block checksums (XISF -> XISF: nor read the output\n"
           "                              back, except with --in-place)\n\n"
-          "XISF and ASDF output:\n"
+          "XISF, ASDF and FITS output:\n"
           "      --codec <zlib|zstd|none>  compression codec (zlib and zstd imply --compress). XISF blocks are\n"
           "                              also byte shuffled. zstd in ASDF needs the asdf-compression package\n"
           "                              in Python. none: no compression; XISF -> XISF: decompress the blocks\n"
+          "                              FITS: zlib compresses the tiles of every sample type with gzip\n"
+          "                              (GZIP_2; GZIP_1 for 8-bit data); there is no zstd for FITS\n"
           "      --checksum <sha1|sha256|sha512|sha3-256|sha3-512|none>\n"
           "                              XISF: store a checksum of the pixel data block; XISF -> XISF: of every\n"
           "                              attached block (none removes them). ASDF blocks always carry MD5.\n"
@@ -227,6 +233,11 @@ std::string lowerExt(const std::string& path) { return toLower(fromPath(toPath(p
 
 std::optional<xisfconv_format> formatFromExtension(const std::string& path) {
     const std::string e = lowerExt(path);
+    // image.fits.fz: FITS, tile-compressed
+    if (e == ".fz") {
+        if (formatFromExtension(fromPath(toPath(path).stem())) == XISFCONV_FORMAT_FITS) return XISFCONV_FORMAT_FITS;
+        return std::nullopt;
+    }
     if (e == ".fits" || e == ".fit" || e == ".fts") return XISFCONV_FORMAT_FITS;
     if (e == ".tif" || e == ".tiff") return XISFCONV_FORMAT_TIFF;
     if (e == ".png") return XISFCONV_FORMAT_PNG;
@@ -241,9 +252,9 @@ std::string outputPathFor(const std::string& input, const Options& opt, xisfconv
     const fs::path dir = opt.outdir.empty() ? p.parent_path() : toPath(opt.outdir);
     fs::path name = p.stem();
     // image.fits.fz is named after "image"
-    if (lowerExt(input) == ".fz" && formatFromExtension(fromPath(name))) name = name.stem();
+    if (lowerExt(input) == ".fz" && formatFromExtension(fromPath(name)) && lowerExt(fromPath(name)) != ".fz") name = name.stem();
     switch (format) {
-        case XISFCONV_FORMAT_FITS: name += ".fits"; break;
+        case XISFCONV_FORMAT_FITS: name += opt.compress ? ".fits.fz" : ".fits"; break;   // tile-compressed, as fpack names it
         case XISFCONV_FORMAT_TIFF: name += ".tif"; break;
         case XISFCONV_FORMAT_PNG: name += ".png"; break;
         case XISFCONV_FORMAT_ASDF: name += ".asdf"; break;
@@ -770,11 +781,7 @@ void findImageFiles(const fs::path& directory, std::vector<std::string>& found, 
                 directories.push_back(it->path());
             } else if (it->is_regular_file(entryError)) {
                 const std::string name = fromPath(it->path());
-                auto format = formatFromExtension(name);
-                // image.fits.fz: a FITS file with tile-compressed images
-                if (!format && lowerExt(name) == ".fz" && formatFromExtension(fromPath(it->path().stem())) == XISFCONV_FORMAT_FITS) {
-                    format = XISFCONV_FORMAT_FITS;
-                }
+                const auto format = formatFromExtension(name);   // image.fits.fz is FITS, too
                 if (format && (*format == XISFCONV_FORMAT_XISF || *format == XISFCONV_FORMAT_FITS || *format == XISFCONV_FORMAT_ASDF)) {
                     found.push_back(name);
                 }

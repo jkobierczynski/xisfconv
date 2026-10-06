@@ -5,6 +5,9 @@
 #include <algorithm>
 #include <cstdio>
 #include <fstream>
+#include <limits>
+
+#include "fitstile.hpp"
 
 namespace xisfconv {
 
@@ -226,59 +229,72 @@ void storeBE(uint8_t* p, T v) {
     for (size_t i = 0; i < sizeof(T); ++i) p[i] = static_cast<uint8_t>(v >> (8 * (sizeof(T) - 1 - i)));
 }
 
+// The samples [first, first + count) of the buffer as a FITS data unit holds them: big-endian,
+// unsigned integers of 16 bits and more as signed ones (the header says BZERO).
+void storedSamples(const PixelBuffer& px, size_t first, size_t count, uint8_t* d) {
+    const size_t sb = sampleBytes(px.format);
+    const uint8_t* s = px.data.data() + first * sb;
+    const size_t m = count;
+    switch (px.format) {
+        case SampleFormat::UInt8:
+            std::memcpy(d, s, m);
+            break;
+        case SampleFormat::UInt16:
+            for (size_t i = 0; i < m; ++i) {
+                uint16_t v; std::memcpy(&v, s + 2 * i, 2);
+                storeBE<uint16_t>(d + 2 * i, static_cast<uint16_t>(v ^ 0x8000u));
+            }
+            break;
+        case SampleFormat::UInt32:
+            for (size_t i = 0; i < m; ++i) {
+                uint32_t v; std::memcpy(&v, s + 4 * i, 4);
+                storeBE<uint32_t>(d + 4 * i, v ^ 0x80000000u);
+            }
+            break;
+        case SampleFormat::UInt64:
+            for (size_t i = 0; i < m; ++i) {
+                uint64_t v; std::memcpy(&v, s + 8 * i, 8);
+                storeBE<uint64_t>(d + 8 * i, v ^ 0x8000000000000000ull);
+            }
+            break;
+        case SampleFormat::Float32:
+            for (size_t i = 0; i < m; ++i) {
+                uint32_t v; std::memcpy(&v, s + 4 * i, 4);
+                storeBE<uint32_t>(d + 4 * i, v);
+            }
+            break;
+        case SampleFormat::Float64:
+            for (size_t i = 0; i < m; ++i) {
+                uint64_t v; std::memcpy(&v, s + 8 * i, 8);
+                storeBE<uint64_t>(d + 8 * i, v);
+            }
+            break;
+    }
+}
+
+void writeZeros(std::ofstream& out, uint64_t count) {
+    const std::vector<char> zeros(static_cast<size_t>(std::min<uint64_t>(count, 1u << 16)), 0);
+    for (uint64_t done = 0; done < count;) {
+        const uint64_t n = std::min<uint64_t>(count - done, zeros.size());
+        out.write(zeros.data(), static_cast<std::streamsize>(n));
+        done += n;
+    }
+}
+
+// Fills the last block of a data unit of `bytes` bytes.
+void padBlock(std::ofstream& out, uint64_t bytes) { writeZeros(out, (kBlock - bytes % kBlock) % kBlock); }
+
 void writeData(std::ofstream& out, const PixelBuffer& px) {
     const size_t sb = sampleBytes(px.format);
     const size_t n = static_cast<size_t>(px.samples());
     const size_t chunk = size_t(1) << 20;
     std::vector<uint8_t> buf(std::min(n, chunk) * sb);
-    const uint8_t* src = px.data.data();
     for (size_t off = 0; off < n; off += chunk) {
         const size_t m = std::min(chunk, n - off);
-        const uint8_t* s = src + off * sb;
-        uint8_t* d = buf.data();
-        switch (px.format) {
-            case SampleFormat::UInt8:
-                std::memcpy(d, s, m);
-                break;
-            case SampleFormat::UInt16:
-                for (size_t i = 0; i < m; ++i) {
-                    uint16_t v; std::memcpy(&v, s + 2 * i, 2);
-                    storeBE<uint16_t>(d + 2 * i, static_cast<uint16_t>(v ^ 0x8000u));
-                }
-                break;
-            case SampleFormat::UInt32:
-                for (size_t i = 0; i < m; ++i) {
-                    uint32_t v; std::memcpy(&v, s + 4 * i, 4);
-                    storeBE<uint32_t>(d + 4 * i, v ^ 0x80000000u);
-                }
-                break;
-            case SampleFormat::UInt64:
-                for (size_t i = 0; i < m; ++i) {
-                    uint64_t v; std::memcpy(&v, s + 8 * i, 8);
-                    storeBE<uint64_t>(d + 8 * i, v ^ 0x8000000000000000ull);
-                }
-                break;
-            case SampleFormat::Float32:
-                for (size_t i = 0; i < m; ++i) {
-                    uint32_t v; std::memcpy(&v, s + 4 * i, 4);
-                    storeBE<uint32_t>(d + 4 * i, v);
-                }
-                break;
-            case SampleFormat::Float64:
-                for (size_t i = 0; i < m; ++i) {
-                    uint64_t v; std::memcpy(&v, s + 8 * i, 8);
-                    storeBE<uint64_t>(d + 8 * i, v);
-                }
-                break;
-        }
-        out.write(reinterpret_cast<const char*>(d), static_cast<std::streamsize>(m * sb));
+        storedSamples(px, off, m, buf.data());
+        out.write(reinterpret_cast<const char*>(buf.data()), static_cast<std::streamsize>(m * sb));
     }
-    const size_t bytes = n * sb;
-    const size_t pad = (kBlock - bytes % kBlock) % kBlock;
-    if (pad) {
-        const std::vector<char> zeros(pad, 0);
-        out.write(zeros.data(), static_cast<std::streamsize>(pad));
-    }
+    padBlock(out, static_cast<uint64_t>(n) * sb);
 }
 
 }  // namespace
@@ -369,59 +385,254 @@ std::string fitsCards(const std::vector<FitsKeyword>& keywords) {
     return text;
 }
 
-void writeFits(const std::string& path, const std::vector<FitsHdu>& hdus) {
+namespace {
+
+std::string logicalCard(const std::string& name, bool v, const std::string& comment) {
+    return valueCard(name, padLeft(v ? "T" : "F", 20), comment);
+}
+
+// The cards that say how the samples of the buffer relate to the integers that are stored.
+void scalingCards(SampleFormat format, std::vector<std::string>& cards) {
+    switch (format) {
+        case SampleFormat::UInt16:
+            cards.push_back(intCard("BZERO", 32768, "offset for unsigned 16-bit data"));
+            cards.push_back(intCard("BSCALE", 1, "default scaling factor"));
+            break;
+        case SampleFormat::UInt32:
+            cards.push_back(intCard("BZERO", 2147483648LL, "offset for unsigned 32-bit data"));
+            cards.push_back(intCard("BSCALE", 1, "default scaling factor"));
+            break;
+        case SampleFormat::UInt64:
+            cards.push_back(valueCard("BZERO", padLeft("9223372036854775808", 20), "offset for unsigned 64-bit data"));
+            cards.push_back(intCard("BSCALE", 1, "default scaling factor"));
+            break;
+        default:
+            break;
+    }
+}
+
+// The cards every image gets after those that describe its storage: who wrote it, its name,
+// the order of its rows, and the keywords it brought along. `tableName`: the EXTNAME of an
+// image without a name, if it needs one.
+void imageCards(const FitsHdu& hdu, const std::vector<FitsKeyword>& keywords, bool first, const char* tableName,
+                std::vector<std::string>& cards) {
+    if (first) cards.push_back(valueCard("PROGRAM", fitsString(std::string("xisfconv ") + kVersion), "software that created this HDU"));
+    bool named = !hdu.extname.empty();
+    if (named) {
+        // The name has to fit one card with its quotes (a quote inside it counts double).
+        std::string name = sanitize(hdu.extname);
+        const std::string whole = name;
+        while (fitsString(name).size() > 70) name.pop_back();
+        if (name != whole) warn("image name '" + whole + "' shortened to fit a FITS card");
+        cards.push_back(valueCard("EXTNAME", fitsString(name), "image identifier"));
+    }
+    for (const auto& k : keywords)
+        if (toUpper(trim(k.name)) == "EXTNAME") named = true;
+    if (!named && tableName) cards.push_back(valueCard("EXTNAME", fitsString(tableName), "name of this binary table extension"));
+    cards.push_back(valueCard("ROWORDER", fitsString(hdu.bottomUp ? "BOTTOM-UP" : "TOP-DOWN"), "order of image rows"));
+    const std::vector<std::string> userCards = userKeywordCards(keywords, !hdu.extname.empty(), first);
+    cards.insert(cards.end(), userCards.begin(), userCards.end());
+}
+
+std::string headerBlocks(std::vector<std::string> cards) {
+    cards.push_back(finishCard("END"));
+    std::string header;
+    for (const auto& c : cards) header += c;
+    header.append((kBlock - header.size() % kBlock) % kBlock, ' ');
+    return header;
+}
+
+void writePlainImage(std::ofstream& out, const FitsHdu& hdu, bool primary, bool first) {
+    const PixelBuffer& px = *hdu.pixels;
+    std::vector<std::string> cards;
+    if (primary) cards.push_back(logicalCard("SIMPLE", true, "file conforms to FITS standard"));
+    else cards.push_back(valueCard("XTENSION", fitsString("IMAGE"), "image extension"));
+    cards.push_back(intCard("BITPIX", bitpixFor(px.format), "bits per data value"));
+    const int naxis = px.channels > 1 ? 3 : 2;
+    cards.push_back(intCard("NAXIS", naxis, "number of data axes"));
+    cards.push_back(intCard("NAXIS1", static_cast<long long>(px.width), "image width"));
+    cards.push_back(intCard("NAXIS2", static_cast<long long>(px.height), "image height"));
+    if (naxis == 3) cards.push_back(intCard("NAXIS3", static_cast<long long>(px.channels), "number of channels"));
+    if (primary) {
+        cards.push_back(logicalCard("EXTEND", true, "file may contain extensions"));
+    } else {
+        cards.push_back(intCard("PCOUNT", 0, "no group parameters"));
+        cards.push_back(intCard("GCOUNT", 1, "one data group"));
+    }
+    scalingCards(px.format, cards);
+    imageCards(hdu, hdu.keywords, first, nullptr, cards);
+    const std::string header = headerBlocks(std::move(cards));
+    out.write(header.data(), static_cast<std::streamsize>(header.size()));
+    writeData(out, px);
+}
+
+// An image as the tiled image compression convention stores it: a binary table with one row
+// per tile, each a descriptor (size and position) of the compressed tile in the heap behind the
+// table. A tile is one row of the image, as in the files of fpack and astropy. The table and the
+// sizes in the header are known only when the tiles are compressed: both are written last, into
+// the room left for them.
+void writeTiledImage(std::ofstream& out, const std::string& path, const FitsHdu& hdu, bool first, FitsTiles tiles) {
+    const PixelBuffer& px = *hdu.pixels;
+    const size_t sb = sampleBytes(px.format);
+    const bool rice = tiles == FitsTiles::Default && !isFloat(px.format);
+    const char* algorithm = rice ? "RICE_1" : sb == 1 ? "GZIP_1" : "GZIP_2";
+    const uint64_t ntiles = checkedMul(px.height, px.channels, "number of tiles");
+    const uint64_t tileSamples = px.width;
+    if (tileSamples > std::numeric_limits<size_t>::max() / 16) throw Error("image too large for this platform");
+
+    // Descriptors of 32 bits where the heap is sure to stay below 2 GiB, of 64 bits otherwise.
+    const uint64_t tileLimit = rice ? riceBound(tileSamples, static_cast<int>(sb)) : TileGzip::bound(tileSamples * sb);
+    const uint64_t narrowLimit = static_cast<uint64_t>(std::numeric_limits<int32_t>::max());
+    const bool wide = tileLimit > narrowLimit || ntiles > narrowLimit / tileLimit;
+    const size_t rowBytes = wide ? 16 : 8;
+    const uint64_t tableBytes = checkedMul(ntiles, rowBytes, "table size");
+    if (tableBytes > std::numeric_limits<size_t>::max() / 2) throw Error("image too large for this platform");
+
+    // The cards of the image itself. Keywords that describe a compressed image and its table
+    // (an image read from a tile-compressed file has none, but a caller may hand some over)
+    // would contradict those written here, or be taken for them by a reader: they are left out.
+    std::vector<FitsKeyword> keywords;
+    for (const auto& k : hdu.keywords) {
+        const std::string name = toUpper(trim(k.name));
+        if (isTileKeyword(name)) warn("keyword " + name + " describes a tile-compressed image and is set by the writer; the one given is left out");
+        else keywords.push_back(k);
+    }
+    std::vector<std::string> ownCards;
+    imageCards(hdu, keywords, first, "COMPRESSED_IMAGE", ownCards);
+
+    const int naxis = px.channels > 1 ? 3 : 2;
+    auto header = [&](uint64_t heapBytes, uint64_t longestTile) {
+        std::vector<std::string> cards;
+        cards.push_back(valueCard("XTENSION", fitsString("BINTABLE"), "binary table extension"));
+        cards.push_back(intCard("BITPIX", 8, "array data type"));
+        cards.push_back(intCard("NAXIS", 2, "number of array dimensions"));
+        cards.push_back(intCard("NAXIS1", static_cast<long long>(rowBytes), "width of table in bytes"));
+        cards.push_back(intCard("NAXIS2", static_cast<long long>(ntiles), "number of rows in table: the tiles"));
+        cards.push_back(intCard("PCOUNT", static_cast<long long>(heapBytes), "size of the heap: the compressed tiles"));
+        cards.push_back(intCard("GCOUNT", 1, "one data group"));
+        cards.push_back(intCard("TFIELDS", 1, "number of fields in each row"));
+        cards.push_back(valueCard("TTYPE1", fitsString("COMPRESSED_DATA"), "label for field 1"));
+        cards.push_back(valueCard("TFORM1", fitsString(std::string(wide ? "1QB(" : "1PB(") + std::to_string(longestTile) + ")"),
+                                  "variable-length array of bytes"));
+        cards.push_back(logicalCard("ZIMAGE", true, "extension contains a compressed image"));
+        if (first) {
+            cards.push_back(logicalCard("ZSIMPLE", true, "file conforms to FITS standard"));
+        } else {
+            cards.push_back(valueCard("ZTENSION", fitsString("IMAGE"), "image extension"));
+        }
+        // (with the comments of the plain image, which funpack takes over when it restores it)
+        cards.push_back(intCard("ZBITPIX", bitpixFor(px.format), "bits per data value"));
+        cards.push_back(intCard("ZNAXIS", naxis, "number of data axes"));
+        cards.push_back(intCard("ZNAXIS1", static_cast<long long>(px.width), "image width"));
+        cards.push_back(intCard("ZNAXIS2", static_cast<long long>(px.height), "image height"));
+        if (naxis == 3) cards.push_back(intCard("ZNAXIS3", static_cast<long long>(px.channels), "number of channels"));
+        if (first) {
+            cards.push_back(logicalCard("ZEXTEND", true, "file may contain extensions"));
+        } else {
+            cards.push_back(intCard("ZPCOUNT", 0, "no group parameters"));
+            cards.push_back(intCard("ZGCOUNT", 1, "one data group"));
+        }
+        cards.push_back(intCard("ZTILE1", static_cast<long long>(px.width), "width of a tile"));
+        cards.push_back(intCard("ZTILE2", 1, "height of a tile: one row"));
+        if (naxis == 3) cards.push_back(intCard("ZTILE3", 1, "a tile stays within a channel"));
+        cards.push_back(valueCard("ZCMPTYPE", fitsString(algorithm), "compression algorithm"));
+        if (rice) {
+            cards.push_back(valueCard("ZNAME1", fitsString("BLOCKSIZE"), "compression block size"));
+            cards.push_back(intCard("ZVAL1", kRiceBlockSize, "pixels per block"));
+            cards.push_back(valueCard("ZNAME2", fitsString("BYTEPIX"), "bytes per pixel (1, 2, 4, or 8)"));
+            cards.push_back(intCard("ZVAL2", static_cast<long long>(sb), "bytes per pixel (1, 2, 4, or 8)"));
+        }
+        if (isFloat(px.format)) cards.push_back(valueCard("ZQUANTIZ", fitsString("NONE"), "lossless: the pixels are not quantized"));
+        scalingCards(px.format, cards);
+        cards.insert(cards.end(), ownCards.begin(), ownCards.end());
+        return headerBlocks(std::move(cards));
+    };
+
+    const std::ofstream::pos_type headerAt = out.tellp();
+    const std::string placeholder = header(0, 0);
+    out.write(placeholder.data(), static_cast<std::streamsize>(placeholder.size()));
+    const std::ofstream::pos_type tableAt = out.tellp();
+    writeZeros(out, tableBytes);
+
+    std::vector<uint8_t> table(static_cast<size_t>(tableBytes));
+    std::vector<uint8_t> tile(static_cast<size_t>(tileSamples) * sb);
+    TileGzip gzip;
+    uint64_t heap = 0, longest = 0;
+    const size_t count = static_cast<size_t>(tileSamples);
+    // a sign of life (and a chance to stop) every 8 MiB of pixels or so
+    const uint64_t reportEvery = std::max<uint64_t>(1, (uint64_t(8) << 20) / (tileSamples * sb));
+    // The rows of the buffer one after the other, channel by channel: the order of the tiles.
+    for (uint64_t row = 0; row < ntiles; ++row) {
+        if (row % reportEvery == 0) progress("compressing", row, ntiles);
+        storedSamples(px, static_cast<size_t>(row) * count, count, tile.data());
+        const std::vector<uint8_t> packed = rice ? riceEncode(tile.data(), count, static_cast<int>(sb))
+                                                 : gzip.compress(tile.data(), count, sb, true);
+        if (!wide && heap + packed.size() > narrowLimit) throw Error("the compressed tiles do not fit the table (internal error)");
+        uint8_t* descriptor = table.data() + static_cast<size_t>(row) * rowBytes;
+        if (wide) {
+            storeBE<uint64_t>(descriptor, packed.size());
+            storeBE<uint64_t>(descriptor + 8, heap);
+        } else {
+            storeBE<uint32_t>(descriptor, static_cast<uint32_t>(packed.size()));
+            storeBE<uint32_t>(descriptor + 4, static_cast<uint32_t>(heap));
+        }
+        out.write(reinterpret_cast<const char*>(packed.data()), static_cast<std::streamsize>(packed.size()));
+        if (!out) throw Error("write error on " + path, ErrorKind::Io);
+        heap += packed.size();
+        longest = std::max<uint64_t>(longest, packed.size());
+    }
+    padBlock(out, tableBytes + heap);
+    const std::ofstream::pos_type endAt = out.tellp();
+
+    const std::string finished = header(heap, longest);
+    if (finished.size() != placeholder.size()) throw Error("the header of the compressed image changed its size (internal error)");
+    out.seekp(headerAt);
+    out.write(finished.data(), static_cast<std::streamsize>(finished.size()));
+    out.seekp(tableAt);
+    out.write(reinterpret_cast<const char*>(table.data()), static_cast<std::streamsize>(table.size()));
+    out.seekp(endAt);
+}
+
+}  // namespace
+
+void writeFits(const std::string& path, const std::vector<FitsHdu>& hdus, const FitsWriteOptions& options) {
     std::ofstream out(toPath(path), std::ios::binary | std::ios::trunc);
     if (!out) throw Error("cannot create " + path, ErrorKind::Io);
 
-    for (size_t h = 0; h < hdus.size(); ++h) {
-        const FitsHdu& hdu = hdus[h];
-        const PixelBuffer& px = *hdu.pixels;
-        std::vector<std::string> cards;
-        if (h == 0) cards.push_back(valueCard("SIMPLE", padLeft("T", 20), "file conforms to FITS standard"));
-        else cards.push_back(valueCard("XTENSION", fitsString("IMAGE"), "image extension"));
-        cards.push_back(intCard("BITPIX", bitpixFor(px.format), "bits per data value"));
-        const int naxis = px.channels > 1 ? 3 : 2;
-        cards.push_back(intCard("NAXIS", naxis, "number of data axes"));
-        cards.push_back(intCard("NAXIS1", static_cast<long long>(px.width), "image width"));
-        cards.push_back(intCard("NAXIS2", static_cast<long long>(px.height), "image height"));
-        if (naxis == 3) cards.push_back(intCard("NAXIS3", static_cast<long long>(px.channels), "number of channels"));
-        if (h == 0) {
-            cards.push_back(valueCard("EXTEND", padLeft("T", 20), "file may contain extensions"));
-        } else {
-            cards.push_back(intCard("PCOUNT", 0, "no group parameters"));
-            cards.push_back(intCard("GCOUNT", 1, "one data group"));
+    if (options.tiles == FitsTiles::None) {
+        for (size_t h = 0; h < hdus.size(); ++h) {
+            writePlainImage(out, hdus[h], h == 0, h == 0);
+            if (!out) throw Error("write error on " + path, ErrorKind::Io);
         }
-        switch (px.format) {
-            case SampleFormat::UInt16:
-                cards.push_back(intCard("BZERO", 32768, "offset for unsigned 16-bit data"));
-                cards.push_back(intCard("BSCALE", 1, "default scaling factor"));
-                break;
-            case SampleFormat::UInt32:
-                cards.push_back(intCard("BZERO", 2147483648LL, "offset for unsigned 32-bit data"));
-                cards.push_back(intCard("BSCALE", 1, "default scaling factor"));
-                break;
-            case SampleFormat::UInt64:
-                cards.push_back(valueCard("BZERO", padLeft("9223372036854775808", 20), "offset for unsigned 64-bit data"));
-                cards.push_back(intCard("BSCALE", 1, "default scaling factor"));
-                break;
-            default:
-                break;
+    } else {
+        // Two kinds of image stay as they are: 64-bit integers, which CFITSIO (and with it most
+        // programs) neither writes nor reads tile-compressed, and an image without pixels.
+        auto compressed = [](const FitsHdu& hdu) {
+            return hdu.pixels->samples() != 0 && hdu.pixels->format != SampleFormat::UInt64;
+        };
+        for (const FitsHdu& hdu : hdus) {
+            if (hdu.pixels->format == SampleFormat::UInt64) {
+                warn("64-bit integer images are not tile-compressed (CFITSIO does not read them): " +
+                     (hdu.extname.empty() ? std::string("the image") : "image '" + hdu.extname + "'") + " is stored as it is");
+            }
         }
-        if (h == 0) cards.push_back(valueCard("PROGRAM", fitsString(std::string("xisfconv ") + kVersion),
-                                              "software that created this HDU"));
-        if (!hdu.extname.empty()) cards.push_back(valueCard("EXTNAME", fitsString(sanitize(hdu.extname)), "image identifier"));
-        cards.push_back(valueCard("ROWORDER", fitsString(hdu.bottomUp ? "BOTTOM-UP" : "TOP-DOWN"), "order of image rows"));
-
-        const std::vector<std::string> userCards = userKeywordCards(hdu.keywords, !hdu.extname.empty(), h == 0);
-        cards.insert(cards.end(), userCards.begin(), userCards.end());
-        cards.push_back(finishCard("END"));
-
-        std::string header;
-        for (const auto& c : cards) header += c;
-        header.append((kBlock - header.size() % kBlock) % kBlock, ' ');
-        out.write(header.data(), static_cast<std::streamsize>(header.size()));
-        writeData(out, px);
-        if (!out) throw Error("write error on " + path, ErrorKind::Io);
+        // A compressed image is a table, and a table cannot be the primary HDU: that one is
+        // empty then, and the first image says that it belongs there (ZSIMPLE).
+        const bool emptyPrimary = compressed(hdus.front());
+        if (emptyPrimary) {
+            std::vector<std::string> cards;
+            cards.push_back(logicalCard("SIMPLE", true, "file conforms to FITS standard"));
+            cards.push_back(intCard("BITPIX", 8, "bits per data value"));
+            cards.push_back(intCard("NAXIS", 0, "no data: the images are in the extensions"));
+            cards.push_back(logicalCard("EXTEND", true, "file may contain extensions"));
+            const std::string primary = headerBlocks(std::move(cards));
+            out.write(primary.data(), static_cast<std::streamsize>(primary.size()));
+        }
+        for (size_t h = 0; h < hdus.size(); ++h) {
+            if (compressed(hdus[h])) writeTiledImage(out, path, hdus[h], h == 0, options.tiles);
+            else writePlainImage(out, hdus[h], h == 0, h == 0);
+            if (!out) throw Error("write error on " + path, ErrorKind::Io);
+        }
     }
     out.close();
     if (!out) throw Error("write error on " + path, ErrorKind::Io);

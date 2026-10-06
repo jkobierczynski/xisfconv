@@ -52,8 +52,8 @@
 #include <stdint.h>
 
 #define XISFCONV_VERSION_MAJOR 0
-#define XISFCONV_VERSION_MINOR 11
-#define XISFCONV_VERSION_PATCH 1
+#define XISFCONV_VERSION_MINOR 12
+#define XISFCONV_VERSION_PATCH 0
 
 #if defined(XISFCONV_STATIC)
 #  define XISFCONV_API
@@ -102,7 +102,7 @@ XISFCONV_API const char *xisfconv_status_text(xisfconv_status status);
  * Library information
  * ---------------------------------------------------------------------------------------- */
 
-/* "0.11.0" */
+/* "0.12.0" */
 XISFCONV_API const char *xisfconv_version(void);
 /* major * 10000 + minor * 100 + patch, for comparing at run time */
 XISFCONV_API int32_t xisfconv_version_number(void);
@@ -116,7 +116,8 @@ enum {
     XISFCONV_CODEC_LZ4HC   = 3,  /* read only */
     XISFCONV_CODEC_ZSTD    = 4,  /* needs a build with libzstd */
     XISFCONV_CODEC_DEFAULT = 5   /* writing: the usual codec of the format. XISF: Zstandard, or zlib in
-                                    a build without libzstd; ASDF: zlib; TIFF: Deflate */
+                                    a build without libzstd; ASDF: zlib; TIFF: Deflate; FITS: tile
+                                    compression with RICE_1 (GZIP_2 for floating point) */
 };
 
 /* 1 if this build can read (for_writing = 0) or write (for_writing = 1) the codec, else 0. */
@@ -140,8 +141,10 @@ enum {
 typedef void (*xisfconv_message_fn)(void *user, xisfconv_message_level level, const char *path, const char *message);
 
 /* Called from time to time during reading, writing, rewriting and verifying. `stage` is a short
- * word ("reading", "writing", "rewriting", "comparing", "verifying"); `total` is 0 when the
- * amount of work is not known. Return 0 to go on, anything else to stop: the call in progress
+ * word ("reading", "writing", "compressing", "rewriting", "comparing", "verifying"); `total` is 0
+ * when the amount of work is not known. ("compressing", for tile-compressed FITS, counts the
+ * rows of the image being written: it starts again with every image, every 8 MiB or so of
+ * pixels, and is not called once more when an image is complete.) Return 0 to go on, anything else to stop: the call in progress
  * then returns XISFCONV_ERR_CANCELLED and leaves no partly written file behind. */
 typedef int32_t (*xisfconv_progress_fn)(void *user, const char *stage, uint64_t done, uint64_t total);
 
@@ -603,8 +606,8 @@ XISFCONV_API xisfconv_status xisfconv_wcs_flip_rows(xisfconv_keywords *kw, uint6
  * Converting files
  *
  * The whole of the command line tool's conversion in one call: XISF to FITS, ASDF, TIFF or PNG;
- * FITS and ASDF to XISF, to each other, or to TIFF or PNG; FITS to FITS for a file with
- * tile-compressed images (they are written as plain images). XISF to XISF is xisfconv_rewrite.
+ * FITS and ASDF to XISF, to each other, or to TIFF or PNG; FITS to FITS to write tile-compressed
+ * images as plain ones, or plain images tile-compressed. XISF to XISF is xisfconv_rewrite.
  * ---------------------------------------------------------------------------------------- */
 
 typedef struct xisfconv_convert_options {
@@ -617,7 +620,16 @@ typedef struct xisfconv_convert_options {
 
     /* -c / --codec. Default XISFCONV_CODEC_NONE. XISF: ZLIB or ZSTD, with byte shuffling. ASDF:
      * ZLIB or ZSTD. TIFF: any value but NONE means Deflate with predictor. DEFAULT picks the
-     * usual codec of the output format. */
+     * usual codec of the output format.
+     * FITS: the images are written tile-compressed (the tiled image compression convention of
+     * the FITS standard, the format of fpack), one row per tile and without loss: DEFAULT uses
+     * RICE_1 for integers and GZIP_2 for floating point, ZLIB uses gzip for both (GZIP_2, and
+     * GZIP_1 for 8-bit samples); ZSTD is XISFCONV_ERR_ARGUMENT (XISFCONV_ERR_UNSUPPORTED in a
+     * build without libzstd). Images of 64-bit integers stay uncompressed (a warning says so):
+     * CFITSIO reads no such compressed images. An output path that ends in ".fz"
+     * (image.fits.fz) is written with DEFAULT also when the codec is NONE. Keywords that
+     * describe a compressed image and its table (TFORMn, ZCMPTYPE, ZSCALE, ...) are left out of
+     * such a file, with a warning. (Up to 0.11 the codec had no effect on FITS output.) */
     xisfconv_codec codec;
     xisfconv_checksum checksum;           /* XISF output; default XISFCONV_CHECKSUM_NONE */
     uint64_t subblock_size;               /* XISF output; default 1 GiB */

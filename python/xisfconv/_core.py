@@ -167,6 +167,8 @@ _OPTION_WORDS = [
     ("--bits f32", 'sample_format="float32"'),
     ("--bits", "sample_format"),
     ("--codec zlib", 'codec="zlib"'),
+    ("use --compress", "use codec=True"),
+    ("add --compress", "add codec=True"),
     ("--compress", "codec"),
     ("--force", "overwrite=True"),
     ("--bounds expects lo:hi with hi > lo, e.g. 0:65535", "bounds expects (lower, upper) with upper above lower"),
@@ -1966,6 +1968,10 @@ def write(path, images, *, format=None, codec=None, checksum=None, stored_row_or
     codec
         None: no compression. "zlib" or "zstd" for XISF and ASDF; any codec means Deflate
         for TIFF. ``True`` or "default": the usual codec of the format.
+        FITS: the images are written tile-compressed and without loss, in the format of
+        fpack: ``True`` uses RICE_1 for integers and GZIP_2 for floating point, "zlib" gzip
+        for both. A ``path`` that ends in ".fz" (``image.fits.fz``) is written that way
+        whatever ``codec`` says. Images of 64-bit integers stay uncompressed, with a warning.
     checksum
         XISF: "sha1", "sha256", "sha512" (also "sha3-256" and "sha3-512", which PixInsight
         does not open).
@@ -1978,7 +1984,8 @@ def write(path, images, *, format=None, codec=None, checksum=None, stored_row_or
         Replace an existing file. Without it :class:`OutputExistsError`.
     progress
         A function ``progress(stage, done, total)``, called when the file is written (once: a
-        file is written in one step). An exception it raises stops the work.
+        file is written in one step, except tile-compressed FITS, which reports as it goes).
+        An exception it raises stops the work.
 
     About a NumPy array (an :class:`Image` brings its own): ``keywords``, ``name``, ``bounds``,
     ``icc_profile``, ``row_order`` (of the array: "top-down" or "bottom-up"), ``channels``
@@ -2062,7 +2069,8 @@ def convert(input, output, *, format=None, sample_format=None, image=None, stret
             subblock_size=None, row_order=None, property_keywords=True, wcs=True, sip_order=3, verify=True, bounds=None,
             overwrite=False, progress=None):   # noqa: A002 - the names of the command line
     """Converts a file, as the command line tool does: XISF to FITS, ASDF, TIFF or PNG; FITS
-    and ASDF to XISF, to each other, or to TIFF or PNG. (XISF to XISF is :func:`rewrite`.)
+    and ASDF to XISF, to each other, or to TIFF or PNG; FITS to FITS to pack a file
+    (``codec=True``: tile-compressed) or to unpack one. (XISF to XISF is :func:`rewrite`.)
 
     format
         Of the output; None: from the extension of ``output``.

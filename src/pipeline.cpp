@@ -236,6 +236,22 @@ std::pair<double, double> floatBounds(const FitsImage& img, const ConvertOptions
     return {img.dataMin, img.dataMax > img.dataMin ? img.dataMax : img.dataMin + 1};
 }
 
+// How FITS output is stored: tile-compressed when compression is asked for, and when the output
+// has the name of a tile-compressed file (image.fits.fz).
+FitsWriteOptions fitsStorage(const ConvertOptions& opt, const std::string& outPath) {
+    FitsWriteOptions storage;
+    if (opt.compress) {
+        if (opt.codec == "zstd") {
+            throw Error("FITS has no Zstandard compression; use --compress for tile compression (RICE_1, and GZIP_2 for "
+                        "floating point), or --codec zlib for GZIP_2 alone", ErrorKind::Argument);
+        }
+        storage.tiles = opt.codec == "zlib" ? FitsTiles::Gzip : FitsTiles::Default;
+    } else if (toLower(fromPath(toPath(outPath).extension())) == ".fz") {
+        storage.tiles = FitsTiles::Default;
+    }
+    return storage;
+}
+
 }  // namespace
 
 InputFormat detectInputFormat(const std::string& path) {
@@ -352,6 +368,7 @@ void flipKeywordRows(std::vector<FitsKeyword>& keywords, uint64_t height) {
 
 void convertXisfFile(const std::string& input, const std::string& outPath, Format format, const ConvertOptions& opt) {
     if (format == Format::Xisf) throw Error("XISF to XISF is a rewrite, not a conversion", ErrorKind::Argument);
+    const FitsWriteOptions fitsOptions = format == Format::Fits ? fitsStorage(opt, outPath) : FitsWriteOptions();
     XisfFile file(input);
 
     std::vector<size_t> indices;
@@ -475,7 +492,7 @@ void convertXisfFile(const std::string& input, const std::string& outPath, Forma
                 if (opt.compress) aopt.codec = opt.codec.empty() ? "zlib" : opt.codec;
                 writeAsdf(tmpPath, hdus, aopt);
             } else {
-                writeFits(tmpPath, hdus);
+                writeFits(tmpPath, hdus, fitsOptions);
             }
         } else if (format == Format::Tiff) {
             std::vector<TiffPage> pages;
@@ -529,6 +546,7 @@ void convertXisfFile(const std::string& input, const std::string& outPath, Forma
 void convertFitsOrAsdfFile(const std::string& input, InputFormat kind, const std::string& outPath, Format format,
                            const ConvertOptions& opt) {
     if (kind == InputFormat::Xisf) throw Error("not a FITS or ASDF file", ErrorKind::Argument);
+    if (format == Format::Fits) fitsStorage(opt, outPath);   // an option that does not apply is reported before the file is read
     const bool asdfInput = kind == InputFormat::Asdf;
     const char* inputName = asdfInput ? "ASDF" : "FITS";
     const bool exporting = format == Format::Tiff || format == Format::Png;
@@ -552,12 +570,14 @@ void convertFitsOrAsdfFile(const std::string& input, InputFormat kind, const std
     for (const auto& s : fits.skipped) warn("skipped " + s);
     if (fits.images.empty()) throw Error(std::string("no image data found in this ") + inputName + " file");
     if (!asdfInput && format == Format::Fits) {
-        // FITS -> FITS has one use: writing tile-compressed images as plain ones.
+        // FITS -> FITS has two uses: writing tile-compressed images as plain ones, and plain
+        // images as tile-compressed ones (what funpack and fpack do).
         bool tiled = false;
         for (const auto& img : fits.images)
             if (!img.tileCompression.empty()) tiled = true;
-        if (!tiled) {
-            throw Error("the input is already a FITS file; choose xisf, asdf, tiff or png as output", ErrorKind::Argument);
+        if (!tiled && fitsStorage(opt, outPath).tiles == FitsTiles::None) {
+            throw Error("the input is already a FITS file; choose xisf, asdf, tiff or png as output, or add --compress "
+                        "for a tile-compressed FITS file", ErrorKind::Argument);
         }
     }
     ImageSetOrigin origin;
@@ -585,6 +605,7 @@ void writeImageSet(FitsFile& fits, const ImageSetOrigin& source, const std::stri
     const bool exporting = format == Format::Tiff || format == Format::Png;
     const std::string& input = source.input;
     if (fits.images.empty()) throw Error("no images to write", ErrorKind::Argument);
+    const FitsWriteOptions fitsOptions = format == Format::Fits ? fitsStorage(opt, outPath) : FitsWriteOptions();
 
     std::vector<size_t> indices;
     if (opt.imageIndex) {
@@ -761,7 +782,7 @@ void writeImageSet(FitsFile& fits, const ImageSetOrigin& source, const std::stri
                 if (opt.compress) aopt.codec = opt.codec.empty() ? "zlib" : opt.codec;
                 writeAsdf(tmpPath, hdus, aopt);
             } else {
-                writeFits(tmpPath, hdus);
+                writeFits(tmpPath, hdus, fitsOptions);
             }
             replaceFile(tmpPath, outPath);
         } catch (...) {

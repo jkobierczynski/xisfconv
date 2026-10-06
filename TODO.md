@@ -11,6 +11,8 @@ in `DEVELOPMENT.md`.
       and lossless floating point) instead of asking for funpack; `-t fits` unpacks (0.9.0)
 - [x] **libxisfconv**: the converter as a library with a plain C API (0.10.0), and its Python
       package: NumPy arrays, astropy `CCDData` and HDU lists (0.11.0); see "Library" below
+- [x] Write tile-compressed FITS (`-c` on FITS output, `image.fits.fz`): lossless, RICE_1 for
+      integers and GZIP_2 for floating point, the tiles and the layout of fpack (0.12.0)
 - [ ] Lossless property round trip: carry all XISF properties through FITS (HIERARCH keywords) and
       ASDF (tree entries) and restore them on the way back
 - [ ] Downsampling (`--resize` / `--bin`) for TIFF and PNG export, and a `.thumbnailer` entry so Linux
@@ -27,8 +29,9 @@ Smaller items, each closing a limitation listed in the README:
 - [ ] Recursive directory conversion (directories are accepted by `--verify` only)
 - [ ] Wildcard expansion on Windows (`*.xisf` is not expanded by cmd or PowerShell)
 - [ ] Write CHECKSUM / DATASUM keywords in FITS output
-- [ ] Write tile-compressed FITS (`-t fits -c`: RICE_1 for integers, GZIP_2 for floating point)
 - [ ] Read HCOMPRESS_1 tile compression
+- [ ] Tile-compressed FITS output: quantized floating point as an option (lossy, fpack's default
+      for floats and much smaller), a choice of tile shape
 
 ## Library
 
@@ -48,8 +51,11 @@ The decisions are recorded in `DEVELOPMENT.md`; the API is `include/xisfconv.h`.
 
 Open checks of the Python package:
 
-- [ ] Run the `wheels` workflow once (it can be started by hand): the wheels for macOS and Windows
-      have never been built, and the Linux ones only outside the manylinux container.
+- [ ] The Windows wheel: the `wheels` workflow built and tested the wheels for Linux (x86_64,
+      arm64) and macOS and the source distribution for v0.11.1, but the Windows wheel failed in
+      its build step (the cause is in the log of that step, not yet looked at). The same build
+      with GCC on Windows Python under Wine works, as do `delvewheel repair` and the tests of the
+      installed wheel.
 - [ ] Register the project on PyPI and switch publishing on (see "Releasing" in the README).
 
 Later, each when it is needed:

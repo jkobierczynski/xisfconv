@@ -1,4 +1,4 @@
-// FITS writer (primary HDU + IMAGE extensions).
+// FITS writer (primary HDU + IMAGE extensions, or tile-compressed images).
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 Jurgen Kobierczynski
 #pragma once
@@ -17,7 +17,21 @@ struct FitsHdu {
     bool bottomUp = false;  // pixel rows already flipped to bottom-up order
 };
 
-void writeFits(const std::string& path, const std::vector<FitsHdu>& hdus);
+// How the images are stored. With tile compression (the "tiled image compression convention" of
+// the FITS standard, the format of fpack) each image is a binary table that holds its rows
+// compressed one by one, behind a primary HDU without data. Both choices are lossless.
+// Images of 64-bit integers stay plain images (CFITSIO has no tile compression for them).
+enum class FitsTiles {
+    None,     // plain images: the primary HDU and IMAGE extensions
+    Default,  // RICE_1 for integers, GZIP_2 for floating point
+    Gzip      // GZIP_2 for every sample type (GZIP_1 for single bytes, which is the same)
+};
+
+struct FitsWriteOptions {
+    FitsTiles tiles = FitsTiles::None;
+};
+
+void writeFits(const std::string& path, const std::vector<FitsHdu>& hdus, const FitsWriteOptions& options = {});
 
 // The cards the writer makes of the keywords of an image, 80 characters each, one after the
 // other: long strings on CONTINUE cards (announced by a LONGSTRN card), HIERARCH for names

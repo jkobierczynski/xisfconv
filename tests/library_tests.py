@@ -392,6 +392,66 @@ def test_write_fits():
         check(r.returncode == 0, f"fitsverify accepts the file: {r.stdout.strip()[:200]}")
 
 
+def test_write_fits_tile_compressed():
+    """FITS with a codec: tile-compressed without loss. astropy decompresses it, and its Rice
+    encoder gives the same tiles."""
+    import warnings
+    path = os.path.join(TMP, "w.fits.fz")
+
+    def table(n=1):
+        with fits.open(path, disable_image_compression=True) as h:
+            return h[n].header.copy(), [np.asarray(x, np.uint8).tobytes() for x in h[n].data["COMPRESSED_DATA"]]
+
+    for dtype in DTYPES:
+        for shape in SHAPES:
+            a = image(dtype, shape)
+            label = f"{np.dtype(dtype).name} {shape}"
+            for codec, gzip_only in ((CODEC_DEFAULT, False), (CODEC_ZLIB, True)):
+                check(write_images(path, [a], cards=CARDS, names=["first"], codec=codec) == OK, f"write tile-compressed FITS {label}: {err()}")
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    with fits.open(path) as h:
+                        d = np.array(h[-1].data)
+                        check(same(d if d.ndim == 3 else d[None], a[:, ::-1, :]) and h[-1].header["OBJECT"] == "M 31" and
+                              h[-1].header["EXTNAME"] == "first", f"tile-compressed FITS {label}: astropy reads the array and the keywords")
+                        compressed = type(h[-1]).__name__ == "CompImageHDU"
+                    if np.dtype(dtype) == np.uint64:
+                        check(not compressed, f"{label}: 64-bit integers stay a plain image")
+                        continue
+                    header, mine = table()
+                    rice = not gzip_only and np.dtype(dtype).kind == "u"
+                    check(compressed and header["ZCMPTYPE"] == ("RICE_1" if rice else "GZIP_1" if np.dtype(dtype).itemsize == 1 else "GZIP_2"),
+                          f"{label}: {header['ZCMPTYPE']}")
+                    if rice:
+                        ref = os.path.join(TMP, "ref.fits.fz")
+                        fits.HDUList([fits.PrimaryHDU(), fits.CompImageHDU(a[:, ::-1, :] if a.shape[0] > 1 else a[0, ::-1], compression_type="RICE_1")]).writeto(
+                            ref, overwrite=True)
+                        with fits.open(ref, disable_image_compression=True) as h:
+                            theirs = [np.asarray(x, np.uint8).tobytes() for x in h[1].data["COMPRESSED_DATA"]]
+                            comparable = h[1].header["ZVAL2"] == header["ZVAL2"] and h[1].header.get("ZTILE2", 1) == 1
+                        check(comparable and mine == theirs, f"{label}: the Rice tiles are astropy's, byte for byte")
+            with Opened(path) as f:
+                d = f.read(rows=ROWS_TOP_DOWN)
+                check(same(d, a) and f.detail("tileCompression") == ("" if np.dtype(dtype) == np.uint64 else header["ZCMPTYPE"]),
+                      f"{label}: the library reads its own file back")
+    # by the name alone, several images, and what FITS does not have
+    a, b = image(np.uint16, (1, 20, 30)), image(np.float32, (3, 8, 9))
+    check(write_images(path, [a, b], names=["one", "two"]) == OK, "write two images to a name that ends in .fz")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with fits.open(path) as h:
+            check([type(x).__name__ for x in h] == ["PrimaryHDU", "CompImageHDU", "CompImageHDU"] and same(np.array(h[1].data)[None], a[:, ::-1]) and
+                  same(np.array(h[2].data), b[:, ::-1]) and h[2].header["EXTNAME"] == "two", "two tile-compressed images")
+    check(table(1)[0]["ZCMPTYPE"] == "RICE_1" and table(2)[0]["ZCMPTYPE"] == "GZIP_2", "RICE_1 for integers, GZIP_2 for floating point")
+    r = subprocess.run(["fitsverify", "-q", path], capture_output=True, text=True) if shutil.which("fitsverify") else None
+    if r is not None:
+        check(r.returncode == 0, f"fitsverify accepts the file: {r.stdout.strip()[:200]}")
+    zstd = os.path.join(TMP, "zstd.fits")
+    st = write_images(zstd, [a], codec=CODEC_ZSTD)
+    check(st in (ERR_ARGUMENT, ERR_UNSUPPORTED) and not os.path.exists(zstd) and not os.path.exists(zstd + ".part"),
+          f"FITS has no Zstandard: {err()}")
+
+
 def xisf_read(path, n=0):
     x = XISF(path)
     return x, np.moveaxis(np.asarray(x.read_image(n)), -1, 0)   # channels last -> first
@@ -1109,7 +1169,7 @@ if __name__ == "__main__":
     print("libxisfconv:", LIB_PATH, version().decode())
     print("xisfconv:", EXE or "(not given: the comparison with the tool's --stretch is skipped)")
     print("asdf + asdf-astropy:", "yes" if HAVE_ASDF else "no")
-    for t in (test_write_fits, test_write_xisf, test_write_asdf, test_write_tiff_png, test_writer_arguments, test_read_fits,
+    for t in (test_write_fits, test_write_fits_tile_compressed, test_write_xisf, test_write_asdf, test_write_tiff_png, test_writer_arguments, test_read_fits,
               test_read_xisf, test_wcs, test_wcs_forms, test_stretch, test_odd_files, test_locale, test_progress_and_cancel,
               test_kept_messages_and_cancel_from_another_thread, test_threads, test_silence):
         try:

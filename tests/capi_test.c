@@ -529,7 +529,9 @@ static void test_convert_rewrite_verify(xisfconv_context *ctx) {
     CHECK(xisfconv_convert(ctx, path_of("missing.xisf"), path_of("m.fits"), NULL) == XISFCONV_ERR_IO, "an input that is not there");
     CHECK(xisfconv_convert(ctx, path_of("gray.png"), path_of("m.fits"), NULL) == XISFCONV_ERR_FORMAT, "an input that is no image file");
     CHECK(xisfconv_convert(ctx, path_of("gray.xisf"), path_of("same.xisf"), NULL) == XISFCONV_ERR_ARGUMENT, "XISF to XISF is a rewrite");
-    CHECK(xisfconv_convert(ctx, path_of("gray.fits"), path_of("same.fits"), NULL) == XISFCONV_ERR_ARGUMENT, "FITS to FITS needs a reason");
+    CHECK(xisfconv_convert(ctx, path_of("conv.fits"), path_of("same.fits"), NULL) == XISFCONV_ERR_ARGUMENT, "FITS to FITS needs a reason");
+    CHECK(xisfconv_convert(ctx, path_of("gray.fits"), path_of("same.fits"), NULL) == XISFCONV_OK,
+          "which a tile-compressed file is (the writer compressed gray.fits)");
     xisfconv_convert_options_init(&co, sizeof co);
     co.sip_order = 1;
     CHECK(xisfconv_convert(ctx, path_of("gray.xisf"), path_of("sip.fits"), &co) == XISFCONV_ERR_ARGUMENT, "a SIP order out of range");
@@ -593,6 +595,178 @@ static void test_convert_rewrite_verify(xisfconv_context *ctx) {
         st = xisfconv_read_pixels(f, 0, NULL, back, sizeof back);
         CHECK(st == XISFCONV_ERR_CHECKSUM, "but its pixels are refused");
         xisfconv_close(f);
+    }
+}
+
+/* ---- tile-compressed FITS ---- */
+
+typedef struct {
+    int compressing, others, cancel_at;
+    uint64_t last_done, total;
+    int in_order;
+} tile_progress;
+
+static int32_t on_tile_progress(void *user, const char *stage, uint64_t done, uint64_t total) {
+    tile_progress *p = (tile_progress *)user;
+    if (strcmp(stage, "compressing") != 0) {
+        ++p->others;
+        return 0;
+    }
+    if (p->compressing && (done <= p->last_done || total != p->total)) p->in_order = 0;
+    ++p->compressing;
+    p->last_done = done;
+    p->total = total;
+    return p->cancel_at && p->compressing >= p->cancel_at;
+}
+
+static const char *tiles_of(xisfconv_context *ctx, const char *path, size_t image, uint16_t *pixels) {
+    static char algorithm[32];
+    xisfconv_file *f = NULL;
+    algorithm[0] = 0;
+    if (xisfconv_open(ctx, path, &f) != XISFCONV_OK) return "(cannot open)";
+    if (image < xisfconv_image_count(f)) {
+        strncpy(algorithm, xisfconv_image_detail(f, image, "tileCompression"), sizeof algorithm - 1);
+        if (pixels) {
+            xisfconv_read_options ro;
+            xisfconv_read_options_init(&ro, sizeof ro);
+            ro.row_order = XISFCONV_ROWS_TOP_DOWN;
+            if (xisfconv_read_pixels(f, image, &ro, pixels, W * H * sizeof *pixels) != XISFCONV_OK) strcpy(algorithm, "(cannot read)");
+        }
+    }
+    xisfconv_close(f);
+    return algorithm;
+}
+
+static void test_tile_compression(xisfconv_context *ctx) {
+    xisfconv_write_options wo;
+    xisfconv_convert_options co;
+    xisfconv_writer *w = NULL;
+    xisfconv_image img;
+    uint16_t back[W * H];
+    messages seen;
+
+    /* the writer */
+    xisfconv_write_options_init(&wo, sizeof wo);
+    wo.codec = XISFCONV_CODEC_DEFAULT;
+    CHECK(write_gray(ctx, path_of("tiles.fits"), &wo, NULL, NULL, 0) == XISFCONV_OK, "FITS with the default codec");
+    memset(back, 0, sizeof back);
+    CHECK(strcmp(tiles_of(ctx, path_of("tiles.fits"), 0, back), "RICE_1") == 0 && rows_equal(back, g_gray, 0),
+          "is tile-compressed with RICE_1, and reads back");
+    wo.codec = XISFCONV_CODEC_ZLIB;
+    CHECK(write_gray(ctx, path_of("gzip.fits"), &wo, NULL, NULL, 0) == XISFCONV_OK &&
+              strcmp(tiles_of(ctx, path_of("gzip.fits"), 0, back), "GZIP_2") == 0 && rows_equal(back, g_gray, 0),
+          "zlib means GZIP_2");
+    CHECK(file_size(path_of("tiles.fits")) % 2880 == 0 && file_size(path_of("gzip.fits")) % 2880 == 0, "whole FITS blocks");
+    CHECK(write_gray(ctx, path_of("byname.fits.fz"), NULL, NULL, NULL, 0) == XISFCONV_OK &&
+              strcmp(tiles_of(ctx, path_of("byname.fits.fz"), 0, back), "RICE_1") == 0 && rows_equal(back, g_gray, 0),
+          "a name that ends in .fz asks for it");
+    CHECK(write_gray(ctx, path_of("byname.tif.fz"), NULL, NULL, NULL, 0) == XISFCONV_ERR_ARGUMENT, "but only a FITS name");
+    wo.codec = XISFCONV_CODEC_NONE;
+    CHECK(write_gray(ctx, path_of("plain.fits"), &wo, NULL, NULL, 0) == XISFCONV_OK && *tiles_of(ctx, path_of("plain.fits"), 0, NULL) == 0,
+          "without a codec the image is plain");
+    wo.codec = XISFCONV_CODEC_ZSTD;
+    {
+        const xisfconv_status st = write_gray(ctx, path_of("zstd.fits"), &wo, NULL, NULL, 0);
+        CHECK((st == XISFCONV_ERR_ARGUMENT && strstr(xisfconv_error_message(ctx), "Zstandard") != NULL) || st == XISFCONV_ERR_UNSUPPORTED,
+              "FITS has no Zstandard");
+        CHECK(!file_exists(path_of("zstd.fits")) && !file_exists(path_of("zstd.fits.part")), "and nothing is written");
+    }
+
+    /* floating point, and 64-bit integers, which stay as they are */
+    xisfconv_write_options_init(&wo, sizeof wo);
+    wo.codec = XISFCONV_CODEC_DEFAULT;
+    memset(&seen, 0, sizeof seen);
+    xisfconv_context_set_message_handler(ctx, on_message, &seen);
+    CHECK(xisfconv_writer_new(ctx, path_of("mixed.fits.fz"), &wo, &w) == XISFCONV_OK, "a writer for three images");
+    if (w) {
+        static uint64_t wide[W * H];
+        int i;
+        for (i = 0; i < W * H; ++i) wide[i] = (uint64_t)i << 40;
+        xisfconv_image_init(&img, sizeof img);
+        img.width = W;
+        img.height = H;
+        img.pixels = g_rgb;
+        img.channels = 3;
+        img.sample_format = XISFCONV_SAMPLE_FLOAT32;
+        CHECK(xisfconv_writer_add_image(w, &img) == XISFCONV_OK, "floating point");
+        img.pixels = wide;
+        img.channels = 1;
+        img.sample_format = XISFCONV_SAMPLE_UINT64;
+        img.name = "wide";
+        CHECK(xisfconv_writer_add_image(w, &img) == XISFCONV_OK, "64-bit integers");
+        img.pixels = g_gray;
+        img.sample_format = XISFCONV_SAMPLE_UINT16;
+        img.name = "gray";
+        CHECK(xisfconv_writer_add_image(w, &img) == XISFCONV_OK, "16-bit integers");
+        CHECK(xisfconv_writer_finish(w) == XISFCONV_OK, "write them");
+        CHECK(strcmp(tiles_of(ctx, path_of("mixed.fits.fz"), 0, NULL), "GZIP_2") == 0 && *tiles_of(ctx, path_of("mixed.fits.fz"), 1, NULL) == 0 &&
+                  strcmp(tiles_of(ctx, path_of("mixed.fits.fz"), 2, back), "RICE_1") == 0 && rows_equal(back, g_gray, 0),
+              "GZIP_2 for floating point, 64-bit integers plain, RICE_1 for the rest");
+        CHECK(seen.warnings == 1 && strstr(seen.last, "64-bit integer") != NULL && strstr(seen.last, "'wide'") != NULL,
+              "a warning names the image that is not compressed");
+    }
+    xisfconv_context_set_message_handler(ctx, NULL, NULL);
+
+    /* conversions */
+    xisfconv_convert_options_init(&co, sizeof co);
+    co.codec = XISFCONV_CODEC_DEFAULT;
+    CHECK(xisfconv_convert(ctx, path_of("gray.xisf"), path_of("conv-tiles.fits"), &co) == XISFCONV_OK &&
+              strcmp(tiles_of(ctx, path_of("conv-tiles.fits"), 0, back), "RICE_1") == 0 && rows_equal(back, g_gray, 0),
+          "XISF to tile-compressed FITS");
+    CHECK(*tiles_of(ctx, path_of("plain.fits"), 0, NULL) == 0 &&
+              xisfconv_convert(ctx, path_of("plain.fits"), path_of("packed.fits"), &co) == XISFCONV_OK &&
+              strcmp(tiles_of(ctx, path_of("packed.fits"), 0, back), "RICE_1") == 0 && rows_equal(back, g_gray, 0),
+          "a plain FITS file to a tile-compressed one");
+    CHECK(xisfconv_convert(ctx, path_of("plain.fits"), path_of("packed.fits.fz"), NULL) == XISFCONV_OK &&
+              strcmp(tiles_of(ctx, path_of("packed.fits.fz"), 0, NULL), "RICE_1") == 0,
+          "and by the name of the output alone");
+    CHECK(xisfconv_convert(ctx, path_of("gzip.fits"), path_of("repacked.fits"), &co) == XISFCONV_OK &&
+              strcmp(tiles_of(ctx, path_of("repacked.fits"), 0, back), "RICE_1") == 0 && rows_equal(back, g_gray, 0),
+          "a tile-compressed file written again with another algorithm");
+    CHECK(xisfconv_convert(ctx, path_of("packed.fits.fz"), path_of("unpacked.fits"), NULL) == XISFCONV_OK &&
+              *tiles_of(ctx, path_of("unpacked.fits"), 0, back) == 0 && rows_equal(back, g_gray, 0),
+          "and back to a plain FITS file");
+    co.codec = XISFCONV_CODEC_ZSTD;
+    {
+        const xisfconv_status st = xisfconv_convert(ctx, path_of("gray.xisf"), path_of("conv-zstd.fits"), &co);
+        CHECK((st == XISFCONV_ERR_ARGUMENT || st == XISFCONV_ERR_UNSUPPORTED) && !file_exists(path_of("conv-zstd.fits")), "no Zstandard here either");
+    }
+
+    /* an image large enough for the work to be reported, and stopped */
+    {
+        enum { BW = 3000, BH = 2000 };
+        uint16_t *big = (uint16_t *)malloc((size_t)BW * BH * sizeof *big);
+        tile_progress tp;
+        size_t i;
+        CHECK(big != NULL, "memory for a larger image");
+        if (big) {
+            for (i = 0; i < (size_t)BW * BH; ++i) big[i] = (uint16_t)((i % BW) * 7 + (i / BW) * 3 + (i * 2654435761u >> 28));
+            xisfconv_write_options_init(&wo, sizeof wo);
+            wo.codec = XISFCONV_CODEC_DEFAULT;
+            xisfconv_image_init(&img, sizeof img);
+            img.pixels = big;
+            img.width = BW;
+            img.height = BH;
+            img.sample_format = XISFCONV_SAMPLE_UINT16;
+            memset(&tp, 0, sizeof tp);
+            tp.in_order = 1;
+            xisfconv_context_set_progress_handler(ctx, on_tile_progress, &tp);
+            CHECK(xisfconv_writer_new(ctx, path_of("big.fits.fz"), &wo, &w) == XISFCONV_OK && xisfconv_writer_add_image(w, &img) == XISFCONV_OK &&
+                      xisfconv_writer_finish(w) == XISFCONV_OK,
+                  "a larger image");
+            CHECK(tp.compressing >= 2 && tp.in_order && tp.total == BH && tp.last_done < BH,
+                  "the compression reports how far it is, in rows");
+            CHECK(file_size(path_of("big.fits.fz")) > 0 && file_size(path_of("big.fits.fz")) < (long)BW * BH * 2 * 3 / 4, "and compresses");
+            memset(&tp, 0, sizeof tp);
+            tp.in_order = 1;
+            tp.cancel_at = 2;
+            CHECK(xisfconv_writer_new(ctx, path_of("stopped.fits.fz"), &wo, &w) == XISFCONV_OK && xisfconv_writer_add_image(w, &img) == XISFCONV_OK &&
+                      xisfconv_writer_finish(w) == XISFCONV_ERR_CANCELLED,
+                  "it can be stopped on the way");
+            CHECK(!file_exists(path_of("stopped.fits.fz")) && !file_exists(path_of("stopped.fits.fz.part")), "which leaves no file");
+            xisfconv_context_set_progress_handler(ctx, NULL, NULL);
+            free(big);
+        }
     }
 }
 
@@ -1188,6 +1362,7 @@ int main(int argc, char **argv) {
     test_writer_and_readers(ctx, kw);
     xisfconv_keywords_free(kw);
     test_convert_rewrite_verify(ctx);
+    test_tile_compression(ctx);
     test_callbacks(ctx);
     test_kept_messages_and_cancel(ctx);
     test_host_progress(ctx);

@@ -120,6 +120,140 @@ def test_fits_several_hdus(tmp_path):
         assert same(hdus["A"].data, first[::-1]) and same(hdus["B"].data, second[::-1])
 
 
+# --- tile-compressed FITS, read by astropy ----------------------------------------------------
+
+def tiles(path, hdu=1):
+    """The header of the binary table that holds a tile-compressed image."""
+    with fits.open(path, disable_image_compression=True) as hdus:
+        return hdus[hdu].header.copy()
+
+
+def smooth_sample(dtype, shape):
+    """An image that compresses: a slope with a little noise, and the extremes of its type."""
+    dtype = np.dtype(dtype)
+    slope = np.indices(shape).sum(axis=0) * 3 + np.random.default_rng(7).integers(0, 9, shape)
+    if dtype.kind == "f":
+        data = (slope / 1024).astype(dtype)
+        data.reshape(-1)[0] = np.nan
+        return data
+    data = (slope % (min(int(np.iinfo(dtype).max), 2 ** 40) + 1)).astype(dtype)
+    data.reshape(-1)[:2] = np.iinfo(dtype).max, 0
+    return data
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("channels", [1, 3])
+@pytest.mark.parametrize("codec", [True, "default", "zlib"])
+def test_tile_compressed_fits_read_by_astropy(tmp_path, dtype, channels, codec):
+    data = smooth_sample(dtype, shape_for(channels))
+    path = tmp_path / "w.fits"
+    keywords = {"OBJECT": "M 31", "EXPTIME": (12.5, "seconds")}
+    if dtype == "uint64":
+        # CFITSIO reads no tile-compressed images of 64-bit integers: they stay as they are
+        with pytest.warns(xisfconv.XisfconvWarning, match="64-bit integer images are not tile-compressed"):
+            xisfconv.write(path, data, codec=codec, name="LIGHT", keywords=keywords)
+    elif np.dtype(dtype).kind == "f":
+        with pytest.warns(xisfconv.XisfconvWarning, match="NaN"):       # which is in the sample, and stays there
+            xisfconv.write(path, data, codec=codec, name="LIGHT", keywords=keywords)
+    else:
+        xisfconv.write(path, data, codec=codec, name="LIGHT", keywords=keywords)
+    expect = data[::-1] if channels == 1 else np.moveaxis(data[::-1], -1, 0)
+    with fits.open(path) as hdus:
+        hdus.verify("exception")
+        if dtype == "uint64":
+            assert [type(hdu).__name__ for hdu in hdus] == ["PrimaryHDU"]
+        else:
+            assert [type(hdu).__name__ for hdu in hdus] == ["PrimaryHDU", "CompImageHDU"] and hdus[0].data is None
+        image = hdus[-1]
+        assert same(image.data, expect)
+        header = image.header
+        assert header["ROWORDER"] == "BOTTOM-UP" and header["EXTNAME"] == "LIGHT"
+        assert header["OBJECT"] == "M 31" and header["EXPTIME"] == 12.5 and header.comments["EXPTIME"] == "seconds"
+    if dtype != "uint64":
+        table = tiles(path)
+        gzip = "GZIP_1" if dtype == "uint8" else "GZIP_2"
+        assert table["ZCMPTYPE"] == (gzip if codec == "zlib" or np.dtype(dtype).kind == "f" else "RICE_1")
+        assert table["ZTILE1"] == data.shape[1] and table["ZTILE2"] == 1 and table["NAXIS2"] == data.shape[0] * channels
+        assert table.get("ZQUANTIZ") == ("NONE" if np.dtype(dtype).kind == "f" else None)       # without loss
+        assert os.path.getsize(path) < 2880 * 3 + data.nbytes * 0.8
+    # and the package reads its own file
+    with xisfconv.open(path) as file:
+        assert file[0].detail("tileCompression") == ("" if dtype == "uint64" else tiles(path)["ZCMPTYPE"])
+        assert same(file[0].read(), data) and file[0].name == "LIGHT"
+
+
+def test_tile_compressed_fits_by_name_and_several_images(tmp_path):
+    first, second = smooth_sample("uint16", (16, 40)), smooth_sample("float32", (9, 12, 3))
+    path = tmp_path / "m.fits.fz"
+    with pytest.warns(xisfconv.XisfconvWarning, match="NaN"):
+        xisfconv.write(path, [xisfconv.Image(first, name="A", keywords={"N": 1}), xisfconv.Image(second, keywords={"N": 2})])
+    with fits.open(path) as hdus:
+        assert [type(hdu).__name__ for hdu in hdus] == ["PrimaryHDU", "CompImageHDU", "CompImageHDU"]
+        assert [hdu.header["N"] for hdu in hdus[1:]] == [1, 2]
+        assert same(hdus[1].data, first[::-1]) and same(hdus[2].data, np.moveaxis(second[::-1], -1, 0))
+    assert [tiles(path, n)["ZCMPTYPE"] for n in (1, 2)] == ["RICE_1", "GZIP_2"]
+    assert "ZSIMPLE" in tiles(path, 1) and tiles(path, 2)["ZTENSION"] == "IMAGE"
+    assert [tiles(path, n)["EXTNAME"] for n in (1, 2)] == ["A", "COMPRESSED_IMAGE"]
+    with xisfconv.open(path) as file:
+        assert [image.name for image in file] == ["A", ""] and same(file[1].read(), second)
+    # conversions: to a tile-compressed file, and a plain FITS file packed and unpacked again
+    xisfconv.write(tmp_path / "in.xisf", first, keywords={"OBJECT": "M 31"})
+    xisfconv.convert(tmp_path / "in.xisf", tmp_path / "c.fits", codec=True)
+    xisfconv.convert(tmp_path / "in.xisf", tmp_path / "plain.fits")
+    assert tiles(tmp_path / "c.fits")["ZCMPTYPE"] == "RICE_1" and same(fits.getdata(tmp_path / "c.fits", 1), first[::-1])
+    with pytest.raises(xisfconv.ArgumentError, match="add codec=True for a tile-compressed FITS file"):
+        xisfconv.convert(tmp_path / "plain.fits", tmp_path / "again.fits")
+    xisfconv.convert(tmp_path / "plain.fits", tmp_path / "packed.fits.fz")
+    xisfconv.convert(tmp_path / "packed.fits.fz", tmp_path / "unpacked.fits")
+    assert tiles(tmp_path / "packed.fits.fz")["ZCMPTYPE"] == "RICE_1"
+    with fits.open(tmp_path / "plain.fits") as plain, fits.open(tmp_path / "unpacked.fits") as unpacked:
+        assert same(unpacked[0].data, plain[0].data) and unpacked[0].header["OBJECT"] == "M 31"
+    # what FITS does not have
+    if xisfconv.codec_available("zstd", writing=True):
+        with pytest.raises(xisfconv.ArgumentError, match='FITS has no Zstandard compression; use codec=True') as error:
+            xisfconv.write(tmp_path / "z.fits", first, codec="zstd")
+        assert "--" not in str(error.value)
+    assert not os.path.exists(tmp_path / "z.fits") and not os.path.exists(tmp_path / "z.fits.part")
+    with pytest.raises(xisfconv.ArgumentError, match="cannot infer output format"):
+        xisfconv.write(tmp_path / "image.png.fz", first)
+
+
+def test_keywords_of_a_compressed_image_are_the_writers(tmp_path):
+    data = smooth_sample("uint16", (6, 10))
+    keywords = [("OBJECT", "M 31"), ("ZSCALE", 2.0), ("THEAP", 5760), ("TFORM1", "1PJ"), ("ZNAXIS1", 5), ("ZENITH", 12.5)]
+    with pytest.warns(xisfconv.XisfconvWarning) as caught:
+        xisfconv.write(tmp_path / "k.fits.fz", data, keywords=keywords)
+    said = [str(w.message) for w in caught]
+    assert len(said) == 4 and all("describes a tile-compressed image" in text for text in said)
+    with fits.open(tmp_path / "k.fits.fz") as hdus:
+        assert same(hdus[1].data, data[::-1]) and hdus[1].header["OBJECT"] == "M 31" and hdus[1].header["ZENITH"] == 12.5
+    table = tiles(tmp_path / "k.fits.fz")
+    assert "ZSCALE" not in table and "THEAP" not in table and table["TFORM1"].startswith("1PB(") and table["ZNAXIS1"] == 10
+    # in a plain file they are keywords like any other
+    xisfconv.write(tmp_path / "k.fits", data, keywords=keywords)
+    assert fits.getheader(tmp_path / "k.fits")["ZSCALE"] == 2.0
+    # codec=None says nothing against a name that asks for compression
+    xisfconv.write(tmp_path / "n.fits.fz", data, codec=None)
+    assert tiles(tmp_path / "n.fits.fz")["ZCMPTYPE"] == "RICE_1"
+
+
+def test_tile_compression_reports_progress_and_can_be_stopped(tmp_path):
+    data = smooth_sample("uint16", (2000, 3000))          # 12 MB: a report every 8 MiB or so
+    calls = []
+    xisfconv.write(tmp_path / "big.fits.fz", data, progress=lambda *arguments: calls.append(arguments))
+    compressing = [call for call in calls if call[0] == "compressing"]
+    assert len(compressing) >= 2 and all(total == 2000 for _, _, total in compressing)
+    assert [done for _, done, _ in compressing] == sorted({done for _, done, _ in compressing}) and compressing[0][1] == 0
+    assert same(fits.getdata(tmp_path / "big.fits.fz", 1), data[::-1])
+
+    def stop(stage, done, total):
+        if stage == "compressing" and done:
+            raise LookupError("enough")
+    with pytest.raises(LookupError, match="enough"):
+        xisfconv.write(tmp_path / "stopped.fits.fz", data, progress=stop)
+    assert sorted(os.listdir(tmp_path)) == ["big.fits.fz"]
+
+
 def test_fits_keywords_read_by_astropy(tmp_path):
     path = tmp_path / "k.fits"
     long_text = "a long text " * 12

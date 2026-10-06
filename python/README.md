@@ -47,9 +47,15 @@ xisfconv.write("plain.xisf", data)                                 # XISF, FITS,
 xisfconv.write("out.xisf", data, keywords={"OBJECT": "M 31", "EXPTIME": (300.0, "seconds")},
                name="M31_L", codec="zstd", checksum="sha256")
 xisfconv.write("out.fits", [image1, image2])                       # several images: FITS HDUs
+xisfconv.write("out.fits.fz", data)                                # tile-compressed FITS, lossless
 xisfconv.write("copy.fits", xisfconv.read_image("m31.xisf"))       # the image with its keywords
 xisfconv.write("out.xisf", data, overwrite=True)                   # an existing file is kept otherwise
 ```
+
+`codec=True` compresses with the usual codec of the format. For FITS that is tile compression
+without loss (RICE_1 for integers, GZIP_2 for floating point; the format of fpack, which astropy
+and CFITSIO read), and a name that ends in `.fz` is written that way whatever `codec` says. (Up
+to 0.11 `codec` had no effect on FITS output.)
 
 The samples are uint8, uint16, uint32, uint64, float32 or float64. Keywords describe the array
 as it is given; WCS keywords and BAYERPAT are converted when the rows are stored in the other
@@ -76,7 +82,8 @@ report = xisfconv.verify("m31.xisf")                            # report.verdict
 `progress=` takes a function `progress(stage, done, total)`. It is called between the steps of
 the work, in the thread that made the call. A rewrite and a verification have a step per data
 block. A conversion has a step per image while it reads an XISF file; it reads a FITS or ASDF
-file in one step and writes its output in one, as `write` does. So there are many reports for a
+file in one step and writes its output in one, as `write` does; only a tile-compressed FITS
+file is written with a report every few megabytes of pixels. So there are many reports for a
 file with many images and few for one large image. An exception that the function raises
 stops the work there and leaves no partly written file.
 

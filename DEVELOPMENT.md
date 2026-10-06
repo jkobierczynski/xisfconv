@@ -2,7 +2,7 @@
 
 What was decided while building xisfconv, and why. The README says what the program does and
 `TODO.md` what is planned; this file records the choices behind both, so that they are not
-reopened by accident. State: version 0.11.1, 5 October 2026.
+reopened by accident. State: version 0.12.0, 6 October 2026.
 
 ## Purpose and scope
 
@@ -91,8 +91,52 @@ These are the choices a user could otherwise be surprised by. Each has an option
   but PixInsight 1.9.3 implements only SHA-1, SHA-256 and SHA-512 and refuses an image that carries
   another one. Writing a SHA-3 checksum is therefore allowed, with a warning: the file is valid,
   and what the specification allows is not withheld because one reader lacks it.
-- **Tile-compressed FITS** is read, not written. Quantized floating point is restored as
-  CFITSIO restores it, including its dithering sequence; that it is lossy is stated in the README.
+- **Tile-compressed FITS** is read in every form but `HCOMPRESS_1`. Quantized floating point is
+  restored as CFITSIO restores it, including its dithering sequence; that it is lossy is stated
+  in the README.
+- **Tile-compressed FITS is written without loss** (0.12.0, `-c` on FITS output). What was decided:
+  - *Lossless only*: `RICE_1` for integers, `GZIP_2` for floating point. What makes fpack's
+    floating point files small is quantization, which discards bits; a converter does not do that
+    unasked. It can become an option of its own.
+  - *A tile is a row*, the default of fpack and astropy, and gzip runs at zlib's level 6. Measured
+    on real 32-bit floating point frames (4656 x 3520): the whole image as one tile would be 3 %
+    smaller, level 9 another 0.2 %, level 1 0.8 % larger. None of that is worth leaving the
+    layout every reader has seen most.
+  - *The Rice encoder is CFITSIO's, bit for bit* (`ricecomp.c`: the split position of a block
+    from its mean, differences in the arithmetic of the sample width). The tests can then compare
+    bytes with astropy and fpack, which says more than decoding the result with the same reader
+    that the encoder was written against.
+  - *Nothing in the file names the system it was written on*: the gzip header carries no time
+    and no operating system (zlib would write the one it was built on). The Rice-coded tiles are
+    the same bytes everywhere; the gzip ones are as far as the zlib that is linked compresses
+    alike, which holds for zlib itself and not for zlib-ng.
+  - *The file is laid out as fpack lays it out*: an empty primary HDU, the first image marked
+    `ZSIMPLE`, the others `ZTENSION`, and the cards of the image with the comments of the plain
+    writer, so that funpack restores exactly the file xisfconv writes without `-c`.
+  - *Keywords of a compressed image belong to the writer.* An image handed over with `ZSCALE`,
+    `THEAP` or `TFORM1` among its keywords (found in the review: astropy and funpack then read
+    wrong pixels or none) is written without them, with a warning. In a plain file they are
+    keywords like any other.
+  - *64-bit integers stay plain images.* CFITSIO 4.3 refuses to compress them and to decompress
+    them ("Bad image datatype"); astropy writes them with gzip. A FITS file that CFITSIO cannot
+    read is not worth the saving, and the type is rare. If such an image comes first it is the
+    primary HDU, as in a plain file.
+  - *The table is written last.* Its rows (size and place of every tile) and two numbers in the
+    header are known only when the tiles are compressed: room is left for both, the tiles are
+    written one by one, then the writer goes back. The memory needed is one row. Whether the
+    rows are 32-bit or 64-bit descriptors has to be known before, so it is decided from the
+    largest size the tiles could have, not from the size they turn out to have. The 64-bit form
+    cannot be part of the test suite (it starts near 2 GiB of pixels): it was checked once with
+    a 34000 x 32000 image of noise, and in the review with the limit lowered in a patched copy.
+  - *A name that ends in `.fz` asks for compression*, in the tool and in the library. `--codec
+    zstd` is an error for FITS output; before 0.12.0 `-c` and `--codec` were ignored there, so
+    `xisfconv -c image.xisf` now writes `image.fits.fz` where it wrote `image.fits`.
+  - *FITS to FITS with `-c` is a conversion*, like every other path: the images go through the
+    reader (which maps signed integers with negative values to floating point) and tables are
+    left out. A copy that only repacks the data would be another program inside this one; fpack
+    is that program.
+  - *The C API has no new fields*: `codec` of the conversion and writer options means tile
+    compression for FITS, as it means Deflate for TIFF.
 - **Arithmetic does not depend on the processor.** The code is compiled with
   `-ffp-contract=off`: every multiplication and addition is rounded by itself. GCC and Clang
   otherwise fuse `a*b + c` into one instruction on arm64, which changes the last bit of some
@@ -178,7 +222,7 @@ and built in 0.10.0. What remains is in `TODO.md`.
 - Writing images from memory and the stretch on buffers are in the first release, for all five
   output formats: saving an array as XISF is what Python users cannot get elsewhere.
 - Version 0.x with no ABI promise until two bindings have used the API. The shared library version
-  changes with every 0.x release (`libxisfconv.so.0.11`), so that a binding built for another
+  changes with every 0.x release (`libxisfconv.so.0.12`), so that a binding built for another
   release fails to load.
 - Bindings: Python first (NumPy arrays; it can register `xisf` with astropy's I/O registry), then
   Rust and Perl when someone asks for them.
@@ -421,7 +465,7 @@ Built in 0.11.0, in `python/`. What was decided:
 
 ## Testing
 
-- `tests/run_tests.py` drives the built program (3470 checks at 0.11.0). The Python packages it
+- `tests/run_tests.py` drives the built program (4867 checks at 0.12.0). The Python packages it
   needs are listed at its top; the `asdf` packages and the external tools (`tiffcp`, `fitsverify`,
   `pngcheck`, `fpack`/`funpack`) are used when installed and their checks skipped when not.
 - Every format is checked against an implementation that shares no code with xisfconv: astropy
@@ -443,7 +487,7 @@ Built in 0.11.0, in `python/`. What was decided:
   lifetimes, callbacks), a Python script that calls the API through ctypes and compares what the
   library writes and reads with astropy, the `xisf` package, asdf, tifffile and Pillow, and a
   program that reads all there is of any file, which is what gets fuzzed.
-- The Python package is tested with pytest (`python/tests`, 249 tests at 0.11.0): the same
+- The Python package is tested with pytest (`python/tests`, 288 tests at 0.12.0): the same
   comparisons with other software, made through the package, run from the source tree and from the
   installed wheel on Python 3.10 to 3.14, with the oldest NumPy and astropy the package allows and
   with the newest, and under AddressSanitizer.

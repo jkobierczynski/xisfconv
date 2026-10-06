@@ -274,6 +274,21 @@ const TileColumn* findColumn(const TiledImage& image, const char* name) {
 
 }  // namespace
 
+// Keywords that describe the table and the compression, not the image.
+bool isTileKeyword(const std::string& name) {
+    static const char* exact[] = {"TFIELDS", "THEAP", "ZIMAGE", "ZCMPTYPE", "ZBITPIX", "ZNAXIS", "ZMASKCMP", "ZQUANTIZ", "ZDITHER0",
+                                  "ZSIMPLE", "ZEXTEND", "ZBLOCKED", "ZTENSION", "ZPCOUNT", "ZGCOUNT", "ZHECKSUM", "ZDATASUM",
+                                  "ZBLANK", "ZSCALE", "ZZERO"};
+    for (const char* e : exact)
+        if (name == e) return true;
+    static const char* indexed[] = {"TTYPE", "TFORM", "TUNIT", "TDIM", "TNULL", "TSCAL", "TZERO", "TDISP", "ZNAXIS", "ZTILE", "ZNAME", "ZVAL"};
+    for (const char* prefix : indexed) {
+        uint64_t k;
+        if (startsWith(name, prefix) && parseUInt64(name.substr(std::strlen(prefix)), k)) return true;
+    }
+    return false;
+}
+
 bool tileAlgorithmSupported(const std::string& algorithm) {
     return algorithm == "RICE_1" || algorithm == "RICE_ONE" || algorithm == "GZIP_1" || algorithm == "GZIP_2" ||
            algorithm == "PLIO_1" || algorithm == "NOCOMPRESS";
@@ -498,6 +513,156 @@ std::vector<uint8_t> decodeTiledImage(const TiledImage& image, const std::vector
             }
         }
     }
+    return out;
+}
+
+// ------------------------------------------------------------------------------------------
+// Compression
+// ------------------------------------------------------------------------------------------
+
+uint64_t riceBound(uint64_t count, int bytepix, int blockSize) {
+    // the first value, then per block the code of its split position and at most the plain
+    // differences (a block that would take more is stored that way)
+    const uint64_t blocks = (count + static_cast<uint64_t>(blockSize) - 1) / static_cast<uint64_t>(blockSize);
+    return static_cast<uint64_t>(bytepix) * (count + 1) + blocks + 1;
+}
+
+std::vector<uint8_t> riceEncode(const uint8_t* src, size_t count, int bytepix, int blockSize) {
+    int fsbits, fsmax;
+    switch (bytepix) {
+        case 1: fsbits = 3; fsmax = 6; break;
+        case 2: fsbits = 4; fsmax = 14; break;
+        case 4: fsbits = 5; fsmax = 25; break;
+        default: throw Unsupported("Rice compression with " + std::to_string(bytepix) + " bytes per pixel is not supported");
+    }
+    if (blockSize <= 0) throw Error("Rice: invalid block size");
+    const int bbits = 8 * bytepix;
+    const uint32_t mask = bytepix == 4 ? 0xFFFFFFFFu : (1u << bbits) - 1;
+    const uint32_t sign = 1u << (bbits - 1);
+    const size_t bytes = static_cast<size_t>(bytepix);
+
+    std::vector<uint8_t> out;
+    if (count == 0) return out;
+    out.reserve(static_cast<size_t>(riceBound(count, bytepix, blockSize)));
+    // The bits go out most significant first; `pending` holds fewer than 8 of them between calls.
+    uint64_t pending = 0;
+    int npending = 0;
+    auto put = [&](uint32_t value, int n) {  // the low n bits of value, n <= 32
+        pending = (pending << n) | (n == 32 ? value : value & ((1u << n) - 1));
+        npending += n;
+        while (npending >= 8) {
+            npending -= 8;
+            out.push_back(static_cast<uint8_t>(pending >> npending));
+        }
+    };
+
+    uint32_t last = static_cast<uint32_t>(getBE(src, bytes));
+    put(last, bbits);  // the first pixel as it is
+    std::vector<uint32_t> diff(static_cast<size_t>(blockSize));
+    for (size_t i = 0; i < count;) {
+        const size_t n = std::min(count - i, static_cast<size_t>(blockSize));
+        // Differences of neighbours, in the arithmetic of the sample width (they wrap around),
+        // mapped to non-negative numbers: 0, -1, 1, -2, 2 ... become 0, 1, 2, 3, 4 ...
+        uint64_t sum = 0;
+        for (size_t j = 0; j < n; ++j, ++i) {
+            const uint32_t next = static_cast<uint32_t>(getBE(src + i * bytes, bytes));
+            const uint32_t d = (next - last) & mask;
+            diff[j] = (d & sign) ? ~((d | ~mask) << 1) : d << 1;
+            sum += diff[j];
+            last = next;
+        }
+        // The split position: the number of low bits stored as they are. CFITSIO takes it from
+        // the mean of the block, (sum - n/2 - 1) / n in floating point, cut off; the integer
+        // division gives the same number (sum < 2^37, so the quotient cannot round up to a
+        // whole number it does not reach).
+        const uint64_t bias = n / 2 + 1;
+        uint64_t mean = sum > bias ? (sum - bias) / n : 0;
+        int fs = 0;
+        for (mean >>= 1; mean > 0; mean >>= 1) ++fs;
+
+        if (fs >= fsmax) {
+            // high entropy: the differences as plain numbers
+            put(static_cast<uint32_t>(fsmax + 1), fsbits);
+            for (size_t j = 0; j < n; ++j) put(diff[j], bbits);
+        } else if (fs == 0 && sum == 0) {
+            // all differences are zero
+            put(0, fsbits);
+        } else {
+            put(static_cast<uint32_t>(fs + 1), fsbits);
+            for (size_t j = 0; j < n; ++j) {
+                // the high part in unary (that many zero bits, then a one), the low fs bits plain
+                uint32_t top = diff[j] >> fs;
+                for (; top >= 32; top -= 32) put(0, 32);
+                put(1, static_cast<int>(top) + 1);
+                if (fs > 0) put(diff[j], fs);
+            }
+        }
+    }
+    if (npending > 0) out.push_back(static_cast<uint8_t>(pending << (8 - npending)));
+    return out;
+}
+
+struct TileGzip::State {
+    z_stream zs{};
+    gz_header header{};
+};
+
+TileGzip::TileGzip() : state_(new State) {
+    // 15 + 16: a gzip stream, which is what the convention asks for. Level 6 is zlib's default.
+    if (deflateInit2(&state_->zs, 6, Z_DEFLATED, 15 + 16, 8, Z_DEFAULT_STRATEGY) != Z_OK) {
+        delete state_;
+        throw Error("zlib: deflateInit failed");
+    }
+}
+
+TileGzip::~TileGzip() {
+    deflateEnd(&state_->zs);
+    delete state_;
+}
+
+uint64_t TileGzip::bound(uint64_t bytes) {
+    // Generous: data that does not compress is stored in blocks with 5 bytes each in front
+    // (zlib: one per 16383 bytes), between a header of 10 bytes and a trailer of 8.
+    return bytes + (bytes >> 3) + 64;
+}
+
+std::vector<uint8_t> TileGzip::compress(const uint8_t* samples, size_t count, size_t sampleSize, bool regroup) {
+    const size_t size = count * sampleSize;
+    const uint8_t* src = samples;
+    if (regroup && sampleSize > 1) {
+        regrouped_.resize(size);
+        for (size_t b = 0; b < sampleSize; ++b) {
+            uint8_t* d = regrouped_.data() + b * count;
+            const uint8_t* s = samples + b;
+            for (size_t i = 0; i < count; ++i, s += sampleSize) d[i] = *s;
+        }
+        src = regrouped_.data();
+    }
+    z_stream& zs = state_->zs;
+    if (deflateReset(&zs) != Z_OK) throw Error("zlib: deflateReset failed");
+    // No time stamp and no operating system in the header: zlib would name the one it was built
+    // on, and the same image would not compress to the same bytes everywhere.
+    state_->header = gz_header{};
+    state_->header.os = 255;
+    if (deflateSetHeader(&zs, &state_->header) != Z_OK) throw Error("zlib: deflateSetHeader failed");
+
+    std::vector<uint8_t> out(static_cast<size_t>(std::min<uint64_t>(bound(size), size / 2 + 4096)));
+    const size_t chunk = std::numeric_limits<uInt>::max() / 2;
+    size_t consumed = 0, produced = 0;
+    for (;;) {
+        const size_t in = std::min(size - consumed, chunk), room = std::min(out.size() - produced, chunk);
+        zs.next_in = const_cast<Bytef*>(src + consumed);
+        zs.avail_in = static_cast<uInt>(in);
+        zs.next_out = out.data() + produced;
+        zs.avail_out = static_cast<uInt>(room);
+        const int ret = deflate(&zs, consumed + in == size ? Z_FINISH : Z_NO_FLUSH);
+        if (ret == Z_STREAM_ERROR) throw Error("zlib: compression failed");
+        consumed += in - zs.avail_in;
+        produced += room - zs.avail_out;
+        if (ret == Z_STREAM_END) break;
+        if (produced == out.size()) out.resize(out.size() * 2);
+    }
+    out.resize(produced);
     return out;
 }
 
