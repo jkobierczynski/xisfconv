@@ -136,7 +136,7 @@ from xisfconv.xisf import XISF                      # the interface of the xisf 
 |---|---|
 | [`MANUAL.md`](MANUAL.md) | The command line tool: every option, what each conversion does with keywords, rows, astrometry and properties, the limitations, and what was verified against PixInsight |
 | [`man/xisfconv.1`](man/xisfconv.1) | The manual page of the tool: the options in short. `man xisfconv` once it is installed, `man ./xisfconv.1` in the directory of a release |
-| [`docs/manual.html`](docs/manual.html) | The library for C, C++ and Python: the rules that hold everywhere, a tour of example programs in the three languages with what they print, and the reference of every function. One file, to be opened in a browser (GitHub shows its source) |
+| [`docs/manual.html`](docs/manual.html), [`offsite online manual.html`](https://jurgenkobierczynski.com/xisfconv/docs/manual.html) | The library for C, C++ and Python: the rules that hold everywhere, a tour of example programs in the three languages with what they print, and the reference of every function. One file, to be opened in a browser (GitHub shows its source) |
 | [`python/README.md`](python/README.md) | The Python package: arrays, keywords, properties, astropy, the interface of the `xisf` package |
 | [`examples/`](examples) | The programs the manual of the library shows, in C, C++ and Python |
 | [`docs/xisf-properties-in-fits-and-asdf.md`](docs/xisf-properties-in-fits-and-asdf.md) | For programs that read or write them without xisfconv: where the XISF properties are in a FITS and in an ASDF file, column by column and key by key, and the digest that ties an astrometric solution to its WCS keywords |
