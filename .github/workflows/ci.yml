@@ -165,7 +165,9 @@ jobs:
         run: |
           pkg="xisfconv-${GITHUB_REF_NAME#v}-${{ matrix.name }}"
           mkdir -p "dist/$pkg"
-          cp "${{ steps.bin.outputs.path }}" README.md MANUAL.md LICENSE COPYING.LESSER THIRD-PARTY-NOTICES.md "dist/$pkg/"
+          cp "${{ steps.bin.outputs.path }}" README.md MANUAL.md CHANGELOG.md LICENSE COPYING.LESSER THIRD-PARTY-NOTICES.md "dist/$pkg/"
+          # the manual page, where there is a man to show it (man ./xisfconv.1, or copied to share/man/man1)
+          if [ "$RUNNER_OS" != "Windows" ]; then cp man/xisfconv.1 "dist/$pkg/"; fi
           # previews in the file manager: the thumbnailer entry and the file types (see MANUAL.md)
           if [ "$RUNNER_OS" = "Linux" ]; then cp -r desktop "dist/$pkg/"; fi
           cd dist

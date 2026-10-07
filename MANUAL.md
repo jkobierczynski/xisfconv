@@ -2,7 +2,8 @@
 
 How the command line tool `xisfconv` is used and what it does with each format, option by option
 and direction by direction; what is known not to work; and what was checked against PixInsight.
-[`README.md`](README.md) is the short version.
+[`README.md`](README.md) is the short version, and `man xisfconv` the options at hand: the manual
+page ([`man/xisfconv.1`](man/xisfconv.1)) is installed with the tool on Linux and macOS.
 
 Programs use the same code as a library. For that there is a manual of its own,
 [`docs/manual.html`](docs/manual.html) (C, C++ and Python, with example programs and the reference of
@@ -265,6 +266,10 @@ A FITS input is converted to XISF automatically.
   along: the next XISF file has its own.
 - `--no-properties` turns it off in both directions: XISF → FITS and ASDF writes the images alone,
   and from FITS and ASDF the properties a file carries are left where they are.
+- For a program that reads these tables and trees itself, or writes them for xisfconv to read,
+  [`docs/xisf-properties-in-fits-and-asdf.md`](docs/xisf-properties-in-fits-and-asdf.md) has the
+  layout in full: every column and key, the types, what a table needs to be accepted, and what
+  goes into the digest, with [a program](examples/wcs_digest.py) that computes it without xisfconv.
 
 ## Distributed XISF units
 

@@ -221,6 +221,19 @@ that fails on request (`tests/rename_shim.c`, loaded into the program on Linux):
 replacing a unit, the files that were there must still be there. With `OPENXISF_BIN` set to the
 directory of OpenXISF's sample programs, each side reads what the other wrote.
 
+The documents are held against the program, so that they cannot fall behind it unnoticed: the man
+page must have the options of `xisfconv --help`, in its order and with the values an option takes;
+the man page, `CITATION.cff` and the first section of `CHANGELOG.md` must name the version of the
+program, and one date for it; every link from one Markdown document to another must lead to a file,
+and to a heading of it. The examples of `docs/xisf-properties-in-fits-and-asdf.md` are taken out of
+the document and run as they stand, on files xisfconv made, and the table the document writes with
+astropy alone must come back as the properties of an XISF image. `examples/wcs_digest.py`, which
+computes the digest of the WCS without xisfconv, must give what the tool stored: for both row
+orders, with and without distortion, for a tile-compressed file, and for a header with what a WCS
+card may hold (numbers of 16 and 17 digits and in the forms FITS allows, the records of the
+distortion paper, a complex value, no value, a keyword that stands twice). It must give another
+digest once a keyword, the size or the row order is another.
+
 ASDF is checked against Python's `asdf` library with `asdf-astropy` (the tests are skipped if those
 are not installed). Files written by xisfconv must open without a warning, pass schema validation
 and checksum validation, and yield an astropy HDU list with the pixels and header cards of the
@@ -250,6 +263,16 @@ compared with PyYAML on random documents in all of PyYAML's output styles.
   for why it is made this way.
 - [`python/README.md`](python/README.md) is the page of the Python package (and what PyPI will
   show); the docstrings in `python/xisfconv` are its reference.
+- [`man/xisfconv.1`](man/xisfconv.1), the manual page, is written by hand, in the `man` macros,
+  and is the short form of `MANUAL.md`: the options and what each does, the exit statuses, the
+  files a run leaves. An option that is added, renamed or given another value is changed there
+  too; `tests/run_tests.py` fails until it is. To look at it: `man ./man/xisfconv.1`, and
+  `mandoc -Tlint -W warning man/xisfconv.1` for its syntax.
+- [`docs/xisf-properties-in-fits-and-asdf.md`](docs/xisf-properties-in-fits-and-asdf.md) is the
+  layout of the properties in FITS and ASDF files, for programs other than xisfconv. Its examples
+  are run by the tests as they stand, so an example that is changed there is tested as changed.
+- [`CHANGELOG.md`](CHANGELOG.md) gets its lines with the change, in the words of somebody who uses
+  the program: what is new, what the same command now does differently, what was wrong.
 
 ## A change, from start to delivery
 
@@ -281,11 +304,12 @@ made](#how-changes-are-made).
    be checked that way goes into `TODO.md` as an open check.
 8. **Have it reviewed by a reader who did not write it**, with the task of finding what the tests
    passed over, and fix what is found. A fix is new code and is reviewed as new code is.
-9. **Write it down**: `MANUAL.md` (what it does, its limitations, what was verified), the README
+9. **Write it down**: `MANUAL.md` (what it does, its limitations, what was verified), the man
+   page if an option changed, `CHANGELOG.md` (what somebody who uses it will notice), the README
    if the short version changes, `python/README.md`, `TODO.md` (done items, new open checks), this
-   file (what was decided and why), and the version in `include/xisfconv.h`, which is the one
-   place it is stated. If an example, the header or a docstring changed, the manual of the
-   library is made again.
+   file (what was decided and why), and the version in `include/xisfconv.h`, from which the
+   program and the build take it. If an example, the header or a docstring changed, the manual of
+   the library is made again.
 10. **One commit per feature**, then the check that the commit is what was tested: a clean clone
     of the commit before, the patch applied with `git am`, both builds, every suite, and the source
     archive compared with the tree.
@@ -294,8 +318,11 @@ made](#how-changes-are-made).
 
 ## Releasing
 
-Bump the version in `include/xisfconv.h` (CMake reads it from there), commit, then push a matching
-tag:
+Bump the version in `include/xisfconv.h` (CMake reads it from there). Three documents state the
+version and its date as well, because each is read where the header is not: the heading of the
+newest section of `CHANGELOG.md`, `version` and `date-released` in `CITATION.cff`, and the `.TH`
+line of `man/xisfconv.1`. The tool's tests fail while one of them says something else. Commit,
+then push a matching tag:
 
 ```
 git tag v0.16.0 && git push origin v0.16.0
@@ -319,9 +346,14 @@ brought are in the sections below.
 | When | Version | Step |
 |---|---|---|
 | 1 October 2026 | 0.1.0 | XISF to FITS and TIFF: the reader for XISF 1.0, the FITS and TIFF writers |
-| | | FITS rows bottom-up by default, as FITS viewers expect them; `--stretch`, PixInsight's screen stretch; PNG output; WCS keywords from PixInsight's astrometric solutions, with SIP distortion |
-| | | GPL-3.0-or-later; CI on Linux, macOS and Windows; release binaries built by CI on a version tag |
-| 2 October | | FITS to XISF, with PixInsight's native solution properties written from WCS keywords (verified in PixInsight 1.9.3) |
+| | 0.1.1 | FITS rows bottom-up by default, as FITS viewers expect them |
+| | 0.2.0 | `--stretch`, PixInsight's screen stretch |
+| | 0.3.0 | PNG output; WCS keywords from PixInsight's astrometric solutions, with SIP distortion |
+| | 0.3.1 | GPL-3.0-or-later; CI on Linux, macOS and Windows |
+| | 0.3.2 | Release binaries built by CI on a version tag |
+| | 0.3.3 | Compressed TIFF of 64-bit integers that older libtiff reads |
+| 2 October | 0.4.0 | FITS to XISF |
+| | 0.5.0 | PixInsight's native solution properties written from WCS keywords (verified in PixInsight 1.9.3) |
 | | 0.6.0 | ASDF in both directions |
 | 4 October | 0.7.0 | TIFF and PNG export from FITS and ASDF input |
 | | 0.8.0 | XISF to XISF rewriting (compression, checksums, one image, in place), `--verify`, SHA-3 checksums |
@@ -343,6 +375,7 @@ brought are in the sections below.
 | | | The test scripts read the tool's output as UTF-8 (the first Windows run of 0.16.0 failed on that) |
 | | | The manual of the library for C, C++ and Python (`docs/manual.html`), with examples that are compiled and run by the tests |
 | | | The README condensed; `MANUAL.md` for the tool; this file extended with the steps |
+| | | The documents around the program: the changelog, how to report and to contribute, the citation file, the man page, and the layout of the properties in FITS and ASDF for other programs |
 
 ## Purpose and scope
 
@@ -1361,7 +1394,7 @@ library with one line changed.
   Python. What they print is held against what they must print for those files (most lines word
   for word, numbers that depend on the arithmetic of the machine by their form and range), and
   what they write is read back.
-- `tests/run_tests.py` drives the built program (6128 checks at 0.16.0, 6141 with OpenXISF beside it). The Python packages it
+- `tests/run_tests.py` drives the built program (6170 checks at 0.16.0, 6183 with OpenXISF beside it). The Python packages it
   needs are listed at its top; the `asdf` packages and the external tools (`tiffcp`, `fitsverify`,
   `pngcheck`, `fpack`/`funpack`) are used when installed and their checks skipped when not.
 - Every format is checked against an implementation that shares no code with xisfconv: astropy
@@ -1474,6 +1507,61 @@ library with one line changed.
   README is new writing. The manual of the library stays a file of its own (`docs/manual.html`),
   because it is made from the examples and the header and not written by hand.
 - Messages to the user say what happened and what to do about it; nothing is skipped silently.
+
+### The documents around the program (October 2026, after 0.16.0)
+
+- **A document that states a fact of the program is tested against the program.** The man page
+  repeats the options, and three files repeat the version. Each of them is where its reader looks
+  (`man xisfconv`, GitHub's "Cite this repository", the top of the changelog), so the repetition
+  stays, and the tests compare. The man page is written by hand and not made from `--help`: the
+  help text is laid out for a terminal of some 100 columns, and a page made from it by `help2man`
+  reads like one. Making the help from the page would put a build step before the first line the program
+  prints. So there are two texts, and a test that fails when they name different options.
+- **The changelog was written afterwards**, from the commit of each version and what the manual
+  says of the feature, on the day 0.16.0 was finished; from here on it is written with the change.
+  It leaves out what a user does not see (the split of the code, a test that was made stable) or
+  says it in a line. It marks which versions have binaries, because the others cannot be
+  downloaded.
+- **The layout of the properties is a document of its own**, apart from the manual of the tool.
+  Its reader writes a program, not a command: somebody who wants the spline of a solution out of a
+  FITS file in Python, or who writes a table that xisfconv should turn into properties. For that
+  reader the manual's paragraph was too little (which column is required, what `BLOCK` means when
+  it is missing, what exactly goes into the digest). The digest is specified by a second
+  implementation, `examples/wcs_digest.py`, that the tests hold against the first: a description
+  in words of "the WCS keywords, sorted, with their numbers written the shortest way" would have
+  been right in every sentence and not enough to get the same forty hexadecimal digits.
+- **What the document promises is now an interface.** A FITS file with these tables may be read by
+  a program that is not xisfconv, so the names of the extensions and columns, the keys of the tree
+  and the digest stay as they are. What is added later must be something an older reader passes
+  over: a new column of a table, a new key in the entry of an image or in a property. (Not a new
+  key beside `images` and `metadata`: xisfconv takes a key `xisf` for its own only if it holds
+  those two and nothing else, and reads it as any other key of a tree otherwise, so an older
+  version would take the matrices among the properties for images.)
+- **The documents were reviewed against the program**, by a reader who had the sources and the
+  built tool and the task of finding statements that either contradicts. That found what the
+  writing had not: the example of the digest took the values astropy makes of the cards, and
+  astropy makes a number of `DP1 = 'EXTVER: 1'`; the digest is computed for every image that
+  comes from XISF with properties, not only with a solution among them; which exit status a
+  command line ends with that cannot be carried out (2 where the options alone show it, 1 where
+  it takes the file). The corrections were reviewed again, which found more of the same kind (a
+  `HIERARCH` card with a number, where a `.replaced` file appears). The two passes also found
+  places where the program does not do what its manual says, which are now in `TODO.md`. A
+  document is a second description of the program, and holding the two against each other tests
+  both.
+- **Security reports go through GitHub's private reports**, not to an address in the file: an
+  address in a public file is collected, and a report sent to it is in nobody's list of things to
+  do. That needs "Private vulnerability reporting" switched on in the settings of the repository;
+  `SECURITY.md` says what to do where the page is not there. The file also says what is not
+  promised (the rule for external files is not a sandbox, an image is held in memory as a whole),
+  because a list of protections without its limits is read as more than it is.
+- **Two issue templates, and blank issues stay allowed.** One asks for what a report of a file
+  that fails needs and never has at first: the version, the command, `--info` and `--verify` of
+  the file, the program that wrote it. `--dump-header` is named, there and in `CONTRIBUTING.md`,
+  as the way to show a file without its data blocks; `CONTRIBUTING.md` adds that a header may hold
+  the place of an observatory.
+- **The citation file names both licences**, as the two parts of the program have them, and has
+  no DOI: there is none until a release is archived somewhere that gives one (Zenodo does, from a
+  GitHub release).
 
 ## Not decided yet
 

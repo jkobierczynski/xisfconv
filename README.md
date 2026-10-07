@@ -69,7 +69,7 @@ checksums. They need no extra libraries: Zstandard (and on Windows the C runtime
 cmake -S . -B build
 cmake --build build -j
 ./build/xisfconv --version        # lists the enabled codecs
-sudo cmake --install build        # optional
+sudo cmake --install build        # optional: the tool and its man page, the library
 ```
 
 Windows (vcpkg): `vcpkg install zlib zstd`, then configure with
@@ -135,9 +135,15 @@ from xisfconv.xisf import XISF                      # the interface of the xisf 
 | Document | What is in it |
 |---|---|
 | [`MANUAL.md`](MANUAL.md) | The command line tool: every option, what each conversion does with keywords, rows, astrometry and properties, the limitations, and what was verified against PixInsight |
+| [`man/xisfconv.1`](man/xisfconv.1) | The manual page of the tool: the options in short. `man xisfconv` once it is installed, `man ./xisfconv.1` in the directory of a release |
 | [`docs/manual.html`](docs/manual.html) | The library for C, C++ and Python: the rules that hold everywhere, a tour of example programs in the three languages with what they print, and the reference of every function. One file, to be opened in a browser (GitHub shows its source) |
 | [`python/README.md`](python/README.md) | The Python package: arrays, keywords, properties, astropy, the interface of the `xisf` package |
 | [`examples/`](examples) | The programs the manual of the library shows, in C, C++ and Python |
+| [`docs/xisf-properties-in-fits-and-asdf.md`](docs/xisf-properties-in-fits-and-asdf.md) | For programs that read or write them without xisfconv: where the XISF properties are in a FITS and in an ASDF file, column by column and key by key, and the digest that ties an astrometric solution to its WCS keywords |
+| [`CHANGELOG.md`](CHANGELOG.md) | What changed in each version |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | How to report a file that fails, and what a change to the code needs |
+| [`SECURITY.md`](SECURITY.md) | How to report a security problem, what counts as one, and what the program does about files from people you do not know |
+| [`CITATION.cff`](CITATION.cff) | How to cite xisfconv (GitHub: "Cite this repository") |
 | [`DEVELOPMENT.md`](DEVELOPMENT.md) | For whoever changes the program: building and testing, the way a change is made and released, the steps taken so far, and the decisions behind it all |
 | [`TODO.md`](TODO.md) | What is planned |
 

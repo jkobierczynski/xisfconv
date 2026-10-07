@@ -256,6 +256,10 @@ if(BUILD_SHARED_LIBS AND NOT WIN32)
   endif()
 endif()
 install(TARGETS xisfconv RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+# The manual page of the tool. (tests/run_tests.py holds its options and its version against the program.)
+if(UNIX)
+  install(FILES man/xisfconv.1 DESTINATION ${CMAKE_INSTALL_MANDIR}/man1)
+endif()
 
 # Previews in the file managers of the freedesktop world: the entry that names the program, and
 # the file types (shared-mime-info knows FITS, not XISF and ASDF). Whoever installs runs

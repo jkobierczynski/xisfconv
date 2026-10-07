@@ -1,0 +1,390 @@
+.\" SPDX-License-Identifier: GPL-3.0-or-later
+.\" Copyright (C) 2026 Jurgen Kobierczynski
+.\" The manual page of the command line tool. Its options are those of "xisfconv --help", and its
+.\" version that of include/xisfconv.h: tests/run_tests.py holds both against the program.
+.TH XISFCONV 1 "2026-10-07" "xisfconv 0.16.0" "User Commands"
+.SH NAME
+xisfconv \- convert between PixInsight XISF, FITS and ASDF images; export TIFF and PNG
+.SH SYNOPSIS
+.B xisfconv
+.RI [ options ]
+.IR file ...
+.br
+.B xisfconv \-\-verify
+.IR "file or directory" ...
+.br
+.B xisfconv \-\-info
+.IR file ...
+.SH DESCRIPTION
+.B xisfconv
+converts astronomical images between the XISF format of PixInsight, FITS and ASDF, in every
+direction, and writes TIFF and PNG pictures from all three. Keywords, the order of the rows,
+astrometric solutions and XISF properties are carried from one format to the other.
+.PP
+The format of the input is recognized by its first bytes. The format of the output is given with
+.BR \-t ,
+or follows the name given with
+.BR \-o .
+Without either, an XISF file becomes a FITS file, and a FITS or an ASDF file becomes an XISF file.
+The output is named after the input, with the extension of its format, and is written next to it
+unless
+.B \-d
+names a directory.
+.PP
+An XISF input is a monolithic file
+.RI ( .xisf )
+or the header file of a distributed unit
+.RI ( .xish ),
+whose data is in the files that header names
+.RI ( .xisb ).
+.B \-t xish
+writes such a unit,
+.B \-t xisf
+one file. An XISF file given with
+.BR "\-t xisf" ,
+.B "\-t xish"
+or
+.B \-\-in\-place
+is rewritten: its data blocks are stored another way (compressed, with checksums), and nothing else
+changes.
+.PP
+Tile-compressed FITS
+.RI ( .fits.fz ,
+the format of
+.BR fpack (1))
+is read like any FITS file;
+.B "\-t fits"
+writes it as a plain FITS file, and
+.B "\-t fits \-c"
+writes a FITS file tile-compressed.
+.PP
+With several inputs, each is converted on its own; a file that fails is reported and the others
+are still converted.
+.SH OPTIONS
+.SS Output
+.TP
+.BR \-t ", " \-\-to " \fIformat\fR"
+The output format:
+.BR fits ,
+.BR asdf ,
+.BR tiff ,
+.BR png ,
+.B xisf
+or
+.BR xish .
+The default is
+.B fits
+for XISF input and
+.B xisf
+for FITS and ASDF input, or what the extension of the name given with
+.B \-o
+says.
+.B xish
+is XISF as a distributed unit: the header in
+.IB name .xish
+and the data blocks in
+.IB name .xisb
+beside it. (PixInsight itself opens monolithic
+.I .xisf
+files only.)
+.TP
+.BR \-o ", " \-\-output " \fIfile\fR"
+The name of the output file, for a single input.
+.TP
+.BR \-d ", " \-\-outdir " \fIdir\fR"
+The directory for the output files. The default is next to each input.
+.TP
+.BR \-f ", " \-\-force
+Overwrite output files that exist.
+.TP
+.B \-\-in\-place
+XISF to XISF: replace the input file. The new file is written next to it, read back and compared,
+and only then takes its place. A file that is already stored as asked is left alone.
+.SS Conversion
+.TP
+.BR \-b ", " \-\-bits " \fIformat\fR"
+The sample format of the output:
+.BR u8 ,
+.BR u16 ,
+.BR u32 ,
+.B f32
+or
+.BR f64 .
+The default is the format the input is stored in. Samples are rescaled, not cast.
+.TP
+.BR \-i ", " \-\-image " \fIn\fR"
+Convert only image
+.I n
+(counted from 0). The default is all images: further images become further HDUs in FITS and ASDF,
+and further pages in TIFF.
+.TP
+.BR \-c ", " \-\-compress
+Compress the output. FITS: tile compression without loss
+.RI ( \%image.fits.fz ),
+.B RICE_1
+for integers and
+.B GZIP_2
+for floating point; an output name that ends in
+.I .fz
+is written this way with or without the option. TIFF: Deflate with a predictor. XISF: the pixel
+data, with Zstandard (zlib in a build without it) and byte shuffling; XISF to XISF: every attached
+data block. ASDF: the pixel data, with zlib.
+.TP
+.BR \-s ", " \-\-stretch [ =\fImode\fR ]
+Apply a screen stretch, for looking at linear data.
+.I mode
+is
+.B auto
+(the default: the stretch PixInsight saved in the file if there is one, else
+.BR linked ),
+.B linked
+(an automatic stretch with the statistics of the channels shared, which keeps the colour balance),
+.B unlinked
+(an automatic stretch for each channel, which takes colour casts out) or
+.B stf
+(only the stretch saved in the file). For FITS and ASDF input,
+.B auto
+means
+.BR linked .
+Stretched floating point data is written to TIFF as 16 bits unless
+.B \-\-bits
+says otherwise.
+.TP
+.BI \-\-bin " n"
+TIFF and PNG output: a smaller picture,
+.IR n " x " n
+pixels averaged into one.
+.TP
+.BI \-\-resize " size"
+TIFF and PNG output: a smaller picture, each of its pixels the mean of the pixels it covers.
+.I size
+is
+.B 256
+(the longest side in pixels),
+.B 1024x768
+(a box to fit, the proportions kept) or
+.B 50%
+(half the width and half the height). The picture is never larger than the image, and it is made
+before a stretch is applied.
+.TP
+.B \-\-top\-down
+XISF input: keep the top-down row order of XISF in FITS and ASDF output
+.RB ( ROWORDER='TOP\-DOWN' )
+in place of the FITS convention, bottom-up. FITS and ASDF input: the rows are stored top-down.
+.TP
+.B \-\-bottom\-up
+FITS and ASDF input: the rows are stored bottom-up, whatever
+.B ROWORDER
+says.
+.TP
+.B \-\-no\-property\-keywords
+From XISF: do not add the keywords that are missing and can be derived from XISF properties
+.RB ( EXPTIME ,
+.BR DATE\-OBS ,
+.B BAYERPAT
+and others).
+.TP
+.B \-\-no\-properties
+From XISF: do not take the XISF properties along to FITS and ASDF. From FITS and ASDF: leave the
+XISF properties a file carries where they are.
+.TP
+.B \-\-no\-wcs
+From XISF: do not write WCS keywords from an astrometric solution of PixInsight. To XISF: do not
+write the solution properties of PixInsight from WCS keywords.
+.TP
+.BI \-\-sip\-order " n"
+From XISF: the order of the SIP distortion polynomials that are fitted to the solution, 2 to 7.
+The default is 3; 0 turns the fit off.
+.TP
+.BI \-\-bounds " lo:hi"
+FITS and ASDF input: the range of floating point data. It is written as the bounds of the XISF
+image, and taken as black and white for TIFF and PNG. The default is 0:1 if the data fits, else
+0:65535 if it fits, else its minimum and maximum.
+.TP
+.B \-\-no\-verify
+Do not verify the checksums of data blocks. XISF to XISF: do not read the output back either,
+except with
+.BR \-\-in\-place .
+.TP
+.BI \-\-external\-files " which"
+XISF input: which files the header of a distributed unit may name for its data.
+.B header\-dir
+(the default): files in the directory of the header and below.
+.BR anywhere :
+also absolute paths,
+.B file:
+URLs and where symbolic links lead.
+.BR none :
+no file but the header itself. A header is data that came from somewhere, and could name any file
+of the machine as the pixels of an image. Nothing is ever fetched from a network.
+.SS XISF, ASDF and FITS output
+.TP
+.BI \-\-codec " codec"
+The compression codec:
+.BR zlib ,
+.BR zstd ,
+.BR lz4 ,
+.B lz4hc
+or
+.BR none .
+A codec implies
+.BR \-\-compress .
+XISF blocks are also byte shuffled;
+.B lz4
+and
+.B lz4hc
+are for XISF only.
+.B zstd
+in an ASDF file needs the asdf-compression package to be read in Python.
+.B none
+writes without compression; XISF to XISF it decompresses the blocks. FITS:
+.B zlib
+compresses the tiles of every sample type with gzip; there is no
+.B zstd
+or
+.B lz4
+for FITS.
+.TP
+.BI \-\-checksum " algorithm"
+XISF: store a checksum of the pixel data block; XISF to XISF: of every attached block.
+.I algorithm
+is
+.BR sha1 ,
+.BR sha256 ,
+.BR sha512 ,
+.BR sha3\-256 ,
+.B sha3\-512
+or
+.B none
+(which removes them). PixInsight opens files with
+.BR sha1 ,
+.B sha256
+and
+.B sha512
+checksums only. ASDF blocks always carry an MD5 checksum.
+.SS Inspection
+.TP
+.B \-\-verify
+Check the files given, and the XISF, FITS and ASDF files in the directories given, without
+converting anything: checksums are verified, compressed data is decompressed, sizes are compared.
+The exit status is 1 if a file is damaged.
+.TP
+.BR \-I ", " \-\-info
+Print the geometry, the keywords and the properties of the images. Nothing is converted.
+.TP
+.B \-\-dump\-header
+Print the header: the XML header of an XISF file and the YAML tree of an ASDF file as they are, and
+of a FITS file what
+.B \-\-info
+prints. Nothing is converted.
+.SS Other
+.TP
+.BR \-q ", " \-\-quiet
+Suppress warnings.
+.TP
+.BR \-h ", " \-\-help
+Show the options.
+.TP
+.BR \-V ", " \-\-version
+Show the version and the codecs this build has.
+.SH EXIT STATUS
+.TP
+.B 0
+Every file was converted, or
+.B \-\-verify
+found no damage.
+.TP
+.B 1
+A file could not be read, converted or written, or
+.B \-\-verify
+found a damaged one. The other files were still processed. What only the file shows ends this way
+too: a codec its output format does not have,
+.B \-\-in\-place
+on a file that is not XISF.
+.TP
+.B 2
+The command line was refused before a file was read: an option that does not exist, a value an
+option does not take, options that exclude each other, no input,
+.B \-o
+with more than one input, an output directory that is not there.
+.SH FILES
+.TP
+.IB name .part
+An output is written under this name and renamed when it is complete, so that a run that is
+interrupted leaves no half-written file under the final name. One that already exists is not
+overwritten without
+.BR \-\-force ,
+and never when it is the input itself.
+.TP
+.IB name .replaced
+Where a file cannot be renamed over the one that
+.B \-\-force
+replaces, the old file is set aside under this name until the new one has its name, and put back
+if it does not get it. The data blocks file of a distributed unit that is replaced (with
+.B \-\-force
+or
+.BR \-\-in\-place )
+is set aside this way on every system, until the header has its name. A run that is killed in
+that moment may leave it:
+.B xisfconv \-\-verify
+on the output then says whether the replacement was complete.
+.SH EXAMPLES
+Convert an XISF file to FITS, and a FITS file to a compressed XISF file:
+.PP
+.RS
+.nf
+xisfconv M31_integration.xisf
+xisfconv \-c light_0001.fits
+.fi
+.RE
+.PP
+A stretched 8-bit PNG to look at, its longest side 1024 pixels, of every XISF file here:
+.PP
+.RS
+.nf
+xisfconv \-t png \-s \-b u8 \-\-resize 1024 *.xisf
+.fi
+.RE
+.PP
+Compress the XISF files of a folder where they are, and check an archive:
+.PP
+.RS
+.nf
+xisfconv \-c \-\-in\-place *.xisf
+xisfconv \-\-verify ~/astro/2026
+.fi
+.RE
+.PP
+Write a distributed unit, and pack it into one file again:
+.PP
+.RS
+.nf
+xisfconv \-t xish light_0001.xisf
+xisfconv light_0001.xish \-t xisf \-o packed.xisf
+.fi
+.RE
+.SH NOTES
+On Windows the shell does not expand
+.IR *.xisf :
+name the files, or give a directory to
+.BR \-\-verify .
+.PP
+A header of a distributed unit that names a file outside its own directory is refused unless
+.B "\-\-external\-files anywhere"
+is given. Give that option only for files whose origin is known.
+.PP
+The full description of what each conversion does, its limitations, and what was verified against
+PixInsight is in the file
+.I MANUAL.md
+of the distribution; the library and the Python package are described in
+.IR docs/manual.html .
+.SH SEE ALSO
+.BR fpack (1),
+.BR funpack (1),
+.BR fitsverify (1)
+.PP
+https://github.com/jkobierczynski/xisfconv
+.SH COPYRIGHT
+Copyright \(co 2026 Jurgen Kobierczynski. The command line tool is free software under the GNU
+General Public License, version 3 or later; the library libxisfconv under the GNU Lesser General
+Public License, version 3 or later. There is no warranty.

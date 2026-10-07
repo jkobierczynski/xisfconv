@@ -5640,6 +5640,315 @@ def test_distributed_units():
         skipped.append("OpenXISF reads what xisfconv wrote and the reverse (set OPENXISF_BIN to the directory of its sample programs)")
 
 
+def markdown_headings(text):
+    """The anchors GitHub gives the headings of a Markdown document."""
+    import re
+    anchors, seen, fenced = set(), {}, False
+    for line in text.splitlines():
+        if line.lstrip().startswith("```"):
+            fenced = not fenced
+        m = None if fenced else re.match(r"#{1,6}\s+(.*?)\s*#*\s*$", line)
+        if not m:
+            continue
+        title = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", m.group(1)).replace("`", "").replace("*", "")
+        slug = re.sub(r"[^\w\- ]", "", title.lower()).replace(" ", "-")
+        n = seen.get(slug, 0)
+        seen[slug] = n + 1
+        anchors.add(slug if n == 0 else f"{slug}-{n}")
+    return anchors
+
+
+def markdown_links(text):
+    """The targets of the links of a Markdown document, those in code left out."""
+    import re
+    out, fenced = [], False
+    for line in text.splitlines():
+        if line.lstrip().startswith("```"):
+            fenced = not fenced
+        if not fenced:
+            out += re.findall(r"\]\(([^)\s]+)\)", re.sub(r"`[^`]*`", "", line))
+    return out
+
+
+def test_documents():
+    """The documents beside the program say what the program does: the man page has the options of
+    --help, the man page, CITATION.cff and CHANGELOG.md the version of the program, the links between
+    the documents lead somewhere, and the examples of docs/xisf-properties-in-fits-and-asdf.md and
+    examples/wcs_digest.py do with the files of xisfconv what the document says."""
+    import importlib.util
+    import re
+    root = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+    here = lambda *parts: os.path.join(root, *parts)   # noqa: E731
+    text_of = lambda *parts: open(here(*parts), encoding="utf-8").read()   # noqa: E731
+    if not all(os.path.exists(here(*p)) for p in (("man", "xisfconv.1"), ("CITATION.cff",), ("CHANGELOG.md",),
+                                                  ("docs", "xisf-properties-in-fits-and-asdf.md"), ("examples", "wcs_digest.py"))):
+        skipped.append("the documents (the tests are not run from a source tree)")
+        return
+    version = run("--version").stdout.split()[1]
+    months = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November",
+              "December"]
+
+    # ---- the man page: the options of --help, in its order, and the values an option takes
+    man = text_of("man", "xisfconv.1")
+    help_text = run("--help").stdout
+    in_help, values = [], {}
+    for line in help_text.splitlines():
+        m = re.match(r"  (?:(-\w), |    )(--[a-z0-9-]+)(?: <([^>]*\|[^>]*)>)?", line)
+        if m:
+            in_help.append((m.group(1), m.group(2)))
+            if m.group(3):
+                values[m.group(2)] = m.group(3).split("|")
+    options = re.search(r"^\.SH OPTIONS\n(.*?)^\.SH ", man, re.S | re.M).group(1)
+    in_man, paragraphs = [], {}
+    for part in re.split(r"^\.TP\n", options, flags=re.M)[1:]:
+        tag, _, body = part.partition("\n")
+        tag = tag.replace("\\-", "-")
+        short = re.search(r"(?<![\w-])(-\w)(?![\w-])", tag)
+        name = re.search(r"--[a-z0-9-]+", tag).group(0)
+        in_man.append((short.group(1) if short else None, name))
+        paragraphs[name] = re.split(r"^\.S[SH] ", body, flags=re.M)[0].replace("\\-", "-")
+    check(len(in_help) > 25 and in_man == in_help,
+          f"the man page has the options of --help, in its order: only in the page {[o for o in in_man if o not in in_help]}, "
+          f"only in --help {[o for o in in_help if o not in in_man]}")
+    missing = [(name, v) for name, vs in values.items() for v in vs
+               if not re.search(r"(?<![\w-])%s(?![\w-])" % re.escape(v), paragraphs.get(name, ""))]
+    check(len(values) >= 4 and not missing, f"... and for {sorted(values)} every value --help names: missing {missing}")
+    written = "\n".join(line for line in man.splitlines() if not line.startswith('.\\"'))
+    check("\\-\\-" in options and not re.search(r"(?<!\\)--", written),
+          "... with the hyphens of its options written as minus signs (\\-), as man wants them")
+
+    # ---- one version and one date in the man page, the citation file and the changelog
+    th = re.search(r'^\.TH XISFCONV 1 "(\d{4}-\d\d-\d\d)" "xisfconv ([\d.]+)"', man, re.M)
+    check(th is not None and th.group(2) == version, f"the man page is that of xisfconv {version}: {th and th.group(2)}")
+    cff = text_of("CITATION.cff")
+    cff_version = re.search(r'^version: "?([\d.]+)"?\s*$', cff, re.M)
+    cff_date = re.search(r'^date-released: "?(\d{4}-\d\d-\d\d)"?\s*$', cff, re.M)
+    check(cff_version is not None and cff_version.group(1) == version,
+          f"CITATION.cff cites xisfconv {version}: {cff_version and cff_version.group(1)}")
+    if HAVE_YAML:
+        try:
+            tree = yaml.safe_load(cff)
+        except yaml.YAMLError as e:
+            tree = str(e)
+        check(isinstance(tree, dict) and tree.get("cff-version") == "1.2.0" and tree.get("type") == "software" and
+              all(tree.get(k) for k in ("message", "title", "authors")) and tree.get("version") == version,
+              f"... and is a citation file with what the format requires: {str(tree)[:200]}")
+    changelog = text_of("CHANGELOG.md")
+    sections = re.findall(r"^## (\d+)\.(\d+)\.(\d+)\b[^(\n]*\((\d+) (\w+) (\d{4})\)", changelog, re.M)
+    first = sections[0] if sections else None
+    check(first is not None and ".".join(first[:3]) == version,
+          f"CHANGELOG.md begins with xisfconv {version}: {first and '.'.join(first[:3])}")
+    numbers = [tuple(int(n) for n in s[:3]) for s in sections]
+    check(len(numbers) > 20 and numbers == sorted(numbers, reverse=True) and len(set(numbers)) == len(numbers),
+          f"... and has its {len(numbers)} versions with the newest first")
+    said = first and "%s-%02d-%02d" % (first[5], months.index(first[4]) + 1 if first[4] in months else 0, int(first[3]))
+    check(th is not None and cff_date is not None and th.group(1) == cff_date.group(1) == said,
+          f"the three give that version one date: {th and th.group(1)}, {cff_date and cff_date.group(1)}, {said}")
+
+    # ---- the links between the documents lead to a file, and to a heading of it
+    documents = [here(n) for n in sorted(os.listdir(root)) if n.endswith(".md")]
+    for sub in (("docs",), ("python",), (".github", "ISSUE_TEMPLATE")):
+        if os.path.isdir(here(*sub)):
+            documents += [here(*sub, n) for n in sorted(os.listdir(here(*sub))) if n.endswith(".md")]
+    dead, followed = [], 0
+    for doc in documents:
+        text = open(doc, encoding="utf-8").read()
+        for target in markdown_links(text):
+            if re.match(r"[a-z][a-z0-9+.-]*:", target):
+                continue                                         # another site
+            path, _, anchor = target.partition("#")
+            file = os.path.normpath(os.path.join(os.path.dirname(doc), path)) if path else doc
+            followed += 1
+            if not os.path.exists(file):
+                dead.append(f"{os.path.relpath(doc, root)}: {target}")
+            elif anchor and file.endswith(".md"):
+                if anchor not in markdown_headings(open(file, encoding="utf-8").read()):
+                    dead.append(f"{os.path.relpath(doc, root)}: {target} (no such heading)")
+            elif anchor and file.endswith(".html"):
+                if not re.search(r'\bid="%s"' % re.escape(anchor), open(file, encoding="utf-8").read()):
+                    dead.append(f"{os.path.relpath(doc, root)}: {target} (no such id)")
+    check(followed > 40 and not dead, f"the {followed} links between the {len(documents)} documents lead somewhere: {dead[:6]}")
+    for name in ("file-that-fails.md", "something-else.md"):
+        if os.path.exists(here(".github", "ISSUE_TEMPLATE", name)):
+            head = re.match(r"---\n(.*?)\n---\n", text_of(".github", "ISSUE_TEMPLATE", name), re.S)
+            check(head is not None and re.search(r"^name: \S", head.group(1), re.M) and re.search(r"^about: \S", head.group(1), re.M),
+                  f"the issue template {name} has the name and the description GitHub shows")
+
+    # ---- the format note: its examples, run as they stand on files xisfconv made
+    d = os.path.join(TMP, "documents")
+    os.makedirs(d, exist_ok=True)
+    W, H = 240, 160
+    ref_img = np.array([W / 2 + 0.3, H / 2 - 0.7])
+    M = np.array([[-2.3565e-4, 1.1696e-5], [-1.1715e-5, -2.3575e-4]])
+    xy = np.random.default_rng(5).uniform([5, 5], [W - 5, H - 5], (200, 2))
+    offset = xy - ref_img
+    world = (offset @ M.T) * (1 + 4e-4 * ((offset / 120.0) ** 2).sum(1)[:, None])
+    P = "PCL:AstrometricSolution:"
+    properties = "".join([
+        f'<Property id="{P}ProjectionSystem" type="String">Gnomonic</Property>',
+        f64_prop(P + "ReferenceCelestialCoordinates", [328.178, 47.358]),
+        f64_prop(P + "ReferenceImageCoordinates", ref_img),
+        f64_prop(P + "ReferenceNativeCoordinates", [0, 90]),
+        f64_prop(P + "CelestialPoleNativeCoordinates", [180, 90]),
+        f64_prop(P + "LinearTransformationMatrix", M.ravel(), 2, 2),
+        f64_prop(P + "SplineWorldTransformation:ControlPoints:Image", xy.ravel()),
+        f64_prop(P + "SplineWorldTransformation:ControlPoints:World", world.ravel()),
+        '<Property id="Observation:CelestialReferenceSystem" type="String">ICRS</Property>',
+        '<Property id="Instrument:Telescope:FocalLength" type="Float64" value="0.922597"/>'])
+    source = os.path.join(d, "image.xisf")
+    write_xisf(source, [image_entry(test_image(np.uint16, H, W, 1, 77), children=properties)])
+    run(source, "-o", os.path.join(d, "image.fits"), "-q")
+    run(source, "-o", os.path.join(d, "image.asdf"), "-q")
+    note = text_of("docs", "xisf-properties-in-fits-and-asdf.md")
+    blocks = re.findall(r"^```python\n(.*?)^```", note, re.S | re.M)
+    by_file = {name: [b for b in blocks if f'"{name}"' in b] for name in ("image.fits", "with-properties.fits", "image.asdf")}
+    check(len(blocks) == 3 and all(len(b) == 1 for b in by_file.values()),
+          f"the note has its three examples in Python: {len(blocks)}, {[len(b) for b in by_file.values()]}")
+
+    def python(code):
+        return subprocess.run([sys.executable, "-c", code], cwd=d, capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", env=dict(os.environ, PYTHONIOENCODING="utf-8"))
+
+    if all(len(b) == 1 for b in by_file.values()):
+        r = python(by_file["image.fits"][0])
+        matrix = re.search(r"LinearTransformationMatrix \[\[\s*(\S+)\s+(\S+)\]\s*\[\s*(\S+)\s+(\S+)\]\]", r.stdout)
+        check(r.returncode == 0 and "Instrument:Telescope:FocalLength Float64 0.922597" in r.stdout.splitlines() and
+              "PCL:AstrometricSolution:ProjectionSystem String Gnomonic" in r.stdout.splitlines() and matrix is not None and
+              np.array_equal(np.array([float(v) for v in matrix.groups()]), np.array([float("%.8g" % v) for v in M.ravel()])),
+              f"reading with astropy, as the note does it, prints the properties: {r.stdout[:300]!r} {r.stderr[-300:]}")
+        r = python(by_file["with-properties.fits"][0])
+        check(r.returncode == 0 and os.path.exists(os.path.join(d, "with-properties.fits")),
+              f"writing a table with astropy, as the note does it: {r.stderr[-300:]}")
+        if r.returncode == 0:
+            r = run(os.path.join(d, "with-properties.fits"))
+            got = {p["id"]: p for p in xisf_properties(os.path.join(d, "with-properties.xisf"))[0][0]}
+            name, gain, flags, grid = (got.get(k, {}) for k in ("Observation:Object:Name", "My:Gain", "My:Flags", "My:Matrix"))
+            check(name.get("type") == "String" and name.get("value") == ("text", b"M 31") and
+                  gain.get("type") == "Float64" and gain.get("value") == ("text", b"1.25") and gain.get("comment") == "electrons per ADU",
+                  f"... which xisfconv turns into the properties of an XISF image: {name} {gain}")
+            check(flags.get("type") == "UI16Vector" and flags.get("value") == ("data", (3, None, None), np.array([1, 2, 3], "<u2").tobytes())
+                  and grid.get("type") == "F64Matrix" and
+                  grid.get("value") == ("data", (None, 2, 2), np.array([[1, 2], [3, 4]], "<f8").tobytes()),
+                  f"... the vector and the matrix with their values: {flags} {grid}")
+            # the same table with its columns in another order and one the convention does not have
+            with fits.open(os.path.join(d, "with-properties.fits")) as hdul:
+                table = hdul["XISF_PROPERTIES"]
+                columns = [fits.Column(name="LATER", format="J", array=np.arange(len(table.data)))]
+                for c in list(table.columns)[::-1]:           # (made anew: astropy does not copy a heap column as it is)
+                    values = table.data[c.name]
+                    if c.format.startswith("P"):
+                        values = np.array([np.asarray(v, np.uint8) for v in values] + [None], dtype=object)[:-1]
+                    columns.append(fits.Column(name=c.name, format="PB()" if c.format.startswith("P") else c.format, array=values))
+                other = fits.BinTableHDU.from_columns(columns, name="XISF_PROPERTIES")
+                fits.HDUList([fits.PrimaryHDU(hdul[0].data), other]).writeto(os.path.join(d, "other-order.fits"), overwrite=True)
+            run(os.path.join(d, "other-order.fits"), "-f")
+            again = {p["id"]: p for p in xisf_properties(os.path.join(d, "other-order.xisf"))[0][0]}
+            check(again == got and len(got) == 4, f"... and the same from a table with its columns in another order and one more: {sorted(again)}")
+        if HAVE_ASDF:
+            r = python(by_file["image.asdf"][0] + "    print(repr(focal), type(focal).__name__, matrix.shape, matrix.dtype, matrix.tolist())\n")
+            check(r.returncode == 0 and r.stdout.split("]]")[0] + "]]" ==
+                  "0.922597 float (2, 2) float64 " + repr(M.tolist()),
+                  f"reading with the asdf library, as the note does it, gives a float and a matrix: {r.stdout[:300]!r} {r.stderr[-300:]}")
+        else:
+            skipped.append("the ASDF example of the format note (pip install asdf asdf-astropy)")
+
+    # ---- the digest of the WCS: the example program computes what xisfconv stores
+    spec = importlib.util.spec_from_file_location("wcs_digest_example", here("examples", "wcs_digest.py"))
+    example = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(example)
+    # (xisfconv writes the keywords of a solution with 12 digits. An image that has WCS keywords of its own keeps them
+    # as they are written, and those are the numbers that need the rule of 15, 16 or 17 digits, and the forms a
+    # FITS card may have: more digits than a double holds, a D for the exponent, a point without a fraction.)
+    written = {"CRVAL1": repr(985 / 3), "CRVAL2": repr(47 + 0.1 + 0.2), "CRPIX1": "120.8", "CRPIX2": "81.2",
+               "CD1_1": "-2.3565000000000001E-04", "CD1_2": "-1.1696e-05", "CD2_1": repr(-1.1715e-5 / 3), "CD2_2": "2.3575D-04",
+               "LONPOLE": "180.", "EQUINOX": "2000", "CRVAL1A": "-0.0"}
+    # (... and the values that are not numbers: the records of the distortion paper, of which astropy makes keywords
+    # of other names with numbers for values; a text with a quote in it and blanks at its end; a complex value; none)
+    others = [("CPDIS1", "'LOOKUP'"), ("DP1", "'EXTVER: 1'"), ("DP1", "'NAXES: 2'"), ("DP1", "'AXIS.1: 1'"), ("PS1_0", "'it''s  '"),
+              ("PV1_1", "(1.0, 2.0)"), ("PV1_2", ""), ("PV1_3", ".5"), ("PV1_3", "5."), ("CRVAL1000", "1.5"), ("D2IMARR ONE", "'x y'")]
+    keywords = "".join(f'<FITSKeyword name="{k}" value="{v}" comment=""/>' for k, v in
+                       [("WCSAXES", "2"), ("CTYPE1", "'RA---TAN'"), ("CTYPE2", "'DEC--TAN'"), ("RADESYS", "'ICRS    '")] +
+                       list(written.items()) + others)
+    own = os.path.join(d, "keywords.xisf")
+    write_xisf(own, [image_entry(test_image(np.uint16, H, W, 1, 78), children=keywords + "".join([
+        f'<Property id="{P}ProjectionSystem" type="String">Gnomonic</Property>',
+        f64_prop(P + "ReferenceCelestialCoordinates", [985 / 3, 47 + 0.1 + 0.2]),
+        f64_prop(P + "ReferenceImageCoordinates", [120.3, 79.3]),
+        f64_prop(P + "LinearTransformationMatrix", [-2.3565e-4, 1.1696e-5, -1.1715e-5 / 3, -2.3575e-4], 2, 2)]))])
+    bare = os.path.join(d, "bare.xisf")       # properties without a solution among them have a digest too
+    write_xisf(bare, [image_entry(test_image(np.uint16, H, W, 1, 79),
+                                  children='<Property id="Instrument:Telescope:FocalLength" type="Float64" value="0.92"/>')])
+    digests = {}
+    for label, origin, name, flags in (("bottom-up", source, "image.fits", []), ("top-down", source, "top-down.fits", ["--top-down"]),
+                                       ("tile-compressed", source, "packed.fits.fz", []),
+                                       ("without SIP", source, "linear.fits", ["--sip-order", "0"]),
+                                       ("keywords of its own", own, "keywords.fits", []), ("no solution", bare, "bare.fits", [])):
+        out = os.path.join(d, name)
+        run(origin, "-o", out, "-f", "-q", *flags)
+        with fits.open(out) as hdul:
+            packed = hdul[0].data is None
+            image = hdul[1] if packed else hdul[0]
+            stored = hdul["XISF_PROPERTIES"].header.get("WCSDIGST")
+            header = image.header.copy()
+            size = image.data.shape[-1], image.data.shape[-2]
+        up = label != "top-down"
+        digests[label] = mine = example.wcs_digest(header, *size, up)
+        check(stored is not None and re.fullmatch(r"[0-9a-f]{40}", stored) and mine == stored and
+              (label in ("without SIP", "keywords of its own", "no solution")) != ("A_ORDER" in header) and
+              (label == "tile-compressed") == packed,
+              f"the digest of the example program is that of the file ({label}): {mine}, {stored}")
+        if label == "keywords of its own":
+            texts = {k: example.number_text(float(header[k])) for k in written}
+            check(texts == {"CRVAL1": "328.3333333333333", "CRVAL2": "47.300000000000004", "CRPIX1": "120.8", "CRPIX2": "81.2",
+                            "CD1_1": "-0.00023565", "CD1_2": "-1.1696e-05", "CD2_1": "-3.905e-06", "CD2_2": "0.00023575",
+                            "LONPOLE": "180", "EQUINOX": "2000", "CRVAL1A": "0"} and
+                  [len(t.replace(".", "")) for t in (texts["CRVAL1"], texts["CRVAL2"])] == [16, 17],
+                  f"... with numbers of 16 and of 17 digits, and numbers written in other ways, each as its value: {texts}")
+            lines = sorted("%s=%s" % (c.rawkeyword, example.value_text(c)) for c in header.cards
+                           if c.rawkeyword in {k for k, _ in others})
+            long_names = sorted(c.image.split("=")[0].rstrip() for c in header.cards if c.image.startswith("HIERARCH"))
+            check(lines == ["CPDIS1=LOOKUP", "CRVAL1000=1.5", "D2IMARR ONE=x y", "DP1=AXIS.1: 1", "DP1=EXTVER: 1", "DP1=NAXES: 2",
+                            "PS1_0=it's", "PV1_1=(1.0, 2.0)", "PV1_2=", "PV1_3=0.5", "PV1_3=5"] and "DP1.EXTVER" in header and
+                  long_names == ["HIERARCH CRVAL1000", "HIERARCH D2IMARR ONE"],
+                  f"... and with records, a text, a complex value, none, a keyword that stands twice and HIERARCH cards: {lines} "
+                  f"{long_names}")
+        r = subprocess.run([sys.executable, here("examples", "wcs_digest.py"), out], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace")
+        check(r.returncode == 0 and "the WCS keywords, the size and the row order are what they were" in r.stdout and
+              "changed" not in r.stdout,
+              f"... and the program says so: {r.stdout.strip()} {r.stderr[-200:]}")
+        if label == "bottom-up":
+            for what, change in (("another row order", lambda h: None), ("another size", lambda h: None),
+                                 ("a keyword changed in its last digit", lambda h: h.set("CRVAL1", np.nextafter(h["CRVAL1"], 400))),
+                                 ("a keyword removed", lambda h: h.remove("CD1_2")),
+                                 ("a keyword added", lambda h: h.set("PV1_1", 1.0))):
+                other = header.copy()
+                change(other)
+                theirs = example.wcs_digest(other, size[0] + (what == "another size"), size[1], what != "another row order")
+                check(theirs != stored, f"... {what} gives another digest")
+            same = header.copy()
+            same["OBJECT"] = "M 31"
+            same["CRVAL2"] = (same["CRVAL2"], "the comment of a card is not its value")
+            check(example.wcs_digest(same, *size, up) == stored, "... and a keyword that is none of the WCS, or a comment, the same")
+    check(len(set(digests.values())) == 5 and digests["bottom-up"] == digests["tile-compressed"],
+          f"the row order and the distortion are in the digest, the compression of the file is not: {digests}")
+    # what the digest is for: a solution that was changed in the FITS file is not overruled by the properties
+    edited = os.path.join(d, "edited.fits")
+    shutil.copy(os.path.join(d, "image.fits"), edited)
+    with fits.open(edited, mode="update") as hdul:
+        hdul[0].header["CRVAL1"] = 10.5
+    r = subprocess.run([sys.executable, here("examples", "wcs_digest.py"), edited], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace")
+    check(r.returncode == 0 and "the WCS keywords, the size or the row order changed since" in r.stdout,
+          f"after a change of CRVAL1 the program says that the keywords changed: {r.stdout.strip()} {r.stderr[-200:]}")
+    run(edited, "-o", os.path.join(d, "edited.xisf"), "-f", "-q")
+    center = xisf_property(os.path.join(d, "edited.xisf"), P + "ReferenceCelestialCoordinates")
+    run(os.path.join(d, "image.fits"), "-o", os.path.join(d, "back.xisf"), "-f", "-q")
+    kept = xisf_property(os.path.join(d, "back.xisf"), P + "ReferenceCelestialCoordinates")
+    check(center is not None and abs(center[0] - 10.5) < 1e-9 and kept is not None and np.array_equal(kept, [328.178, 47.358]),
+          f"... and xisfconv takes the solution of the keywords then, and that of the properties otherwise: {center}, {kept}")
+
+
 if __name__ == "__main__":
     print("xisfconv:", EXE)
     print(subprocess.run([EXE, "--version"], capture_output=True, text=True).stdout.strip())
@@ -5658,7 +5967,7 @@ if __name__ == "__main__":
               test_xisf_fits_xisf_roundtrip, test_asdf_yaml, test_asdf_hand_written, test_asdf_output,
               test_asdf_python_files, test_asdf_roundtrips, test_export_from_fits_and_asdf, test_xisf_rewrite,
               test_verify, test_fits_tile_compressed, test_fits_tile_writing, test_property_round_trip,
-              test_downsampling_and_thumbnailer, test_distributed_units):
+              test_downsampling_and_thumbnailer, test_distributed_units, test_documents):
         try:
             t()
         except Exception as e:  # noqa: BLE001

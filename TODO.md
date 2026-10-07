@@ -30,8 +30,12 @@ in `DEVELOPMENT.md`.
 - [x] A manual of the library for C, C++ and Python (`docs/manual.html`): one file, with a tour of
       example programs in the three languages that the tests compile and run, and the reference
       of the C API and of the Python package made from the header and the docstrings (0.16.0)
+- [x] The documents around the program: `CHANGELOG.md`, `SECURITY.md`, `CONTRIBUTING.md` with
+      issue templates, `CITATION.cff`, a man page (`man/xisfconv.1`, installed with the tool), and
+      the layout of the XISF properties in FITS and ASDF as a document for other programs
+      (`docs/xisf-properties-in-fits-and-asdf.md`, with `examples/wcs_digest.py`) (0.16.0)
 - [ ] More platforms and packaging: Linux arm64 and Intel macOS release builds; Homebrew formula,
-      AUR package, winget manifest; man page
+      AUR package, winget manifest
 
 Smaller items, each closing a limitation listed in `MANUAL.md`:
 
@@ -56,6 +60,25 @@ Smaller items, each closing a limitation listed in `MANUAL.md`:
 - [ ] Mark the keywords a conversion from XISF adds (derived from properties, made from a
       solution) so that the way back can leave them out, and XISF -> FITS -> XISF returns the
       keywords as they were
+
+Found when the documents were checked against the program (October 2026), and not changed yet:
+
+- [ ] The digest of the WCS is taken from the keywords of the XISF image before the FITS writer
+      has them. A WCS keyword that cannot be written as it is (text outside ASCII or with a tab,
+      a number too long for a card or too large for a double, a complex value with a lower-case
+      exponent) is written changed or left out, and xisfconv then does not find its own digest
+      on the way back: the solution is made from the keywords, though nothing changed. Through
+      ASDF the same happens to a value that the tree writes another way (`(1,2)`). The digest
+      should be taken from what is written.
+- [ ] A FITS file that ends inside the header of an `XISF_PROPERTIES` table converts without the
+      properties and without a warning (what is behind the last whole HDU counts as something
+      that does not belong to the file). `--verify` reports it; a conversion should warn.
+- [ ] `MANUAL.md` says a refusal does not tell whether there is something where a symbolic link
+      leads. For a path that goes through a link and back (`link/../name`, the link leading to a
+      directory outside) the message differs between a file that is there and one that is not.
+- [ ] `--dump-header` of a FITS file prints what `--info` prints (the keywords without the
+      structural ones, and the properties), where the help says "all keywords". Either the
+      cards as they are, or other words.
 
 ## Library
 

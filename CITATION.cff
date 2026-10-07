@@ -1,0 +1,29 @@
+# How to cite xisfconv. GitHub shows this as "Cite this repository".
+# The version below is that of include/xisfconv.h: the tests hold the two against each other.
+cff-version: 1.2.0
+message: "If you use xisfconv in work that you publish, please cite it as below."
+type: software
+title: "xisfconv: a converter between PixInsight XISF, FITS and ASDF images, and its library libxisfconv"
+abstract: >-
+  xisfconv converts astronomical images between PixInsight XISF, FITS and ASDF in every direction,
+  with their keywords, astrometric solutions and XISF properties, exports TIFF and PNG, rewrites
+  the storage of XISF files and verifies files. The same code is a library with a C API,
+  libxisfconv, and a Python package that reads and writes the images as NumPy arrays.
+authors:
+  - family-names: Kobierczynski
+    given-names: Jurgen
+version: 0.16.0
+date-released: "2026-10-07"
+repository-code: "https://github.com/jkobierczynski/xisfconv"
+url: "https://github.com/jkobierczynski/xisfconv"
+license:
+  - GPL-3.0-or-later
+  - LGPL-3.0-or-later
+keywords:
+  - astronomy
+  - astrophotography
+  - XISF
+  - PixInsight
+  - FITS
+  - ASDF
+  - WCS
