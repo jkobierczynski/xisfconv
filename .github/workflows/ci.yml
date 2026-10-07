@@ -99,6 +99,12 @@ jobs:
           out="$("$dir/xisfconv_capi_test" capi-quiet --quiet 2>&1)"
           if [ -n "$out" ]; then echo "::error::the library printed: $out"; exit 1; fi
 
+      # The example programs of the manual (docs/manual.html), in C and C++: built with the test
+      # programs, run on a small file, and what they print and write is checked.
+      - name: Test the examples of the manual
+        shell: bash
+        run: python tests/examples_test.py "$(dirname "${{ steps.bin.outputs.path }}")"
+
       # The shared library, called from Python through ctypes and compared with astropy,
       # the xisf package, asdf, tifffile and Pillow.
       - name: Build the shared library

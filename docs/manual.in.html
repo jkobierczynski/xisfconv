@@ -1,0 +1,745 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: LGPL-3.0-or-later
+     Copyright (C) 2026 Jurgen Kobierczynski
+     The manual of libxisfconv. docs/make_manual.py makes it from docs/manual.in.html: change that file, not this one. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>xisfconv library manual: C, C++ and Python</title>
+<meta name="description" content="How to read and write PixInsight XISF images with libxisfconv from C, C++ and Python, with example programs run on a real frame and the complete API reference.">
+<meta name="generator" content="docs/make_manual.py">
+<meta name="xisfconv-manual-sources" content="<!--@sources-->">
+<script>
+(function () {
+  var root = document.documentElement;
+  root.className += " js";
+  var lang = null, theme = null;
+  try { lang = localStorage.getItem("xisfconv-manual-language"); theme = localStorage.getItem("xisfconv-manual-theme"); } catch (e) {}
+  root.setAttribute("data-lang", lang === "cpp" || lang === "py" ? lang : "c");
+  if (theme === "light" || theme === "dark") root.setAttribute("data-theme", theme);
+})();
+</script>
+<style>
+:root {
+  --paper: #F7F8FA;
+  --panel: #ECEFF4;
+  --ink: #17202E;
+  --muted: #556072;
+  --rule: #D3D9E2;
+  --accent: #A61E2E;
+  --accent-wash: #F6E3E5;
+  --link: #1D4E89;
+  --link-line: #98A4B6;
+  --terminal: #121A27;
+  --terminal-ink: #DCE3ED;
+  --terminal-muted: #8F9CB0;
+  --mark: #FF6577;
+  --c-comment: #5B6777;
+  --c-keyword: #1D4E89;
+  --c-string: #86480A;
+  --c-number: #0D6657;
+  --c-pre: #763A99;
+  --serif: Charter, "Bitstream Charter", "Iowan Old Style", "Sitka Text", Cambria, Georgia, serif;
+  --sans: "Avenir Next", "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", "Liberation Mono", monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #0E1420; --panel: #172030; --ink: #DDE3EC; --muted: #96A2B5; --rule: #2A3547;
+    --accent: #F0808C; --accent-wash: #3A1D25; --link: #93BBEC; --link-line: #5B6A82;
+    --terminal: #070B12; --terminal-ink: #D5DCE7; --terminal-muted: #7F8CA0;
+    --c-comment: #8793A6; --c-keyword: #93BBEC; --c-string: #E6BC7E; --c-number: #7FD3BB; --c-pre: #CDA8EA;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #0E1420; --panel: #172030; --ink: #DDE3EC; --muted: #96A2B5; --rule: #2A3547;
+  --accent: #F0808C; --accent-wash: #3A1D25; --link: #93BBEC; --link-line: #5B6A82;
+  --terminal: #070B12; --terminal-ink: #D5DCE7; --terminal-muted: #7F8CA0;
+  --c-comment: #8793A6; --c-keyword: #93BBEC; --c-string: #E6BC7E; --c-number: #7FD3BB; --c-pre: #CDA8EA;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+html { scroll-padding-top: 1.5rem; -webkit-text-size-adjust: 100%; }
+body { margin: 0; background: var(--paper); color: var(--ink); font: 1.0625rem/1.62 var(--serif); }
+a { color: var(--link); text-decoration-thickness: 1px; text-underline-offset: 0.18em; }
+a:hover { text-decoration-thickness: 2px; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+code, samp, pre, kbd { font-family: var(--mono); font-size: 0.82em; }
+pre { margin: 0; font-size: 0.8125rem; line-height: 1.55; tab-size: 4; }
+pre code, pre samp { font-size: inherit; }
+p code, li code, dd code { overflow-wrap: anywhere; }
+
+.page { display: grid; grid-template-columns: 17.5rem minmax(0, 1fr); }
+
+/* ---- the side: language, theme, contents ---- */
+.side { position: sticky; top: 0; align-self: start; height: 100vh; overflow-y: auto; padding: 1.6rem 1.25rem 2rem 1.5rem;
+        border-right: 1px solid var(--rule); font: 0.875rem/1.45 var(--sans); }
+.brand { display: block; font-weight: 700; font-size: 1.25rem; letter-spacing: -0.01em; color: var(--ink); text-decoration: none; }
+.brand-version { margin: 0.1rem 0 1.3rem; color: var(--muted); }
+.side-label { display: none; margin: 0 0 0.35rem; color: var(--muted); }
+.js .side-label { display: block; }
+.switch { display: none; }
+.js .switch { display: flex; margin: 0 0 0.9rem; border: 1px solid var(--rule); border-radius: 6px; overflow: hidden; }
+.switch button { flex: 1; padding: 0.42rem 0; border: 0; border-right: 1px solid var(--rule); background: transparent; color: var(--ink);
+                 font: inherit; cursor: pointer; }
+.switch button:last-child { border-right: 0; }
+.switch button[aria-pressed="true"] { background: var(--accent); color: var(--paper); font-weight: 600; }
+.switch button:focus-visible { outline-offset: -4px; outline-color: currentColor; }
+.theme { display: none; }
+.js .theme { display: inline; padding: 0; border: 0; background: none; color: var(--link); font: inherit; text-decoration: underline;
+             text-decoration-thickness: 1px; text-underline-offset: 0.18em; cursor: pointer; }
+.contents { margin-top: 1.5rem; }
+.contents summary { display: none; }
+.contents ul { list-style: none; margin: 0; padding: 0; }
+.contents > ul > li { margin-top: 1rem; }
+.contents > ul > li > a { font-weight: 700; color: var(--ink); text-decoration: none; }
+.contents ul ul { margin-top: 0.25rem; }
+.contents ul ul a { display: block; padding: 0.16rem 0 0.16rem 0.7rem; border-left: 2px solid transparent; color: var(--muted); text-decoration: none; }
+.contents a:hover { color: var(--link); }
+.contents ul ul a[aria-current="true"] { border-left-color: var(--accent); color: var(--ink); }
+
+/* ---- the text ---- */
+main { min-width: 0; padding: 0 clamp(1.1rem, 4.5vw, 4rem) 6rem; }
+main > * { max-width: 58rem; }
+p, ul, ol, dl, .figure-text { max-width: 41rem; }
+p { margin: 0 0 1rem; }
+h1, h2, h3, h4 { font-family: var(--sans); line-height: 1.2; letter-spacing: -0.012em; text-wrap: balance; }
+h1 { margin: 0 0 1rem; max-width: 20ch; font-size: clamp(2rem, 4.6vw, 3rem); font-weight: 700; letter-spacing: -0.025em; line-height: 1.08; }
+h2 { margin: 5rem 0 0.4rem; padding-top: 1.4rem; border-top: 3px solid var(--ink); font-size: 1.9rem; font-weight: 700; }
+h3 { margin: 3.2rem 0 0.8rem; font-size: 1.36rem; font-weight: 650; }
+h4 { margin: 1.6rem 0 0.5rem; font-size: 1rem; font-weight: 650; }
+.part-lede { color: var(--muted); font-size: 1.12rem; }
+main ul, main ol { padding-left: 1.2rem; }
+main li { margin-bottom: 0.3rem; }
+dl { margin: 0 0 1rem; }
+dt { font-weight: 600; font-family: var(--sans); font-size: 0.95rem; margin-top: 0.7rem; }
+dd { margin: 0.1rem 0 0 1.2rem; }
+
+.hero { padding-top: clamp(2rem, 6vw, 4.5rem); }
+.hero-version { margin: 0 0 0.9rem; font: 0.95rem var(--sans); color: var(--muted); }
+.lede { font-size: 1.22rem; line-height: 1.5; }
+.frame { margin: 2.2rem 0 0; max-width: 50rem; }
+.frame-picture { position: relative; background: #05070B; line-height: 0; }
+.frame img { display: block; width: 100%; height: auto; }
+.crop-mark { position: absolute; left: 44.50%; top: 42.73%; width: 11.00%; height: 14.55%; border: 1.5px solid var(--mark); }
+.crop-mark span { position: absolute; left: calc(100% + 0.45rem); top: -0.2rem; white-space: nowrap; font: 0.75rem/1.2 var(--mono); color: var(--mark);
+                  text-shadow: 0 0 4px #000, 0 0 2px #000; }
+.frame figcaption { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); gap: 0.4rem 2.2rem; padding-top: 0.9rem;
+                    font: 0.875rem/1.5 var(--sans); color: var(--muted); }
+.frame figcaption p { margin: 0; max-width: none; }
+.frame figcaption strong { color: var(--ink); font-weight: 650; }
+.facts { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 0.12rem 0.9rem; max-width: none; }
+.facts dt { margin: 0; font-weight: 400; font-size: inherit; color: var(--muted); }
+.facts dd { margin: 0; color: var(--ink); }
+
+/* ---- code and what it prints ---- */
+.code, .output { position: relative; margin: 1.1rem 0 0; }
+.code pre { padding: 2.1rem 1.1rem 1rem; overflow-x: auto; background: var(--panel); border-radius: 6px 6px 0 0; }
+.code:last-child pre, .code.small pre, .doc .code pre, .code.alone pre { border-radius: 6px; }
+.code.small pre { padding: 0.8rem 1rem; }
+.code.plain pre { padding: 0.9rem 1.1rem; border-radius: 6px; }
+.js .code.plain pre, .js .code.small pre { padding-top: 2.1rem; }   /* room for the button that copies */
+.output pre { padding: 2.1rem 1.1rem 1rem; overflow-x: auto; background: var(--terminal); color: var(--terminal-ink); border-radius: 0 0 6px 6px; }
+.output:first-child pre, .output.alone pre { border-radius: 6px; }
+.code + p, .output + p, .langs + p, table + p { margin-top: 1.2rem; }
+.code-label { position: absolute; left: 1.1rem; top: 0.6rem; font: 0.75rem var(--sans); color: var(--muted); }
+.output .code-label { color: var(--terminal-muted); }
+.copy { position: absolute; right: 0.6rem; top: 0.4rem; padding: 0.15rem 0.55rem; border: 1px solid var(--rule); border-radius: 4px;
+        background: var(--paper); color: var(--muted); font: 0.75rem var(--sans); cursor: pointer; }
+.copy:hover { color: var(--ink); border-color: var(--muted); }
+
+.t-c, .t-c1, .t-cm, .t-ch, .t-cs, .t-sd { color: var(--c-comment); }
+.t-cp, .t-cpf { color: var(--c-pre); }
+.t-k, .t-kc, .t-kd, .t-kn, .t-kr, .t-kt, .t-kp, .t-ow, .t-nb { color: var(--c-keyword); }
+.t-s, .t-s1, .t-s2, .t-sa, .t-sb, .t-sc, .t-se, .t-sh, .t-si, .t-sx, .t-dl { color: var(--c-string); }
+.t-m, .t-mi, .t-mf, .t-mh, .t-mo, .t-mb, .t-il { color: var(--c-number); }
+pre a { color: inherit; text-decoration: underline dotted var(--link-line); text-decoration-thickness: 1px; text-underline-offset: 0.24em; }
+pre a:hover { text-decoration: underline solid var(--accent); text-decoration-thickness: 1px; }
+
+/* ---- one panel per language ---- */
+.langs { margin: 1.2rem 0 0; }
+.lang-name { margin: 1.4rem 0 0; font-size: 0.875rem; color: var(--muted); }
+.lang > p { margin: 0.9rem 0 0; }
+.js .lang { display: none; }
+.js[data-lang="c"] .lang[data-lang="c"], .js[data-lang="cpp"] .lang[data-lang="cpp"], .js[data-lang="py"] .lang[data-lang="py"] { display: block; }
+.js .lang-name { display: none; }
+.tabbar { display: flex; gap: 1.4rem; border-bottom: 1px solid var(--rule); font: 0.875rem var(--sans); }
+.tabbar button { padding: 0.45rem 0; margin-bottom: -1px; border: 0; border-bottom: 2px solid transparent; background: none; color: var(--muted);
+                 font: inherit; cursor: pointer; }
+.tabbar button:hover { color: var(--ink); }
+.tabbar button[aria-pressed="true"] { border-bottom-color: var(--accent); color: var(--ink); font-weight: 650; }
+.tabbar + .lang .code, .tabbar ~ .lang > .code:first-of-type, .tabbar ~ .lang > .output:first-of-type { margin-top: 0.8rem; }
+
+/* ---- tables ---- */
+table.grid { display: block; overflow-x: auto; margin: 1.2rem 0 0; border-collapse: collapse; font: 0.875rem/1.45 var(--sans); }
+.grid th, .grid td { padding: 0.5rem 1.1rem 0.5rem 0; text-align: left; vertical-align: top; border-bottom: 1px solid var(--rule); }
+.grid th { font-weight: 650; border-bottom: 2px solid var(--ink); white-space: nowrap; }
+.grid td p { margin: 0; max-width: 34rem; }
+.grid td.num { font-family: var(--mono); font-size: 0.8125rem; text-align: right; white-space: nowrap; padding-right: 1.6rem; }
+.grid th:nth-child(2):has(+ th) { }
+.grid code { white-space: nowrap; }
+
+/* ---- the reference ---- */
+.entry { margin: 1.5rem 0 0; }
+.entry.class { margin-top: 2.4rem; padding-top: 1.4rem; border-top: 1px solid var(--rule); }
+pre.decl { padding: 0.8rem 1rem; overflow-x: auto; background: var(--panel); border-left: 3px solid var(--rule); border-radius: 0 6px 6px 0; scroll-margin-top: 1.5rem; }
+.entry .doc, .note { margin: 0.6rem 0 0 1rem; font-size: 1rem; line-height: 1.55; }
+.note { margin-left: 0; margin-top: 1.4rem; }
+.doc p, .note p { margin-bottom: 0.6rem; }
+.doc dl { margin-bottom: 0.6rem; }
+.doc dt { font-family: var(--mono); font-size: 0.8125rem; font-weight: 400; }
+.laid { margin: 0 0 0.7rem; padding: 0; white-space: pre-wrap; font-size: 0.8125rem; color: var(--ink); max-width: 52rem; }
+.laid code { font-size: inherit; }
+.members { margin: 0.6rem 0 0 1rem; padding-left: 1rem; border-left: 1px solid var(--rule); }
+.members .entry { margin-top: 1.1rem; }
+.members pre.decl { background: none; border-left: 0; padding: 0; }
+.kind { color: var(--muted); margin-right: 0.6em; }
+.fields { margin: 0.6rem 0 0 1rem; font-size: 1rem; }
+.def { scroll-margin-top: 5rem; }
+.def:target, pre.decl:target, tr:target td { background: var(--accent-wash); }
+.def:target { outline: 3px solid var(--accent-wash); }
+.rules { display: grid; grid-template-columns: 6.5rem minmax(0, 1fr); gap: 0.55rem 1rem; max-width: 50rem; font-size: 1rem; line-height: 1.5; }
+.rules dt { margin: 0; }
+.rules dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.index { margin: 1.6rem 0 0; max-width: 58rem; font: 0.875rem var(--sans); }
+.index summary { cursor: pointer; color: var(--link); }
+.columns { columns: 19rem 3; column-gap: 1.5rem; list-style: none; padding: 0; margin: 0.8rem 0 0; max-width: none; }
+.columns li { margin: 0; break-inside: avoid; }
+.colophon { margin-top: 5rem; padding-top: 1.2rem; border-top: 1px solid var(--rule); font: 0.875rem/1.5 var(--sans); color: var(--muted); }
+.colophon p { max-width: 46rem; }
+
+@media (max-width: 62rem) {
+  .page { display: block; }
+  .side { position: static; height: auto; overflow: visible; padding: 1rem 1.1rem; border-right: 0; border-bottom: 1px solid var(--rule);
+          display: grid; grid-template-columns: 1fr auto; column-gap: 1rem; align-items: center; }
+  .brand-version { margin: 0; }
+  .js .side-label { display: none; }
+  .js .switch { grid-column: 1 / -1; margin: 0.8rem 0 0.4rem; max-width: 22rem; }
+  .js .theme { grid-row: 1; grid-column: 2; }
+  .contents { grid-column: 1 / -1; margin-top: 0.6rem; }
+  .contents summary { display: block; cursor: pointer; color: var(--link); }
+  .contents:not([open]) > ul { display: none; }
+  .frame figcaption { grid-template-columns: 1fr; }
+  .crop-mark span { display: none; }
+  h2 { margin-top: 3.5rem; font-size: 1.6rem; }
+}
+@media print {
+  :root, :root[data-theme="dark"], :root:not([data-theme="light"]) {
+    --paper: #FFFFFF; --panel: #F1F3F6; --ink: #111111; --muted: #444C59; --rule: #C9CED6; --accent: #A61E2E; --accent-wash: #F6E3E5;
+    --link: #1D4E89; --link-line: #98A4B6; --terminal: #F1F3F6; --terminal-ink: #111111; --terminal-muted: #444C59;
+    --c-comment: #5B6777; --c-keyword: #1D4E89; --c-string: #86480A; --c-number: #0D6657; --c-pre: #763A99;
+    color-scheme: light;
+  }
+  .side, .copy, .tabbar { display: none; }
+  .page { display: block; }
+  pre { white-space: pre-wrap; }
+  .output pre { border: 1px solid var(--rule); }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
+</style>
+</head>
+<body>
+<div class="page">
+
+<nav class="side" aria-label="Manual">
+  <div>
+    <a class="brand" href="#top">xisfconv</a>
+    <p class="brand-version">Library manual, <!--@version--></p>
+  </div>
+  <p class="side-label" id="language-label">Show the examples in</p>
+  <div class="switch" role="group" aria-labelledby="language-label">
+    <button type="button" data-set-lang="c">C</button><button type="button" data-set-lang="cpp">C++</button><button type="button" data-set-lang="py">Python</button>
+  </div>
+  <button type="button" class="theme" id="theme">Use the dark theme</button>
+  <details class="contents" open>
+    <summary>Contents</summary>
+    <!--@@contents-->
+  </details>
+</nav>
+
+<main id="top">
+
+<header class="hero">
+  <p class="hero-version">libxisfconv <!--@version-->, the library manual</p>
+  <h1>Reading and writing XISF images from C, C++ and Python</h1>
+  <p class="lede">libxisfconv reads PixInsight XISF, FITS and ASDF images into arrays and writes arrays as XISF, FITS, ASDF, TIFF or
+  PNG. This manual shows how to use it from each of the three languages, with programs that ran on one real frame.
+  What they printed is printed here.</p>
+
+  <figure class="frame">
+    <div class="frame-picture">
+      <img src="<!--@frame-->" <!--@frame-size--> alt="A monochrome star field with the round glow of the Cocoon Nebula left of the centre, at the end of a dark lane.">
+      <div class="crop-mark" aria-hidden="true"><span>crop.xisf</span></div>
+    </div>
+    <figcaption>
+      <p><strong>The example frame: IC 5146, the Cocoon Nebula.</strong> Every program in this manual ran on
+      <code>integrated_light_ABE.xisf</code>, a stack of light frames as PixInsight integrated and saved it. The picture is the
+      <code>preview.png</code> that the chapter <a href="#convert">Converting files</a> writes, kept here as a JPEG. The square is the part that
+      <a href="#write">Writing an image</a> cuts out. Frame: Jurgen Kobierczynski.</p>
+      <dl class="facts">
+        <dt>Pixels</dt><dd>4656 × 3520, one channel, 32-bit floating point</dd>
+        <dt>File</dt><dd>65 693 664 bytes, monolithic, not compressed</dd>
+        <dt>Camera</dt><dd>ZWO ASI1600MM-Cool, Skywatcher 200 mm f/4</dd>
+        <dt>Observed</dt><dd>12 August 2026, 01:02 to 02:59 UTC</dd>
+        <dt>Written by</dt><dd>PixInsight 1.9.3</dd>
+      </dl>
+    </figcaption>
+  </figure>
+</header>
+
+<!-- ============================================================================================ -->
+<h2 id="start">Start here</h2>
+<p class="part-lede">What the library is, how to get it, and a first program.</p>
+
+<h3 id="what">One library, three languages</h3>
+<p>libxisfconv has one interface: the C API that <code>include/xisfconv.h</code> declares. The command line tool
+<code>xisfconv</code> is written on it and uses nothing else, so whatever the tool does, a program can do with the same calls.</p>
+<ul>
+  <li><strong>C</strong> programs include the header and link the library. It is plain C99.</li>
+  <li><strong>C++</strong> programs include the same header. There is no separate C++ interface, and none is needed: forty lines of
+  C++ turn the handles into objects that free themselves and the status codes into exceptions. <a href="#cpp">From C++</a> shows them.</li>
+  <li><strong>Python</strong> programs import the package <code>xisfconv</code>, which holds the library and calls it through
+  <code>ctypes</code>. It is not a copy of the C API: images are NumPy arrays, failures are exceptions, options are keyword arguments.</li>
+</ul>
+<p>The purpose of the library is XISF, and the conversion between XISF, FITS and ASDF. FITS and ASDF are supported as far as
+images need them; for tables and everything else in those formats, CFITSIO, astropy and the Python package <code>asdf</code> are
+the libraries to use.</p>
+<table class="grid">
+  <thead><tr><th>Format</th><th>Read</th><th>Written</th><th>What that covers</th></tr></thead>
+  <tbody>
+    <tr><td>XISF</td><td>yes</td><td>yes</td><td>Monolithic files (<code>.xisf</code>) and distributed units (<code>.xish</code> with
+      <code>.xisb</code>); zlib, LZ4, LZ4HC and Zstandard compression; SHA-1, SHA-2 and SHA-3 checksums; FITS keywords, XISF
+      properties, ICC profiles, the saved screen stretch, PixInsight's astrometric solutions</td></tr>
+    <tr><td>FITS</td><td>yes</td><td>yes</td><td>Image HDUs, plain or tile-compressed (<code>.fits.fz</code>, without loss)</td></tr>
+    <tr><td>ASDF</td><td>yes</td><td>yes</td><td>Images: the HDUs of FITS-tagged nodes and other 2-D and 3-D numeric arrays</td></tr>
+    <tr><td>TIFF</td><td>no</td><td>yes</td><td>One page per image, with Deflate compression if asked for</td></tr>
+    <tr><td>PNG</td><td>no</td><td>yes</td><td>One image</td></tr>
+  </tbody>
+</table>
+<p>Zstandard needs a build with libzstd; <code>xisfconv_codec_available</code> and <code>xisfconv.codec_available</code> say what
+a build has. The library and the Python package are under the LGPL, version 3 or later, so that programs under other licences can
+use them. The version is 0.x: the API may still change between releases.</p>
+
+<h3 id="install">Getting it</h3>
+<h4>C and C++</h4>
+<p>Building needs a C++17 compiler, CMake 3.15 or later and zlib; libzstd is optional and recommended, because PixInsight
+can write Zstandard-compressed files.</p>
+<pre data-lang="sh">cmake -S . -B build -DBUILD_SHARED_LIBS=ON
+cmake --build build -j
+sudo cmake --install build      # libxisfconv, xisfconv.h, xisfconv.pc, the CMake package, the tool</pre>
+<p>A program finds the header and the library through pkg-config, or through the CMake package:</p>
+<pre data-lang="sh">cc app.c $(pkg-config --cflags --libs xisfconv) -o app
+c++ -std=c++17 app.cpp $(pkg-config --cflags --libs xisfconv) -o app</pre>
+<pre data-lang="cmake">find_package(xisfconv REQUIRED)
+target_link_libraries(app PRIVATE xisfconv::xisfconv)</pre>
+<p>Without <code>-DBUILD_SHARED_LIBS=ON</code> the library is static. A static library comes with the pkg-config file only, to
+be used with <code>pkg-config --static</code>; the CMake package is installed with the shared library.</p>
+<h4>Python</h4>
+<pre data-lang="sh">pip install .                    # from a checkout: builds the library and installs the package
+pip install ".[astropy]"         # the same, with astropy</pre>
+<p>The package needs Python 3.10 or later and NumPy. It brings its own copy of the library, so nothing else has to be
+installed. At the time of version <!--@version--> the package is not on PyPI yet; once it is, <code>pip install xisfconv</code>
+does the same without a checkout.</p>
+
+<h3 id="first">A first program</h3>
+<p>The smallest useful program opens a file and says what is in it. It works on any file the library reads: FITS and ASDF
+are recognized by their first bytes, and anything else is taken for XISF.</p>
+<!--@first-->
+<p>Three things in it come back in every program. A <em>context</em> holds the text of the last failure, so the program can
+print it. Every struct is filled by its <code>_init</code> function before it is used. And what was opened is closed: by hand in C,
+by the handle in C++, by the <code>with</code> block in Python.</p>
+<p>One thing the examples leave out. Text is UTF-8 everywhere in the library, file names on Windows included. A Windows
+program that takes file names from its command line gets them in the code page of the system unless it asks for them as wide
+characters (<code>wmain</code>) and converts them, as the tool does; the examples take the names as they come, which is right
+for names in ASCII.</p>
+
+<h3 id="cpp">From C++</h3>
+<p>The header is C++ as it stands: it wraps itself in <code>extern "C"</code>. What a C++ program wants on top of it is that
+handles free themselves and that a failure is an exception. That is the namespace <code>xisf</code> below, taken from
+<code>examples/tour.cpp</code>. It is not part of the library: copy it into a program and change it to taste. The C++ examples in
+this manual use it.</p>
+<!--@code cpp raii-->
+<p>One rule comes with it. The handlers a program gives to the library, for messages and for progress, are called from C: no
+exception may leave them. A lambda that captures nothing converts to the function pointer the API takes, and gets at the
+program's state through the <code>void *user</code> pointer that is passed along.</p>
+
+<!-- ============================================================================================ -->
+<h2 id="model">How the library works</h2>
+<p class="part-lede">The few rules that hold everywhere: failures, pixels, and what describes an image.</p>
+
+<h3 id="errors">Contexts, failures and messages</h3>
+<p>The library has no global state and prints nothing. A program makes a context, and everything that happens is told to
+that context or to the handles made from it. A context and its handles belong to one thread at a time; a program with several
+threads gives each its own, and different contexts are independent.</p>
+<div class="langs" data-group="errors">
+  <section class="lang" data-lang="c"><h4 class="lang-name">C</h4>
+    <p>Every function that can fail returns an <code>xisfconv_status</code>. <code>XISFCONV_OK</code> is 0, so a call is tested like any
+    C call. The status says what kind of failure it was; the text for this one case is kept in the context until the next failure.
+    Warnings and notes go to a message handler, if the program sets one, and are dropped otherwise.</p>
+    <!--@code c errors-->
+  </section>
+  <section class="lang" data-lang="cpp"><h4 class="lang-name">C++</h4>
+    <p>With the helpers of <a href="#cpp">From C++</a>, a call is wrapped in <code>xisf::check</code>, which throws
+    <code>xisf::Error</code> when the status is not <code>XISFCONV_OK</code>. The exception carries the status and, as
+    <code>what()</code>, the text the context has for it. Calls whose failure is an answer and not an error are tested by hand:
+    <a href="#wcs">Astrometry</a> asks for a solution that an image may not have, and <a href="#progress">Progress, messages and
+    failures</a> stops a call on purpose.</p>
+  </section>
+  <section class="lang" data-lang="py"><h4 class="lang-name">Python</h4>
+    <p>A call that fails raises <code>xisfconv.Error</code>, or the class below it for the kind of failure. Most of these classes are
+    also the exception Python itself has for the case, so code that catches <code>FileNotFoundError</code> or
+    <code>ValueError</code> catches them. There is no context to make: the package keeps one for each thread. Warnings of the library
+    are Python warnings, and its notes go to the logger <code>xisfconv</code>.</p>
+    <!--@code py errors-->
+  </section>
+</div>
+<p>The statuses, and what each of them is in Python:</p>
+<!--@status-table-->
+<p>The messages are those of the command line tool, and some name its options (<code>--force</code>,
+<code>--bounds</code>): the option names say which setting is meant. In Python the same messages name the arguments
+(<code>overwrite=True</code>).</p>
+
+<h3 id="options">Options</h3>
+<p>In C and C++, the options of a call are a struct. Each struct starts with its own size and is filled with its defaults
+by an <code>_init</code> function that is told the size the program was compiled with:
+<code>xisfconv_read_options_init(&amp;options, sizeof options)</code>. New fields are only ever added at the end, and the library
+reads no more of a struct than that size says, so a program built against an older header keeps working with a newer library.
+Where a call takes a pointer to options, <code>NULL</code> means the defaults. Enumerations are 32-bit integers with named
+constants, and flags are 0 or 1.</p>
+<p>In Python the options are keyword arguments, with names in place of the constants:
+<code>sample_format="float32"</code>, <code>codec="zstd"</code>, <code>row_order="bottom-up"</code>.</p>
+
+<h3 id="pixel-layout">Pixels</h3>
+<p>An image is read and written as a whole, in memory. The table says how it lies there.</p>
+<table class="grid">
+  <thead><tr><th></th><th>C and C++</th><th>Python</th></tr></thead>
+  <tbody>
+    <tr><td>Layout</td><td>One buffer, planar: channel 0, all its rows, then channel 1, and so on. Host byte order.</td>
+        <td>A NumPy array: <code>[height, width]</code> for one channel, <code>[height, width, channels]</code> for several.
+        <code>channels="first"</code> gives <code>[channels, height, width]</code>.</td></tr>
+    <tr><td>Row order</td><td>Stated in every call that passes pixels: <code>XISFCONV_ROWS_TOP_DOWN</code> or
+        <code>XISFCONV_ROWS_BOTTOM_UP</code>.</td>
+        <td>Row 0 is the top of the image, as in Pillow and matplotlib. <code>row_order="bottom-up"</code> gives the FITS
+        convention.</td></tr>
+    <tr><td>Samples</td><td><code>XISFCONV_SAMPLE_UINT8</code>, <code>UINT16</code>, <code>UINT32</code>, <code>UINT64</code>,
+        <code>FLOAT32</code>, <code>FLOAT64</code>; <code>XISFCONV_SAMPLE_AS_STORED</code> reads what the file has.</td>
+        <td>The NumPy types of the same names; <code>sample_format=None</code> reads what the file has.</td></tr>
+  </tbody>
+</table>
+<p>Asking for another sample format than the file has <em>rescales</em>; it does not cast. Integers go to integers over
+their full ranges, integers go to floating point as 0 to 1, and floating point goes to integers with the bounds of the image
+mapped to the full range of the integer. Only floating point to floating point is left as it is. The <em>bounds</em> are the
+range that floating point samples are meant to cover, 0 to 1 in most XISF files and 0 to 65535 in some; an image carries them,
+the stretch functions are told them, and writing takes them.</p>
+<p>The files differ in which row comes first. XISF, TIFF and PNG store the top row first; FITS stores the bottom row first
+unless its <code>ROWORDER</code> keyword says otherwise. The library turns the rows as needed, which is why it always wants to
+know which order a buffer has.</p>
+
+<h3 id="metadata">Keywords and properties</h3>
+<p>Two kinds of data describe an image, and the library keeps both.</p>
+<p><strong>FITS keywords</strong> are cards of a name, a value and a comment, in order; XISF files carry them as well as FITS files do.
+In C a value is the text FITS writes for it, so a string comes with its quotes; <code>xisfconv_keywords_get_text</code> takes
+them off. In Python a value is a <code>str</code>, a <code>bool</code>, an <code>int</code>, a <code>float</code>, or
+<code>None</code> for a card without one. A keyword that was read and not changed is written back exactly as it was.</p>
+<p><strong>XISF properties</strong> are typed values with an id such as <code>Instrument:Telescope:FocalLength</code>: numbers,
+strings, time points, vectors and matrices. An image has them, and so has the file. PixInsight keeps the processing history
+and its astrometric solution there. Converted to FITS or ASDF, a file takes its properties along, and gives them back when it
+is converted to XISF again.</p>
+<p>WCS keywords need one more thought, because they describe pixel positions and so depend on the row order. In an XISF
+file they count rows from the bottom, as PixInsight writes them, while the pixels are stored from the top.
+<a href="#wcs">Astrometry</a> shows the call that gives them for either order.</p>
+
+<!-- ============================================================================================ -->
+<h2 id="tour">A tour on one frame</h2>
+<p class="part-lede">Nine short programs, each in C, in C++ and in Python, and what each printed for the frame at the top of this page.</p>
+
+<h3 id="run">Running the tour</h3>
+<p>The chapters are the functions of one program per language: <code>examples/tour.c</code>, <code>examples/tour.cpp</code> and
+<code>examples/tour.py</code>. Each takes an XISF file and a directory for what it writes, and optionally the name of one chapter.
+The frame of this manual is not in the repository; any XISF image will do. (The chapters ask about what an XISF file has, so
+a FITS or ASDF file is turned away; <code>first</code> takes those too.)</p>
+<pre data-lang="sh">cmake -S . -B build -DXISFCONV_BUILD_TESTS=ON && cmake --build build -j
+mkdir out
+build/xisfconv_tour_c   integrated_light_ABE.xisf out            # every chapter
+build/xisfconv_tour_cpp integrated_light_ABE.xisf out pixels     # one of them
+python examples/tour.py integrated_light_ABE.xisf out</pre>
+<p>The main function of each makes the context and runs the chapters:</p>
+<!--@tabs main quiet-->
+<p>After a run on the example frame, the directory holds these files. The same ones are written whatever the language;
+the Python tour adds three, from the two chapters only it has.</p>
+<!--@files-->
+
+<h3 id="inspect">What is in a file</h3>
+<p>Opening a file reads its header and no pixels, so it is cheap for a file of any size. The file then answers questions:
+how many images, what size and sample format each has, how it is stored, and which keywords and properties it has.</p>
+<!--@tabs inspect-->
+<p>The details that have a field or an attribute are the ones every format has. What only one format knows is asked for by
+name, as text: <code>xisfconv_image_detail(file, 0, "compression")</code> in C, <code>image.detail("compression")</code> in Python.
+The empty compression above says that this frame is stored as it is.</p>
+
+<h3 id="pixels">Reading pixels</h3>
+<p>Reading takes the number of the image, the sample format the program wants and the row order it wants. In C the
+program asks how large the buffer has to be, allocates it and has it filled. In Python the array comes back from the call.</p>
+<!--@tabs pixels-->
+<p>The function <code>read_float32</code> of the C and C++ versions is used by the chapters that follow. Beside the pixels
+it returns the range their samples are meant to cover, because that depends on what the file holds: floating point samples
+come as they are stored, with the bounds the image states, and integers come as 0 to 1. In Python,
+<code>xisfconv.read_image</code> returns the same range as the <code>bounds</code> of its image.</p>
+
+<h3 id="stretch">Stretching for the screen</h3>
+<p>A linear frame looks black: nearly all of its samples are close to the background. PixInsight shows such a frame through a
+screen transfer function, and the library computes it the same way. <code>auto_stretch</code> finds shadows, midtones and
+highlights from the data, with the shadows 2.8 normalized median deviations below the median and 0.25 as the target for the
+background. <code>apply_stretch</code> returns the stretched samples as 32-bit floating point from 0 to 1. Both are told the
+range of the samples they are given.</p>
+<!--@tabs stretch-->
+<p>With a colour image, <em>linked</em> shares the statistics between the channels, which keeps the colour balance;
+unlinked stretches each channel for itself. A file may also carry the stretch its author saved:
+<code>xisfconv_stored_stretch</code> in C, <code>image.stored_stretch</code> in Python.</p>
+
+<h3 id="write">Writing an image</h3>
+<p>This chapter cuts 512 × 512 pixels from the middle of the frame, the square in the picture at the top, and writes them as a
+new XISF file with keywords, four properties, compression and a checksum.</p>
+<p>The keywords are not simply those of the frame. A part of a frame is another image: what the cards say of the instrument
+and the observation holds for it as well, but WCS keywords and <code>BAYERPAT</code> say where a pixel is, and for the part
+they would be wrong. The chapter takes the cards it knows to hold by their names, and adds two of its own. The range of the
+samples is given along for the same reason: left out, it would be guessed from the pixels of the part.</p>
+<!--@tabs write-->
+<p>The format follows the name of the file: <code>.xisf</code>, <code>.fits</code>, <code>.asdf</code>, <code>.tif</code> or
+<code>.png</code>. A file is written under its name with <code>.part</code> added and renamed when it is complete, so a call
+that fails leaves no half-written file under the final name. An existing file is replaced only when the call says so.</p>
+<p>In C and C++ a <em>writer</em> collects images and writes them when it is finished: one image here, several for an XISF file
+with several images or a FITS file with several HDUs. The writer copies what it is given, so the program may free its buffers
+as soon as the image is added. In Python, <code>xisfconv.write</code> takes one array, one <code>Image</code>, or a list of them.</p>
+
+<h3 id="convert">Converting files</h3>
+<p>One call does what the command line tool does with a file: it reads every image, turns the rows as the output format
+wants them, takes keywords and properties along, translates the astrometric solution, and writes the output.</p>
+<!--@tabs convert-->
+<p>The second conversion is how the picture at the top of this page was made. A smaller picture is the mean of the pixels it
+covers, taken before the stretch. From XISF, the call converts to FITS, ASDF, TIFF and PNG; from FITS and ASDF, to XISF,
+to each other, and to TIFF and PNG. XISF to XISF is the next chapter.</p>
+
+<h3 id="rewrite">Rewriting and verifying</h3>
+<p>A rewrite stores the data blocks of an XISF file another way: compressed, or not, with checksums added or removed. It
+converts nothing. Pixels, keywords and properties come out as they went in, and unless told otherwise the call reads
+its output back and compares every block with the input.</p>
+<!--@tabs rewrite-->
+<p>The frame shrinks from 65.7 to 48.3 megabytes. Two blocks were compressed: the pixels, and the thumbnail
+PixInsight saves with them. <code>xisfconv_rewrite_in_place</code> and <code>xisfconv.rewrite_in_place</code> do the
+same to a file under its own name, and leave the file alone when it is already stored as asked.</p>
+
+<h3 id="units">Distributed units</h3>
+<p>XISF allows an image to live in more than one file: a header file, <code>.xish</code>, which is the XML header and nothing
+else, and the files that header names, where the data is. The library writes the data into one data blocks file,
+<code>.xisb</code>, beside the header. A program only ever names the header file. PixInsight itself opens monolithic files
+only, so the last step of the chapter packs the unit into one file again.</p>
+<!--@tabs units-->
+<p>A header is data that came from somewhere, and it says which other files are read. So the library follows a header only
+as far as it is allowed to. By default that is to files in the directory of the header and below it, and only from a file that is
+named as a header file. To anywhere on the machine, or to no other file, is a setting: of the context in C and C++,
+<code>xisfconv_context_set_external_files</code>, and of each call in Python, <code>external_files=</code>. A block the header is not
+followed to is not read, and the failure says that this is the reason: <code>XISFCONV_ERR_NOT_ALLOWED</code>, or
+<code>xisfconv.NotAllowedError</code>, which is a <code>PermissionError</code>. Nothing is ever fetched from a network. A program
+that opens files from people it does not know should leave the default as it is.</p>
+
+<h3 id="wcs">Astrometry</h3>
+<p>PixInsight stores the astrometric solution of an image as XISF properties, with its distortion as surface splines. Other
+software expects WCS keywords. <code>xisfconv_wcs_keywords</code> and <code>image.wcs_keywords()</code> give them for the row order
+the program asks for: those the file has, or new ones made from PixInsight's solution, with the distortion fitted as SIP
+polynomials.</p>
+<!--@tabs wcs-->
+<p>The example frame has not been plate-solved, so the call says that there is nothing to make keywords from. That answer
+is a status of its own, <code>XISFCONV_ERR_NOT_FOUND</code>, and <code>xisfconv.NotFoundError</code> in Python. On the same frame
+after PixInsight's ImageSolver has solved it, the chapter prints this:</p>
+<!--@solved-->
+<p>The rest of the line that counts the keywords says how good the fit is: the scale, where the polynomials come from, and how far the result is
+from the catalogue stars the solution was made with. <code>xisfconv_fits_keywords</code> and <code>image.fits_keywords()</code> give
+the whole header an image gets when it is converted to FITS, and <code>xisfconv_wcs_flip_rows</code> converts WCS keywords from
+one row order to the other.</p>
+
+<h3 id="progress">Progress, messages and failures</h3>
+<p>Long calls report their progress to a handler, and the handler can stop them. A call that is stopped leaves no partly
+written file. The chapter also shows what a failure looks like, and how the notes of a conversion reach the program: it
+converts the frame to FITS and that file back to XISF, and prints what the library has to say about both.</p>
+<!--@tabs progress-->
+<p>In C and C++ the progress handler returns something other than 0 to stop the call, which then returns
+<code>XISFCONV_ERR_CANCELLED</code>. Another thread can ask for the same with <code>xisfconv_context_cancel</code>, the one
+function that may be called while a call runs in the context. In Python the handler stops the work by raising, and the
+exception comes out of the call; Ctrl-C does the same.</p>
+
+<!-- ============================================================================================ -->
+<h2 id="python-more">More for Python</h2>
+<p class="part-lede">Two modules for programs that already speak another interface: astropy's, and that of the <code>xisf</code> package.</p>
+
+<h3 id="astropy">With astropy</h3>
+<p>Importing <code>xisfconv.astropy</code> registers the format <code>xisf</code> with astropy's unified I/O, so that
+<code>CCDData.read</code> and <code>CCDData.write</code> take XISF files; <code>read_hdulist</code> and <code>write_hdulist</code> do
+the same for <code>astropy.io.fits</code>. Everything in this module follows the FITS conventions, as astropy does: row 0 of an
+array is the bottom of the image, a colour image is <code>[channels, height, width]</code>, and the header describes the pixels
+that way, WCS included.</p>
+<!--@code py astropy-->
+<!--@output py astropy-->
+<p>The header has eight cards more than the file has keywords: the six with which a FITS file describes its data
+(<code>SIMPLE</code>, <code>BITPIX</code>, <code>NAXIS</code>, <code>NAXIS1</code>, <code>NAXIS2</code>, <code>EXTEND</code>), and
+<code>EXTNAME</code> and <code>ROWORDER</code>. For a file with instrument and observation properties and no keywords for them,
+the keywords derived from those properties come on top. The data is big-endian because astropy's own FITS reader made the
+array; the image is handed to it as a FITS file in memory, which takes about four times the size of the image.</p>
+
+<h3 id="compat">For programs written for the xisf package</h3>
+<p>The <code>xisf</code> package of Sergio Díaz is the usual way to read and write XISF in Python. <code>xisfconv.xisf</code> has
+a class of the same name, with the same methods, arguments and return values, so that a program written for that package
+runs on this library with its import line changed. None of that package's code is used. The
+<a href="#py-xisf">reference of the module</a> lists where the two differ on purpose.</p>
+<!--@code py compat-->
+<!--@output py compat-->
+
+<!-- ============================================================================================ -->
+<h2 id="c-reference">C API reference</h2>
+<p class="part-lede">The declarations of <code>xisfconv.h</code>, version <!--@version-->, in the order of the header. C++ programs use the same ones.</p>
+<p>Two things of the header are not listed below. The macros <code>XISFCONV_VERSION_MAJOR</code>,
+<code>XISFCONV_VERSION_MINOR</code> and <code>XISFCONV_VERSION_PATCH</code> are the version a program was compiled with;
+<code>xisfconv_version</code> gives the one it runs with. And a program that links the static library defines
+<code>XISFCONV_STATIC</code> before it includes the header, which matters on Windows; the pkg-config file of a static
+library does that for it.</p>
+<!--@c-reference-->
+
+<!-- ============================================================================================ -->
+<h2 id="python-reference">Python API reference</h2>
+<p class="part-lede">The package <code>xisfconv</code>, version <!--@version-->: its functions and classes with their own documentation.</p>
+<!--@python-reference-->
+
+<footer class="colophon">
+  <p>This manual is one file and needs nothing else. <code>docs/make_manual.py</code> makes it from the example programs in
+  <code>examples/</code>, from <code>include/xisfconv.h</code> and from the docstrings of the Python package, together with what the
+  examples printed when they ran on the example frame. The tests of the project compile and run the examples, and check that
+  this file was made from the sources as they are.</p>
+  <p>libxisfconv and its Python package are free software under the GNU Lesser General Public License, version 3 or later.
+  Copyright © 2026 Jurgen Kobierczynski. <a href="https://github.com/jkobierczynski/xisfconv">github.com/jkobierczynski/xisfconv</a></p>
+</footer>
+
+</main>
+</div>
+
+<script>
+(function () {
+  var root = document.documentElement;
+  var names = { c: "C", cpp: "C++", py: "Python" };
+  function keep(key, value) { try { localStorage.setItem(key, value); } catch (e) {} }
+
+  // The language: one choice for the whole page. The group that was clicked stays where it is on the screen.
+  function show(lang, anchor) {
+    var before = anchor ? anchor.getBoundingClientRect().top : 0;
+    root.setAttribute("data-lang", lang);
+    keep("xisfconv-manual-language", lang);
+    var buttons = document.querySelectorAll("[data-set-lang]");
+    for (var i = 0; i < buttons.length; i++) {
+      buttons[i].setAttribute("aria-pressed", buttons[i].getAttribute("data-set-lang") === lang ? "true" : "false");
+    }
+    if (anchor) {
+      var by = anchor.getBoundingClientRect().top - before;
+      try { window.scrollBy({ top: by, left: 0, behavior: "instant" }); } catch (e) { window.scrollBy(0, by); }
+    }
+  }
+  var groups = document.querySelectorAll(".langs");
+  for (var g = 0; g < groups.length; g++) {
+    var bar = document.createElement("div");
+    bar.className = "tabbar";
+    bar.setAttribute("role", "group");
+    bar.setAttribute("aria-label", "Language of the example");
+    var panels = groups[g].querySelectorAll(".lang");
+    for (var p = 0; p < panels.length; p++) {
+      var button = document.createElement("button");
+      button.type = "button";
+      button.setAttribute("data-set-lang", panels[p].getAttribute("data-lang"));
+      button.textContent = names[panels[p].getAttribute("data-lang")];
+      bar.appendChild(button);
+    }
+    groups[g].insertBefore(bar, groups[g].firstChild);
+  }
+  document.addEventListener("click", function (event) {
+    var button = event.target.closest ? event.target.closest("[data-set-lang]") : null;
+    if (button) show(button.getAttribute("data-set-lang"), button.closest(".langs"));
+  });
+  show(root.getAttribute("data-lang"));
+
+  // The theme: what the system says, until the reader says otherwise.
+  var theme = document.getElementById("theme");
+  function dark() {
+    var set = root.getAttribute("data-theme");
+    return set ? set === "dark" : !!(window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches);
+  }
+  function label() { theme.textContent = dark() ? "Use the light theme" : "Use the dark theme"; }
+  theme.addEventListener("click", function () {
+    var next = dark() ? "light" : "dark";
+    root.setAttribute("data-theme", next);
+    keep("xisfconv-manual-theme", next);
+    label();
+  });
+  label();
+
+  // Copying a block of code.
+  var blocks = document.querySelectorAll(".code");
+  for (var b = 0; b < blocks.length; b++) {
+    var copy = document.createElement("button");
+    copy.type = "button";
+    copy.className = "copy";
+    copy.textContent = "Copy";
+    blocks[b].appendChild(copy);
+  }
+  document.addEventListener("click", function (event) {
+    var button = event.target;
+    if (!button.classList || !button.classList.contains("copy")) return;
+    var text = button.parentNode.querySelector("pre").textContent;
+    function done(ok) {
+      button.textContent = ok ? "Copied" : "Select and copy by hand";
+      setTimeout(function () { button.textContent = "Copy"; }, 1600);
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () { done(true); }, function () { done(false); });
+    } else {
+      done(false);
+    }
+  });
+
+  // The contents: the section that is being read is marked.
+  var links = {}, items = document.querySelectorAll(".contents ul ul a");
+  for (var k = 0; k < items.length; k++) links[items[k].getAttribute("href").slice(1)] = items[k];
+  var heads = [];
+  var all = document.querySelectorAll("main h3[id]");
+  for (var h = 0; h < all.length; h++) if (links[all[h].id]) heads.push(all[h]);
+  var marked = null, waiting = false;
+  function mark() {
+    waiting = false;
+    var current = null;
+    for (var i = 0; i < heads.length; i++) {
+      if (heads[i].getBoundingClientRect().top <= 120) current = heads[i]; else break;
+    }
+    var link = current ? links[current.id] : null;
+    if (link === marked) return;
+    if (marked) marked.removeAttribute("aria-current");
+    if (link) {
+      link.setAttribute("aria-current", "true");
+      var side = document.querySelector(".side");
+      if (side.scrollHeight > side.clientHeight) {
+        var box = link.getBoundingClientRect(), frame = side.getBoundingClientRect();
+        if (box.top < frame.top + 40 || box.bottom > frame.bottom - 40) side.scrollTop += box.top - frame.top - frame.height / 2;
+      }
+    }
+    marked = link;
+  }
+  window.addEventListener("scroll", function () { if (!waiting) { waiting = true; requestAnimationFrame(mark); } }, { passive: true });
+  mark();
+
+  // On a narrow screen the contents start closed.
+  if (window.matchMedia && window.matchMedia("(max-width: 62rem)").matches) document.querySelector(".contents").removeAttribute("open");
+})();
+</script>
+</body>
+</html>

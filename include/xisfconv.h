@@ -169,6 +169,17 @@ XISFCONV_API void xisfconv_context_set_progress_handler(xisfconv_context *ctx, x
  * xisfconv_context_clear_messages: a caller that keeps them has to clear them. */
 XISFCONV_API void xisfconv_context_keep_messages(xisfconv_context *ctx, int32_t keep);
 
+/* The number of messages the context keeps. */
+XISFCONV_API size_t xisfconv_context_message_count(const xisfconv_context *ctx);
+/* A kept message: its level, the file it is about (NULL if none) and its text. Any out pointer
+ * may be NULL. The strings are valid until the next call in the context or
+ * xisfconv_context_clear_messages. XISFCONV_ERR_INDEX beyond the last one. */
+XISFCONV_API xisfconv_status xisfconv_context_message(const xisfconv_context *ctx, size_t index,
+                                                      xisfconv_message_level *level, const char **path,
+                                                      const char **message);
+/* Drops the messages the context keeps. */
+XISFCONV_API void xisfconv_context_clear_messages(xisfconv_context *ctx);
+
 /* Distributed XISF units (since 0.16). An XISF unit is one monolithic file (.xisf), or it is
  * distributed: a header file (.xish), which is the XML header and nothing else, and the files
  * that header names, where its data blocks are. Those are XISF data blocks files (.xisb), which
@@ -203,14 +214,6 @@ enum {
 };
 XISFCONV_API xisfconv_status xisfconv_context_set_external_files(xisfconv_context *ctx, xisfconv_external_files which);
 XISFCONV_API xisfconv_external_files xisfconv_context_external_files(const xisfconv_context *ctx);
-XISFCONV_API size_t xisfconv_context_message_count(const xisfconv_context *ctx);
-/* A kept message: its level, the file it is about (NULL if none) and its text. Any out pointer
- * may be NULL. The strings are valid until the next call in the context or
- * xisfconv_context_clear_messages. XISFCONV_ERR_INDEX beyond the last one. */
-XISFCONV_API xisfconv_status xisfconv_context_message(const xisfconv_context *ctx, size_t index,
-                                                      xisfconv_message_level *level, const char **path,
-                                                      const char **message);
-XISFCONV_API void xisfconv_context_clear_messages(xisfconv_context *ctx);
 
 /* Asks the call that is running in this context to stop: at its next step it returns
  * XISFCONV_ERR_CANCELLED and leaves no partly written file, as when the progress handler asks.
@@ -360,6 +363,8 @@ XISFCONV_API xisfconv_status xisfconv_keywords_append_string(xisfconv_keywords *
  * that are needed to read back the same double. */
 XISFCONV_API xisfconv_status xisfconv_keywords_append_number(xisfconv_keywords *kw, const char *name, double number,
                                                              const char *comment);
+/* Removes the card at `index`: XISFCONV_ERR_INDEX beyond the last one, XISFCONV_ERR_ARGUMENT for
+ * a list owned by a file. */
 XISFCONV_API xisfconv_status xisfconv_keywords_remove(xisfconv_keywords *kw, size_t index);
 
 /* The unquoted content of a FITS string value ("M 31" for 'M 31    '); other values are returned
@@ -639,7 +644,9 @@ XISFCONV_API void xisfconv_read_options_init(xisfconv_read_options *options, siz
 XISFCONV_API xisfconv_status xisfconv_load_pixels(xisfconv_file *file, size_t image, int32_t verify_checksums);
 
 /* Size in bytes of the buffer xisfconv_read_pixels needs. options may be NULL for the defaults.
- * For FITS and ASDF images whose sample format is not yet known this loads the pixels. */
+ * With XISFCONV_SAMPLE_AS_STORED, for a FITS or ASDF image whose sample format is not yet known,
+ * this loads the pixels: the size depends on them. (With a sample format that is asked for it
+ * does not, and xisfconv_image_info_get still reports data_known = 0 afterwards.) */
 XISFCONV_API xisfconv_status xisfconv_pixels_size(xisfconv_file *file, size_t image,
                                                   const xisfconv_read_options *options, uint64_t *size);
 

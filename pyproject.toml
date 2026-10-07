@@ -47,7 +47,8 @@ wheel.packages = ["python/xisfconv"]
 wheel.install-dir = "xisfconv"         # the library goes next to the modules
 wheel.py-api = "py3"                   # no Python C API is used: one wheel per platform serves every Python 3
 # The source distribution holds what the wheel is built from, all of it LGPL.
-sdist.exclude = [".github", "tests", "python/tests", "examples", "desktop", "src/main.cpp", "TODO.md", "DEVELOPMENT.md"]
+sdist.exclude = [".github", "tests", "python/tests", "examples", "docs", "desktop", "src/main.cpp", "TODO.md",
+                 "DEVELOPMENT.md"]
 
 # Windows: build in a directory that stays. By default the build directory is a temporary one
 # that is deleted when the wheel is made, and on Windows that fails ("the process cannot access

@@ -662,9 +662,18 @@ xisfconv_convert(ctx, "M31.xisf", "M31.fits", NULL); /* what the tool does, in o
 xisfconv_context_free(ctx);
 ```
 
-[`examples/example.c`](examples/example.c) is a complete program: it lists the images and keywords
-of a file, reads pixels, writes them as a compressed XISF file, makes a stretched PNG and verifies
-the input.
+**The manual.** [`docs/manual.html`](docs/manual.html) is the manual of the library for C, C++ and
+Python: how to get and link it, the rules that hold everywhere (failures, pixels, keywords and
+properties), a tour of nine short programs in each of the three languages with what they printed
+for a real frame, and the complete reference of the C API and of the Python package. It is one
+file that needs nothing else: download it and open it in a browser (GitHub shows its source, not
+the page). The programs it shows are in [`examples/`](examples): `first.c`, `first.cpp` and
+`first.py` say what is in a file, and `tour.c`, `tour.cpp` and `tour.py` go through inspecting a
+file, reading pixels, the screen stretch, writing an image with keywords and properties,
+converting, rewriting and verifying, distributed units, astrometry, and progress and failures.
+There is one interface for C and C++, the header; `tour.cpp` begins with the forty lines that give
+a C++ program handles that free themselves and exceptions.
+[`examples/example.c`](examples/example.c) is one more complete program, in one function.
 
 What to know:
 
@@ -838,6 +847,9 @@ cmake -S . -B build-shared -DBUILD_SHARED_LIBS=ON -DXISFCONV_BUILD_TESTS=ON && c
 mkdir /tmp/capi && build-shared/xisfconv_capi_test /tmp/capi
 python3 tests/library_tests.py build-shared/libxisfconv.so build-shared/xisfconv
 
+# the example programs of the manual, in C and C++ (those in Python are run by python/tests)
+python3 tests/examples_test.py build-shared
+
 # the Python package: against the build above, or installed (then without the first two settings)
 pip install pytest
 XISFCONV_LIBRARY=build-shared/libxisfconv.so PYTHONPATH=python XISFCONV_TOOL=build-shared/xisfconv \
@@ -878,6 +890,21 @@ either, in every codec, the two must return the same dictionaries (key order, tu
 dtypes) and the same arrays, the package must read what the module writes (but for the few
 values it does not read from any file, which the module's documentation names), and each
 difference that documentation names has a test.
+
+The example programs of the manual are tested like the rest. CMake builds `examples/first.c`,
+`first.cpp`, `tour.c` and `tour.cpp` with the test programs, with the warnings of the library, and
+`tests/examples_test.py` runs them on small XISF files that it writes byte by byte: one of
+floating point with keywords and properties, one of three channels of 16-bit integers with WCS
+keywords and a Bayer pattern, one whose range is 0 to 65535. What the chapters print is held
+against what they must print for those files, the C and the C++ version must print the same,
+every chapter must run alone and a second time in the same directory, and the files they leave
+are verified by the tool. `python/tests` does the same for `first.py` and `tour.py`, and checks
+that `docs/manual.html` was made from the examples, the header and the docstrings as they are now.
+`python docs/make_manual.py` makes it again; that needs Pygments, and the package importable with
+astropy. The manual shows what the examples printed for one real frame, which is kept in
+`docs/manual-output.json`: after a change to an example the maker asks for the examples to be run
+on that frame again (`--run`), or to be told that the change does not change what they print
+(`--keep-output`).
 
 Test inputs come from two independent writers: the `xisf` PyPI package (all codecs ± shuffling,
 5 sample formats, gray and RGB) and a small encoder in the test script for the features that package
@@ -1139,8 +1166,8 @@ the terms of the GNU Lesser General Public License, either version 3 of the Lice
 option) any later version: see [COPYING.LESSER](COPYING.LESSER), which adds its permissions to the
 terms in [LICENSE](LICENSE). A program may link the library without taking on the GPL, provided the
 conditions of the LGPL are met. Each source file says in its first lines which of the two applies;
-the build files, the example and the Python package (`python/xisfconv`) belong to the library, the
-tests to the tool.
+the build files, the examples, the manual and the Python package (`python/xisfconv`) belong to the
+library, the tests to the tool.
 
 The release binaries and the Python wheels contain Zstandard, and some of them zlib:
 see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).

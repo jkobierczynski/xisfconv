@@ -1,0 +1,106 @@
+{
+ "examples": {
+  "first.c": "f1ce4e20c965fe89f21839ef2ee8ed479e20b092f61059384ee2a3633a27ff6c",
+  "first.cpp": "94822798496bbf9bbb669011b36f58c74d576a49b278483f07259de1a3ad83e4",
+  "first.py": "b58efbd8aecc54d1833c397590c0a9fc6e89800d79362d252d70282842e0091c",
+  "tour.c": "5f9c687d1e7cc4879a9743cac0b2a848ebedf1548e65615bf315dc2b7433e4a0",
+  "tour.cpp": "6727c7698619003293c0b85feb51b731b77e1cd374f83b1fbf7a773eabd1bf53",
+  "tour.py": "304193e564fcc0cfcb8d07b19771dc224a023fbe166d1f9f1ba2bee5c59f2fa0"
+ },
+ "files": [
+  [
+   "back.xisf",
+   65572864
+  ],
+  [
+   "crop.xisf",
+   754362
+  ],
+  [
+   "frame.fits",
+   65571840
+  ],
+  [
+   "packed.xisf",
+   65693664
+  ],
+  [
+   "preview.png",
+   397943
+  ],
+  [
+   "smaller.xisf",
+   48330346
+  ],
+  [
+   "stretched.png",
+   11699702
+  ],
+  [
+   "there.fits",
+   65571840
+  ],
+  [
+   "unit.xisb",
+   65681376
+  ],
+  [
+   "unit.xish",
+   14358
+  ]
+ ],
+ "first": {
+  "c": "integrated_light_ABE: 4656 x 3520 pixels, 1 channel(s)",
+  "cpp": "integrated_light_ABE: 4656 x 3520 pixels, 1 channel(s)",
+  "py": "integrated_light_ABE: 4656 x 3520 pixels, 1 channel(s)"
+ },
+ "frame": "integrated_light_ABE.xisf",
+ "frame_bytes": 65693664,
+ "picture": [
+  800,
+  605
+ ],
+ "solved": {
+  "c": "astrometric solution: yes\n51 WCS keywords; WCS TAN 0.850\"/px, SIP order 3 from spline grid; vs 651 stars rms 1.30\" (linear 2.22\"), inverse max err 0.074 px\n  WCSAXES = 2\n  CTYPE1  = 'RA---TAN-SIP'\n  CTYPE2  = 'DEC--TAN-SIP'\n  CUNIT1  = 'deg     '\n  CUNIT2  = 'deg     '\n  CRVAL1  = 328.178191582\n  CRVAL2  = 47.3578235755\n  CRPIX1  = 2328.22456097",
+  "cpp": "astrometric solution: yes\n51 WCS keywords; WCS TAN 0.850\"/px, SIP order 3 from spline grid; vs 651 stars rms 1.30\" (linear 2.22\"), inverse max err 0.074 px\n  WCSAXES = 2\n  CTYPE1  = 'RA---TAN-SIP'\n  CTYPE2  = 'DEC--TAN-SIP'\n  CUNIT1  = 'deg     '\n  CUNIT2  = 'deg     '\n  CRVAL1  = 328.178191582\n  CRVAL2  = 47.3578235755\n  CRPIX1  = 2328.22456097",
+  "py": "astrometric solution: yes\n51 WCS keywords; WCS TAN 0.850\"/px, SIP order 3 from spline grid; vs 651 stars rms 1.30\" (linear 2.22\"), inverse max err 0.074 px\n  WCSAXES = 2\n  CTYPE1  = 'RA---TAN-SIP'\n  CTYPE2  = 'DEC--TAN-SIP'\n  CUNIT1  = 'deg'\n  CUNIT2  = 'deg'\n  CRVAL1  = 328.178191582\n  CRVAL2  = 47.3578235755\n  CRPIX1  = 2328.22456097"
+ },
+ "solved_frame": "integrated_light_ABE_ast.xisf",
+ "tour": {
+  "c": {
+   "convert": "wrote frame.fits\nwrote preview.png",
+   "inspect": "1 image(s) in 65693664 bytes, XISF 1.0, monolithic\nimage 0 \"integrated_light_ABE\": 4656 x 3520 pixels, 1 channel(s), Float32, range 0 to 1\nstored at attachment:16384:65556480, compression \"\"\n24 keywords, the first of them:\n  INSTRUME= 'ZWO CCD ASI1600MM-Cool' / Name of instrument\n  IMAGETYP= 'Light' / Type of integrated image\n  XPIXSZ  = 3.8 / Pixel size including binning, X-axis (um)\n  YPIXSZ  = 3.8 / Pixel size including binning, Y-axis (um)\nthe object is ic5146\n2 properties of the image:\n  PixInsight:Previews (String) = 1.0:2:Preview01:2780:2096:462:528:Preview02:...\n  PixInsight:ProcessingHistory (String) = <?xml version=\"1.0\" encoding=\"UTF-8\"?><Proce...\n6 properties of the file:\n  XISF:CreationTime (String) = 2026-08-15T14:12:01Z\n  XISF:CreatorApplication (String) = PixInsight 1.9.3\n  XISF:CreatorModule (String) = XISF module version 1.1.3\n  XISF:CreatorOS (String) = Windows\n  XISF:BlockAlignmentSize (UInt16) = 4096\n  XISF:MaxInlineBlockSize (UInt16) = 3072",
+   "pixels": "16389120 samples: minimum 0.000000, maximum 1.000000, mean 0.278100\nthe pixel in the middle of channel 0: 0.247907",
+   "progress": "status 2, \"input/output error\": cannot open file\n  [note] image 0: 2 XISF properties taken along\n  [note] image 0 (HDU 0): 32-bit float, rows bottom-up (flipped to XISF's top-down order)\n  [note] image 0: 2 XISF properties restored\n  rewriting 0 of 2\n  rewriting 1 of 2\nstopped: cancelled; a file is left: no",
+   "rewrite": "65693664 -> 48330346 bytes: 2 block(s) compressed, 0 kept, 2 checksum(s), read back: yes\nsmaller.xisf is stored as asked: yes\nverdict OK: 1 image, 2 data blocks; 2 checksum(s) verified",
+   "stretch": "shadows 0.133544, midtones 0.271266, highlights 1.000000\nwrote stretched.png, 4656 x 3520, 8 bits",
+   "units": "unit.xish is a distributed unit: header 14358 bytes, 65695734 bytes with its data\n  data in unit.xisb\nwith XISFCONV_EXTERNAL_NONE: not allowed\nwith the default: read\npacked into packed.xisf",
+   "wcs": "astrometric solution: none\nthis image has no solution to make WCS keywords from",
+   "write": "wrote crop.xisf: 512 x 512 pixels, compressed with zlib, SHA-256 checksum"
+  },
+  "cpp": {
+   "convert": "wrote frame.fits\nwrote preview.png",
+   "inspect": "1 image(s) in 65693664 bytes, XISF 1.0, monolithic\nimage 0 \"integrated_light_ABE\": 4656 x 3520 pixels, 1 channel(s), Float32, range 0 to 1\nstored at attachment:16384:65556480, compression \"\"\n24 keywords, the first of them:\n  INSTRUME= 'ZWO CCD ASI1600MM-Cool' / Name of instrument\n  IMAGETYP= 'Light' / Type of integrated image\n  XPIXSZ  = 3.8 / Pixel size including binning, X-axis (um)\n  YPIXSZ  = 3.8 / Pixel size including binning, Y-axis (um)\nthe object is ic5146\n2 properties of the image:\n  PixInsight:Previews (String) = 1.0:2:Preview01:2780:2096:462:528:Preview02:...\n  PixInsight:ProcessingHistory (String) = <?xml version=\"1.0\" encoding=\"UTF-8\"?><Proce...\n6 properties of the file:\n  XISF:CreationTime (String) = 2026-08-15T14:12:01Z\n  XISF:CreatorApplication (String) = PixInsight 1.9.3\n  XISF:CreatorModule (String) = XISF module version 1.1.3\n  XISF:CreatorOS (String) = Windows\n  XISF:BlockAlignmentSize (UInt16) = 4096\n  XISF:MaxInlineBlockSize (UInt16) = 3072",
+   "pixels": "16389120 samples: minimum 0.000000, maximum 1.000000, mean 0.278100\nthe pixel in the middle of channel 0: 0.247907",
+   "progress": "status 2, \"input/output error\": cannot open file\n  [note] image 0: 2 XISF properties taken along\n  [note] image 0 (HDU 0): 32-bit float, rows bottom-up (flipped to XISF's top-down order)\n  [note] image 0: 2 XISF properties restored\n  rewriting 0 of 2\n  rewriting 1 of 2\nstopped: cancelled; a file is left: no",
+   "rewrite": "65693664 -> 48330346 bytes: 2 block(s) compressed, 0 kept, 2 checksum(s), read back: yes\nsmaller.xisf is stored as asked: yes\nverdict OK: 1 image, 2 data blocks; 2 checksum(s) verified",
+   "stretch": "shadows 0.133544, midtones 0.271266, highlights 1.000000\nwrote stretched.png, 4656 x 3520, 8 bits",
+   "units": "unit.xish is a distributed unit: header 14358 bytes, 65695734 bytes with its data\n  data in unit.xisb\nwith XISFCONV_EXTERNAL_NONE: not allowed\nwith the default: read\npacked into packed.xisf",
+   "wcs": "astrometric solution: none\nthis image has no solution to make WCS keywords from",
+   "write": "wrote crop.xisf: 512 x 512 pixels, compressed with zlib, SHA-256 checksum"
+  },
+  "py": {
+   "astropy": "CCDData of (3520, 4656), >f4, in adu, with 32 header cards\nOBJECT = ic5146, ROWORDER = BOTTOM-UP\nrow 0 of the CCDData is the last row of xisfconv.read(): yes\nwrote ccd.xisf\n1 HDU(s), the first of (3520, 4656) with 32 cards\nwrote hdus.xisf",
+   "compat": "geometry (4656, 3520, 1), Float32, pixels of (3520, 4656, 1)\nmade by PixInsight 1.9.3\n24 FITS keywords, 2 XISF properties\nwrote compat.xisf",
+   "convert": "wrote frame.fits\nwrote preview.png",
+   "inspect": "1 image(s) in 65693664 bytes, XISF 1.0, monolithic\nimage 0 \"integrated_light_ABE\": 4656 x 3520 pixels, 1 channel(s), float32, range 0 to 1\nstored at attachment:16384:65556480, compression \"\"\n24 keywords, the first of them:\n  INSTRUME= 'ZWO CCD ASI1600MM-Cool' / Name of instrument\n  IMAGETYP= 'Light' / Type of integrated image\n  XPIXSZ  = 3.8 / Pixel size including binning, X-axis (um)\n  YPIXSZ  = 3.8 / Pixel size including binning, Y-axis (um)\nthe object is ic5146\n2 properties of the image:\n  PixInsight:Previews (String) = 1.0:2:Preview01:2780:2096:462:528:Preview02:...\n  PixInsight:ProcessingHistory (String) = <?xml version=\"1.0\" encoding=\"UTF-8\"?><Proce...\n6 properties of the file:\n  XISF:CreationTime (String) = 2026-08-15T14:12:01Z\n  XISF:CreatorApplication (String) = PixInsight 1.9.3\n  XISF:CreatorModule (String) = XISF module version 1.1.3\n  XISF:CreatorOS (String) = Windows\n  XISF:BlockAlignmentSize (UInt16) = 4096\n  XISF:MaxInlineBlockSize (UInt16) = 3072",
+   "pixels": "16389120 samples: minimum 0.000000, maximum 1.000000, mean 0.278100\nthe pixel in the middle of channel 0: 0.247907\nread bottom-up, the first row is the last row of the other: yes",
+   "progress": "InputNotFoundError (a FileNotFoundError: yes): no such file.xisf: cannot open file\n  [note] integrated_light_ABE.xisf: image 0: 2 XISF properties taken along\n  [note] out/there.fits: image 0 (HDU 0): 32-bit float, rows bottom-up (flipped to XISF's top-down order)\n  [note] out/there.fits: image 0: 2 XISF properties restored\n  rewriting 0 of 2\n  rewriting 1 of 2\nstopped: by the handler; a file is left: no",
+   "rewrite": "65693664 -> 48330346 bytes: 2 block(s) compressed, 0 kept, 2 checksum(s), read back: yes\nsmaller.xisf is stored as asked: yes\nverdict OK: 1 image, 2 data blocks; 2 checksum(s) verified",
+   "stretch": "shadows 0.133544, midtones 0.271266, highlights 1.000000\nwrote stretched.png, 4656 x 3520, 8 bits",
+   "units": "unit.xish is a distributed unit: header 14358 bytes, 65695734 bytes with its data\n  data in unit.xisb\nwith external_files=\"none\": not allowed\nwith the default: read\npacked into packed.xisf",
+   "wcs": "astrometric solution: none\nthis image has no solution to make WCS keywords from",
+   "write": "wrote crop.xisf: 512 x 512 pixels, compressed with zlib, SHA-256 checksum"
+  }
+ }
+}

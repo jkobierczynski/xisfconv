@@ -22,7 +22,8 @@ reopened by accident. State: version 0.16.0, 7 October 2026.
   can link it. The tool stays GPL-3.0-or-later. "Or later" was chosen for both, to keep them
   consistent.
 - Since 0.10.0 the first lines of each source file say which applies: `include/xisfconv.h`,
-  everything in `src/` but `main.cpp`, the example and the build files are the library (LGPL);
+  everything in `src/` but `main.cpp`, the examples, the manual (`docs/`) and the build files are the
+  library (LGPL);
   `main.cpp` and the tests are GPL. `COPYING.LESSER` holds the LGPL text, `LICENSE` the GPL it
   builds on.
 - The Python package (`python/xisfconv`) is part of the library: LGPL. Its tests are GPL like the
@@ -951,8 +952,75 @@ library with one line changed.
 - LZ4 is written to XISF only. ASDF has its own LZ4 layout, which is read; nothing asks for it
   to be written.
 
+## The manual (`docs/manual.html`)
+
+- One manual for the three languages, because there is one library: the chapters are the same,
+  and each example stands there in C, in C++ and in Python, with one switch for the whole page.
+- There is no C++ API beside the C API, and the manual says so. A second interface would be a
+  second thing to keep right and to keep stable, for what forty lines do: handles that free
+  themselves and a status turned into an exception. Those lines are the beginning of
+  `examples/tour.cpp` (namespace `xisf`), shown in the manual and meant to be copied. If a header
+  of that kind is wanted in the installation one day, it is these lines.
+- The manual is made, not written by hand: `docs/make_manual.py` puts it together from
+  `docs/manual.in.html` (the text), the example programs (the lines between their marks,
+  `[inspect]` to `[/inspect]`), `include/xisfconv.h` (the C reference is the header, set as a
+  page: its comments as text, what they set out in columns as it is set out) and the signatures
+  and docstrings of the Python package (the few forms of reStructuredText they use). So the
+  reference cannot differ from the header and the package, and an example cannot differ from the
+  program that is tested.
+- What the examples print is shown as it was printed. The programs ran on a real frame
+  (`integrated_light_ABE.xisf`, IC 5146; and its plate-solved version for the astrometry chapter),
+  and what they printed is kept in `docs/manual-output.json`. The frame itself is not in the
+  repository (65 MB); `docs/manual-frame.jpg` is the `preview.png` the tour made of it, as a JPEG
+  of 800 pixels, and is in the manual. `make_manual.py --run FRAME` runs the programs again; without
+  it the manual is made from what is kept, so that making it needs neither the frame nor a build
+  of the examples.
+- Output and program belong together: what is kept is kept with the checksums of the examples that
+  printed it, and the manual is not made from an example that has changed since, unless the
+  examples are run again or the maker is told (`--keep-output`) that the change does not change
+  what they print. Without that, a changed `printf` would stand beside the old output, and no
+  test would notice.
+- One file that needs nothing else: styles, scripts and the picture are in it, the fonts are those
+  of the system, and the colours of the code are put in when the manual is made (Pygments, needed
+  for that and by nobody who reads it). Without scripts every example shows in all three
+  languages. That makes it about a megabyte, most of it the two references.
+- A manual that is made can be stale. It carries a checksum of what it was made from (the files,
+  and of the package the signatures and docstrings, not its code), and `make_manual.py --check`
+  compares; `python/tests/test_examples.py` runs that, so a changed example, header or docstring
+  fails the tests until the manual is made again. The rule that comes with it: whoever changes one
+  of them runs `python docs/make_manual.py` and commits the result. (The check says that the
+  manual was made from these sources, not that nobody edited the file afterwards.)
+- The examples are tested as programs (see "Testing"), and the review of the manual is why they
+  are tested on more than one kind of frame. The first version of the C tour passed its first run
+  and failed its second, silently, because a conversion did not ask to replace its output and its
+  status was not looked at. The first versions of all three copied the keywords of the frame to
+  the part they cut out of it, WCS keywords and Bayer pattern included, which made a file with
+  wrong astrometry; stretched every image as if its range were 0 to 1; and the Python one failed on
+  integer samples. None of that shows on a monochrome floating point frame without a solution,
+  which is what the manual's frame is. Since then: every tour twice in one directory, every chapter
+  alone, a colour frame of integers with WCS keywords, and a frame with the range 0 to 65535.
+- A crop takes the cards of its frame by name (those that tell of the instrument and the
+  observation), not all of them: the example is there to be copied, and the short way is the wrong
+  one.
+- The tours take an XISF file and turn a FITS or ASDF file away, because half of their chapters
+  ask about what only XISF has. Their function that reads the pixels is right for the other
+  formats all the same, since it is the part that gets copied: it asks what the image is like
+  after it has read the pixels, because of a FITS or ASDF image the sample format and the range
+  are not known before. (The header said that asking for the size of the buffer loads those
+  pixels; it does so only when the sample format is left as stored. The second review of the
+  manual found that, on a FITS file whose range is 0 to 65535; the comment is corrected.) That
+  function was checked on FITS and ASDF by hand, with a program that includes the tour; no test
+  does it.
+- The lines of the examples are kept to 112 columns, which is what the page shows without
+  scrolling on a screen of 1440 pixels.
+
 ## Testing
 
+- `tests/examples_test.py` runs the example programs of the manual in C and C++ on files it
+  writes byte by byte, and needs nothing but Python; `python/tests/test_examples.py` runs those in
+  Python. What they print is held against what they must print for those files (most lines word
+  for word, numbers that depend on the arithmetic of the machine by their form and range), and
+  what they write is read back.
 - `tests/run_tests.py` drives the built program (6128 checks at 0.16.0, 6141 with OpenXISF beside it). The Python packages it
   needs are listed at its top; the `asdf` packages and the external tools (`tiffcp`, `fitsverify`,
   `pngcheck`, `fpack`/`funpack`) are used when installed and their checks skipped when not.
@@ -991,6 +1059,16 @@ library with one line changed.
   that write a file again after astropy read it open it with `memmap=False`, and since 0.14.1 the
   two test scripts switch astropy's mapping off altogether.) The wheels for macOS and Windows have
   only CI to prove them.
+- The tool's suite ran under Wine with the Python of Linux reading what the Windows program
+  prints, and that hides what a Windows Python does with it. The first Windows run of 0.16.0
+  failed in that suite. Its log cannot be read from where this work is done; what was found by
+  running the suite with a Windows Python under Wine is one check that has to fail on Windows:
+  it reads the name of a data blocks file, `blöcke (1).xisb`, from the tool's `--info`. The tool
+  prints UTF-8 on every system, and `subprocess` with `text=True` reads it in the code page of
+  Windows, where the name comes back as another one. The test scripts now read the tool's output
+  as UTF-8, and the suite is run with a Windows Python under Wine before delivery. (That run has
+  to be read with care: Wine says it makes symbolic links and makes none, which the test now
+  looks at, and a file named `nul.fits` is the null device there.)
 - MinGW is not the compiler of the Windows build: CI uses Microsoft's, and that one is not at hand
   here either. 0.14.0 did not compile there: `if constexpr (isFloat)` inside a lambda, with
   `isFloat` a `constexpr` variable of the function template around it, is "not a constant" for

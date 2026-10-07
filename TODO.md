@@ -27,6 +27,9 @@ in `DEVELOPMENT.md`.
       blocks in other files (`path(...)`), read and written by the tool, the library and the
       Python package; packing and unpacking; a setting for which files a header is followed to
       (0.16.0)
+- [x] A manual of the library for C, C++ and Python (`docs/manual.html`): one file, with a tour of
+      example programs in the three languages that the tests compile and run, and the reference
+      of the C API and of the Python package made from the header and the docstrings (0.16.0)
 - [ ] More platforms and packaging: Linux arm64 and Intel macOS release builds; Homebrew formula,
       AUR package, winget manifest; man page
 

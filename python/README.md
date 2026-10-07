@@ -10,6 +10,11 @@ pip install xisfconv            # NumPy is the only dependency
 pip install "xisfconv[astropy]" # with astropy, for CCDData and HDUList
 ```
 
+The [manual of the library](https://github.com/jkobierczynski/xisfconv/blob/main/docs/manual.html)
+(`docs/manual.html` in the repository: one file, to be opened in a browser) goes through the package
+with programs that ran on a real frame, next to the same programs in C and C++, and has the
+reference of every function and class.
+
 ## Reading
 
 ```python

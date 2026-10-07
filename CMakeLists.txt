@@ -31,7 +31,7 @@ endif()
 
 option(XISFCONV_WITH_ZSTD "Support Zstandard-compressed XISF files (needs libzstd)" ON)
 option(BUILD_SHARED_LIBS "Build libxisfconv as a shared library (default: static, linked into the tool)" OFF)
-option(XISFCONV_BUILD_TESTS "Build the C test program of the library (needs a C compiler)" OFF)
+option(XISFCONV_BUILD_TESTS "Build the C test programs of the library and the examples of the manual (needs a C compiler)" OFF)
 option(XISFCONV_PORTABLE "Build a self-contained binary for distribution (static zstd/zlib/C++ runtime)" OFF)
 
 # The Python wheel (pyproject.toml, built by scikit-build-core) holds the shared library and
@@ -225,6 +225,22 @@ if(XISFCONV_BUILD_TESTS)
     else()
       target_compile_options(xisfconv_${_test} PRIVATE -Wall -Wextra -Wpedantic)
     endif()
+  endforeach()
+  # The example programs of the manual (docs/manual.html), in C and in C++: built here so that
+  # what the manual shows is compiled on every platform, and run by tests/examples_test.py.
+  foreach(_example first tour)
+    add_executable(xisfconv_${_example}_c examples/${_example}.c)
+    set_target_properties(xisfconv_${_example}_c PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF LINKER_LANGUAGE CXX)
+    add_executable(xisfconv_${_example}_cpp examples/${_example}.cpp)
+    foreach(_target xisfconv_${_example}_c xisfconv_${_example}_cpp)
+      target_link_libraries(${_target} PRIVATE xisfconv_core)
+      if(MSVC)
+        target_compile_options(${_target} PRIVATE /W4)
+        target_compile_definitions(${_target} PRIVATE _CRT_SECURE_NO_WARNINGS)
+      else()
+        target_compile_options(${_target} PRIVATE -Wall -Wextra -Wpedantic)
+      endif()
+    endforeach()
   endforeach()
 endif()
 

@@ -93,7 +93,9 @@ def check(cond, msg):
 
 
 def run(*args, expect_ok=True):
-    r = subprocess.run([EXE, *args], capture_output=True, text=True)
+    # What the program prints is UTF-8 on every system. (Left to the system, Windows reads it in its
+    # own code page, and a file name with an umlaut comes back as another name.)
+    r = subprocess.run([EXE, *args], capture_output=True, text=True, encoding="utf-8", errors="replace")
     if expect_ok and r.returncode != 0:
         raise RuntimeError(f"xisfconv {' '.join(args)} failed:\n{r.stdout}{r.stderr}")
     return r
@@ -5421,6 +5423,8 @@ def test_distributed_units():
         os.makedirs(os.path.join(shared, "x"), exist_ok=True)
         if not os.path.lexists(os.path.join(shared, "a", "L")):
             os.symlink(os.path.join("..", "x"), os.path.join(shared, "a", "L"))
+        if not os.path.islink(os.path.join(shared, "a", "L")):
+            raise OSError("no link was made")       # (Wine says yes and makes none)
     except (OSError, NotImplementedError, AttributeError):
         skipped.append("symbolic links (a path through a link and back)")
     else:

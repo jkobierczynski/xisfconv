@@ -710,20 +710,20 @@ def test_the_tool_and_the_package_read_each_other(tmp_path, tool):
     data = sample("float32", (8, 9, 3))
     mine = tmp_path / "mine.xish"
     xisfconv.write(mine, data, codec="zlib", checksum="sha1")
-    done = subprocess.run([tool, "--verify", str(mine)], capture_output=True, text=True)
+    done = subprocess.run([tool, "--verify", str(mine)], capture_output=True, text=True, encoding="utf-8", errors="replace")
     assert done.returncode == 0 and ": OK" in done.stdout and "distributed unit" in done.stdout
-    done = subprocess.run([tool, str(mine), "-o", str(tmp_path / "theirs.xisf")], capture_output=True, text=True)
+    done = subprocess.run([tool, str(mine), "-o", str(tmp_path / "theirs.xisf")], capture_output=True, text=True, encoding="utf-8", errors="replace")
     assert done.returncode == 0 and same(xisfconv.read(tmp_path / "theirs.xisf"), data)
     done = subprocess.run([tool, str(tmp_path / "theirs.xisf"), "-t", "xish", "-d", str(tmp_path), "--codec", "none"],
-                          capture_output=True, text=True)
+                          capture_output=True, text=True, encoding="utf-8", errors="replace")
     assert done.returncode == 0 and same(xisfconv.read(tmp_path / "theirs.xish"), data)
     assert same(pixels_of(str(tmp_path / "theirs.xish")), np.moveaxis(data, 2, 0))
     # the tool has the same default, and the same word for more
     unit, pixels = gray_unit(tmp_path, "abs.xish", "path(%s)" % slashes(tmp_path / "elsewhere.dat"))
     (tmp_path / "elsewhere.dat").write_bytes(pixels.astype("<u2").tobytes())
-    done = subprocess.run([tool, unit, "-o", str(tmp_path / "abs.fits")], capture_output=True, text=True)
+    done = subprocess.run([tool, unit, "-o", str(tmp_path / "abs.fits")], capture_output=True, text=True, encoding="utf-8", errors="replace")
     assert done.returncode == 1 and "--external-files anywhere" in done.stderr and not os.path.exists(tmp_path / "abs.fits")
-    done = subprocess.run([tool, unit, "-o", str(tmp_path / "abs.fits"), "--external-files", "anywhere"], capture_output=True, text=True)
+    done = subprocess.run([tool, unit, "-o", str(tmp_path / "abs.fits"), "--external-files", "anywhere"], capture_output=True, text=True, encoding="utf-8", errors="replace")
     assert done.returncode == 0 and os.path.exists(tmp_path / "abs.fits")
 
 
