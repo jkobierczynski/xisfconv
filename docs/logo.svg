@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 120" width="100%" height="100%">
+  <defs>
+    <linearGradient id="grad1" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#00d2ff" />
+      <stop offset="100%" stop-color="#3a7bd5" />
+    </linearGradient>
+    <linearGradient id="grad2" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#f7971e" />
+      <stop offset="100%" stop-color="#ffd200" />
+    </linearGradient>
+  </defs>
+  <!-- Background Icon Badge -->
+  <rect x="10" y="10" width="100" height="100" rx="24" fill="#0f172a" />
+  
+  <!-- Outer Aperture Ring -->
+  <circle cx="60" cy="60" r="32" stroke="url(#grad1)" stroke-width="4" fill="none" stroke-dasharray="140 30" />
+  
+  <!-- Central Sync / Conversion Arrow with Stars -->
+  <path d="M 50 48 A 16 16 0 0 1 72 52 L 76 46 M 72 52 L 66 54" stroke="url(#grad2)" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  <path d="M 70 72 A 16 16 0 0 1 48 68 L 44 74 M 48 68 L 54 66" stroke="url(#grad2)" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  <circle cx="60" cy="60" r="3" fill="#ffffff" />
+  <circle cx="75" cy="40" r="1.5" fill="#ffffff" />
+  <circle cx="42" cy="78" r="1.5" fill="#ffffff" />
+
+  <!-- Text -->
+  <text x="130" y="62" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="800" font-size="38" fill="#0f172a">xisf<tspan fill="#3a7bd5">conv</tspan></text>
+  <text x="132" y="85" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-weight="500" font-size="14" fill="#64748b" letter-spacing="1.5">XISF IMAGE CONVERTER</text>
+</svg>

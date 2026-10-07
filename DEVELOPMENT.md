@@ -376,6 +376,7 @@ brought are in the sections below.
 | | | The manual of the library for C, C++ and Python (`docs/manual.html`), with examples that are compiled and run by the tests |
 | | | The README condensed; `MANUAL.md` for the tool; this file extended with the steps |
 | | | The documents around the program: the changelog, how to report and to contribute, the citation file, the man page, and the layout of the properties in FITS and ASDF for other programs |
+| | | A logo at the top of the README (`docs/logo.svg`) |
 
 ## Purpose and scope
 
@@ -1559,6 +1560,10 @@ library with one line changed.
   the file, the program that wrote it. `--dump-header` is named, there and in `CONTRIBUTING.md`,
   as the way to show a file without its data blocks; `CONTRIBUTING.md` adds that a header may hold
   the place of an observatory.
+- **The logo is two files.** GitHub shows a README on a white page or on a dark one, and the name
+  in the logo is dark: `docs/logo-dark.svg` is the same drawing with the name and the line under
+  it in light colours, and the README lets the page choose (`<picture>`). The link check of the
+  tests follows the two paths as it follows the links.
 - **The citation file names both licences**, as the two parts of the program have them, and has
   no DOI: there is none until a release is archived somewhere that gives one (Zenodo does, from a
   GitHub release).

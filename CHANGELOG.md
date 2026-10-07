@@ -9,7 +9,7 @@ in [`DEVELOPMENT.md`](DEVELOPMENT.md).
 Under "changed" stands what makes the same command, or the same call, do something else than
 before.
 
-## 0.16.0 (7 October 2026)
+## 0.16.0 (7 October 2026), released
 
 **Distributed XISF units.** An XISF unit may be one file, or a header file (`.xish`) and the files
 it names, where the data is (`.xisb`). xisfconv reads and writes such units, in the tool, the C

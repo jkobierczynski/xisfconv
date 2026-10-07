@@ -5659,14 +5659,16 @@ def markdown_headings(text):
 
 
 def markdown_links(text):
-    """The targets of the links of a Markdown document, those in code left out."""
+    """The targets of the links and pictures of a Markdown document, those in code left out."""
     import re
     out, fenced = [], False
     for line in text.splitlines():
         if line.lstrip().startswith("```"):
             fenced = not fenced
         if not fenced:
-            out += re.findall(r"\]\(([^)\s]+)\)", re.sub(r"`[^`]*`", "", line))
+            line = re.sub(r"`[^`]*`", "", line)
+            out += re.findall(r"\]\(([^)\s]+)\)", line)
+            out += re.findall(r'\b(?:src|srcset|href)="([^"\s]+)"', line)      # (pictures and links written as HTML)
     return out
 
 

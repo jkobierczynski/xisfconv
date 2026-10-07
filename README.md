@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/logo-dark.svg">
+    <img src="docs/logo.svg" alt="xisfconv, XISF image converter" width="480">
+  </picture>
+</p>
+
 # xisfconv
 
 A small, dependency-light command-line converter between PixInsight **XISF**, **FITS** and **ASDF**,
