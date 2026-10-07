@@ -5666,7 +5666,7 @@ if __name__ == "__main__":
             print("ERROR in", t.__name__, ":", e)
     if LAST_BIT:
         print(f"\n{len(LAST_BIT)} comparisons of quantized floating point were equal but for the rounding of one multiplication:\n"
-              "  the other software fuses multiplication and addition on this machine, xisfconv does not (see README)")
+              "  the other software fuses multiplication and addition on this machine, xisfconv does not (see MANUAL.md)")
     if skipped:
         print(f"\nskipped {len(skipped)} checks that need optional tools:")
         for what in sorted(set(skipped))[:8]:

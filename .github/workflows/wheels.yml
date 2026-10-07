@@ -4,7 +4,7 @@ name: Wheels
 # The Python package: one wheel per platform (it serves every Python 3, see pyproject.toml) and
 # the source distribution. Each wheel is installed in a fresh environment and tested there.
 # Started by a version tag, or by hand. Publishing to PyPI happens for a tag, and only once the
-# repository variable PUBLISH_TO_PYPI is set to "true" (see "Releasing" in the README).
+# repository variable PUBLISH_TO_PYPI is set to "true" (see "Releasing" in DEVELOPMENT.md).
 
 on:
   push:

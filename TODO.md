@@ -1,6 +1,6 @@
 # To do
 
-Planned features, roughly in order. Done items move to the README; the decisions behind them are
+Planned features, roughly in order. Done items move to `MANUAL.md`; the decisions behind them are
 in `DEVELOPMENT.md`.
 
 - [x] TIFF and PNG export from FITS and ASDF input, with `--stretch` and `--bits` (0.7.0)
@@ -33,7 +33,7 @@ in `DEVELOPMENT.md`.
 - [ ] More platforms and packaging: Linux arm64 and Intel macOS release builds; Homebrew formula,
       AUR package, winget manifest; man page
 
-Smaller items, each closing a limitation listed in the README:
+Smaller items, each closing a limitation listed in `MANUAL.md`:
 
 - [ ] BigTIFF for output over 4 GiB
 - [ ] Distributed units: several data blocks files for one unit when writing (one per image),
@@ -77,7 +77,7 @@ Open checks of the Python package:
 
 - [x] The wheels for macOS and Windows: for v0.12.1 the `wheels` workflow built and tested all
       of them (Linux x86_64 and arm64, macOS arm64, Windows x64) and the source distribution.
-- [ ] Register the project on PyPI and switch publishing on (see "Releasing" in the README).
+- [ ] Register the project on PyPI and switch publishing on (see "Releasing" in `DEVELOPMENT.md`).
 
 Later, each when it is needed:
 

@@ -1,8 +1,348 @@
-# Development decisions
+# Development
 
-What was decided while building xisfconv, and why. The README says what the program does and
-`TODO.md` what is planned; this file records the choices behind both, so that they are not
-reopened by accident. State: version 0.16.0, 7 October 2026.
+How xisfconv is worked on, the steps it has taken so far, and what was decided on the way and why.
+[`README.md`](README.md) says in a page what the program is, [`MANUAL.md`](MANUAL.md) what it does
+and [`TODO.md`](TODO.md) what is planned; this file is for whoever changes it, and records the
+choices behind the others so that they are not reopened by accident. State: version 0.16.0,
+7 October 2026.
+
+## Contents
+
+The steps:
+
+- [Building for development](#building-for-development)
+- [Running the tests](#running-the-tests)
+- [What the tests check](#what-the-tests-check)
+- [The manuals](#the-manuals)
+- [A change, from start to delivery](#a-change-from-start-to-delivery)
+- [Releasing](#releasing)
+- [The steps so far](#the-steps-so-far)
+
+The decisions:
+
+- [Purpose and scope](#purpose-and-scope)
+- [Licence](#licence)
+- [Language, build and dependencies](#language-build-and-dependencies)
+- [Format conventions](#format-conventions)
+- [XISF properties in FITS and ASDF](#xisf-properties-in-fits-and-asdf)
+- [Distributed XISF units (0.16.0)](#distributed-xisf-units-0160)
+- [Care with files](#care-with-files)
+- [Structure of the code](#structure-of-the-code)
+- [The library (libxisfconv)](#the-library-libxisfconv)
+- [The Python package](#the-python-package)
+- [The manual (`docs/manual.html`)](#the-manual-docsmanualhtml)
+- [Testing: what was decided](#testing-what-was-decided)
+- [How changes are made](#how-changes-are-made)
+- [Not decided yet](#not-decided-yet)
+
+## Building for development
+
+Requirements as in the README: a C++17 compiler, CMake 3.15 or later, zlib, and libzstd if
+Zstandard is wanted. The work uses three build trees.
+
+```
+# the tool with the library linked into it, the C test programs and the examples of the manual
+cmake -S . -B build -DXISFCONV_BUILD_TESTS=ON && cmake --build build -j
+
+# the shared library: what the library tests and the Python package load
+cmake -S . -B build-shared -DBUILD_SHARED_LIBS=ON -DXISFCONV_BUILD_TESTS=ON && cmake --build build-shared -j
+
+# the same code under the sanitizers of GCC or clang
+cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DXISFCONV_BUILD_TESTS=ON \
+  -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=undefined -g" \
+  -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g" && cmake --build build-asan -j
+```
+
+Options: `-DBUILD_SHARED_LIBS=ON` builds libxisfconv as a shared library (the default is a static
+library that is linked into the tool), `-DXISFCONV_BUILD_TESTS=ON` builds the C test programs of
+the library, `-DXISFCONV_WITH_ZSTD=OFF` leaves Zstandard out, `-DXISFCONV_PORTABLE=ON` makes the
+self-contained binary that is released.
+
+Warnings are on (`-Wall -Wextra -Wpedantic`, `/W4`) and kept at zero, with GCC and with clang.
+`pip install .` builds the Python package from the same sources (scikit-build-core; see
+`pyproject.toml`), and `python/xisfconv` runs from the source tree with `PYTHONPATH=python` and
+`XISFCONV_LIBRARY` naming the shared library.
+
+## Running the tests
+
+```
+pip install numpy astropy tifffile imagecodecs xisf lz4 zstandard pillow asdf asdf-astropy asdf-compression
+python3 tests/run_tests.py build/xisfconv
+
+# the library: C test programs, and its API called from Python
+cmake -S . -B build-shared -DBUILD_SHARED_LIBS=ON -DXISFCONV_BUILD_TESTS=ON && cmake --build build-shared -j
+mkdir /tmp/capi && build-shared/xisfconv_capi_test /tmp/capi
+python3 tests/library_tests.py build-shared/libxisfconv.so build-shared/xisfconv
+
+# the example programs of the manual, in C and C++ (those in Python are run by python/tests)
+python3 tests/examples_test.py build-shared
+
+# the Python package: against the build above, or installed (then without the first two settings)
+pip install pytest
+XISFCONV_LIBRARY=build-shared/libxisfconv.so PYTHONPATH=python XISFCONV_TOOL=build-shared/xisfconv \
+  python3 -m pytest python/tests
+```
+
+`tests/run_tests.py` uses `tiffcp`, `fitsverify`, `pngcheck`, `fpack` and `funpack` where they are
+installed, and the `asdf` packages likewise; it says at its start and its end what it had to leave
+out. With `OPENXISF_BIN` set to the directory of OpenXISF's sample programs, each side also reads
+the distributed units of the other. Every script ends with the number of checks passed and
+failed, and with exit status 1 if one failed. CI (`.github/workflows/ci.yml`) runs all of this on
+Linux, macOS and Windows for every push.
+
+## What the tests check
+
+The library is tested on its own. `tests/capi_test.c` is plain C99 and built by a C compiler, so the
+header stays C; it writes its test files with the library, reads them back and goes through the
+error paths: missing arguments, buffers that are too small, indices out of range, options of an
+older and shorter layout, handles that outlive their context, the message and progress callbacks,
+messages kept in the context, the host's progress handler, and cancellation by a handler and
+through the context. `tests/library_tests.py` calls the API through `ctypes`: arrays written as XISF, FITS,
+ASDF, TIFF and PNG are read back by astropy, the `xisf` package, Python's `asdf`, tifffile and
+Pillow, and files written by astropy and the `xisf` package are read through the library and
+compared with what that software reads. It also checks the WCS functions through astropy, the
+stretch against the tool's `--stretch`, file names beyond ASCII, several threads with their own
+contexts at once, and that the library prints nothing. The LZ4 blocks the library writes are decoded
+there by the lz4 library itself: for both codecs, every level, subblocks, and rows of every length
+around the limits of the block format. `tests/capi_readall.c` reads everything the
+API offers from any file and is the target for fuzzing.
+
+The Python package has its tests in `python/tests` (pytest). They are the same comparisons made
+through the package: what it writes is read by astropy, the `xisf` package, `asdf`, tifffile and
+Pillow, and what those write is read through it; WCS keywords are evaluated with astropy for both
+row orders and through every format; `CCDData.read` of an XISF file must give what
+`CCDData.read` gives for the FITS file the converter writes from it, and a `CCDData` with unit,
+WCS, mask and uncertainty must come back from XISF as it comes back from FITS. The stretch
+functions are compared with the formulas written out in NumPy. The declarations of the package
+are checked against `xisfconv.h`: every function, constant and structure field, and the sizes and
+offsets a C compiler gives the structures. Interrupts are tested with real signals: sent at any
+moment of a loop of library calls, from a timer or from another thread, SIGINT must end the loop
+with `KeyboardInterrupt` and an alarm with the exception its handler raises; handlers and progress
+functions use the package themselves; a process is forked and Python is ended in the middle of
+calls. With
+`XISFCONV_TOOL` set, files converted by the package and by the tool must be identical byte for
+byte. `xisfconv.xisf` is tested against the `xisf` package it stands in for: for files written by
+either, in every codec, the two must return the same dictionaries (key order, tuples and lists,
+dtypes) and the same arrays, the package must read what the module writes (but for the few
+values it does not read from any file, which the module's documentation names), and each
+difference that documentation names has a test.
+
+The example programs of the manual are tested like the rest. CMake builds `examples/first.c`,
+`first.cpp`, `tour.c` and `tour.cpp` with the test programs, with the warnings of the library, and
+`tests/examples_test.py` runs them on small XISF files that it writes byte by byte: one of
+floating point with keywords and properties, one of three channels of 16-bit integers with WCS
+keywords and a Bayer pattern, one whose range is 0 to 65535. What the chapters print is held
+against what they must print for those files, the C and the C++ version must print the same,
+every chapter must run alone and a second time in the same directory, and the files they leave
+are verified by the tool. `python/tests` does the same for `first.py` and `tour.py`, and checks
+that `docs/manual.html` was made from the examples, the header and the docstrings as they are now.
+`python docs/make_manual.py` makes it again; that needs Pygments, and the package importable with
+astropy. The manual shows what the examples printed for one real frame, which is kept in
+`docs/manual-output.json`: after a change to an example the maker asks for the examples to be run
+on that frame again (`--run`), or to be told that the change does not change what they print
+(`--keep-output`).
+
+Test inputs come from two independent writers: the `xisf` PyPI package (all codecs ± shuffling,
+5 sample formats, gray and RGB) and a small encoder in the test script for the features that package
+doesn't produce (Normal storage, big-endian, inline/embedded blocks, subblocks, checksums, CFA, ICC,
+multiple images, tricky keywords, corrupt and truncated files). FITS output is checked with astropy
+and, if installed, NASA's `fitsverify`; TIFF output is decoded with libtiff's `tiffcp` and tifffile;
+PNG output with an independent decoder in the test script, Pillow and `pngcheck`; WCS output is
+checked against synthetic astrometric solutions (with and without distortion) through astropy.
+
+For FITS → XISF, the inputs are written by astropy (every BITPIX, signed and unsigned, BSCALE/BZERO,
+cubes, several HDUs, CONTINUE and HIERARCH cards) and astropy's own reading of each file is the
+reference. The XISF output is read back by the `xisf` package, and by a separate decoder in the test
+script for what that package lacks (subblocks, UInt64); checksums are verified there as well. Round
+trips XISF → FITS → XISF and FITS → XISF → FITS must return identical pixels, keywords and WCS.
+
+For the XISF properties, the test script writes a file with properties of every type and in every
+form XISF has for them (scalars with odd spellings, strings with markup, control characters and
+bytes that are not UTF-8, vectors and matrices of every element type, big-endian, compressed,
+embedded, empty, types nobody knows) and takes it through FITS, tile-compressed FITS, ASDF and
+chains of them. A reader in the script that shares no code with xisfconv compares what comes back
+with what went in: every id, type, value, comment and format, in order. astropy reads the table,
+the asdf library validates and reads the tree and writes it again after changes, fpack and
+funpack pass the table on. Damaged tables and trees that say other things must cost the one
+property or the one table, with a warning, and never the image. The astrometric solution must come
+back exactly when the WCS is unchanged (also after astropy rewrote the file and its header), and be
+made from the keywords when a value was changed, the image cropped or the rows taken the other way.
+
+Tile-compressed FITS is checked against astropy and CFITSIO: files written by astropy's
+`CompImageHDU` (every algorithm, every integer and floating point type, several tile shapes, cubes,
+each quantization and dithering method, NaN pixels) must decode to what astropy reads from them,
+bit for bit, and, where `fpack` and `funpack` are installed, files packed by fpack must decode to
+what funpack writes. For quantized floating point a difference no larger than the rounding of
+one multiplication is accepted and counted in the summary: there the other software's result
+depends on how it was compiled (see "Tile-compressed FITS" in `MANUAL.md`). Damaged and truncated files,
+headers that contradict the table and an `HCOMPRESS_1` image are covered as well.
+
+Writing tile-compressed FITS is checked against the plain FITS file the same input gives: for
+every sample type, gray and colour, widths around the Rice block size, data that does not
+compress, differences that wrap around, constant rows, NaN and infinities, several images and
+keywords of every kind, astropy must read the same pixels and the same cards from both files.
+The Rice-coded tiles must be the bytes astropy's encoder (which is CFITSIO's) produces for the
+same rows, and the tiles fpack writes when a FITS file is packed; the gzip tiles are decoded
+with Python's `gzip`. funpack must restore the plain file, cards and data, fitsverify must find
+nothing it does not find in the plain file, and xisfconv must read its own file back. The
+64-bit form of the table, which is used when the compressed tiles could take more than 2 GiB,
+was written once, with tiles of 2.04 GiB, and read by astropy, funpack and xisfconv (such an
+image is too large for the test suite).
+
+TIFF and PNG export from FITS and ASDF input is checked against the export of the XISF file the input
+was made from: for every sample format, gray and RGB, both row orders and a set of `--bits`,
+`--stretch` and `--compress` combinations the pixels must be identical, and separate cases cover
+ADU-scaled floats, signed data, NaN pixels, cubes and several HDUs.
+
+`--bin` and `--resize` are checked against the mean written out in the test script with exact
+fractions: for every sample format, gray and colour, whole and odd ratios, from XISF, FITS and ASDF,
+with NaN and Inf among the samples. A stretched picture must be, pixel for pixel, what the binned
+image gives with the same options. The thumbnailer entry is read as a file manager reads it and its
+command is run for each format and size; the file types are checked with `update-mime-database`.
+
+XISF → XISF is checked with a reader in the test script that knows nothing of xisfconv: for source
+files in every codec, with and without checksums and subblocks, and for every option set, all data
+blocks of the output must decode to the bytes of the input, the header must be the same text once
+the storage attributes are taken out, and the blocks must be stored the way the options say. The
+source holds what a rewrite could lose: attached and inline properties, an embedded image, an ICC
+profile, a thumbnail, comments, CDATA, entities and an unknown element. Damaged inputs must be
+refused with the original left byte for byte as it was, and so must an input that is named like
+the temporary file. `--verify` is tested on intact files, on files with one byte flipped in each
+kind of place and on files cut short at each kind of place; FITS checksums come from astropy
+(image HDUs and random groups), SHA-3 digests are compared with Python's hashlib.
+
+Distributed units are checked from both sides without xisfconv: the test scripts take the header
+file and the data blocks file apart themselves and hold them against the specification, and
+build units by hand in the forms a writer may choose (several index nodes, free elements, decimal
+identifiers, files that are one block, names with blanks and parentheses), damaged in each kind
+of place. Every way out of a header's directory is tried under each setting of
+`--external-files`. What happens when a file cannot be given its name is tested with a `rename`
+that fails on request (`tests/rename_shim.c`, loaded into the program on Linux): at each step of
+replacing a unit, the files that were there must still be there. With `OPENXISF_BIN` set to the
+directory of OpenXISF's sample programs, each side reads what the other wrote.
+
+ASDF is checked against Python's `asdf` library with `asdf-astropy` (the tests are skipped if those
+are not installed). Files written by xisfconv must open without a warning, pass schema validation
+and checksum validation, and yield an astropy HDU list with the pixels and header cards of the
+corresponding FITS output. In the other direction the inputs are written by the library: plain trees
+with arrays of every data type, byte order and compression, views and shared arrays, and HDU lists
+serialized by asdf-astropy. A third set of files is assembled byte by byte in the test script (old
+tags, padded and streamed blocks, both checksum conventions, damaged files). The YAML reader is
+compared with PyYAML on random documents in all of PyYAML's output styles.
+
+## The manuals
+
+- [`MANUAL.md`](MANUAL.md), the manual of the tool, is written by hand. What a feature does, and
+  what it does not, is written there when the feature is made.
+- [`docs/manual.html`](docs/manual.html), the manual of the library, is made by
+  `docs/make_manual.py` from `docs/manual.in.html`, the examples in `examples/`, the header and the
+  docstrings of the Python package. After a change to one of them:
+
+  ```
+  XISFCONV_LIBRARY=build-shared/libxisfconv.so PYTHONPATH=python python3 docs/make_manual.py
+  ```
+
+  That needs Pygments and astropy. If an example changed, the maker asks for the examples to be
+  run on the frame of the manual again (`--run FRAME.xisf --solved SOLVED.xisf`, with the examples
+  built first), or to be told that the change does not change what they print (`--keep-output`).
+  `python3 docs/make_manual.py --check` says whether the manual was made from the sources as they
+  are; the tests of the Python package run it. See [The manual](#the-manual-docsmanualhtml) below
+  for why it is made this way.
+- [`python/README.md`](python/README.md) is the page of the Python package (and what PyPI will
+  show); the docstrings in `python/xisfconv` are its reference.
+
+## A change, from start to delivery
+
+The steps a feature goes through. They are the practice of the versions so far; the reasons are
+in [Testing: what was decided](#testing-what-was-decided) and [How changes are
+made](#how-changes-are-made).
+
+1. **Say what it is.** What the feature does, in the words the manual will use, and what it will
+   not do: the limitations are written down with the feature, not found later.
+2. **Write it** in the library (`src/`, everything but `main.cpp`), with the interface in
+   `include/xisfconv.h` first if it has one, then the option of the tool in `src/main.cpp` and the
+   argument of the Python package. Messages say what happened and what to do about it.
+3. **Test it against something that shares no code with it**: astropy, CFITSIO's tools, the `xisf`
+   package, Python's `asdf`, tifffile, Pillow, OpenXISF, or a reader written out in the test
+   script. Damaged and truncated files belong to every reader, and a file that cannot get its
+   name to every writer.
+4. **Run the suites** on the static and on the shared build: the tool's suite, the C test program
+   (once more with `--quiet`, where it must print nothing), the library tests, the tests of the
+   Python package, the examples of the manual.
+5. **Run them under the sanitizers** (`build-asan`), and compile with the other compiler (GCC and
+   clang).
+6. **Look at the other platforms as far as that goes from Linux.** A Windows build made with MinGW
+   runs under Wine, and the test scripts run there with a Windows build of Python, so that what
+   Windows does to paths, code pages and open files shows. A change to arithmetic is run as an
+   arm64 build under qemu. The Python package is tested in clean environments with Python 3.10
+   to 3.14. MSVC and macOS are seen by CI only.
+7. **Try real files**: the frames PixInsight saved in every codec and checksum, and, where a
+   feature writes something PixInsight should read, PixInsight itself opening it. What could not
+   be checked that way goes into `TODO.md` as an open check.
+8. **Have it reviewed by a reader who did not write it**, with the task of finding what the tests
+   passed over, and fix what is found. A fix is new code and is reviewed as new code is.
+9. **Write it down**: `MANUAL.md` (what it does, its limitations, what was verified), the README
+   if the short version changes, `python/README.md`, `TODO.md` (done items, new open checks), this
+   file (what was decided and why), and the version in `include/xisfconv.h`, which is the one
+   place it is stated. If an example, the header or a docstring changed, the manual of the
+   library is made again.
+10. **One commit per feature**, then the check that the commit is what was tested: a clean clone
+    of the commit before, the patch applied with `git am`, both builds, every suite, and the source
+    archive compared with the tree.
+11. **Deliver** the patch (`git format-patch`) and the archive; apply, push, and let CI run on the
+    three platforms. A release is a tag: see below.
+
+## Releasing
+
+Bump the version in `include/xisfconv.h` (CMake reads it from there), commit, then push a matching
+tag:
+
+```
+git tag v0.16.0 && git push origin v0.16.0
+```
+
+CI builds and tests all three platforms and, only if every one passes, publishes a GitHub release with
+the packaged binaries. A tag that doesn't match the program version fails the build.
+
+The same tag starts `.github/workflows/wheels.yml`, which builds the wheels and the source
+distribution of the Python package and tests each wheel; it can also be started by hand, and the
+files are kept as artifacts of the run. Publishing to PyPI is off until it is set up: register the
+project `xisfconv` on PyPI with this repository and the workflow `wheels.yml` as a trusted
+publisher (environment `pypi`), then set the repository variable `PUBLISH_TO_PYPI` to `true`.
+From then on a tag publishes the wheels. A version can be uploaded to PyPI once only.
+
+## The steps so far
+
+What was built, in the order it was built. The numbers are versions; the decisions each step
+brought are in the sections below.
+
+| When | Version | Step |
+|---|---|---|
+| 1 October 2026 | 0.1.0 | XISF to FITS and TIFF: the reader for XISF 1.0, the FITS and TIFF writers |
+| | | FITS rows bottom-up by default, as FITS viewers expect them; `--stretch`, PixInsight's screen stretch; PNG output; WCS keywords from PixInsight's astrometric solutions, with SIP distortion |
+| | | GPL-3.0-or-later; CI on Linux, macOS and Windows; release binaries built by CI on a version tag |
+| 2 October | | FITS to XISF, with PixInsight's native solution properties written from WCS keywords (verified in PixInsight 1.9.3) |
+| | 0.6.0 | ASDF in both directions |
+| 4 October | 0.7.0 | TIFF and PNG export from FITS and ASDF input |
+| | 0.8.0 | XISF to XISF rewriting (compression, checksums, one image, in place), `--verify`, SHA-3 checksums |
+| | 0.9.0 | Tile-compressed FITS read (`.fits.fz`) |
+| | 0.9.1 | The code split into a core library and a conversion module, with no change in behaviour |
+| 5 October | | `DEVELOPMENT.md`: the decisions made so far |
+| | 0.9.2 | A warning when SHA-3 checksums are written: PixInsight does not open them |
+| | 0.10.0 | libxisfconv: the C API, and the tool rebuilt on it |
+| | 0.10.1 | Arithmetic that does not depend on the processor (`-ffp-contract=off`) |
+| | 0.11.0 | The Python package: NumPy arrays, astropy `CCDData` and HDU lists |
+| | 0.11.1 | Windows: a directory is called a directory there too; tests that hold on macOS and Windows |
+| 6 October | 0.12.0 | Tile-compressed FITS written, without loss |
+| | 0.12.1 | The Windows wheel builds; a test that no longer depends on the timing of a signal |
+| | 0.13.0 | XISF properties through FITS and ASDF and back, without loss |
+| | 0.14.0 | Smaller pictures (`--bin`, `--resize`) and previews in the file manager |
+| | 0.14.1 | The Windows build: a compile-time condition MSVC accepts inside a lambda |
+| | 0.15.0 | The interface of the `xisf` package (`xisfconv.xisf`), properties written from values, LZ4 and LZ4HC output |
+| 7 October | 0.16.0 | Distributed XISF units (`.xish` and `.xisb`), read and written; the rule for which files a header is followed to |
+| | | The test scripts read the tool's output as UTF-8 (the first Windows run of 0.16.0 failed on that) |
+| | | The manual of the library for C, C++ and Python (`docs/manual.html`), with examples that are compiled and run by the tests |
+| | | The README condensed; `MANUAL.md` for the tool; this file extended with the steps |
 
 ## Purpose and scope
 
@@ -94,7 +434,7 @@ These are the choices a user could otherwise be surprised by. Each has an option
   and what the specification allows is not withheld because one reader lacks it.
 - **Tile-compressed FITS** is read in every form but `HCOMPRESS_1`. Quantized floating point is
   restored as CFITSIO restores it, including its dithering sequence; that it is lossy is stated
-  in the README.
+  in the manual.
 - **Tile-compressed FITS is written without loss** (0.12.0, `-c` on FITS output). What was decided:
   - *Lossless only*: `RICE_1` for integers, `GZIP_2` for floating point. What makes fpack's
     floating point files small is quantization, which discards bits; a converter does not do that
@@ -317,7 +657,7 @@ them. The choices:
   under a message that said "as it was" (the error names every file that is under another
   name now); on Windows a file that may not be written to is renamed and then not deleted, so
   `--force` left `<name>.replaced` behind without a word (it is made deletable, and a warning
-  names it if it stays, unless `-q` has turned warnings off); and the advice in the README, "rename it back", was wrong for a run
+  names it if it stays, unless `-q` has turned warnings off); and the advice in the manual (then the README), "rename it back", was wrong for a run
   that was stopped *after* both renames (the advice is now: only if the unit does not verify,
   and the message of the failure names the file that really has the blocks, by looking into its
   index).
@@ -396,7 +736,7 @@ them. The choices:
   nothing: the first version counted the whole size of every file a header named, and a header
   could raise its own limit to 8 GiB by naming a large (or sparse) file that happened to lie
   beside it. The price: a property of more than 256 MiB stored as a file of its own is left
-  out (in a data blocks file it is read). Nobody writes such units; it is in the README. For the same reason the size of an image's pixels in another file is held against
+  out (in a data blocks file it is read). Nobody writes such units; it is in the manual. For the same reason the size of an image's pixels in another file is held against
   the geometry before the file is read.
 - **An XML file is not read to find out that it is not XISF.** A header file begins with `<`,
   and so does every SVG and HTML file; `--verify` of a directory opens what it finds. The root
@@ -1014,7 +1354,7 @@ library with one line changed.
 - The lines of the examples are kept to 112 columns, which is what the page shows without
   scrolling on a screen of 1440 pixels.
 
-## Testing
+## Testing: what was decided
 
 - `tests/examples_test.py` runs the example programs of the manual in C and C++ on files it
   writes byte by byte, and needs nothing but Python; `python/tests/test_examples.py` runs those in
@@ -1036,7 +1376,7 @@ library with one line changed.
 - A refactor is checked by running the old and the new binary on the same invocations and comparing
   exit status, stdout, stderr and every file written.
 - Real files matter: PixInsight 1.9.3 output in every codec and checksum, and PixInsight opening
-  what xisfconv writes. What was verified that way is listed in the README. A feature that follows
+  what xisfconv writes. What was verified that way is listed in `MANUAL.md`. A feature that follows
   the specification is not proven until PixInsight has opened its output: SHA-3 checksums passed
   every test here and were refused by PixInsight.
 - The library has tests of its own: a C99 program for the mechanics of the API (arguments, buffers,
@@ -1115,8 +1455,8 @@ library with one line changed.
 
 ## How changes are made
 
-- One commit per feature, with the version bumped in `include/xisfconv.h` and the
-  README and `TODO.md` updated in the same commit.
+- One commit per feature, with the version bumped in `include/xisfconv.h` and `MANUAL.md`,
+  `TODO.md` and, where its short version changes, the README updated in the same commit.
 - The work is done together with Claude (Anthropic), credited as co-author in the commit messages.
   Each change is delivered as a `git format-patch` file to apply with `git am`, plus a source
   archive, after it has been built and tested on a clean clone.
@@ -1124,7 +1464,15 @@ library with one line changed.
   independent review pass before delivery; its findings are fixed first. The review of 0.13.0
   is the example of why: every test passed, and it found that PixInsight's own files lost their
   carriage returns, that a file of 89 KB could ask for 12 GiB, and a read beyond a buffer.
-- Limitations are written into the README when a feature ships, not left to be discovered.
+- Limitations are written into `MANUAL.md` when a feature ships, not left to be discovered.
+- Three documents for three readers (October 2026, after 0.16.0). Until then the README was all of
+  it, at 1176 lines: what the program is, every detail of what it does, how it is tested and
+  released. Now the README says in a page what the program is and how to get it; `MANUAL.md` says
+  what the tool does, option by option and direction by direction, with the limitations and what
+  was verified against PixInsight; this file has the steps of the work and the decisions. The text
+  was moved as it stood, section by section, and checked line by line to be all there; only the
+  README is new writing. The manual of the library stays a file of its own (`docs/manual.html`),
+  because it is made from the examples and the header and not written by hand.
 - Messages to the user say what happened and what to do about it; nothing is skipped silently.
 
 ## Not decided yet

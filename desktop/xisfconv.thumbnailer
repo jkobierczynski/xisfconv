@@ -1,6 +1,6 @@
 # Previews of XISF, FITS and ASDF images in the file managers that use thumbnailer entries
 # (GNOME Files, Nemo, Caja, Thunar, PCManFM). Installed to <prefix>/share/thumbnailers/, or
-# copied to ~/.local/share/thumbnailers/. See "Previews in the file manager" in the README.
+# copied to ~/.local/share/thumbnailers/. See "Previews in the file manager" in MANUAL.md.
 # SPDX-License-Identifier: LGPL-3.0-or-later
 [Thumbnailer Entry]
 TryExec=xisfconv
