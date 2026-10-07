@@ -151,6 +151,59 @@ Ctrl-C stops the work at the same places, and so does any other signal whose han
 raised from the call once the library has stopped and cleaned up. Pressed during the last
 step, Ctrl-C is raised when the file is complete.
 
+## Distributed XISF units
+
+An XISF unit is one file, the monolithic `.xisf`, or it is distributed: a header file (`.xish`),
+which is the XML header alone, and the files that header names, where the data blocks are:
+XISF data blocks files (`.xisb`) and any other files, each of which is one block. PixInsight
+itself reads and writes monolithic files only; other software reads and writes both.
+
+```python
+xisfconv.write("m31.xish", data, codec="zstd")          # m31.xish (the header) and m31.xisb (the data)
+data = xisfconv.read("m31.xish")                        # the header file is the one to name
+xisfconv.rewrite("m31.xish", "m31.xisf")                # packed into one file, every block as it is
+xisfconv.rewrite("m31.xisf", "m31.xish")                # ... and unpacked
+xisfconv.rewrite_in_place("m31.xish", codec="zlib")     # both files replaced, read back first
+
+with xisfconv.open("m31.xish") as f:
+    f.unit                # "distributed" ("monolithic" for m31.xisf)
+    f.external_files      # ["/data/m31.xisb"]: the files the header names
+    f.unit_size           # the size of them all; f.size is that of the header file
+```
+
+The kind of unit follows the name: `.xish` is a header file with its data blocks in the file of
+the same name that ends in `.xisb`, any other name is one monolithic file. That holds for
+`write`, `convert`, `rewrite`, `XISF.write` and `CCDData.write`. An existing file of either name
+is kept unless `overwrite=True`.
+
+A header is data that came from somewhere, and it says which files are read: one that names a
+file of this machine as the pixels of an image would have a conversion copy that file into its
+output. So a header is followed only to files in its own directory and below it, and only a
+header file that is named as one (`.xish`) is followed at all: a monolithic `.xisf` file holds
+all of its data, so one that names the file beside it is not followed there. A header that
+names a file elsewhere (an absolute path, a `file:` URL, a path with `..`, a symbolic link that
+leads out) raises `xisfconv.NotAllowedError`, which is also a `PermissionError`:
+
+```python
+xisfconv.read("frame.xish", external_files="anywhere")  # this header may lead anywhere on the machine
+xisfconv.read("frame.xish", external_files="none")      # ... or to no other file at all
+```
+
+`open`, `read`, `read_image`, `convert`, `rewrite`, `rewrite_in_place`, `stored_as_requested` and
+`verify` take the argument, and each call says it for itself: nothing is remembered, and an open
+file keeps what it was opened with. A property in a file that is not read is left out with a
+warning (`read_image`, `convert`) or raises when it is asked for by name; `verify` reports the
+block as not checked. Nothing is ever fetched from a network: a block at an `http:` URL raises
+`xisfconv.UnsupportedError`. `xisfconv.astropy` reads a unit by the name of its header file; a
+header that comes from a stream without a file name, or that astropy fetched from a URL, has
+no directory of its own to look in, and is refused if it names other files.
+
+A data blocks file is written anew whenever its unit is written, with the blocks of that unit
+alone. `rewrite_in_place` therefore refuses (`FileExistsError`) to replace one that also holds
+blocks its header does not name, unless `overwrite=True`; a data blocks file that several
+headers share is for reading. The name of a unit has to be valid UTF-8, since the header holds
+the name of the data blocks file.
+
 ## Coming from the xisf package
 
 [`xisf`](https://github.com/sergio-dr/xisf) is the usual package for XISF files in Python. The
@@ -190,6 +243,7 @@ Where it differs from the package, on purpose:
 | | `xisf` | `xisfconv.xisf` |
 |---|---|---|
 | a damaged block | is returned | `ChecksumError` |
+| a distributed unit (`.xish`) | not read | read and written; `location` is `("path", path, identifier)` |
 | Float64 written as `3` | the int 3 | the float 3.0 |
 | Boolean written as `1` | False | True |
 | a complex scalar | a pair of numbers | a complex number |
@@ -256,7 +310,7 @@ that a signal handler raises there (an alarm's time limit) can be lost. `Keyboar
 - Warnings of the library are Python warnings of the class `xisfconv.XisfconvWarning`, raised
   when the call is back; its notes on how a conversion was done go to the logger `"xisfconv"` at
   level INFO. Errors of the library are subclasses of `xisfconv.Error`, and several are also
-  `OSError`, `FileNotFoundError`, `FileExistsError`, `ValueError`, `IndexError` or `LookupError`,
+  `OSError`, `FileNotFoundError`, `FileExistsError`, `PermissionError`, `ValueError`, `IndexError` or `LookupError`,
   as fits. An argument of the wrong kind raises `ValueError` or `TypeError` as usual, and an
   image name that the file does not have `KeyError`.
 - FITS and ASDF are supported as far as images need them: signed integers are read as unsigned

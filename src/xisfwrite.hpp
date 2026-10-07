@@ -1,4 +1,5 @@
-// Writer for monolithic XISF 1.0 files.
+// Writer for XISF 1.0 units: monolithic files, and distributed units of a header file and one
+// data blocks file.
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 Jurgen Kobierczynski
 #pragma once
@@ -38,6 +39,11 @@ struct XisfWriteOptions {
     // XISF:CreatorApplication. Empty: this library names itself. With another name the library
     // is named in XISF:CreatorModule, as the specification has it for the code that did the writing.
     std::string creatorApplication;
+    // A distributed unit: `path` gets the header alone (an XISF header file, .xish) and this file
+    // the data blocks (an XISF data blocks file, .xisb), which the header names as blocksName in
+    // its own directory. Empty: a monolithic file, with the blocks attached.
+    std::string blocksPath;
+    std::string blocksName;
 };
 
 // Data blocks up to this size are written into the header, larger ones are attached to the

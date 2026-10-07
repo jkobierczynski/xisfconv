@@ -32,7 +32,8 @@ enum class ErrorKind {
     Index,        // no image with that index
     Exists,       // the output exists and may not be overwritten
     NotFound,     // what was asked for is not in the file
-    Cancelled     // the progress handler asked to stop
+    Cancelled,    // the progress handler asked to stop
+    NotAllowed    // the header of a distributed XISF unit names a file it is not to be followed to
 };
 
 struct Error : std::runtime_error {

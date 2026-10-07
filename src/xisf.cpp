@@ -109,7 +109,7 @@ XisfChecksumState XisfFile::verifyBlockChecksum(const XisfStoredBlock& block, co
     return XisfChecksumState::Verified;
 }
 
-XisfFile::XisfFile(const std::string& path) : path_(path) {
+XisfFile::XisfFile(const std::string& path, const XisfBlocksRedirect* redirect, bool verifying) : path_(path) {
     file_.open(toPath(path), std::ios::binary);
     if (!file_) failToOpen(path);
     std::error_code directoryError;
@@ -118,28 +118,76 @@ XisfFile::XisfFile(const std::string& path) : path_(path) {
     fileSize_ = static_cast<uint64_t>(file_.tellg());
     file_.seekg(0);
 
-    unsigned char preamble[16];
-    if (fileSize_ < 16 || !file_.read(reinterpret_cast<char*>(preamble), 16)) {
-        throw Error("file too short to be XISF");
+    unsigned char preamble[16] = {0};
+    const size_t have = static_cast<size_t>(std::min<uint64_t>(fileSize_, 16));
+    if (have > 0 && !file_.read(reinterpret_cast<char*>(preamble), static_cast<std::streamsize>(have))) {
+        throw Error("cannot read the file", ErrorKind::Io);
     }
-    if (std::memcmp(preamble, "XISF0100", 8) != 0) {
-        if (std::memcmp(preamble, "XISB0100", 8) == 0) {
-            throw Error("this is an XISF data blocks file (.xisb); distributed XISF units are not supported");
+    // An XISF header file is an XML document and nothing else (the specification has it begin
+    // with the XML declaration; a byte order mark and blanks before it are let pass).
+    size_t first = have >= 3 && preamble[0] == 0xEF && preamble[1] == 0xBB && preamble[2] == 0xBF ? 3 : 0;
+    while (first < have && (preamble[first] == ' ' || preamble[first] == '\t' || preamble[first] == '\r' || preamble[first] == '\n')) ++first;
+    if (have >= 8 && std::memcmp(preamble, "XISF0100", 8) == 0) {
+        if (fileSize_ < 16) throw Error("file too short to be XISF");
+        const uint32_t headerLength = readLE32(preamble + 8);
+        if (headerLength == 0 || 16ull + headerLength > fileSize_) throw Error("invalid XISF header length");
+        headerXml_.resize(headerLength);
+        if (!file_.read(&headerXml_[0], headerLength)) throw Error("cannot read XISF header");
+    } else if (first < have && preamble[first] == '<') {
+        // An XML document. Before all of it is read, its beginning has to show the root element
+        // of an XISF header: any SVG, HTML or XML file begins like this, of any size.
+        std::string beginning(static_cast<size_t>(std::min<uint64_t>(fileSize_, kXmlBeginning)), '\0');
+        file_.clear();
+        file_.seekg(0);
+        if (!file_.read(&beginning[0], static_cast<std::streamsize>(beginning.size()))) throw Error("cannot read the file", ErrorKind::Io);
+        const std::string rootName = xmlRootNameAtStart(beginning);
+        if (rootName != "xisf" && (!rootName.empty() || beginning.size() < fileSize_)) {
+            throw Error(rootName.empty() ? "this XML file is not an XISF header: it does not begin with a root element <xisf> (within its first 64 KiB)"
+                                         : "this XML file is not an XISF header: its root element is <" + rootName + ">, expected <xisf>");
         }
+        headerFile_ = true;
+        if (fileSize_ > 0xFFFFFFFFull) throw Error("the XML header is larger than an XISF header can be");
+        headerXml_.resize(static_cast<size_t>(fileSize_));
+        file_.clear();
+        file_.seekg(0);
+        if (!file_.read(&headerXml_[0], static_cast<std::streamsize>(fileSize_))) throw Error("cannot read XISF header", ErrorKind::Io);
+    } else {
+        if (have >= 8 && std::memcmp(preamble, "XISB0100", 8) == 0) {
+            throw Error("this is an XISF data blocks file (.xisb): it holds data of a distributed XISF unit; name the "
+                        "header file of that unit (.xish)");
+        }
+        if (fileSize_ < 16) throw Error("file too short to be XISF");
         if (std::memcmp(preamble, "SIMPLE", 6) == 0) throw Error("this looks like a FITS file, not XISF");
         throw Error("not an XISF 1.0 file (bad signature)");
     }
-    const uint32_t headerLength = readLE32(preamble + 8);
-    if (headerLength == 0 || 16ull + headerLength > fileSize_) throw Error("invalid XISF header length");
-
-    headerXml_.resize(headerLength);
-    if (!file_.read(&headerXml_[0], headerLength)) throw Error("cannot read XISF header");
     while (!headerXml_.empty() && headerXml_.back() == '\0') headerXml_.pop_back();
 
     root_ = xml::parse(headerXml_);
-    if (root_->name != "xisf") throw Error("XML header root element is <" + root_->name + ">, expected <xisf>");
+    if (root_->name != "xisf") {
+        throw Error(std::string(headerFile_ ? "this XML file is not an XISF header: its" : "XML header") +
+                    " root element is <" + root_->name + ">, expected <xisf>");
+    }
     version_ = attrOr(*root_, "version");
     if (version_ != "1.0") warn("unexpected XISF version '" + version_ + "'; trying anyway");
+
+    // The files the header names beside itself. (Before the elements are looked at: the text of
+    // a String may be in one of them.)
+    // A monolithic file holds all of its data, and a header file is named as one: the
+    // specification says both. A file that is neither is not followed to other files by its own
+    // word (a file somebody was sent as "an image" would otherwise read the files beside it).
+    external_ = std::make_unique<XisfExternalFiles>(path_, redirect, verifying);
+    if (!headerFile_) external_->notAHeaderToFollow("this is a monolithic XISF file, which holds all of its data");
+    else if (!isXisfHeaderName(path_)) external_->notAHeaderToFollow("this header file does not have the name of one");
+    unitSize_ = fileSize_;
+    findExternalFiles(*root_);
+    for (const auto& ids : idsByWhere_) {
+        const auto path = resolved_.find(ids.first);
+        if (path != resolved_.end()) namedBlocks_[path->second].insert(ids.second.begin(), ids.second.end());
+    }
+    if (!headerFile_ && !externalFiles_.empty()) {
+        warn("this monolithic XISF file names data in other files (" + externalFiles_.front() +
+             (externalFiles_.size() > 1 ? ", ..." : "") + "), which the specification has for a header file (.xish) only");
+    }
 
     for (const auto& child : root_->children) {
         if (child->name == "Image") {
@@ -150,6 +198,72 @@ XisfFile::XisfFile(const std::string& path) : path_(path) {
             fileProperties_.push_back(parseProperty(*child));
         }
     }
+}
+
+namespace {
+
+// What went wrong with a property, for a message that names the property already: an error
+// that begins with its name is told without it.
+std::string reasonFor(const std::string& id, const std::string& message) {
+    const std::string name = "property " + id;
+    if (!startsWith(message, name)) return message;
+    const std::string rest = message.substr(name.size());
+    if (startsWith(rest, ": ")) return rest.substr(2);
+    if (startsWith(rest, " is ")) return "it" + rest;
+    return message;
+}
+
+}  // namespace
+
+void XisfFile::findExternalFiles(const xml::Node& node) {
+    const std::string* location = node.attr("location");
+    if (location && node.name != "Data" && isExternalXisfLocation(*location)) {
+        try {
+            const XisfLocation loc = parseXisfLocation(*location, "<" + node.name + ">");
+            const std::string where = external_->where(loc);
+            size_t slot = static_cast<size_t>(std::find(externalFiles_.begin(), externalFiles_.end(), where) - externalFiles_.begin());
+            const bool first = slot == externalFiles_.size();
+            if (first) {
+                externalFiles_.push_back(where);
+                externalReasons_.emplace_back(ErrorKind::Io);
+            }
+            // A file is resolved once, however often the header names it; again only while it is
+            // not read and is written another way than before. (One way may be followed where
+            // another is not: an absolute path and @header_dir/ can lead to the same file.)
+            const std::string written = std::string(loc.kind == XisfLocation::Kind::Url ? "u" : loc.headerDir ? "h" : "a") + loc.target;
+            if (tried_.insert(written).second) {
+                const std::string asked = external_->asked(loc);
+                if (!asked.empty() && std::find(externalAsked_.begin(), externalAsked_.end(), asked) == externalAsked_.end()) {
+                    externalAsked_.push_back(asked);
+                }
+                if (externalReasons_[slot]) {
+                    try {
+                        const std::string path = external_->resolve(loc, "<" + node.name + ">");
+                        resolved_[where] = path;
+                        externalReasons_[slot].reset();
+                        if (std::find(externalPaths_.begin(), externalPaths_.end(), path) == externalPaths_.end()) {
+                            std::error_code ec;
+                            const uint64_t size = static_cast<uint64_t>(std::filesystem::file_size(toPath(path), ec));
+                            externalPaths_.push_back(path);
+                            if (!ec && size <= std::numeric_limits<uint64_t>::max() - unitSize_) unitSize_ += size;
+                        }
+                    } catch (const Error& e) {
+                        // (a file that is not there, or that the header is not followed to, is said when it is read)
+                        if (first) externalReasons_[slot] = e.kind;
+                    }
+                }
+            }
+            // (the blocks the header names in data blocks files, whichever way it names the file:
+            // they are put to the file once all of the header was seen, see the constructor)
+            if (loc.hasId) {
+                idsByWhere_[where].insert(loc.id);
+                const std::string asked = external_->asked(loc);
+                if (!asked.empty()) idsAsAsked_[asked].insert(loc.id);
+            }
+        } catch (const Error&) {
+        }
+    }
+    for (const auto& child : node.children) findExternalFiles(*child);
 }
 
 XisfProperty XisfFile::parseProperty(const xml::Node& node) {
@@ -167,7 +281,7 @@ XisfProperty XisfFile::parseProperty(const xml::Node& node) {
         if (p.type == "String") {
             try {
                 // (texts are read when the file is opened: no more of them than the file can hold, see propertyBudget)
-                const uint64_t declared = declaredBlockSize(node), budget = propertyBudget(fileSize_);
+                const uint64_t declared = declaredBlockSize(node), budget = propertyBudget(budgetSize());
                 if (declared > budget || stringBytes_ > budget - declared) {
                     throw Error("the texts of this file declare more data than a file of its size can hold");
                 }
@@ -177,7 +291,7 @@ XisfProperty XisfFile::parseProperty(const xml::Node& node) {
                 while (!bytes.empty() && bytes.back() == 0) bytes.pop_back();
                 p.value.assign(bytes.begin(), bytes.end());
             } catch (const Error& e) {
-                warn(std::string("cannot read property ") + p.id + ": " + e.what());
+                warn(std::string("cannot read property ") + p.id + ": " + reasonFor(p.id, e.what()));
                 p.hasBlockData = true;
             }
         } else {
@@ -338,26 +452,36 @@ XisfStoredBlock XisfFile::readStoredBlock(const xml::Node& element, const std::s
         throw Error("unsupported data encoding '" + encoding + "' in " + what);
     };
 
-    if (startsWith(location, "attachment:")) {
-        const auto parts = split(location, ':');
-        uint64_t pos = 0, size = 0;
-        if (parts.size() != 3 || !parseUInt64(parts[1], pos) || !parseUInt64(parts[2], size)) {
-            throw Error("malformed location '" + location + "' in " + what);
+    const XisfLocation loc = parseXisfLocation(location, what);
+    switch (loc.kind) {
+        case XisfLocation::Kind::Attachment:
+            if (headerFile_) {
+                throw Error(what + " is said to be attached to the file (" + location + "), but this is an XISF header "
+                            "file (.xish): nothing is attached to it");
+            }
+            block.bytes = readAttachment(loc.position, loc.size);
+            block.attachment = true;
+            block.position = loc.position;
+            break;
+        case XisfLocation::Kind::Inline:
+            block.bytes = decodeText(loc.encoding, element.text);
+            break;
+        case XisfLocation::Kind::Embedded: {
+            const xml::Node* data = element.child("Data");
+            if (!data) throw Error("embedded " + what + " has no <Data> element");
+            block.bytes = decodeText(attrOr(*data, "encoding"), data->text);
+            attrSource = data;
+            break;
         }
-        block.bytes = readAttachment(pos, size);
-        block.attachment = true;
-        block.position = pos;
-    } else if (startsWith(location, "inline:")) {
-        block.bytes = decodeText(location.substr(7), element.text);
-    } else if (location == "embedded") {
-        const xml::Node* data = element.child("Data");
-        if (!data) throw Error("embedded " + what + " has no <Data> element");
-        block.bytes = decodeText(attrOr(*data, "encoding"), data->text);
-        attrSource = data;
-    } else if (startsWith(location, "url(") || startsWith(location, "path(")) {
-        throw Error(what + " is stored in an external file (distributed XISF), which is not supported");
-    } else {
-        throw Error("unsupported location '" + location + "' in " + what);
+        case XisfLocation::Kind::Path:
+        case XisfLocation::Kind::Url: {
+            XisfExternalFiles::Block found = external_->read(loc, what);
+            block.bytes = std::move(found.bytes);
+            block.external = true;
+            block.indexed = found.indexed;
+            block.indexUncompressedLength = found.uncompressedLength;
+            break;
+        }
     }
 
     auto attr = [&](const char* key) {
@@ -367,6 +491,11 @@ XisfStoredBlock XisfFile::readStoredBlock(const xml::Node& element, const std::s
     block.checksum = attr("checksum");
     block.compression = attr("compression");
     block.subblocks = attr("subblocks");
+    if (block.indexed && block.indexUncompressedLength != 0 && block.compression.empty()) {
+        // (the header says how a block is read; the index of the data blocks file only repeats it)
+        warn(what + ": the index of its data blocks file calls the block compressed, the header does not; it is read "
+             "as the header says");
+    }
     return block;
 }
 
@@ -436,6 +565,16 @@ PixelBuffer XisfFile::readPixels(size_t index, bool verify) {
     px.height = img.height;
     px.channels = img.channels;
     px.format = img.format;
+    if (isExternalXisfLocation(attrOr(*img.node, "location")) && !img.node->attr("compression")) {
+        // (pixels that are a file, or a block of one: its size is known before it is read, and a
+        // file of another size is not read to find that out)
+        const uint64_t stored = external_->storedSize(parseXisfLocation(attrOr(*img.node, "location"), "image " + std::to_string(index)),
+                                                      "image " + std::to_string(index));
+        if (stored != expected) {
+            throw Error("image " + std::to_string(index) + ": pixel data is " + std::to_string(stored) +
+                        " bytes, geometry requires " + std::to_string(expected));
+        }
+    }
     px.data = readBlock(*img.node, verify, "image " + std::to_string(index), expected);
     if (px.data.size() != expected) {
         throw Error("image " + std::to_string(index) + ": pixel data is " + std::to_string(px.data.size()) +
@@ -519,6 +658,35 @@ Property XisfFile::loadProperty(const XisfProperty& x, bool verify) {
     return p;
 }
 
+const std::vector<std::string>& XisfFile::indexProblems() const { return external_->indexProblems(); }
+
+// What the properties may declare is held against the bytes that are there (propertyBudget): the
+// file, and of its data blocks files the blocks the header names, each once and no more of a
+// file than the file has. A file that is one block counts for nothing: a header could name any
+// large file of its directory that way, and declare as much.
+uint64_t XisfFile::budgetSize() const {
+    if (!budgetSize_) {
+        uint64_t size = fileSize_;
+        for (const auto& file : namedBlocks_) {
+            const uint64_t bytes = external_->indexedBytes(file.first, file.second);
+            size = bytes > std::numeric_limits<uint64_t>::max() - size ? std::numeric_limits<uint64_t>::max() : size + bytes;
+        }
+        budgetSize_ = size;
+    }
+    return *budgetSize_;
+}
+
+uint64_t XisfFile::storedBlockSize(const xml::Node& element) const {
+    const std::string location = attrOr(element, "location");
+    try {
+        const XisfLocation loc = parseXisfLocation(location, "a data block");
+        if (loc.kind == XisfLocation::Kind::Attachment) return loc.size;
+        if (loc.external()) return external_->storedSize(loc, "a data block");
+    } catch (const Error&) {
+    }
+    return 0;
+}
+
 // What the data block of an element says it holds, without reading it: the size it is stored
 // with, or the size it declares to have once it is decompressed. 0 if it has none.
 uint64_t XisfFile::declaredBlockSize(const xml::Node& element) const {
@@ -528,6 +696,12 @@ uint64_t XisfFile::declaredBlockSize(const xml::Node& element) const {
     if (startsWith(location, "attachment:")) {
         const auto parts = split(location, ':');
         if (parts.size() != 3 || !parseUInt64(parts[2], stored)) return 0;   // (reading it says what is wrong)
+    } else if (isExternalXisfLocation(location)) {
+        try {
+            stored = external_->storedSize(parseXisfLocation(location, "a data block"), "a data block");
+        } catch (const Error&) {
+            return 0;   // (reading it says what is wrong)
+        }
     } else if (location == "embedded") {
         if (const xml::Node* data = element.child("Data")) source = data;
         stored = source->text.size();
@@ -562,7 +736,7 @@ Property XisfFile::loadPropertyCounted(const XisfProperty& x, bool verify) {
     const bool counted = counted_.count(&x) != 0;
     const uint64_t declared = x.node && !x.location.empty() ? declaredBlockSize(*x.node) : x.value.size();
     if (!counted) {
-        const uint64_t budget = propertyBudget(fileSize_);
+        const uint64_t budget = propertyBudget(budgetSize());
         if (declared > budget || countedBytes_ > budget - declared) {
             throw Error("the properties of this file declare more data than a file of its size can hold (" +
                         std::to_string(declared) + " bytes on top of " + std::to_string(countedBytes_) + ")");
@@ -578,7 +752,7 @@ Property XisfFile::loadPropertyCounted(const XisfProperty& x, bool verify) {
 
 std::vector<Property> XisfFile::loadProperties(size_t imageIndex, bool verify) {
     const std::vector<XisfProperty>& list = imageIndex == kFileProperties ? fileProperties_ : images_.at(imageIndex).properties;
-    const uint64_t budget = propertyBudget(fileSize_);
+    const uint64_t budget = propertyBudget(budgetSize());
     std::vector<Property> out;
     out.reserve(list.size());
     for (const XisfProperty& x : list) {
@@ -595,7 +769,7 @@ std::vector<Property> XisfFile::loadProperties(size_t imageIndex, bool verify) {
             out.push_back(loadProperty(x, verify));
             propertyBytes_ += std::max<uint64_t>(declared, out.back().array ? out.back().data.size() : out.back().text.size());
         } catch (const Error& e) {
-            warn("property " + x.id + " is left out: " + e.what());
+            warn("property " + x.id + " is left out: " + reasonFor(x.id, e.what()));
         }
     }
     return out;
@@ -609,7 +783,7 @@ bool XisfFile::readNumericProperty(size_t imageIndex, const std::string& id, std
     try {
         p = loadProperty(*x, true);
     } catch (const Error& e) {
-        warn(std::string("cannot read property ") + id + ": " + e.what());
+        warn(std::string("cannot read property ") + id + ": " + reasonFor(id, e.what()));
         return false;
     }
     if (!propertyNumbers(p, out)) return false;

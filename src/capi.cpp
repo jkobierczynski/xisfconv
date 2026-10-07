@@ -57,6 +57,7 @@ struct ContextState {
     std::vector<KeptMessage> kept;
     std::atomic<bool> cancel{false};  // xisfconv_context_cancel: the one thing another thread may set
     std::atomic<int> running{0};      // calls in progress in this context (nested ones included)
+    ExternalFiles externalFiles = ExternalFiles::HeaderDirectory;   // xisfconv_context_set_external_files
     xisfconv_host_progress_fn hostProgress = nullptr;  // xisfconv_context_set_host_progress
     void* hostProgressUser = nullptr;
     bool hostProgressFailed = false;
@@ -163,6 +164,7 @@ xisfconv_status statusOf(ErrorKind kind) {
         case ErrorKind::Exists: return XISFCONV_ERR_EXISTS;
         case ErrorKind::NotFound: return XISFCONV_ERR_NOT_FOUND;
         case ErrorKind::Cancelled: return XISFCONV_ERR_CANCELLED;
+        case ErrorKind::NotAllowed: return XISFCONV_ERR_NOT_ALLOWED;
     }
     return XISFCONV_ERR_INTERNAL;
 }
@@ -203,6 +205,7 @@ xisfconv_status guarded(const StatePtr& state, const char* path, Body&& body) no
             s->hostProgressFailed = false;
         }
         const Running running(s);
+        const ExternalFilesScope followed(s->externalFiles);
         const ProgressScope reports([s](const char* stage, uint64_t done, uint64_t total) {
             if (s->cancel.exchange(false)) return false;
             if (!hostAllows(s, stage, done, total)) return false;
@@ -347,7 +350,7 @@ std::optional<Format> formatFromExtension(const std::string& path) {
     if (e == ".fits" || e == ".fit" || e == ".fts") return Format::Fits;
     if (e == ".tif" || e == ".tiff") return Format::Tiff;
     if (e == ".png") return Format::Png;
-    if (e == ".xisf") return Format::Xisf;
+    if (e == ".xisf" || e == ".xish") return Format::Xisf;   // (.xish: the header file of a distributed unit)
     if (e == ".asdf") return Format::Asdf;
     return std::nullopt;
 }
@@ -603,6 +606,7 @@ const char* xisfconv_status_text(xisfconv_status status) {
         case XISFCONV_ERR_BUFFER: return "buffer too small";
         case XISFCONV_ERR_NOT_FOUND: return "not found";
         case XISFCONV_ERR_CANCELLED: return "cancelled";
+        case XISFCONV_ERR_NOT_ALLOWED: return "a file the header names may not be opened";
         case XISFCONV_ERR_INTERNAL: return "internal error";
         default: return "unknown status";
     }
@@ -661,6 +665,31 @@ void xisfconv_context_keep_messages(xisfconv_context* ctx, int32_t keep) {
     if (!ctx) return;
     ctx->state->keepMessages = keep != 0;
     if (!keep) ctx->state->kept.clear();
+}
+
+xisfconv_status xisfconv_context_set_external_files(xisfconv_context* ctx, xisfconv_external_files which) {
+    if (!ctx) return XISFCONV_ERR_ARGUMENT;
+    switch (which) {
+        case XISFCONV_EXTERNAL_HEADER_DIRECTORY: ctx->state->externalFiles = ExternalFiles::HeaderDirectory; break;
+        case XISFCONV_EXTERNAL_ANYWHERE: ctx->state->externalFiles = ExternalFiles::Anywhere; break;
+        case XISFCONV_EXTERNAL_NONE: ctx->state->externalFiles = ExternalFiles::None; break;
+        default:
+            try {
+                ctx->state->error = "xisfconv_context_set_external_files: not one of the XISFCONV_EXTERNAL_ values";
+            } catch (...) {
+            }
+            return XISFCONV_ERR_ARGUMENT;
+    }
+    return XISFCONV_OK;
+}
+
+xisfconv_external_files xisfconv_context_external_files(const xisfconv_context* ctx) {
+    if (!ctx) return XISFCONV_EXTERNAL_HEADER_DIRECTORY;
+    switch (ctx->state->externalFiles) {
+        case ExternalFiles::Anywhere: return XISFCONV_EXTERNAL_ANYWHERE;
+        case ExternalFiles::None: return XISFCONV_EXTERNAL_NONE;
+        default: return XISFCONV_EXTERNAL_HEADER_DIRECTORY;
+    }
 }
 
 size_t xisfconv_context_message_count(const xisfconv_context* ctx) { return ctx ? ctx->state->kept.size() : 0; }
@@ -839,8 +868,10 @@ xisfconv_status xisfconv_detect_format(xisfconv_context* ctx, const char* path, 
             std::ifstream again(toPath(path), std::ios::binary);
             char signature[8] = {};
             again.read(signature, 8);
-            if (again.gcount() != 8 || std::memcmp(signature, "XISF0100", 8) != 0) {
-                throw Error("not an XISF, FITS or ASDF file");
+            if ((again.gcount() != 8 || std::memcmp(signature, "XISF0100", 8) != 0) && !looksLikeXisfHeaderFile(path)) {
+                throw Error(again.gcount() == 8 && std::memcmp(signature, "XISB0100", 8) == 0
+                                ? "an XISF data blocks file (.xisb): it is read through the header file of its unit (.xish)"
+                                : "not an XISF, FITS or ASDF file");
             }
             *out = XISFCONV_FORMAT_XISF;
         }
@@ -893,9 +924,33 @@ uint64_t xisfconv_file_size(const xisfconv_file* file) {
 
 size_t xisfconv_image_count(const xisfconv_file* file) { return file ? imageCount(file) : 0; }
 
+size_t xisfconv_external_count(const xisfconv_file* file) { return file && isXisf(file) ? file->xisf->externalFiles().size() : 0; }
+
+const char* xisfconv_external_file(const xisfconv_file* file, size_t index) {
+    if (!file || !isXisf(file) || index >= file->xisf->externalFiles().size()) return "";
+    return file->xisf->externalFiles()[index].c_str();
+}
+
+xisfconv_status xisfconv_external_status(const xisfconv_file* file, size_t index) {
+    if (!file || !isXisf(file) || index >= file->xisf->externalReasons().size()) return XISFCONV_ERR_INDEX;
+    const std::optional<ErrorKind>& reason = file->xisf->externalReasons()[index];
+    if (!reason) return XISFCONV_OK;
+    switch (*reason) {
+        case ErrorKind::NotAllowed: return XISFCONV_ERR_NOT_ALLOWED;
+        case ErrorKind::Unsupported: return XISFCONV_ERR_UNSUPPORTED;
+        default: return XISFCONV_ERR_IO;
+    }
+}
+
+uint64_t xisfconv_unit_size(const xisfconv_file* file) {
+    if (!file) return 0;
+    return isXisf(file) ? file->xisf->unitSize() : file->fits.fileSize;
+}
+
 const char* xisfconv_file_detail(const xisfconv_file* file, const char* name) {
     if (!file || !name) return "";
     if (isXisf(file) && !std::strcmp(name, "version")) return file->xisf->version().c_str();
+    if (isXisf(file) && !std::strcmp(name, "unit")) return file->xisf->headerFile() ? "distributed" : "monolithic";
     if (file->format == XISFCONV_FORMAT_ASDF && !std::strcmp(name, "format")) return file->fits.formatNote.c_str();
     return "";
 }

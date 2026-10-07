@@ -15,7 +15,7 @@ from ctypes import (CFUNCTYPE, POINTER, Structure, c_char, c_char_p, c_double, c
 
 # The library version this module was written for. In 0.x every release may change the layout
 # of the structures, so another library is refused.
-API_VERSION = (0, 15)
+API_VERSION = (0, 16)
 
 # ------------------------------------------------------------------------------------------
 # Constants of xisfconv.h
@@ -33,6 +33,7 @@ ERR_EXISTS = 8
 ERR_BUFFER = 9
 ERR_NOT_FOUND = 10
 ERR_CANCELLED = 11
+ERR_NOT_ALLOWED = 12
 ERR_INTERNAL = 99
 
 CODEC_KEEP = -1
@@ -100,6 +101,9 @@ ELEMENT_FLOAT32 = 9
 ELEMENT_FLOAT64 = 10
 ELEMENT_COMPLEX32 = 11
 ELEMENT_COMPLEX64 = 12
+
+# xisfconv_external_files
+EXTERNAL_HEADER_DIRECTORY, EXTERNAL_ANYWHERE, EXTERNAL_NONE = range(3)
 
 # xisfconv_property_storage
 PROPERTY_NONE, PROPERTY_VALUE, PROPERTY_TEXT_BLOCK, PROPERTY_ARRAY, PROPERTY_UNREAD = range(5)
@@ -296,6 +300,8 @@ _FUNCTIONS = {
     "xisfconv_context_free": (None, [_p]),
     "xisfconv_error_message": (_str, [_p]),
     "xisfconv_context_keep_messages": (None, [_p, c_int32]),
+    "xisfconv_context_set_external_files": (_status, [_p, c_int32]),
+    "xisfconv_context_external_files": (c_int32, [_p]),
     "xisfconv_context_message_count": (c_size_t, [_p]),
     "xisfconv_context_message": (_status, [_p, c_size_t, POINTER(c_int32), _strp, _strp]),
     "xisfconv_context_clear_messages": (None, [_p]),
@@ -318,6 +324,10 @@ _FUNCTIONS = {
     "xisfconv_close": (None, [_p]),
     "xisfconv_file_format": (c_int32, [_p]),
     "xisfconv_file_size": (c_uint64, [_p]),
+    "xisfconv_external_count": (c_size_t, [_p]),
+    "xisfconv_external_file": (_str, [_p, c_size_t]),
+    "xisfconv_external_status": (c_int32, [_p, c_size_t]),
+    "xisfconv_unit_size": (c_uint64, [_p]),
     "xisfconv_image_count": (c_size_t, [_p]),
     "xisfconv_file_detail": (_str, [_p, _str]),
     "xisfconv_skipped_count": (c_size_t, [_p]),

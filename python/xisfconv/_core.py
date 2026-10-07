@@ -94,6 +94,14 @@ class NotFoundError(Error, LookupError):
     status = _lib.ERR_NOT_FOUND
 
 
+class NotAllowedError(Error, PermissionError):
+    """The header of a distributed XISF unit names a file it is not followed to: one outside
+    its own directory (``external_files="anywhere"`` allows that), or any file at all with
+    ``external_files="none"``."""
+
+    status = _lib.ERR_NOT_ALLOWED
+
+
 class Cancelled(Error):
     """The operation was stopped from its progress function."""
 
@@ -120,6 +128,7 @@ _ERRORS = {
     _lib.ERR_EXISTS: OutputExistsError,
     _lib.ERR_NOT_FOUND: NotFoundError,
     _lib.ERR_CANCELLED: Cancelled,
+    _lib.ERR_NOT_ALLOWED: NotAllowedError,
 }
 
 
@@ -185,6 +194,8 @@ _OPTION_WORDS = [
     ("--resize", "resize"),
     ("--no-verify", "verify=False"),
     ("add --in-place to replace it", "use rewrite_in_place() to replace it"),
+    ("add --in-place to replace the input", "use rewrite_in_place() to replace the input"),
+    ("--external-files anywhere", 'external_files="anywhere"'),
     ("or directory with -o or -d", ""),
     ("--in-place", "rewrite_in_place()"),
     ("--sip-order", "sip_order"),
@@ -423,6 +434,13 @@ class _Context:
         _library.xisfconv_context_keep_messages(self.pointer, 1)
         self._resource = _own(self, _library.xisfconv_context_free, self.pointer)
 
+    def follow(self, external_files):
+        """Which files the header of an XISF unit may name for its data: "header-dir" (None),
+        "anywhere" or "none"."""
+        which = _lib.EXTERNAL_HEADER_DIRECTORY if external_files is None else \
+            _choice(external_files, _EXTERNAL, "external_files")
+        _library.xisfconv_context_set_external_files(self.pointer, which)
+
     @classmethod
     def borrow(cls):
         """The context of this thread. The caller holds its lock while it uses it and says
@@ -434,9 +452,12 @@ class _Context:
             context = _local.context = cls()
         return context
 
-    def about(self, path=None, reading=True, other=None):
+    def about(self, path=None, reading=True, other=None, external_files=None):
         """Says which file the next calls are about (under the lock: a signal handler that
-        used the package between `borrow` and the lock has used this context)."""
+        used the package between `borrow` and the lock has used this context), and which files
+        the header of an XISF unit is followed to: the context serves one call after another,
+        and each says it for itself."""
+        self.follow(external_files)
         self.path = path
         self.reading = reading
         self.shown = None
@@ -666,6 +687,7 @@ _CODECS = {"none": _lib.CODEC_NONE, "zlib": _lib.CODEC_ZLIB, "lz4": _lib.CODEC_L
 _CHECKSUMS = {"none": _lib.CHECKSUM_NONE, "sha1": _lib.CHECKSUM_SHA1, "sha-1": _lib.CHECKSUM_SHA1,
               "sha256": _lib.CHECKSUM_SHA256, "sha-256": _lib.CHECKSUM_SHA256, "sha512": _lib.CHECKSUM_SHA512,
               "sha-512": _lib.CHECKSUM_SHA512, "sha3-256": _lib.CHECKSUM_SHA3_256, "sha3-512": _lib.CHECKSUM_SHA3_512}
+_EXTERNAL = {"header-dir": _lib.EXTERNAL_HEADER_DIRECTORY, "anywhere": _lib.EXTERNAL_ANYWHERE, "none": _lib.EXTERNAL_NONE}
 _ROWS = {"top-down": _lib.ROWS_TOP_DOWN, "bottom-up": _lib.ROWS_BOTTOM_UP}
 _ROW_NAMES = {_lib.ROWS_TOP_DOWN: "top-down", _lib.ROWS_BOTTOM_UP: "bottom-up"}
 _STRETCHES = {"none": _lib.STRETCH_NONE, "auto": _lib.STRETCH_AUTO, "linked": _lib.STRETCH_LINKED,
@@ -2445,7 +2467,7 @@ class File:
     _count = 0
     path = None
 
-    def __init__(self, path, *, _shown=None):
+    def __init__(self, path, *, external_files=None, _shown=None):
         # (_shown: the name for messages, if `path` is a temporary copy of what the caller gave)
         #: the name the file was opened with
         self.path = path
@@ -2455,6 +2477,7 @@ class File:
         # context needs `steps`, or Ctrl-C will not stop those calls.)
         self._context = _Context(path if _shown is None else _shown, steps=False)
         self._context.shown = _shown
+        self._context.follow(external_files)     # (the file keeps what it is opened with)
         handle = c_void_p()
         # What closes the handle is made first, with nothing to close, and given the handle in
         # one step once there is one. Whatever interrupts this, the handle is closed once.
@@ -2559,6 +2582,30 @@ class File:
             return int(_library.xisfconv_file_size(self._pointer()))
 
     @property
+    def unit(self):
+        """XISF: "monolithic" for a file that holds the whole unit (.xisf), "distributed" for
+        the header file of a unit whose data is in other files (.xish). "" for FITS and ASDF."""
+        return self.detail("unit")
+
+    @property
+    def external_files(self):
+        """The files the header of an XISF unit names beside itself, where its data blocks are:
+        a list of absolute paths (a URL for a file that is not a local one), each once, in the
+        order of the header, whether or not the file is there and may be read. Empty for a
+        monolithic XISF file that names none, and for FITS and ASDF."""
+        with self._context.lock:
+            pointer = self._pointer()
+            return [_text(_library.xisfconv_external_file(pointer, i))
+                    for i in range(_library.xisfconv_external_count(pointer))]
+
+    @property
+    def unit_size(self):
+        """Size in bytes of the file together with :attr:`external_files`, as far as those are
+        there and may be read. The same as :attr:`size` for a file that names none."""
+        with self._context.lock:
+            return int(_library.xisfconv_unit_size(self._pointer()))
+
+    @property
     def properties(self):
         """The file-level XISF properties (the Metadata element): :class:`Properties`."""
         return Properties(self, _lib.FILE_PROPERTIES)
@@ -2586,7 +2633,7 @@ class File:
             return ctypes.string_at(text.value, length.value) if text.value else b""
 
     def detail(self, name):
-        """A detail of the file as text, "" if it has none. XISF: "version". ASDF: "format"."""
+        """A detail of the file as text, "" if it has none. XISF: "version", "unit". ASDF: "format"."""
         with self._context.lock:
             return _text(_library.xisfconv_file_detail(self._pointer(), _bytes(name)))
 
@@ -2596,13 +2643,35 @@ class File:
         return "<xisfconv.File %r: %s, %d image(s)>" % (self.path, self.format, self._count)
 
 
-def open(path):   # noqa: A001 - the name is the point, as in gzip.open
+def open(path, *, external_files=None):   # noqa: A001 - the name is the point, as in gzip.open
     """Opens an XISF, FITS or ASDF file for reading: a :class:`File`.
 
     FITS and ASDF are recognized by their signature; any other file is taken for XISF, so
     that the XISF reader says what is wrong with it.
+
+    An XISF file is a monolithic file (.xisf) or the header file of a distributed unit
+    (.xish), whose data blocks are in the files that header names (data blocks files, .xisb,
+    and any other). ``external_files`` says how far a header is followed, here and wherever a
+    function of this package reads an XISF file:
+
+    "header-dir" (None, the default)
+        to files in the directory of the header and below it; and only a header file that is
+        named as one (.xish) is followed: a monolithic file holds all of its data, so a .xisf
+        file that names the file beside it is not followed there
+    "anywhere"
+        also to absolute paths, ``file:`` URLs, and where ``..`` and symbolic links lead, and
+        from any XISF file
+    "none"
+        to no file but the header itself
+
+    A header is data that came from somewhere: one that names a file of this machine as the
+    pixels of an image would have a conversion copy that file into its output. A block in a
+    file the header is not followed to is not read: :class:`NotAllowedError` for the pixels
+    of an image, a warning for a property. Nothing is ever fetched from a network. (This is a
+    rule for files from people you do not know, not a sandbox: it does not hold against
+    somebody who changes the directory while the file is read.)
     """
-    return File(path)
+    return File(path, external_files=external_files)
 
 
 def detect_format(path):
@@ -2628,22 +2697,23 @@ def _one_image(file, image):
     return file[image]
 
 
-def read(path, image=0, *, sample_format=None, row_order="top-down", channels="last", verify=True, bounds=None):
+def read(path, image=0, *, sample_format=None, row_order="top-down", channels="last", verify=True, bounds=None,
+         external_files=None):
     """Reads one image of a file into a NumPy array: ``xisfconv.read("m31.xisf")``.
 
     ``image`` is the number of the image in the file, or its name. For the array and the
-    options see :meth:`FileImage.read`.
+    options see :meth:`FileImage.read`; for ``external_files`` see :func:`open`.
     """
-    with File(path) as file:
+    with File(path, external_files=external_files) as file:
         return _one_image(file, image).read(sample_format, row_order=row_order, channels=channels, verify=verify,
                                             bounds=bounds)
 
 
 def read_image(path, image=0, *, sample_format=None, row_order="top-down", channels="last", verify=True, bounds=None,
-               properties=True):
+               properties=True, external_files=None):
     """Reads one image of a file with its keywords, name, bounds, ICC profile and properties:
-    an :class:`Image`. See :meth:`FileImage.read_image`."""
-    with File(path) as file:
+    an :class:`Image`. See :meth:`FileImage.read_image`; for ``external_files`` see :func:`open`."""
+    with File(path, external_files=external_files) as file:
         return _one_image(file, image).read_image(sample_format, row_order=row_order, channels=channels,
                                                   verify=verify, bounds=bounds, properties=properties)
 
@@ -2687,6 +2757,10 @@ def write(path, images, *, format=None, codec=None, checksum=None, stored_row_or
 
     format
         "xisf", "fits", "asdf", "tiff" or "png"; None: from the extension of ``path``.
+        XISF under a name that ends in ".xish" is written as a distributed unit: that file is
+        the header, and the pixels (and every other block too large for the header) go into
+        the file of the same name that ends in ".xisb" (``frame.xish`` and ``frame.xisb``).
+        Any other name is a monolithic file. PixInsight itself opens monolithic files only.
     codec
         None: no compression. "zlib", "zstd", "lz4" or "lz4hc" for XISF, "zlib" or "zstd" for
         ASDF; any codec means Deflate for TIFF. ``True`` or "default": the usual codec of the
@@ -2868,10 +2942,16 @@ def _smaller(bin, resize, scale):   # noqa: A002
 
 def convert(input, output, *, format=None, sample_format=None, image=None, stretch=None, codec=None, checksum=None,
             subblock_size=None, row_order=None, property_keywords=True, wcs=True, sip_order=3, verify=True, bounds=None,
-            overwrite=False, progress=None, properties=True, bin=1, resize=None, scale=None):   # noqa: A002 - the names of the command line
+            overwrite=False, progress=None, properties=True, bin=1, resize=None, scale=None,
+            external_files=None):   # noqa: A002 - the names of the command line
     """Converts a file, as the command line tool does: XISF to FITS, ASDF, TIFF or PNG; FITS
     and ASDF to XISF, to each other, or to TIFF or PNG; FITS to FITS to pack a file
     (``codec=True``: tile-compressed) or to unpack one. (XISF to XISF is :func:`rewrite`.)
+
+    An XISF input is a monolithic file or the header file of a distributed unit (.xish); how
+    far that header is followed, ``external_files`` says (see :func:`open`). XISF output under
+    a name that ends in ".xish" is written as a distributed unit: the header there, the data
+    blocks in the file of the same name that ends in ".xisb".
 
     format
         Of the output; None: from the extension of ``output``.
@@ -2940,7 +3020,7 @@ def convert(input, output, *, format=None, sample_format=None, image=None, stret
     options.bin, options.fit_width, options.fit_height, options.scale = _smaller(bin, resize, scale)
     context = _Context.borrow()
     with context.lock:
-        context.about(input, other=output)
+        context.about(input, other=output, external_files=external_files)
         context.call(_library.xisfconv_convert, context.pointer, _path(input), _path(output), byref(options),
                     progress=progress)
 
@@ -2976,9 +3056,15 @@ def _rewrite_result(result):
 
 
 def rewrite(input, output, *, codec=None, checksum=None, image=None, verify=True, read_back=True, subblock_size=None,
-            overwrite=False, progress=None):   # noqa: A002
+            overwrite=False, progress=None, external_files=None):   # noqa: A002
     """Writes an XISF file again with its data blocks stored another way: another compression,
     checksums added or removed, one image of several. Returns a :class:`RewriteResult`.
+
+    The input is a monolithic file or the header file of a distributed unit, and so is the
+    output, by its name: ``rewrite("frame.xish", "frame.xisf")`` packs a distributed unit into
+    one file, and ``rewrite("frame.xisf", "frame.xish")`` writes ``frame.xish`` (the header)
+    and ``frame.xisb`` (every data block) beside it. Whatever files the input has its blocks
+    in, all of them end up in the output.
 
     codec
         None or "keep": leave every block as it is stored. "none", "zlib", "zstd", or
@@ -2992,42 +3078,52 @@ def rewrite(input, output, *, codec=None, checksum=None, image=None, verify=True
         Verify the checksums of the input.
     read_back
         Read the output back and compare every block with the input.
+    external_files
+        How far the header of the input is followed: see :func:`open`.
     """
     options = _rewrite_options(codec, checksum, image, verify, read_back, subblock_size, overwrite)
     result = _lib.struct(_lib.RewriteResult, _library.xisfconv_rewrite_result_init)
     context = _Context.borrow()
     with context.lock:
-        context.about(input, other=output)
+        context.about(input, other=output, external_files=external_files)
         context.call(_library.xisfconv_rewrite, context.pointer, _path(input), _path(output), byref(options),
                      byref(result), progress=progress)
         return _rewrite_result(result)
 
 
 def rewrite_in_place(path, *, codec=None, checksum=None, image=None, verify=True, subblock_size=None, overwrite=False,
-                     progress=None):
+                     progress=None, external_files=None):
     """Replaces an XISF file by its rewritten self. The new file is written next to it, read
     back and compared, flushed to the disk, and only then renamed over the original. A file
     that is already stored as requested is left alone (``changed`` is False). The options are
     those of :func:`rewrite`; ``overwrite`` only decides whether a leftover ``path + ".part"``
-    of an interrupted run may be overwritten."""
+    of an interrupted run may be overwritten.
+
+    A distributed unit is replaced by its header file and the data blocks file of the header's
+    name (``frame.xisb`` for ``frame.xish``), which then holds every block; other files the
+    header named before are left where they are. Two files cannot be replaced in one step: the
+    data blocks file that is there is set aside, the new files take their places, and if one
+    of them cannot, it is put back and the unit is as it was. A data blocks file that also
+    holds blocks this header does not name (those of another header) is replaced only with
+    ``overwrite=True``: without it :class:`OutputExistsError`."""
     options = _rewrite_options(codec, checksum, image, verify, True, subblock_size, overwrite)
     result = _lib.struct(_lib.RewriteResult, _library.xisfconv_rewrite_result_init)
     context = _Context.borrow()
     with context.lock:
-        context.about(path)
+        context.about(path, external_files=external_files)
         context.call(_library.xisfconv_rewrite_in_place, context.pointer, _path(path), byref(options), byref(result),
                      progress=progress)
         return _rewrite_result(result)
 
 
-def stored_as_requested(path, *, codec=None, checksum=None, image=None):
+def stored_as_requested(path, *, codec=None, checksum=None, image=None, external_files=None):
     """True if every data block of the XISF file is already stored the way the options of
     :func:`rewrite` ask, judged by the header alone."""
     options = _rewrite_options(codec, checksum, image, True, True, None, False)
     out = c_int32()
     context = _Context.borrow()
     with context.lock:
-        context.about(path)
+        context.about(path, external_files=external_files)
         context.call(_library.xisfconv_stored_as_requested, context.pointer, _path(path), byref(options), byref(out))
         return bool(out.value)
 
@@ -3070,13 +3166,15 @@ class Report:
         return "<xisfconv.Report %r: %s, %s>" % (self.path, self.verdict, self.summary)
 
 
-def verify(path, *, progress=None):
+def verify(path, *, progress=None, external_files=None):
     """Reads a file completely without converting anything and reports whether it is intact:
     a :class:`Report`. A damaged or unreadable file is not an exception here: its report says
-    "failed" and why."""
+    "failed" and why. Of a distributed XISF unit (its header file, .xish) every block is read
+    from the file the header names for it; a block in a file the header is not followed to
+    (``external_files``, see :func:`open`) is reported as not checked."""
     context = _Context.borrow()
     with context.lock:
-        context.about(path)
+        context.about(path, external_files=external_files)
         handle = c_void_p()
         context.call(_library.xisfconv_verify, context.pointer, _path(path), byref(handle), progress=progress,
                      undo=lambda: _library.xisfconv_report_free(handle))

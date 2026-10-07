@@ -6,7 +6,11 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <map>
+#include <set>
 #ifdef _WIN32
 #include <fcntl.h>
 #include <io.h>
@@ -168,7 +172,30 @@ std::string stretchDescription(const std::string& how, const std::vector<Stretch
 
 // Name of the temporary file an output is written to before it gets its final name. A file of
 // that name that this run did not create is never overwritten silently, and never if it is the input.
-std::string partPathFor(const std::string& outPath, const std::string& input, bool force) {
+// `others`: the files the input reads its data from beside itself (an XISF unit), which are no
+// more to be written over than the input is.
+using InputFiles = std::vector<std::string>;
+
+bool isOneOf(const std::string& path, const InputFiles* files) {
+    if (!files) return false;
+    std::error_code ec;
+    if (!fs::exists(toPath(path), ec)) return false;
+    for (const std::string& file : *files)
+        if (fs::equivalent(toPath(path), toPath(file), ec)) return true;
+    return false;
+}
+
+// What an XISF unit is read from beside its header: the files the header names, as they are
+// looked for and as they are found (both: a file that is not read is no file to write over either).
+InputFiles inputFilesOf(const XisfFile& file) {
+    InputFiles files = file.externalPaths();
+    for (const std::vector<std::string>* more : {&file.externalAsked(), &file.externalFiles()})
+        for (const std::string& other : *more)
+            if (std::find(files.begin(), files.end(), other) == files.end()) files.push_back(other);
+    return files;
+}
+
+std::string partPathFor(const std::string& outPath, const std::string& input, bool force, const InputFiles* others = nullptr) {
     const std::string tmpPath = outPath + ".part";
     std::error_code ec;
     // Only a plain file of that name is ever written over: through a link the data would land
@@ -182,6 +209,10 @@ std::string partPathFor(const std::string& outPath, const std::string& input, bo
         if (!input.empty() && fs::equivalent(toPath(tmpPath), toPath(input), ec)) {
             throw Error("the temporary file for this output, " + tmpPath + ", is the input file; choose another output name",
                         ErrorKind::Argument);
+        }
+        if (isOneOf(tmpPath, others)) {
+            throw Error("the temporary file for this output, " + tmpPath + ", is a file the input reads its data from; choose "
+                        "another output name", ErrorKind::Argument);
         }
         if (!force) {
             throw Error(tmpPath + " exists (left by an interrupted run?); delete it, or use --force to overwrite it",
@@ -209,19 +240,117 @@ void syncToDisk(const std::string& path, bool directory) {
 #endif
 }
 
-void replaceFile(const std::string& tmpPath, const std::string& outPath) {
+// A name beside a file that nothing has: where the file is set aside while another takes its
+// place. "" if there is none to be had.
+std::string asideNameFor(const std::string& path) {
+    std::error_code ec;
+    for (int n = 0; n < 100; ++n) {
+        const std::string name = path + ".replaced" + (n ? std::to_string(n) : std::string());
+        if (!fs::exists(fs::symlink_status(toPath(name), ec))) return name;
+    }
+    return {};
+}
+
+// Removes a file that was set aside while another took its place. One that cannot be removed
+// (on Windows: a file that may not be written to is renamed, and not deleted) is given that
+// right and tried again; if it stays, that is said: nobody else knows what it is.
+void removeSetAside(const std::string& aside) {
+    if (aside.empty()) return;
+    std::error_code ec;
+    fs::remove(toPath(aside), ec);
+    if (ec) {
+        std::error_code other;
+        // (not through a link: what it leads to is not the file that was set aside)
+        if (!fs::is_symlink(fs::symlink_status(toPath(aside), other))) {
+            fs::permissions(toPath(aside), fs::perms::owner_write, fs::perm_options::add, other);
+        }
+        ec.clear();
+        fs::remove(toPath(aside), ec);
+    }
+    if (ec) warn("the file that was replaced could not be removed and is left as " + aside + " (" + ec.message() + ")");
+}
+
+// Gives a file that was written its name. A file of that name that is there stays until the new
+// one has its place: where a file cannot be renamed over an existing one, the old one is set
+// aside, and put back if the new one cannot take its place then either. (It is never removed
+// first: a rename that fails for another reason would leave neither.) Throws
+// std::filesystem::filesystem_error, an I/O error; `keptAs`, if given, is then the name the file
+// that was there is under, should it not have been put back.
+void replaceFile(const std::string& tmpPath, const std::string& outPath, std::string* keptAs = nullptr) {
     std::error_code ec;
     fs::rename(toPath(tmpPath), toPath(outPath), ec);
-    if (ec) {
-        // where a file cannot be renamed over an existing one
-        fs::remove(toPath(outPath), ec);
-        fs::rename(toPath(tmpPath), toPath(outPath));   // throws std::filesystem::filesystem_error: an I/O error
+    if (!ec) return;
+    const std::error_code why = ec;
+    std::error_code other;
+    const std::string aside = fs::exists(fs::symlink_status(toPath(outPath), other)) ? asideNameFor(outPath) : std::string();
+    if (!aside.empty()) {
+        fs::rename(toPath(outPath), toPath(aside), other);
+        if (!other) {
+            fs::rename(toPath(tmpPath), toPath(outPath), other);
+            if (!other) {
+                removeSetAside(aside);
+                return;
+            }
+            fs::rename(toPath(aside), toPath(outPath), other);
+            if (other) {
+                if (keptAs) *keptAs = aside;
+                throw fs::filesystem_error("cannot rename (the file that was there is kept as " + aside + ")", toPath(tmpPath),
+                                           toPath(outPath), why);
+            }
+        }
     }
+    throw fs::filesystem_error("cannot rename", toPath(tmpPath), toPath(outPath), why);
 }
 
 void removeFile(const std::string& path) {
     std::error_code ec;
     fs::remove(toPath(path), ec);
+}
+
+// The files of an XISF unit that was written get their names. Of a distributed unit the data
+// blocks file goes first, so that a header that is there has its data. Two renames are not one.
+// A data blocks file that is there already (of a unit that is written over) is set aside until
+// the header has its name too, and put back if it does not get it: the unit that was there is
+// then there still. Data blocks without a header are nobody's, and are taken away again. What
+// cannot be put back is named in the error, with the name it is under.
+void replaceUnit(const std::string& tmpPath, const std::string& outPath, const std::string& blocksTmp, const std::string& blocksPath) {
+    if (blocksTmp.empty()) {
+        replaceFile(tmpPath, outPath);
+        return;
+    }
+    std::error_code ec;
+    std::string aside;
+    if (fs::exists(toPath(blocksPath), ec)) {
+        aside = asideNameFor(blocksPath);
+        if (!aside.empty()) fs::rename(toPath(blocksPath), toPath(aside), ec);
+        if (aside.empty() || ec) {
+            throw Error("the data blocks file " + blocksPath + " could not be replaced (" +
+                        (aside.empty() ? std::string("no name to set it aside under") : ec.message()) +
+                        "); the unit that was there is as it was", ErrorKind::Io);
+        }
+    }
+    std::string headerKeptAs;
+    try {
+        replaceFile(blocksTmp, blocksPath);
+        replaceFile(tmpPath, outPath, &headerKeptAs);
+    } catch (const std::exception& e) {
+        removeFile(blocksPath);
+        std::string kept;
+        if (!aside.empty()) {
+            ec.clear();
+            fs::rename(toPath(aside), toPath(blocksPath), ec);
+            if (ec) kept = "the data blocks file that was there is kept as " + aside + " (rename it to " + blocksPath + ")";
+        }
+        if (!headerKeptAs.empty()) {
+            kept += std::string(kept.empty() ? "" : ", and ") + "the header file that was there is kept as " + headerKeptAs +
+                    " (rename it to " + outPath + ")";
+        }
+        throw Error("the files of the unit could not be given their names (" + std::string(e.what()) + "); " +
+                    (!kept.empty() ? kept : !aside.empty() ? std::string("the unit that was there is as it was")
+                                                            : std::string("the unit is not written")),
+                    ErrorKind::Io);
+    }
+    removeSetAside(aside);
 }
 
 // An output replaces a file of its name. A directory or a device of that name is left alone,
@@ -236,12 +365,32 @@ void notInPlaceOfSomethingElse(const std::string& outPath) {
 }
 
 // Refuses an output that exists (unless it may be overwritten) or that is the input itself.
-void checkOutput(const std::string& outPath, const std::string& input, bool force) {
+void checkOutput(const std::string& outPath, const std::string& input, bool force, const InputFiles* others = nullptr) {
     notInPlaceOfSomethingElse(outPath);
+    if (isOneOf(outPath, others)) {
+        throw Error("the output, " + outPath + ", is a file the input reads its data from; name another one", ErrorKind::Argument);
+    }
     if (fs::exists(toPath(outPath)) && !force) throw Error(outPath + " already exists (use --force to overwrite)", ErrorKind::Exists);
     if (!input.empty() && fs::exists(toPath(outPath)) && fs::equivalent(toPath(outPath), toPath(input))) {
         throw Error("output would overwrite the input file", ErrorKind::Argument);
     }
+}
+
+// The data blocks file that is written beside an XISF header file: where it goes, the temporary
+// file it is written to first, and the name the header has for it. Nothing for any other output.
+struct BlocksOutput {
+    std::string path, tmpPath, name;
+    bool wanted() const { return !path.empty(); }
+};
+
+BlocksOutput blocksOutputFor(const std::string& outPath, const std::string& input, bool force, const InputFiles* others = nullptr) {
+    BlocksOutput blocks;
+    if (outPath.empty() || !isXisfHeaderName(outPath)) return blocks;
+    blocks.path = xisfBlocksPathFor(outPath);
+    blocks.name = fromPath(toPath(blocks.path).filename());
+    checkOutput(blocks.path, input, force, others);
+    blocks.tmpPath = partPathFor(blocks.path, input, force, others);
+    return blocks;
 }
 
 // Chooses the range of floating point data: the XISF bounds attribute, or black and white when
@@ -304,8 +453,6 @@ InputFormat detectInputFormat(const std::string& path) {
 XisfFileRewrite rewriteXisfFile(const std::string& input, const std::string& output, bool inPlace, bool force,
                                 XisfRewriteOptions ropt) {
     XisfFileRewrite done;
-    std::error_code sizeError;
-    done.inputSize = static_cast<uint64_t>(fs::file_size(toPath(input), sizeError));
     // In place, the file itself is replaced, not a link that leads to it.
     std::error_code pathError;
     const fs::path real = fs::canonical(toPath(input), pathError);
@@ -317,32 +464,169 @@ XisfFileRewrite rewriteXisfFile(const std::string& input, const std::string& out
                     "or directory with -o or -d", ErrorKind::Argument);
     }
     if (!same) notInPlaceOfSomethingElse(outPath);
+    const fs::perms permissions = fs::status(toPath(input)).permissions();
+    const auto readOnly = [](fs::perms p) {
+        return (p & (fs::perms::owner_write | fs::perms::group_write | fs::perms::others_write)) == fs::perms::none;
+    };
+    if (same && readOnly(permissions)) throw Error("the file is read-only; it is not replaced", ErrorKind::Io);
+    if (same && isXisfHeaderName(outPath)) {
+        // A header that is reached through a link from another directory has its data looked for
+        // beside the link, and the unit that replaces it would be written beside the file.
+        std::error_code ec;
+        const fs::path named = fs::absolute(toPath(input), ec).parent_path(), real = toPath(outPath).parent_path();
+        if (!ec && !fs::equivalent(named.empty() ? fs::path(".") : named, real.empty() ? fs::path(".") : real, ec) && !ec) {
+            throw Error("this header file is a link from another directory: its data is looked for beside the link, and "
+                        "in place the unit would be written beside " + outPath + "; name that file itself", ErrorKind::Argument);
+        }
+    }
+
+    // A unit under the name of a header file (.xish) is written distributed: its data blocks go
+    // into the file of that name that ends in .xisb. The files the input reads are not written
+    // over, except, in place, the one that is that very file.
+    InputFiles inputFiles, resolvedFiles;   // the files the header names, and those of them it is read from
+    std::map<std::string, std::set<uint64_t>> namedBlocks;   // of each data blocks file: the blocks the header names
+    bool inputIsHeader = false;
+    {
+        const MessageScope silent([](MessageLevel, const std::string&) {});   // (what there is to say, the rewrite says)
+        const XisfFile in(input);
+        inputFiles = inputFilesOf(in);
+        resolvedFiles = in.externalPaths();
+        for (const std::string& file : in.externalPaths()) namedBlocks[file] = in.namedBlockIds(file);
+        // (and by every way the header writes a file, followed or not: which of them are one file, the system says)
+        for (const auto& asked : in.namedIdsAsAsked()) namedBlocks[asked.first].insert(asked.second.begin(), asked.second.end());
+        done.inputSize = in.unitSize();
+        inputIsHeader = in.headerFile();
+    }
+    const auto readByInput = [&](const std::string& path) { return isOneOf(path, &inputFiles); };
+    if (!same && readByInput(outPath)) {
+        throw Error("the output, " + outPath + ", is a file the input reads its data from; name another one", ErrorKind::Argument);
+    }
     if (!same && fs::exists(toPath(outPath)) && !force) {
         throw Error(outPath + " already exists (use --force to overwrite)", ErrorKind::Exists);
     }
-    const fs::perms permissions = fs::status(toPath(input)).permissions();
-    if (same && (permissions & (fs::perms::owner_write | fs::perms::group_write | fs::perms::others_write)) == fs::perms::none) {
-        throw Error("the file is read-only; it is not replaced", ErrorKind::Io);
+    std::string blocksPath, blocksTmp, blocksName;
+    bool blocksReplaced = false;   // the data blocks file of the output is one the input reads: it is replaced with it
+    if (isXisfHeaderName(outPath)) {
+        blocksPath = xisfBlocksPathFor(outPath);
+        notInPlaceOfSomethingElse(blocksPath);
+        std::error_code ec;
+        if (fs::exists(toPath(blocksPath), ec) && fs::equivalent(toPath(blocksPath), toPath(input), ec)) {
+            throw Error("the data blocks file of the output, " + blocksPath + ", is the input file", ErrorKind::Argument);
+        }
+        blocksReplaced = readByInput(blocksPath);
+        // (a link the header is not followed through is not followed here either: where it leads is not ours to look at)
+        if (blocksReplaced && same && isOneOf(blocksPath, &resolvedFiles) && fs::is_symlink(fs::symlink_status(toPath(blocksPath), ec))) {
+            // In place, the file is replaced and not the link that leads to it, as for the header.
+            // (The header goes on naming the link.)
+            const fs::path target = fs::canonical(toPath(blocksPath), ec);
+            if (!ec) {
+                blocksName = fromPath(toPath(blocksPath).filename());
+                blocksPath = fromPath(target);
+            }
+        }
+        if (blocksReplaced && !same) {
+            throw Error("the data blocks file of the output, " + blocksPath + ", is a file the input reads its data from; "
+                        "name another output, or add --in-place to replace the input", ErrorKind::Argument);
+        }
+        if (!blocksReplaced && fs::exists(toPath(blocksPath), ec) && !force) {
+            throw Error(blocksPath + " already exists (use --force to overwrite)", ErrorKind::Exists);
+        }
+        if (blocksReplaced && readOnly(fs::status(toPath(blocksPath)).permissions())) {
+            throw Error("the data blocks file " + blocksPath + " is read-only; it is not replaced", ErrorKind::Io);
+        }
     }
     ropt.readBack = ropt.readBack || same;  // a file that replaces its source is always read back first
 
-    // Replacing a file by an identical one would only cost time: such files are left alone.
-    if (same && xisfStoredAsRequested(input, ropt)) {
+    // Replacing a file by an identical one would only cost time: such files are left alone. (A
+    // unit that is not of the kind its name says, a header file named .xisf, is not identical
+    // to what is written under that name.)
+    if (same && inputIsHeader == isXisfHeaderName(outPath) && xisfStoredAsRequested(input, ropt)) {
         done.unchanged = true;
         return done;
     }
 
-    const std::string tmpPath = partPathFor(outPath, input, force);
+    // A data blocks file may hold the blocks of several headers. The one that is replaced in
+    // place is written anew with the blocks of this header alone: what it holds beside them
+    // would be gone, and with it the images of whoever names them. So a file that is there is
+    // replaced only when it was read and holds this header's blocks and no others. Nothing is
+    // left to "reading will say so": with --image, what names the file may never be read.
+    if (blocksReplaced) {
+        if (!isOneOf(blocksPath, &resolvedFiles)) {
+            throw NotAllowed("the data blocks file " + blocksPath + " is named by the header, which " +
+                             (externalFilesPolicy() == ExternalFiles::Anywhere
+                                  ? "is not read from it as it names it: a file that is not read is not replaced"
+                                  : "is not followed to it: a file that is not read is not replaced (--external-files "
+                                    "anywhere lets a header lead there)"));
+        }
+        size_t foreign = 0, own = 0;
+        std::set<uint64_t> named;
+        std::error_code ec;
+        for (const auto& file : namedBlocks)
+            if (fs::equivalent(toPath(file.first), toPath(blocksPath), ec)) named.insert(file.second.begin(), file.second.end());
+        bool indexed = true;
+        try {
+            const MessageScope silent([](MessageLevel, const std::string&) {});
+            for (const XisbElement& e : readXisbIndex(blocksPath, blocksPath).elements) {
+                if (e.position == 0) continue;
+                ++(named.count(e.id) ? own : foreign);
+            }
+        } catch (const Error&) {
+            indexed = false;   // (no data blocks file: a file that is one block, or a damaged one)
+        }
+        bool signed_ = false;   // it begins as a data blocks file does
+        if (!indexed) {
+            char first[8] = {0};
+            std::ifstream begin(toPath(blocksPath), std::ios::binary);
+            signed_ = begin.read(first, 8) && std::memcmp(first, "XISB0100", 8) == 0;
+        }
+        if (!indexed && (!named.empty() || signed_) && !force) {
+            throw Error("the data blocks file " + blocksPath + " cannot be read as one, so what it holds beside the blocks of "
+                        "this header cannot be told: write the unit under another name, or use --force to replace the file "
+                        "all the same", ErrorKind::Exists);
+        }
+        if (foreign && !own && !named.empty()) {
+            // The file holds none of the blocks this header names: it is not this header's, as it
+            // is. (What a replacement leaves that was stopped half-way; nothing is to be replaced
+            // then, with or without leave: the files of that run are what puts the unit right.)
+            std::string hint;
+            size_t looked = 0;
+            for (const uint64_t id : named) {
+                if (!hint.empty() || ++looked > 8) break;
+                hint = xisfSetAsideHint(blocksPath, &id);
+            }
+            throw Error("the data blocks file " + blocksPath + " holds none of the blocks this header names (" +
+                        std::to_string(foreign) + " others): it is not the file that was written with this header, and "
+                        "the unit cannot be read as it is" + hint);
+        }
+        if (foreign && !force) {
+            throw Error("the data blocks file " + blocksPath + " also holds " + std::to_string(foreign) +
+                        (foreign == 1 ? " block" : " blocks") + " that this header does not name (another header may read " +
+                        (foreign == 1 ? "it" : "them") + "), and replacing the file would lose " + (foreign == 1 ? "it" : "them") +
+                        ": write the unit under another name, or use --force to replace the file all the same", ErrorKind::Exists);
+        }
+    }
+
+    const std::string tmpPath = partPathFor(outPath, input, force, &inputFiles);
+    if (!blocksPath.empty()) {
+        // (in place, the temporary file of the data blocks file is no file the unit reads either)
+        blocksTmp = partPathFor(blocksPath, input, force, &inputFiles);
+        ropt.blocksPath = blocksTmp;
+        ropt.blocksName = !blocksName.empty() ? blocksName : fromPath(toPath(blocksPath).filename());
+    }
+    const auto removeTemporaries = [&] {
+        removeFile(tmpPath);
+        if (!blocksTmp.empty()) removeFile(blocksTmp);
+    };
     XisfRewriteResult& r = done.result;
     try {
         r = rewriteXisf(input, tmpPath, ropt);
-        if (!same) replaceFile(tmpPath, outPath);
+        if (!same) replaceUnit(tmpPath, outPath, blocksTmp, blocksPath);
     } catch (...) {
-        removeFile(tmpPath);
+        removeTemporaries();
         throw;
     }
     if (same && !r.changed) {
-        removeFile(tmpPath);
+        removeTemporaries();
         done.unchanged = true;
         return done;
     }
@@ -350,13 +634,50 @@ XisfFileRewrite rewriteXisfFile(const std::string& input, const std::string& out
         // The original is only ever replaced by a rename, once the new file is on the disk with
         // the permissions of the old one; if the rename fails both files stay.
         std::error_code ec;
+        const fs::path parent = toPath(outPath).parent_path();
+        if (!blocksTmp.empty()) {
+            if (blocksReplaced) fs::permissions(toPath(blocksTmp), fs::status(toPath(blocksPath)).permissions(), ec);
+            syncToDisk(blocksTmp, false);
+        }
         fs::permissions(toPath(tmpPath), permissions, ec);
         syncToDisk(tmpPath, false);
-        fs::rename(toPath(tmpPath), toPath(outPath), ec);
-        if (ec) {
-            throw Error("could not replace the file (" + ec.message() + "); the rewritten copy is kept as " + tmpPath, ErrorKind::Io);
+        if (blocksTmp.empty()) {
+            fs::rename(toPath(tmpPath), toPath(outPath), ec);
+            if (ec) throw Error("could not replace the file (" + ec.message() + "); the rewritten copy is kept as " + tmpPath, ErrorKind::Io);
+        } else {
+            // A unit of two files cannot be replaced in one step. The data blocks file that is
+            // there is set aside, the new one takes its place, then the header takes its own; if
+            // either cannot, what was set aside is put back and the unit is as it was. (Should the
+            // machine stop between the steps, the old data blocks file is there under the name it
+            // was set aside with, <name>.xisb.replaced, and the old header names its blocks by
+            // identifiers the new file does not have: nothing is read that is not the image.)
+            std::string aside;
+            if (fs::exists(toPath(blocksPath), ec)) {
+                aside = asideNameFor(blocksPath);
+                if (!aside.empty()) fs::rename(toPath(blocksPath), toPath(aside), ec);
+                if (aside.empty() || ec) {
+                    const std::string why = aside.empty() ? std::string("no name to set it aside under") : ec.message();
+                    removeTemporaries();
+                    throw Error("could not replace the data blocks file " + blocksPath + " (" + why + "); the unit is as it was", ErrorKind::Io);
+                }
+            }
+            ec.clear();
+            fs::rename(toPath(blocksTmp), toPath(blocksPath), ec);
+            if (!ec) fs::rename(toPath(tmpPath), toPath(outPath), ec);
+            if (ec) {
+                const std::string why = ec.message();
+                std::error_code back;
+                fs::remove(toPath(blocksPath), back);   // the new one, if it got there
+                back.clear();
+                if (!aside.empty()) fs::rename(toPath(aside), toPath(blocksPath), back);
+                removeTemporaries();
+                throw Error("could not replace the files of the unit (" + why + "); " +
+                            (back ? "the data blocks file that was there is kept as " + aside + ": renamed to " + blocksPath + ", the unit is as it was"
+                                  : std::string("it is as it was")),
+                            ErrorKind::Io);
+            }
+            removeSetAside(aside);
         }
-        const fs::path parent = toPath(outPath).parent_path();
         syncToDisk(parent.empty() ? "." : fromPath(parent), true);
     }
     return done;
@@ -454,7 +775,9 @@ void convertXisfFile(const std::string& input, const std::string& outPath, Forma
         }
     }
 
-    checkOutput(outPath, input, opt.force);
+    // (the files a distributed unit reads its data from are no outputs, and no temporary files)
+    const InputFiles others = inputFilesOf(file);
+    checkOutput(outPath, input, opt.force, &others);
 
     std::vector<PixelBuffer> buffers;
     std::vector<std::string> stretchNotes;  // HISTORY text per converted image
@@ -531,7 +854,7 @@ void convertXisfFile(const std::string& input, const std::string& outPath, Forma
         buffers.push_back(std::move(px));
     }
 
-    const std::string tmpPath = partPathFor(outPath, input, opt.force);
+    const std::string tmpPath = partPathFor(outPath, input, opt.force, &others);
     progress("writing", 0, 0);
     try {
         if (fitsLike) {
@@ -711,6 +1034,9 @@ void writeImageSet(FitsFile& fits, const ImageSetOrigin& source, const std::stri
     // Images that come from a file say so in their header; images handed over in memory do not.
     const std::string history = source.format.empty() ? std::string() : "Converted from " + source.format + " by xisfconv " + kVersion;
     const std::string tmpPath = partPathFor(outPath, input, opt.force);
+    // An XISF unit under the name of a header file (.xish) is written distributed: the header
+    // there, the data blocks in a file of the same name that ends in .xisb.
+    const BlocksOutput blocksFile = blocksOutputFor(format == Format::Xisf ? outPath : std::string(), input, opt.force);
     progress("writing", 0, 0);
 
     if (exporting) {
@@ -1033,11 +1359,14 @@ void writeImageSet(FitsFile& fits, const ImageSetOrigin& source, const std::stri
     wopt.creatorApplication = opt.creatorApplication;
     if (opt.properties) wopt.metadata = std::move(fits.properties);
 
+    wopt.blocksPath = blocksFile.tmpPath;
+    wopt.blocksName = blocksFile.name;
     try {
         writeXisf(tmpPath, out, wopt);
-        replaceFile(tmpPath, outPath);
+        replaceUnit(tmpPath, outPath, blocksFile.tmpPath, blocksFile.path);
     } catch (...) {
         removeFile(tmpPath);
+        if (blocksFile.wanted()) removeFile(blocksFile.tmpPath);
         throw;
     }
 }

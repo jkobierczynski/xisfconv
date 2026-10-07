@@ -18,18 +18,21 @@ xisfconv -t png -s -b u8 integration.xisf      # stretched 8-bit PNG for the web
 xisfconv -t png -s -b u8 light_0001.fits       # quick look at a raw FITS frame
 xisfconv -t png -s -b u8 --resize 1024 *.xisf  # previews, the longest side 1024 pixels
 xisfconv -c --in-place *.xisf                 # recompress XISF files with zstd, replacing them
+xisfconv -t xish light_0001.xisf              # -> light_0001.xish + light_0001.xisb (a distributed unit)
+xisfconv light_0001.xish -t xisf              # ... and packed into one file again
 xisfconv --verify ~/astro/2026                # check every XISF, FITS and ASDF file below a folder
 xisfconv --info light_0001.xisf               # geometry, codecs, FITS keywords, properties
 ```
 
 ## Features
 
-**Reading (monolithic XISF 1.0)**
+**Reading (XISF 1.0: monolithic files and distributed units)**
 - Sample formats UInt8/16/32/64, Float32/64; Gray, RGB (and extra/alpha channels)
 - Planar and Normal (interleaved) pixel storage, little- and big-endian data
 - Compression: zlib, LZ4, LZ4HC (the library's own decoder and, for writing, compressor), Zstandard
   (via libzstd), each with or without byte shuffling, including compressed **subblocks**
-- Data blocks as attachments, `inline:base64`/`inline:hex`, or `embedded` `<Data>` elements
+- Data blocks as attachments, `inline:base64`/`inline:hex`, or `embedded` `<Data>` elements, and
+  in other files (`path(...)`): see "Distributed XISF units" below
 - Checksum verification: SHA-1, SHA-256, SHA-512, SHA3-256 and SHA3-512
 - FITS keywords, XISF properties of every type (scalars, strings, time points, vectors and
   matrices, complex numbers included), ColorFilterArray, Resolution, ICC profile, multiple images
@@ -90,7 +93,8 @@ xisfconv --info light_0001.xisf               # geometry, codecs, FITS keywords,
   image, from which PixInsight rebuilds its thin plate splines. Supported for RA/Dec axes with a
   zenithal projection (TAN, STG, ZEA, SIN, ARC) given as a CD matrix, PC + CDELT or CDELT + CROTA2.
   `--no-wcs` leaves the properties out.
-- Output is a monolithic XISF 1.0 file. `-c` compresses with Zstandard + byte shuffling (the same
+- Output is a monolithic XISF 1.0 file, or under a name that ends in `.xish` (`-t xish`) a
+  distributed unit: see "Distributed XISF units" below. `-c` compresses with Zstandard + byte shuffling (the same
   settings PixInsight uses; `--codec zlib` for zlib), blocks over 1 GiB are written as subblocks, and
   `--checksum sha1|sha256|sha512` adds an integrity checksum (`sha3-256` and `sha3-512` are also
   written, but PixInsight does not open such files: see below).
@@ -162,9 +166,99 @@ xisfconv --info light_0001.xisf               # geometry, codecs, FITS keywords,
 - `--no-properties` turns it off in both directions: XISF → FITS and ASDF writes the images alone,
   and from FITS and ASDF the properties a file carries are left where they are.
 
-**XISF → XISF: another compression, checksums, one image of several** (`-t xisf`, `-o name.xisf` or `--in-place`)
-- Rewrites a file with its attached data blocks stored another way, for example to shrink an archive
-  of uncompressed files: `-c` compresses every attached block with Zstandard and byte shuffling
+**Distributed XISF units** (`.xish` + `.xisb`; `-t xish`, `--external-files`)
+- An XISF unit is one file, the monolithic `.xisf`, or it is distributed: a **header file**
+  (`.xish`), which is the XML header and nothing else, and the files that header names, where the
+  data blocks are. Those are **XISF data blocks files** (`.xisb`: many blocks behind an index, each
+  found by a 64-bit identifier) or any other files, each of which is one block. The header says
+  where: `location="path(@header_dir/frame.xisb):0x4d373e33756e480f"`.
+- **Only the header file is given**, wherever an XISF file is: `xisfconv frame.xish` converts the
+  unit, `--info`, `--verify` and `--dump-header` take it, a directory given to `--verify` stands
+  for its `.xish` files too. The other files are found through the header. A `.xisb` file is no
+  input: the error names the header file.
+- **Writing.** The kind of unit follows the name of the output: `.xish` is a header file, with
+  every block that is not in the header in the file of the same name that ends in `.xisb`; any
+  other name is a monolithic file. `-t xish` gives those names (`light.fits` → `light.xish` and
+  `light.xisb`); `-o frame.xish` does the same. (`-t xisf -o frame.xish` and `-t xish -o
+  frame.xisf` say two things, and are errors.) Compression, checksums and subblocks are what
+  they are in a monolithic file. The blocks get random identifiers, so that a header never finds
+  its pixels in the data blocks file written for another one; the index is one node behind the
+  signature, and the blocks are aligned to 4096 bytes (in a unit that is rewritten from another
+  XISF file the uncompressed ones are, as in a monolithic file). Both files are written as
+  `<name>.part` and renamed when they are complete, the data blocks file first and the header
+  last. An existing file of either name is overwritten only with `--force`; the data blocks file
+  that is there is then set aside as `<name>.xisb.replaced` until both new files have their
+  names, and put back if one of them cannot get its name, so that the unit that was there is
+  there still. If a run is stopped in the middle (a power cut, `kill -9`), a file of that name may
+  be left. Look at `xisfconv --verify <name>.xish` then: if it fails, its message names the file
+  that has the blocks of this header, and renaming that file to `<name>.xisb` gives the unit as
+  it was; if the verdict is `OK`, the replacement was complete and the file is a leftover that
+  can be deleted. (The name is `.replaced1`, `.replaced2` and so on if `.replaced` is taken, and
+  for a data blocks file that is a symbolic link the file is beside what the link leads to.) The name of the
+  data blocks file is written into the header, so it has to be valid UTF-8; `&`, quotes and
+  parentheses in it are written the way XML and the specification ask.
+- **Packing and unpacking** is a rewrite (see below): `xisfconv frame.xish -t xisf` packs a unit
+  into one file, `xisfconv frame.xisf -t xish` unpacks one, and both leave every block as it is
+  stored unless `-c`, `--codec` or `--checksum` ask for something else. Whatever files the input
+  has its blocks in (several data blocks files, files that are one block each), all of them end up
+  in the output. `--in-place` on a header file replaces the header and the data blocks file of its
+  name; other files the header named before stay where they are. Two files cannot be replaced in
+  one step: the old data blocks file is set aside (`<name>.xisb.replaced`), the new files take
+  their places, and if one of them cannot, the old one is put back and the unit is as it was.
+  A data blocks file that is a symbolic link the header is followed through is treated as the
+  header is: the file is replaced, the link stays. A header that is itself a link from another
+  directory is not rewritten in place under the link's name (its data is looked for beside the
+  link, and would be written beside the file): name the file. A data blocks file may hold
+  the blocks of several headers: one that holds blocks this header does not name is not replaced
+  in place without `--force`, since those blocks would be gone; one that holds none of the
+  blocks this header names, or that the header is not followed to (`--external-files`), is not
+  replaced at all; and one that cannot be read as a data blocks file needs `--force` as well.
+  (A second header that names the *same* blocks cannot be seen, and is left without them: give
+  each unit its own data blocks file.) The files a unit reads are never an output or a temporary file of a run that reads
+  them.
+- **Which files a header is followed to.** A header is data that came from somewhere, and it says
+  which files are read: one that names `/etc/passwd`, or a file of another user, as the pixels of
+  an image would have a conversion copy that file into its output. So by default a header is
+  followed only to files **in its own directory and below it**, named `path(@header_dir/...)`; a
+  path that leaves the directory (`..`, a symbolic link that leads out), an absolute path and a
+  `file:` URL are refused, and the message says how to allow them:
+  `--external-files anywhere`. `--external-files none` opens no file but the header. And only a
+  **header file that is named as one** (`.xish`) is followed at all: a monolithic `.xisf` file
+  holds all of its data by the specification, so one that names the file beside it (what
+  somebody was sent as "an image", or what a thumbnailer finds in a download folder) is not
+  followed there, and neither is an XML header under another name. A block that
+  is not read for one of these reasons is an error where it is the pixels of an image, a warning
+  where it is one property of many, and "not checked" for `--verify`. **Nothing is ever fetched
+  from a network**: a block at an `http:` or `ftp:` URL is reported as not supported. Only regular
+  files are read (no devices, no pipes). Where a symbolic link leads, and whether there is
+  something, is not told in the refusal. What a header declares for its properties is held
+  against the bytes the unit brings (the header, and the blocks it names in data blocks files),
+  not against the size of whatever large file it names. These rules are for files from people
+  you do not know; they are not a sandbox, and do not hold against somebody who changes the
+  directory while a file is read.
+- **Reading is lenient where the specification is strict about writers**: an identifier may be
+  decimal or hexadecimal, an index may have several nodes and free elements, and reserved fields
+  that are not zero are named and passed over. (A monolithic file that names a block in another
+  file is read with `--external-files anywhere`, and a warning.) What cannot be right is an
+  error: an index that runs in a circle, leads beyond the file or has nodes that lie in each
+  other, a block that lies beyond the end of its file, a header that
+  asks for an identifier the file does not have ("is it the file that was written with this
+  header?"), a header file with an attached block. `--verify` reports what is wrong with an index
+  as a failure even where reading goes on.
+- `--info` shows the unit: `XISF 1.0, distributed unit, 71303168 bytes in 2 files, header 9210
+  bytes, 1 image(s)` and a `data in:` line for each file the header names, which says so if the
+  file is not there or is not read.
+- **PixInsight reads and writes monolithic files only** (1.9.3): a distributed unit is for other
+  software, and is packed into one file for PixInsight. What xisfconv writes is read by
+  [OpenXISF](https://github.com/openxisf/openxisf), and what OpenXISF writes is read by xisfconv
+  (see "Verified" below; OpenXISF 0.5.0 does not take the backslash off a parenthesis in a file
+  name, which the specification puts there, so keep parentheses out of the names of units it
+  has to read).
+
+**XISF → XISF: another compression, checksums, one image of several, the other kind of unit** (`-t xisf`, `-t xish`, `-o name.xisf` or `--in-place`)
+- Rewrites a file with its data blocks stored another way (those that are attached to it, or in the
+  other files of a distributed unit), for example to shrink an archive
+  of uncompressed files: `-c` compresses every such block with Zstandard and byte shuffling
   (`--codec zlib` for zlib, `--codec none` to store everything uncompressed). On the uncompressed
   71 MiB test frame from PixInsight that gives 52 MiB, the size PixInsight's own zstd files have.
 - `--checksum sha1|sha256|sha512|sha3-256|sha3-512` adds a checksum to every attached block
@@ -255,8 +349,8 @@ xisfconv --info light_0001.xisf               # geometry, codecs, FITS keywords,
 - Reads every file completely without converting anything and says whether it is intact. A
   directory stands for the `.xisf`, `.fits`/`.fit`/`.fts`, `.fits.fz` and `.asdf` files in it and
   below it.
-- XISF: every data block (pixels, properties, ICC profile, thumbnail; attached, inline or embedded)
-  has its checksum verified where it has one, is decompressed, and for images compared with the
+- XISF: every data block (pixels, properties, ICC profile, thumbnail; attached, inline, embedded or
+  in another file of a distributed unit) has its checksum verified where it has one, is decompressed, and for images compared with the
   size the geometry requires.
 - FITS: the structure of every HDU is checked, and the `CHECKSUM` and `DATASUM` keywords where the
   file has them (most capture programs do not write them; astropy and CFITSIO can). Every tile of
@@ -416,6 +510,9 @@ xisfconv --info light_0001.xisf               # geometry, codecs, FITS keywords,
 - The program itself has to be under `/usr` (`/usr/local/bin` is): GNOME runs thumbnailers in a
   sandbox that sees the system and not your home directory, so a copy in `~/bin` or
   `~/.local/bin` makes no previews there.
+- The header file of a distributed unit (`.xish`) gets its preview where the thumbnailer may read
+  the data blocks file beside it: in Nemo, Caja, Thunar and PCManFM. GNOME's sandbox holds the
+  one file it was asked about, so GNOME Files shows no preview of a `.xish` file.
 - File managers make no previews of files above a size they set, and astronomical images are
   often larger: raise the limit. Nemo and Caja have it in their preferences; for GNOME Files it
   is a setting, in megabytes: `gsettings set org.gnome.nautilus.preferences thumbnail-limit 4096`.
@@ -466,8 +563,9 @@ self-contained binary that is released.
 ```
 xisfconv [options] <file>...      # any of XISF, FITS, ASDF -> any other of them, or TIFF/PNG
 
-  -t, --to <fits|asdf|tiff|png|xisf>
+  -t, --to <fits|asdf|tiff|png|xisf|xish>
                               output format (default: fits for XISF input, xisf for FITS and ASDF input)
+                              xish: XISF as a distributed unit, <name>.xish and <name>.xisb
   -o, --output <file>         output file name (single input only)
   -d, --outdir <dir>          directory for output files (default: next to each input)
   -f, --force                 overwrite existing output files
@@ -491,6 +589,10 @@ xisfconv [options] <file>...      # any of XISF, FITS, ASDF -> any other of them
                               to XISF: don't write PixInsight solution properties from WCS
       --sip-order <n>         from XISF: SIP distortion order (2-7, default 3; 0 = linear only)
       --no-verify             don't verify data block checksums
+      --external-files <header-dir|anywhere|none>
+                              XISF input: which files the header of a distributed unit may name for
+                              its data: those in its own directory and below (default), any file
+                              of this machine, or none
       --codec <zlib|zstd|lz4|lz4hc|none>
                               XISF and ASDF output: compression codec (a codec implies -c; lz4 and
                               lz4hc are for XISF only); none = uncompressed (XISF -> XISF: decompress)
@@ -508,7 +610,9 @@ xisfconv [options] <file>...      # any of XISF, FITS, ASDF -> any other of them
 ```
 
 Output is written to `<name>.part` and renamed when complete, so an interrupted run never leaves a
-half-written file under the final name. A `<name>.part` that already exists (the leftover of an
+half-written file under the final name. A file that `--force` replaces stays until the new one has
+its name: where one file cannot be renamed over another, the old one is set aside as
+`<name>.replaced` for that moment, and put back if the new one cannot take its place. A `<name>.part` that already exists (the leftover of an
 interrupted run, or another file) is not overwritten unless `--force` is given, and never when it
 is the input itself. An output name that is a directory or a device (`/dev/null`) is refused, with
 or without `--force`: the output would take its place. With several inputs, a failing file is
@@ -583,6 +687,17 @@ What to know:
   keyword list as FITS cards, for handing to another FITS library. The writer leaves out the cards
   that describe how a FITS file stores its data (SIMPLE, BITPIX, NAXIS, BZERO and the like), so a
   header read from a FITS file can be passed as it is.
+- **Distributed XISF units** (since 0.16). Every function that takes an XISF file takes the header
+  file of a distributed unit (`.xish`); `xisfconv_writer_new`, `xisfconv_convert` and
+  `xisfconv_rewrite` write one under a name that ends in `.xish`, with the data blocks in the file
+  of the same name that ends in `.xisb`. `xisfconv_external_count` and `xisfconv_external_file`
+  list the files a header names, `xisfconv_unit_size` is the size of them all, and
+  `xisfconv_file_detail(file, "unit")` says "monolithic" or "distributed". How far a header is
+  followed is a setting of the context, `xisfconv_context_set_external_files`: to its own
+  directory (the default), anywhere on the machine, or to no other file. A block in a file the
+  header is not followed to gives `XISFCONV_ERR_NOT_ALLOWED`, and `xisfconv_external_status` says
+  for each file whether it is read. A program that opens files from people it does not know
+  should leave the default as it is.
 - **Numbers** in files have a decimal point whatever locale the program has set.
 - **File names** are UTF-8 on every platform, Windows included.
 - **Threads.** There is no global state. A context and the handles made from it belong to one
@@ -591,7 +706,7 @@ What to know:
   so the header maps directly to Python's `ctypes` or `cffi`, Rust's bindgen and Perl's
   FFI::Platypus. The Python package in `python/` is built that way, on `ctypes`.
 - **Stability.** Version 0.x: the API may still change between releases, and the shared library's
-  version changes with each of them (`libxisfconv.so.0.15`).
+  version changes with each of them (`libxisfconv.so.0.16`).
 - **Messages** are the tool's and some name its options (`--force`, `--bounds`): the option names
   say which setting is meant.
 - The CMake package (`find_package(xisfconv)`) is installed with the shared library; a static
@@ -635,6 +750,8 @@ xisfconv.write("copy.xisf", image)                  # what was read: pixels, key
 xisfconv.write("out.fits.fz", data)                 # tile-compressed FITS, lossless
 xisfconv.convert("m31.xisf", "m31.fits")            # what the command line tool does
 print(xisfconv.verify("m31.xisf").verdict)
+xisfconv.write("m31.xish", data)                    # a distributed unit: m31.xish and m31.xisb
+xisfconv.rewrite("m31.xish", "packed.xisf")         # ... packed into one file (and the reverse)
 
 import xisfconv.astropy                             # CCDData.read("m31.xisf"), ccd.write("x.xisf"),
 from astropy.nddata import CCDData                  # and astropy.io.fits HDU lists
@@ -694,6 +811,12 @@ Good to know:
   image are not carried by `read_image` and `write`; `rewrite` copies an XISF file with everything
   in it. A FITS or ASDF file that was converted from XISF shows the properties it carries as
   `file[0].properties` and `file.properties`, like an XISF file.
+- A distributed XISF unit is read by the name of its header file (`.xish`) and written under such
+  a name (since 0.16); `File.unit`, `File.external_files` and `File.unit_size` describe it. A
+  header file (`.xish`) is followed to the files in its own directory; one that names a file
+  elsewhere, and a monolithic `.xisf` file that names any other file, raises
+  `xisfconv.NotAllowedError` (a `PermissionError`) unless the call says
+  `external_files="anywhere"`. Each call says it for itself: there is no setting that stays.
 - An image is read and written as a whole, in memory. Reading takes about twice the size of the
   image for a moment, three times for a compressed file. Writing takes once its size on top of
   the array, twice for a colour image with the channels last, and about four times when the
@@ -825,6 +948,16 @@ the temporary file. `--verify` is tested on intact files, on files with one byte
 kind of place and on files cut short at each kind of place; FITS checksums come from astropy
 (image HDUs and random groups), SHA-3 digests are compared with Python's hashlib.
 
+Distributed units are checked from both sides without xisfconv: the test scripts take the header
+file and the data blocks file apart themselves and hold them against the specification, and
+build units by hand in the forms a writer may choose (several index nodes, free elements, decimal
+identifiers, files that are one block, names with blanks and parentheses), damaged in each kind
+of place. Every way out of a header's directory is tried under each setting of
+`--external-files`. What happens when a file cannot be given its name is tested with a `rename`
+that fails on request (`tests/rename_shim.c`, loaded into the program on Linux): at each step of
+replacing a unit, the files that were there must still be there. With `OPENXISF_BIN` set to the
+directory of OpenXISF's sample programs, each side reads what the other wrote.
+
 ASDF is checked against Python's `asdf` library with `asdf-astropy` (the tests are skipped if those
 are not installed). Files written by xisfconv must open without a warning, pass schema validation
 and checksum validation, and yield an astropy HDU list with the pixels and header cards of the
@@ -836,7 +969,16 @@ compared with PyYAML on random documents in all of PyYAML's output styles.
 
 ## Limitations / not yet done
 
-- Distributed XISF units (`.xish` + `.xisb`) are not supported, only monolithic `.xisf` files.
+- Distributed XISF units: a block at a network URL (`url(http://...)`) is never fetched. A unit is
+  written with one data blocks file, of the header's name; an existing data blocks file is never
+  added to or edited, it is written anew (so a data blocks file that several headers share is
+  for reading: rewrite each unit under a name of its own). A unit cannot be written under a name
+  that is not valid UTF-8. The properties of a file may declare, together, 256 MiB more than
+  the bytes the unit brings; a property that is stored as a file of its own (not in a data
+  blocks file) counts in full against that, so one of more than 256 MiB is left out with a
+  warning. The thumbnailer of the desktop integration shows
+  `.xish` files only where thumbnailers may read the files beside the one they are given (GNOME
+  runs them in a sandbox that holds the one file).
 - Complex sample formats and images with more than two dimensions are skipped.
 - CIELab images are written as raw 3-channel data without color conversion.
 - TIFF output is classic TIFF (4 GiB limit); BigTIFF is not implemented.
@@ -915,7 +1057,7 @@ Bump the version in `include/xisfconv.h` (CMake reads it from there), commit, th
 tag:
 
 ```
-git tag v0.15.0 && git push origin v0.15.0
+git tag v0.16.0 && git push origin v0.16.0
 ```
 
 CI builds and tests all three platforms and, only if every one passes, publishes a GitHub release with
@@ -971,6 +1113,18 @@ and every property as PixInsight wrote it: type, comment, format and the text of
 the content of each data block byte for byte (how a block is stored, its codec and checksum and
 whether it is attached or in the header, is the writer's). Of two more frames, which PixInsight
 saved uncompressed, every keyword and property element of the header comes back as the same bytes.
+
+Distributed units (since 0.16) are not a matter for PixInsight, which reads and writes monolithic
+files only. They were checked against the specification, by test programs that take the two files
+apart and build them without xisfconv, and against [OpenXISF](https://github.com/openxisf/openxisf)
+0.5.0, an independent implementation: its reader reads the units xisfconv writes (uncompressed and
+with zlib, LZ4, LZ4HC and Zstandard, one and three channels, and units unpacked from monolithic
+files with several images and properties), and xisfconv reads, verifies, packs and unpacks the
+unit its writer makes. The test suite runs those checks when `OPENXISF_BIN` names the directory
+of OpenXISF's sample programs. The eleven frames PixInsight saved (the plate-solved test frame
+in nine codec and checksum variants, and two more) were unpacked into units, which OpenXISF
+reads; packed again, each has every data block byte for byte and the same header text as
+PixInsight's file, the attributes that say where a block is aside.
 
 ## License
 

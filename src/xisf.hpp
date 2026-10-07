@@ -1,17 +1,21 @@
-// Reader for monolithic XISF 1.0 files.
+// Reader for XISF 1.0 units: monolithic files (.xisf), and distributed units, which are a header
+// file (.xish) and the files it names (data blocks files, .xisb, and any other).
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 Jurgen Kobierczynski
 #pragma once
 
 #include <cstdint>
 #include <fstream>
+#include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
 
 #include "common.hpp"
 #include "property.hpp"
+#include "xisfblocks.hpp"
 #include "xml.hpp"
 
 namespace xisfconv {
@@ -108,16 +112,52 @@ struct XisfStoredBlock {
     std::string compression, subblocks, checksum;   // attribute text (empty if absent)
     bool attachment = false;
     uint64_t position = 0;                          // attachments: offset in the file
+    bool external = false;                          // read from another file than the header's (path(...), url(...))
+    bool indexed = false;                           // ... through the index of a data blocks file,
+    uint64_t indexUncompressedLength = 0;           //     which says this of its uncompressed length (0: not compressed)
 };
 
 enum class XisfChecksumState { None, Verified, Unsupported };
 
 class XisfFile {
 public:
-    explicit XisfFile(const std::string& path);
+    // `redirect`: see XisfBlocksRedirect.
+    // `verifying`: what is wrong with the index of a data blocks file of the unit is no warning,
+    // it is kept for indexProblems().
+    explicit XisfFile(const std::string& path, const XisfBlocksRedirect* redirect = nullptr, bool verifying = false);
 
     const std::string& path() const { return path_; }
     uint64_t fileSize() const { return fileSize_; }
+    // True for an XISF header file (.xish): the file is the XML header and nothing else, and
+    // its data blocks are in the header itself or in other files.
+    bool headerFile() const { return headerFile_; }
+    // What is wrong with the indexes of the data blocks files that were read so far.
+    const std::vector<std::string>& indexProblems() const;
+    // The files the header names with path(...) and url(...), each once, in the order of the
+    // header: where it is looked for (an absolute path, or the URL if it is not a local file).
+    const std::vector<std::string>& externalFiles() const { return externalFiles_; }
+    // Why the file at that place in externalFiles() is not read: it is not there (Io), the header
+    // is not followed to it (NotAllowed), it is on a network (Unsupported). Nothing for a file
+    // that is there and may be read.
+    const std::vector<std::optional<ErrorKind>>& externalReasons() const { return externalReasons_; }
+    // The same as far as they are files that are there and may be read (see ExternalFiles).
+    const std::vector<std::string>& externalPaths() const { return externalPaths_; }
+    // The paths the system is asked for the files the header names, each way the header writes
+    // them (externalFiles() has them with ".." taken out by the words of the path, for showing;
+    // behind a link that is another file). For telling whether a path is one of those files.
+    const std::vector<std::string>& externalAsked() const { return externalAsked_; }
+    // The identifiers of the blocks the header names by each of those paths, followed or not: a
+    // file can be written in ways that do not look alike (with and without a drive, through a
+    // link), and only the system says that two of them are one file.
+    const std::map<std::string, std::set<uint64_t>>& namedIdsAsAsked() const { return idsAsAsked_; }
+    // The identifiers of the blocks the header names in the data blocks file at `path` (one of
+    // externalPaths()); none for a file it names no block of by an identifier.
+    std::set<uint64_t> namedBlockIds(const std::string& path) const {
+        const auto found = namedBlocks_.find(path);
+        return found == namedBlocks_.end() ? std::set<uint64_t>() : found->second;
+    }
+    // The size of the file, and of those files with it.
+    uint64_t unitSize() const { return unitSize_; }
     const std::string& headerXml() const { return headerXml_; }
     const std::string& version() const { return version_; }
     const std::vector<XisfImage>& images() const { return images_; }
@@ -133,6 +173,9 @@ public:
     // element with a location attribute; `what` names it in error messages.
     const xml::Node& root() const { return *root_; }
     XisfStoredBlock readStoredBlock(const xml::Node& element, const std::string& what);
+    // The size the block of an element is stored with, as far as the header (or the index of
+    // its data blocks file) tells without reading it; 0 if it does not.
+    uint64_t storedBlockSize(const xml::Node& element) const;
     // Throws on a mismatch; Unsupported for algorithms that are not implemented.
     static XisfChecksumState verifyBlockChecksum(const XisfStoredBlock& block, const std::string& what);
     // Decompresses and unshuffles the stored bytes (a copy of them if the block is not compressed).
@@ -170,6 +213,20 @@ private:
     std::string path_;
     std::ifstream file_;
     uint64_t fileSize_ = 0;
+    bool headerFile_ = false;
+    std::unique_ptr<XisfExternalFiles> external_;
+    std::vector<std::string> externalFiles_, externalPaths_;
+    std::vector<std::optional<ErrorKind>> externalReasons_;
+    std::map<std::string, std::set<uint64_t>> namedBlocks_;   // by resolved path: the identifiers the header names there
+    std::map<std::string, std::string> resolved_;             // the resolved path of each file of externalFiles_ that is read
+    std::set<std::string> tried_;                             // the ways of writing a file that were resolved (findExternalFiles)
+    std::map<std::string, std::set<uint64_t>> idsByWhere_;    // the identifiers named in each file of externalFiles_
+    std::vector<std::string> externalAsked_;                  // those files as the system is asked for them
+    std::map<std::string, std::set<uint64_t>> idsAsAsked_;    // and the identifiers named in each of them
+    uint64_t unitSize_ = 0;
+    mutable std::optional<uint64_t> budgetSize_;   // what propertyBudget is given, once it was asked for
+    uint64_t budgetSize() const;
+    void findExternalFiles(const xml::Node& node);
     std::string headerXml_;
     std::string version_;
     std::unique_ptr<xml::Node> root_;

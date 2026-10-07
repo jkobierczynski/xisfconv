@@ -16,6 +16,9 @@
       <match type="string" value="XISF0100" offset="0"/>
     </magic>
     <glob pattern="*.xisf"/>
+    <!-- the header file of a distributed unit: an XML document, known by its name. (Its data is
+         in the file beside it, .xisb, which is no image by itself and has no type here.) -->
+    <glob pattern="*.xish"/>
   </mime-type>
   <mime-type type="application/x-asdf">
     <comment>ASDF data</comment>

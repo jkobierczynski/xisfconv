@@ -2232,6 +2232,363 @@ static void test_fits_header(xisfconv_context *ctx) {
     xisfconv_keywords_free(kw);
 }
 
+/* Distributed XISF units (0.16): a header file (.xish) and the files it names. */
+
+static int file_begins(const char *path, const char *with) {
+    char first[64] = {0};
+    FILE *f = fopen(path, "rb");
+    size_t n;
+    if (!f) return 0;
+    n = fread(first, 1, sizeof first - 1, f);
+    fclose(f);
+    return n >= strlen(with) && memcmp(first, with, strlen(with)) == 0;
+}
+
+static int write_bytes(const char *path, const void *bytes, size_t size) {
+    FILE *f = fopen(path, "wb");
+    size_t n;
+    if (!f) return 0;
+    n = fwrite(bytes, 1, size, f);
+    return fclose(f) == 0 && n == size;
+}
+
+/* A header file for the gray image, with its pixels at `location`. */
+static int write_header(const char *path, const char *location) {
+    char text[2000];
+    sprintf(text,
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<xisf version=\"1.0\" xmlns=\"http://www.pixinsight.com/xisf\">"
+            "<Image geometry=\"%d:%d:1\" sampleFormat=\"UInt16\" colorSpace=\"Gray\" location=\"%s\"/></xisf>\n",
+            W, H, location);
+    return write_bytes(path, text, strlen(text));
+}
+
+/* The pixels of the unit at `path`, held against the gray image. */
+static int unit_is_gray(xisfconv_context *ctx, const char *path, const char *unit) {
+    xisfconv_file *f = NULL;
+    uint16_t back[W * H];
+    int ok = xisfconv_open(ctx, path, &f) == XISFCONV_OK;
+    ok = ok && xisfconv_file_format(f) == XISFCONV_FORMAT_XISF && strcmp(xisfconv_file_detail(f, "unit"), unit) == 0;
+    ok = ok && xisfconv_read_pixels(f, 0, NULL, back, sizeof back) == XISFCONV_OK && rows_equal(back, g_gray, 0);
+    xisfconv_close(f);
+    return ok;
+}
+
+static void test_distributed_units(xisfconv_context *ctx) {
+    xisfconv_write_options wo;
+    xisfconv_convert_options co;
+    xisfconv_rewrite_options ro;
+    xisfconv_rewrite_result rr;
+    xisfconv_report *report = NULL;
+    xisfconv_format format = 0;
+    xisfconv_file *f = NULL;
+    xisfconv_status st;
+    unsigned char little[2 * W * H];
+    uint16_t back[W * H];
+    char location[1400];
+    const char *slash, *name;
+    int32_t same = 0;
+    long header_size, blocks_size;
+    int i;
+
+    /* the setting of a context */
+    CHECK(xisfconv_context_external_files(ctx) == XISFCONV_EXTERNAL_HEADER_DIRECTORY && xisfconv_context_external_files(NULL) == 0,
+          "a header is followed to its own directory unless something else is asked for");
+    CHECK(xisfconv_context_set_external_files(ctx, XISFCONV_EXTERNAL_NONE) == XISFCONV_OK &&
+              xisfconv_context_external_files(ctx) == XISFCONV_EXTERNAL_NONE,
+          "which can be set");
+    CHECK(xisfconv_context_set_external_files(ctx, 3) == XISFCONV_ERR_ARGUMENT && xisfconv_context_set_external_files(ctx, -1) == XISFCONV_ERR_ARGUMENT &&
+              strstr(xisfconv_error_message(ctx), "XISFCONV_EXTERNAL_") && xisfconv_context_external_files(ctx) == XISFCONV_EXTERNAL_NONE,
+          "to one of three values; another one changes nothing");
+    CHECK(xisfconv_context_set_external_files(NULL, XISFCONV_EXTERNAL_ANYWHERE) == XISFCONV_ERR_ARGUMENT, "not without a context");
+    CHECK(*xisfconv_status_text(XISFCONV_ERR_NOT_ALLOWED) != 0 && strcmp(xisfconv_status_text(XISFCONV_ERR_NOT_ALLOWED), xisfconv_status_text(12345)) != 0,
+          "the status of a file a header is not followed to has a text");
+
+    /* written: a header file and a data blocks file. (No file but the header is to be read: what is
+       written is read back all the same, the setting is about what a header sends the reader to.) */
+    xisfconv_write_options_init(&wo, sizeof wo);
+    wo.codec = XISFCONV_CODEC_ZLIB;
+    wo.checksum = XISFCONV_CHECKSUM_SHA256;
+    st = write_gray(ctx, path_of("unit.xish"), &wo, NULL, NULL, 0);
+    CHECK(st == XISFCONV_OK, "an XISF unit written under the name of a header file");
+    if (st != XISFCONV_OK) fprintf(stderr, "  %s\n", xisfconv_error_message(ctx));
+    CHECK(file_begins(path_of("unit.xish"), "<?xml version=\"1.0\" encoding=\"UTF-8\"?>") && file_begins(path_of("unit.xisb"), "XISB0100"),
+          "is a header file, which is XML, and a data blocks file");
+    CHECK(!file_exists(path_of("unit.xish.part")) && !file_exists(path_of("unit.xisb.part")), "no temporary files are left");
+    CHECK(xisfconv_detect_format(ctx, path_of("unit.xish"), &format) == XISFCONV_OK && format == XISFCONV_FORMAT_XISF, "a header file is XISF");
+    CHECK(xisfconv_detect_format(ctx, path_of("unit.xisb"), &format) == XISFCONV_ERR_FORMAT && strstr(xisfconv_error_message(ctx), ".xish"),
+          "a data blocks file is no file to open: the error names the header file");
+    CHECK(xisfconv_open(ctx, path_of("unit.xisb"), &f) == XISFCONV_ERR_FORMAT && f == NULL && strstr(xisfconv_error_message(ctx), ".xish"),
+          "nor does it open");
+    header_size = file_size(path_of("unit.xish"));
+    blocks_size = file_size(path_of("unit.xisb"));
+
+    /* read: with no file but the header, the header and what it holds */
+    st = xisfconv_open(ctx, path_of("unit.xish"), &f);
+    CHECK(st == XISFCONV_OK && f != NULL, "the header file opens, whatever it may be followed to");
+    if (st == XISFCONV_OK) {
+        xisfconv_image_info info;
+        xisfconv_image_info_init(&info, sizeof info);
+        CHECK(strcmp(xisfconv_file_detail(f, "unit"), "distributed") == 0 && strcmp(xisfconv_file_detail(f, "version"), "1.0") == 0,
+              "it is a distributed unit");
+        CHECK(xisfconv_image_info_get(f, 0, &info) == XISFCONV_OK && info.width == W && info.height == H, "the image is described by the header");
+        CHECK(xisfconv_external_count(f) == 1 && (name = xisfconv_external_file(f, 0)) != NULL && strlen(name) > 9 &&
+                  strcmp(name + strlen(name) - 9, "unit.xisb") == 0 && *xisfconv_external_file(f, 1) == 0,
+              "and names one other file, the data blocks file");
+        CHECK((long)xisfconv_file_size(f) == header_size && (long)xisfconv_unit_size(f) == header_size,
+              "of which nothing counts while it may not be read");
+        CHECK(xisfconv_external_status(f, 0) == XISFCONV_ERR_NOT_ALLOWED && xisfconv_external_status(f, 1) == XISFCONV_ERR_INDEX &&
+                  xisfconv_external_status(NULL, 0) == XISFCONV_ERR_INDEX,
+              "and its status says why");
+        CHECK(xisfconv_read_pixels(f, 0, NULL, back, sizeof back) == XISFCONV_ERR_NOT_ALLOWED &&
+                  strstr(xisfconv_error_message(ctx), "no file but the header"),
+              "the pixels are in a file that is not opened");
+    }
+    xisfconv_close(f);
+    f = NULL;
+    CHECK(xisfconv_convert(ctx, path_of("unit.xish"), path_of("refused.fits"), NULL) == XISFCONV_ERR_NOT_ALLOWED && !file_exists(path_of("refused.fits")) &&
+              !file_exists(path_of("refused.fits.part")),
+          "nor is it converted");
+
+    /* ... and with the default: the unit */
+    CHECK(xisfconv_context_set_external_files(ctx, XISFCONV_EXTERNAL_HEADER_DIRECTORY) == XISFCONV_OK, "back to the default");
+    st = xisfconv_open(ctx, path_of("unit.xish"), &f);
+    CHECK(st == XISFCONV_OK, "the unit opens");
+    if (st == XISFCONV_OK) {
+        CHECK((long)xisfconv_file_size(f) == header_size && (long)xisfconv_unit_size(f) == header_size + blocks_size,
+              "the size of the unit is that of its files");
+        CHECK(xisfconv_external_count(f) == 1 && xisfconv_external_status(f, 0) == XISFCONV_OK, "one other file, which is read");
+        /* a file that is open keeps the setting it was opened with */
+        CHECK(xisfconv_context_set_external_files(ctx, XISFCONV_EXTERNAL_NONE) == XISFCONV_OK &&
+                  xisfconv_read_pixels(f, 0, NULL, back, sizeof back) == XISFCONV_OK && rows_equal(back, g_gray, 0),
+              "the pixels are read from the data blocks file, also after the setting has changed");
+        CHECK(xisfconv_context_set_external_files(ctx, XISFCONV_EXTERNAL_HEADER_DIRECTORY) == XISFCONV_OK, "the default again");
+    }
+    xisfconv_close(f);
+    f = NULL;
+    /* what is no distributed unit */
+    CHECK(xisfconv_open(ctx, path_of("gray.xisf"), &f) == XISFCONV_OK && strcmp(xisfconv_file_detail(f, "unit"), "monolithic") == 0 &&
+              xisfconv_external_count(f) == 0 && *xisfconv_external_file(f, 0) == 0 && xisfconv_unit_size(f) == xisfconv_file_size(f),
+          "a monolithic file names no other files");
+    xisfconv_close(f);
+    f = NULL;
+    CHECK(xisfconv_open(ctx, path_of("gray.fits"), &f) == XISFCONV_OK && *xisfconv_file_detail(f, "unit") == 0 && xisfconv_external_count(f) == 0 &&
+              xisfconv_unit_size(f) == xisfconv_file_size(f),
+          "nor does a FITS file");
+    xisfconv_close(f);
+    f = NULL;
+    CHECK(xisfconv_external_count(NULL) == 0 && *xisfconv_external_file(NULL, 0) == 0 && xisfconv_unit_size(NULL) == 0, "nor no file at all");
+
+    /* an existing unit is not written over: neither of its two files */
+    wo.codec = XISFCONV_CODEC_NONE;
+    CHECK(write_gray(ctx, path_of("unit.xish"), &wo, NULL, NULL, 0) == XISFCONV_ERR_EXISTS, "an existing header file is not overwritten");
+    remove(path_of("unit.xish"));
+    CHECK(write_gray(ctx, path_of("unit.xish"), &wo, NULL, NULL, 0) == XISFCONV_ERR_EXISTS && !file_exists(path_of("unit.xish")) &&
+              file_size(path_of("unit.xisb")) == blocks_size,
+          "nor an existing data blocks file, and no header is written then");
+    wo.overwrite = 1;
+    CHECK(write_gray(ctx, path_of("unit.xish"), &wo, NULL, NULL, 0) == XISFCONV_OK && unit_is_gray(ctx, path_of("unit.xish"), "distributed") &&
+              file_size(path_of("unit.xisb")) != blocks_size && !file_exists(path_of("unit.xisb.part")),
+          "unless that is asked for");
+    /* the format is XISF by that name; another format that is asked for is written, in one file */
+    wo.format = XISFCONV_FORMAT_FITS;
+    CHECK(write_gray(ctx, path_of("named.xish"), &wo, NULL, NULL, 0) == XISFCONV_OK && file_begins(path_of("named.xish"), "SIMPLE  =") &&
+              !file_exists(path_of("named.xisb")),
+          "FITS under the name of a header file is FITS");
+
+    /* converted: from a unit, and to one */
+    xisfconv_convert_options_init(&co, sizeof co);
+    co.overwrite = 1;
+    CHECK(xisfconv_convert(ctx, path_of("unit.xish"), path_of("unit.fits"), &co) == XISFCONV_OK, "a unit to FITS");
+    co.codec = XISFCONV_CODEC_LZ4HC;
+    CHECK(xisfconv_convert(ctx, path_of("unit.fits"), path_of("from.xish"), &co) == XISFCONV_OK && file_begins(path_of("from.xisb"), "XISB0100") &&
+              unit_is_gray(ctx, path_of("from.xish"), "distributed"),
+          "FITS to a unit");
+    co.overwrite = 0;
+    CHECK(xisfconv_convert(ctx, path_of("unit.fits"), path_of("from.xish"), &co) == XISFCONV_ERR_EXISTS, "not over an existing one");
+    CHECK(xisfconv_convert(ctx, path_of("unit.xish"), path_of("other.xish"), NULL) == XISFCONV_ERR_ARGUMENT, "XISF to XISF is a rewrite, whatever the kind of unit");
+
+    /* rewritten: packed into one file, unpacked from it, and in place */
+    xisfconv_rewrite_options_init(&ro, sizeof ro);
+    xisfconv_rewrite_result_init(&rr, sizeof rr);
+    header_size = file_size(path_of("unit.xish"));
+    blocks_size = file_size(path_of("unit.xisb"));
+    CHECK(xisfconv_rewrite(ctx, path_of("unit.xish"), path_of("packed.xisf"), &ro, &rr) == XISFCONV_OK && rr.blocks == 1 && rr.kept == 1 &&
+              rr.changed == 1 && rr.read_back == 1 && (long)rr.input_size == header_size + blocks_size &&
+              (long)rr.output_size == file_size(path_of("packed.xisf")) && unit_is_gray(ctx, path_of("packed.xisf"), "monolithic"),
+          "a unit packed into one file");
+    CHECK(xisfconv_open(ctx, path_of("packed.xisf"), &f) == XISFCONV_OK && xisfconv_external_count(f) == 0, "which names no other file");
+    xisfconv_close(f);
+    f = NULL;
+    ro.codec = XISFCONV_CODEC_ZLIB;
+    ro.checksum = XISFCONV_CHECKSUM_SHA1;
+    xisfconv_rewrite_result_init(&rr, sizeof rr);
+    CHECK(xisfconv_rewrite(ctx, path_of("packed.xisf"), path_of("unpacked.xish"), &ro, &rr) == XISFCONV_OK && rr.compressed == 1 && rr.checksums == 1 &&
+              rr.read_back == 1 && (long)rr.output_size == file_size(path_of("unpacked.xish")) + file_size(path_of("unpacked.xisb")) &&
+              unit_is_gray(ctx, path_of("unpacked.xish"), "distributed") && !file_exists(path_of("unpacked.xisb.part")),
+          "a file unpacked into a header and its data, compressed on the way");
+    CHECK(xisfconv_rewrite(ctx, path_of("packed.xisf"), path_of("unpacked.xish"), &ro, NULL) == XISFCONV_ERR_EXISTS, "not over an existing unit");
+    remove(path_of("unpacked.xish"));
+    CHECK(xisfconv_rewrite(ctx, path_of("packed.xisf"), path_of("unpacked.xish"), &ro, NULL) == XISFCONV_ERR_EXISTS && !file_exists(path_of("unpacked.xish")),
+          "nor over the data blocks file of one");
+    ro.overwrite = 1;
+    CHECK(xisfconv_rewrite(ctx, path_of("packed.xisf"), path_of("unpacked.xish"), &ro, NULL) == XISFCONV_OK, "unless that is asked for");
+    CHECK(xisfconv_rewrite(ctx, path_of("unpacked.xish"), path_of("unpacked.xisb"), &ro, NULL) == XISFCONV_ERR_ARGUMENT &&
+              file_begins(path_of("unpacked.xisb"), "XISB0100"),
+          "the output is not a file the input reads");
+    CHECK(xisfconv_stored_as_requested(ctx, path_of("unpacked.xish"), &ro, &same) == XISFCONV_OK && same == 1, "the unit is stored as requested");
+    xisfconv_rewrite_result_init(&rr, sizeof rr);
+    CHECK(xisfconv_rewrite_in_place(ctx, path_of("unpacked.xish"), &ro, &rr) == XISFCONV_OK && rr.changed == 0, "and left alone in place");
+    ro.codec = XISFCONV_CODEC_NONE;
+    CHECK(xisfconv_stored_as_requested(ctx, path_of("unpacked.xish"), &ro, &same) == XISFCONV_OK && same == 0, "not as requested with another codec");
+    blocks_size = file_size(path_of("unpacked.xisb"));
+    xisfconv_rewrite_result_init(&rr, sizeof rr);
+    CHECK(xisfconv_rewrite_in_place(ctx, path_of("unpacked.xish"), &ro, &rr) == XISFCONV_OK && rr.changed == 1 && rr.decompressed == 1 &&
+              rr.read_back == 1 && file_size(path_of("unpacked.xisb")) != blocks_size && unit_is_gray(ctx, path_of("unpacked.xish"), "distributed") &&
+              !file_exists(path_of("unpacked.xish.part")) && !file_exists(path_of("unpacked.xisb.part")),
+          "in place, the header file and its data blocks file are replaced");
+
+    /* verified */
+    CHECK(xisfconv_verify(ctx, path_of("unpacked.xish"), &report) == XISFCONV_OK && report != NULL &&
+              xisfconv_report_verdict(report) == XISFCONV_VERDICT_OK && strstr(xisfconv_report_summary(report), "distributed unit") &&
+              xisfconv_report_verified(report) == 1,
+          "a unit is verified through its header");
+    xisfconv_report_free(report);
+    report = NULL;
+    copy_damaged(path_of("unpacked.xisb"), path_of("damaged.xisb"), 5);
+    CHECK(xisfconv_rewrite(ctx, path_of("unpacked.xish"), path_of("copy.xisf"), NULL, NULL) == XISFCONV_OK, "(a copy of the unit)");
+    remove(path_of("unpacked.xisb"));
+    CHECK(rename(path_of("damaged.xisb"), path_of("unpacked.xisb")) == 0, "(its data blocks file, with one byte changed)");
+    CHECK(xisfconv_verify(ctx, path_of("unpacked.xish"), &report) == XISFCONV_OK && xisfconv_report_verdict(report) == XISFCONV_VERDICT_FAILED &&
+              xisfconv_report_problem_count(report) == 1 && strstr(xisfconv_report_problem(report, 0), "checksum mismatch"),
+          "a changed byte in the data blocks file is found");
+    xisfconv_report_free(report);
+    report = NULL;
+    remove(path_of("unpacked.xisb"));
+    CHECK(xisfconv_open(ctx, path_of("unpacked.xish"), &f) == XISFCONV_OK && xisfconv_external_count(f) == 1 &&
+              xisfconv_external_status(f, 0) == XISFCONV_ERR_IO && (long)xisfconv_unit_size(f) == file_size(path_of("unpacked.xish")) &&
+              xisfconv_read_pixels(f, 0, NULL, back, sizeof back) == XISFCONV_ERR_IO && strstr(xisfconv_error_message(ctx), "unpacked.xisb"),
+          "a unit without its data blocks file opens; the error of reading names the file that is missing");
+    xisfconv_close(f);
+    f = NULL;
+
+    /* what a header is followed to: a file that is one block, by the ways a header can name it */
+    for (i = 0; i < W * H; ++i) {
+        little[2 * i] = (unsigned char)(g_gray[i] & 0xFF);
+        little[2 * i + 1] = (unsigned char)(g_gray[i] >> 8);
+    }
+    CHECK(write_bytes(path_of("whole.dat"), little, sizeof little), "(the pixels in a file of their own)");
+    CHECK(write_header(path_of("beside.xish"), "path(@header_dir/whole.dat)") && unit_is_gray(ctx, path_of("beside.xish"), "distributed"),
+          "a file beside the header that is one block");
+    CHECK(xisfconv_open(ctx, path_of("beside.xish"), &f) == XISFCONV_OK && xisfconv_external_count(f) == 1 &&
+              (long)xisfconv_unit_size(f) == file_size(path_of("beside.xish")) + (long)sizeof little,
+          "counts as a file of the unit");
+    xisfconv_close(f);
+    f = NULL;
+    /* the same file by a path that leaves the directory and comes back: <dir>/../<name of dir>/whole.dat */
+    slash = strrchr(g_dir, '/');
+    name = strrchr(g_dir, '\\');
+    if (name && (!slash || name > slash)) slash = name;
+    name = slash ? slash + 1 : g_dir;
+    if (*name && strcmp(name, ".") != 0 && strcmp(name, "..") != 0 && !strchr(name, '(') && !strchr(name, ')') && !strchr(name, '"') &&
+        !strchr(name, '&') && !strchr(name, '<')) {
+        sprintf(location, "path(@header_dir/../%s/whole.dat)", name);
+        CHECK(write_header(path_of("climbs.xish"), location), "(a header whose path climbs out of its directory)");
+        st = xisfconv_open(ctx, path_of("climbs.xish"), &f);
+        CHECK(st == XISFCONV_OK && xisfconv_read_pixels(f, 0, NULL, back, sizeof back) == XISFCONV_ERR_NOT_ALLOWED &&
+                  strstr(xisfconv_error_message(ctx), "leads out of the directory of the header"),
+              "a path that climbs out of the directory of the header is not followed");
+        xisfconv_close(f);
+        f = NULL;
+        CHECK(xisfconv_convert(ctx, path_of("climbs.xish"), path_of("climbs.fits"), NULL) == XISFCONV_ERR_NOT_ALLOWED && !file_exists(path_of("climbs.fits")),
+              "nor by a conversion");
+        CHECK(xisfconv_rewrite(ctx, path_of("climbs.xish"), path_of("climbs.xisf"), NULL, NULL) == XISFCONV_ERR_NOT_ALLOWED &&
+                  !file_exists(path_of("climbs.xisf")) && !file_exists(path_of("climbs.xisf.part")),
+              "nor by a rewrite: the file is not copied into the output");
+        CHECK(xisfconv_verify(ctx, path_of("climbs.xish"), &report) == XISFCONV_OK && xisfconv_report_verdict(report) == XISFCONV_VERDICT_NOT_FULLY_CHECKED &&
+                  xisfconv_report_not_checked_count(report) == 1,
+              "a verification says what it did not check");
+        xisfconv_report_free(report);
+        report = NULL;
+        CHECK(xisfconv_context_set_external_files(ctx, XISFCONV_EXTERNAL_ANYWHERE) == XISFCONV_OK &&
+                  unit_is_gray(ctx, path_of("climbs.xish"), "distributed"),
+              "unless the context lets a header lead anywhere");
+        CHECK(xisfconv_rewrite(ctx, path_of("climbs.xish"), path_of("climbs.xisf"), NULL, NULL) == XISFCONV_OK &&
+                  unit_is_gray(ctx, path_of("climbs.xisf"), "monolithic"),
+              "then it is packed, too");
+        CHECK(xisfconv_context_set_external_files(ctx, XISFCONV_EXTERNAL_HEADER_DIRECTORY) == XISFCONV_OK, "the default again");
+    }
+    CHECK(write_header(path_of("network.xish"), "url(https://example.com/whole.dat)") &&
+              xisfconv_convert(ctx, path_of("network.xish"), path_of("network.fits"), NULL) == XISFCONV_ERR_UNSUPPORTED &&
+              strstr(xisfconv_error_message(ctx), "nothing is fetched from a network"),
+          "nothing is fetched from a network");
+    CHECK(xisfconv_context_set_external_files(ctx, XISFCONV_EXTERNAL_ANYWHERE) == XISFCONV_OK &&
+              xisfconv_convert(ctx, path_of("network.xish"), path_of("network.fits"), NULL) == XISFCONV_ERR_UNSUPPORTED &&
+              xisfconv_context_set_external_files(ctx, XISFCONV_EXTERNAL_HEADER_DIRECTORY) == XISFCONV_OK,
+          "whatever is allowed");
+    CHECK(xisfconv_open(ctx, path_of("network.xish"), &f) == XISFCONV_OK && xisfconv_external_count(f) == 1 &&
+              strcmp(xisfconv_external_file(f, 0), "https://example.com/whole.dat") == 0 &&
+              xisfconv_external_status(f, 0) == XISFCONV_ERR_UNSUPPORTED,
+          "the URL is what the unit names");
+    xisfconv_close(f);
+    f = NULL;
+    /* only a file that is named as a header file is followed by its own word */
+    CHECK(write_header(path_of("header.xml"), "path(@header_dir/whole.dat)") && xisfconv_open(ctx, path_of("header.xml"), &f) == XISFCONV_OK &&
+              strcmp(xisfconv_file_detail(f, "unit"), "distributed") == 0 && xisfconv_external_status(f, 0) == XISFCONV_ERR_NOT_ALLOWED &&
+              xisfconv_read_pixels(f, 0, NULL, back, sizeof back) == XISFCONV_ERR_NOT_ALLOWED &&
+              strstr(xisfconv_error_message(ctx), "does not have the name of one"),
+          "a header file under another name is read, and not followed to its data");
+    xisfconv_close(f);
+    f = NULL;
+    CHECK(xisfconv_context_set_external_files(ctx, XISFCONV_EXTERNAL_ANYWHERE) == XISFCONV_OK && unit_is_gray(ctx, path_of("header.xml"), "distributed") &&
+              xisfconv_context_set_external_files(ctx, XISFCONV_EXTERNAL_HEADER_DIRECTORY) == XISFCONV_OK,
+          "unless a header may lead anywhere");
+    xisfconv_rewrite_options_init(&ro, sizeof ro);
+    CHECK(xisfconv_rewrite(ctx, path_of("gray.xisf"), path_of("second.xish"), &ro, NULL) == XISFCONV_OK, "(a unit)");
+    CHECK(xisfconv_rewrite(ctx, path_of("second.xish"), path_of("second.xisb"), &ro, NULL) == XISFCONV_ERR_ARGUMENT,
+          "an output that is the data of the input is a wrong argument, whether or not it may be overwritten");
+    /* a rewrite does not replace, in place, a data blocks file that holds what this header does not name:
+       shared.xisb has the pixels twice, as block 11 and as block 22, and shared.xish names block 11 */
+    {
+        unsigned char both[16 + 16 + 2 * 40 + 2 * sizeof little];
+        const size_t first_block = 16 + 16 + 2 * 40;
+        int k;
+        memset(both, 0, sizeof both);
+        memcpy(both, "XISB0100", 8);
+        both[16] = 2;                                             /* a node of two elements, the last one */
+        for (k = 0; k < 2; ++k) {
+            unsigned char *element = both + 32 + 40 * k;
+            const size_t position = first_block + k * sizeof little;
+            element[0] = (unsigned char)(k ? 22 : 11);            /* the identifier */
+            element[8] = (unsigned char)(position & 0xFF);        /* where the block is */
+            element[9] = (unsigned char)(position >> 8);
+            element[16] = (unsigned char)sizeof little;           /* and how long */
+            memcpy(both + position, little, sizeof little);
+        }
+        CHECK(write_bytes(path_of("shared.xisb"), both, sizeof both) && write_header(path_of("shared.xish"), "path(@header_dir/shared.xisb):11") &&
+                  unit_is_gray(ctx, path_of("shared.xish"), "distributed"),
+              "(a unit whose data blocks file holds a block of another header)");
+        xisfconv_rewrite_options_init(&ro, sizeof ro);
+        ro.checksum = XISFCONV_CHECKSUM_SHA1;
+        CHECK(xisfconv_rewrite_in_place(ctx, path_of("shared.xish"), &ro, NULL) == XISFCONV_ERR_EXISTS &&
+                  strstr(xisfconv_error_message(ctx), "does not name") && file_size(path_of("shared.xisb")) == (long)sizeof both &&
+                  !file_exists(path_of("shared.xish.part")) && !file_exists(path_of("shared.xisb.part")),
+              "in place, it is not replaced: the other block would be gone");
+        ro.overwrite = 1;
+        CHECK(xisfconv_rewrite_in_place(ctx, path_of("shared.xish"), &ro, NULL) == XISFCONV_OK && unit_is_gray(ctx, path_of("shared.xish"), "distributed") &&
+                  file_size(path_of("shared.xisb")) != (long)sizeof both && !file_exists(path_of("shared.xisb.replaced")),
+              "unless that is asked for");
+    }
+    CHECK(write_header(path_of("malformed.xish"), "path(whole.dat)") && xisfconv_open(ctx, path_of("malformed.xish"), &f) == XISFCONV_OK &&
+              xisfconv_read_pixels(f, 0, NULL, back, sizeof back) == XISFCONV_ERR_FORMAT,
+          "a path that is neither absolute nor below @header_dir is no location");
+    xisfconv_close(f);
+    f = NULL;
+    CHECK(write_header(path_of("attached.xish"), "attachment:4096:70") && xisfconv_open(ctx, path_of("attached.xish"), &f) == XISFCONV_OK &&
+              xisfconv_read_pixels(f, 0, NULL, back, sizeof back) == XISFCONV_ERR_FORMAT && strstr(xisfconv_error_message(ctx), "nothing is attached"),
+          "nothing is attached to a header file");
+    xisfconv_close(f);
+}
+
 static void test_lifetime(void) {
     xisfconv_context *ctx = xisfconv_context_new();
     xisfconv_file *f = NULL;
@@ -2309,6 +2666,7 @@ int main(int argc, char **argv) {
     test_fits_header(ctx);
     test_carried_properties(ctx);
     test_given_properties(ctx);
+    test_distributed_units(ctx);
     xisfconv_context_free(ctx);
     test_lifetime();
 

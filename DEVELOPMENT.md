@@ -2,7 +2,7 @@
 
 What was decided while building xisfconv, and why. The README says what the program does and
 `TODO.md` what is planned; this file records the choices behind both, so that they are not
-reopened by accident. State: version 0.15.0, 6 October 2026.
+reopened by accident. State: version 0.16.0, 7 October 2026.
 
 ## Purpose and scope
 
@@ -259,6 +259,190 @@ them. The choices:
 - A file written by 0.13 and read by an older xisfconv: the tables of a FITS file are named as
   skipped HDUs, and the matrices in an ASDF tree are taken for images, since any array of two
   dimensions is one there. `--no-properties` writes files without them.
+
+## Distributed XISF units (0.16.0)
+
+- **Scope.** OpenXISF does more than xisfconv in several places; of those, this one was chosen:
+  the header file (`.xish`), the data blocks file (`.xisb`) and `path(...)` locations, read and
+  written, in the tool, the C API and the Python package. Features are added one at a time and
+  for a reason; "everything OpenXISF has" is not a goal.
+- **PixInsight reads and writes monolithic files only.** The baseline of the specification is the
+  monolithic file, and PCL's reader and writer are that. So this feature cannot be checked with
+  PixInsight and is not for it: it is for other software, and for packing what that software
+  writes into a file PixInsight opens. The independent implementation to compare with is
+  OpenXISF (C++20, Apache-2.0): its sample programs read what xisfconv writes and write what
+  xisfconv reads, in the tool's tests when `OPENXISF_BIN` is set. None of its code is used.
+- **Only the header file is named.** A unit is its header and what the header names; there is no
+  second argument for the data, anywhere. A `.xisb` file given as input is an error that names
+  the header file.
+- **The kind of an output follows its name**: `.xish` (in any case of the letters) is a header
+  file with `<stem>.xisb` beside it, any other name a monolithic file. The specification ties
+  the suffixes to the kinds of file, so a name is enough, and no function needed a new
+  argument or a new field in a struct: `write`, `convert` and `rewrite` already take a name.
+  `-t xish` is the tool's way to ask for the names. A header file under another name is still
+  read as what it is, since reading goes by content; whether it is followed to its data is
+  another matter (see "Only a header file that is named as one is followed").
+- **One data blocks file per unit, written anew every time.** Every block that is not in the
+  header goes into it; the index is one node directly behind the signature; nothing is ever
+  added to or changed in an existing `.xisb`. The specification's index (linked nodes, free
+  elements) is made for files that are edited in place; xisfconv never edits a file in place
+  (see "Care with files"), so it writes the simplest index and reads every index.
+- **Random identifiers.** A block is found by a 64-bit number. With numbers counted from 1, the
+  header of one unit would find a block in the data blocks file of any other, and a mixed-up or
+  half-replaced pair of files would be read as an image of noise or, worse, of another frame.
+  With random numbers a header that is not this file's finds nothing, and the error asks "is
+  it the file that was written with this header?". (The specification recommends random
+  identifiers.) Written as 16 hexadecimal digits, as the specification suggests; read in
+  decimal too.
+- **Two files, one commit.** Both are written as `<name>.part`; the data blocks file is renamed
+  first and the header last. Two renames are not one, so a data blocks file that is there
+  already (a unit that is written over, or replaced in place) is first set aside as
+  `<name>.xisb.replaced`; if one of the new files cannot get its name, the new data blocks file
+  is taken away again and the old one put back, and the unit that was there is as it was. Only
+  when both names are given is the old file removed. Should the machine stop in between, the old
+  data is there under that name, and the old header finds none of its blocks in the new file
+  (random identifiers), so nothing is read as an image that is not one. The first version
+  removed the new data blocks file when the header could not follow, which with `--force` was
+  the only copy of the old unit's data by then: found in review, with an immutable header file.
+  The second review found the same one step further on: a rename that fails for another reason
+  than a file that may not be touched (an I/O error) went into the old fallback of every output,
+  "remove the file that is there and try again", and that removed the old header. No output is
+  removed before its replacement has the name now, monolithic ones included: where renaming
+  over a file does not work, the old file is set aside and put back. And where putting back
+  fails too, the message says under which name the old data is, instead of "as it was".
+  These paths are tested with a `rename()` that fails on request (`tests/rename_shim.c`, loaded
+  with LD_PRELOAD on Linux): each step for a conversion, a rewrite and a rewrite in place.
+  A third review went through the fixes of the second: the header's own put-back could fail
+  under a message that said "as it was" (the error names every file that is under another
+  name now); on Windows a file that may not be written to is renamed and then not deleted, so
+  `--force` left `<name>.replaced` behind without a word (it is made deletable, and a warning
+  names it if it stays, unless `-q` has turned warnings off); and the advice in the README, "rename it back", was wrong for a run
+  that was stopped *after* both renames (the advice is now: only if the unit does not verify,
+  and the message of the failure names the file that really has the blocks, by looking into its
+  index).
+- **In place**, a unit becomes its header and the data blocks file of the header's name. Blocks
+  that were in other files (several `.xisb`, files that are one block) come into that one; the
+  other files are left alone, because another header may read them. An output is refused if it
+  is a file the input reads its data from, except in place on that very unit; and so is a
+  temporary file that is one (a hard link named `out.xisb.part`), for rewrites and for
+  conversions alike.
+- **A data blocks file can be shared, and is not written that way.** The specification lets
+  several headers name blocks in one file. xisfconv reads that, and writes every unit a file of
+  its own. Replacing a shared file in place would take the other headers' blocks with it, so a
+  file whose index holds blocks this header does not name is not replaced without
+  `--force`/`overwrite`. A second header that names the *same* blocks (a copy of the header)
+  cannot be seen from here, and loses them: documented, not solved. A file that holds none of
+  the blocks its header names is not replaced at all, with or without `--force`: that is what a
+  replacement leaves that was stopped half-way, and "use --force" would be advice to destroy
+  the half that is good. (For a round, that case was let through to the reader, which "would
+  say so": it does not when the header names the file as a whole, or names it in an image that
+  `--image` leaves out. A check that is skipped because something else will catch the case
+  wants that something tested. The fourth review found the same door open one frame further:
+  a file the header names and is *not followed to*, or whose index cannot be read, was skipped
+  by the check and replaced unread with `--image`. The rule is now stated the other way round:
+  a data blocks file that is there is replaced in place only if it was read and holds this
+  header's blocks and no others; `--force` waives "no others" and "its index can be read",
+  and nothing waives "was read".) A fifth reader then ran the rule over 15 000 generated cases
+  (33 ways for a header to name the file, 25 things the file can be, the three settings, with
+  and without `--force` and `--image`) and found no foreign block lost; what it found were the
+  edges of "names": a path through a link and back (`a/L/../u.xisb`) spells another file than
+  it leads to, so whether a path is one of the input's files is asked of the system with the
+  path as the header wrote it, and the blocks a header names in a file are collected from all
+  the ways it writes that file, whichever comes first.
+- **A header is not trusted with the file system.** It is data from somewhere, and it names the
+  files to read. Followed blindly, `location="path(/etc/passwd)"` on an image would have a
+  conversion copy that file into its output, and a service that converts uploads would hand it
+  out. The default follows a header to its own directory and below, by `@header_dir/` paths
+  only: a `..` that leaves the directory is refused from the words of the path, before the file
+  system is asked anything, and where the path leads is then checked on the resolved path, so a
+  symbolic link out of the directory is refused too. `anywhere` and `none` are the two other
+  settings. It is a setting of the context in C (a thread-local scope inside, like the message
+  handlers), an option of the tool, and in Python an argument of each call that is not
+  remembered: a permission that stays set is one that is forgotten. A refused block is
+  `NotAllowed` (its own status and exception, a `PermissionError` in Python): for a caller it
+  is neither a damaged file nor an unsupported one. The check is not a sandbox: it does not
+  defend against someone who changes the directory while the file is read (the path is
+  resolved and checked, then opened by its name; a reviewer who swapped a file for a link in
+  between got through one time in six).
+- **Only a header file that is named as one is followed.** The first version followed any file
+  with external locations, a monolithic `.xisf` included, to its own directory, with a warning.
+  A reviewer pointed at what that means: `.xisf` is what people are sent and what a thumbnailer
+  opens unasked, and such a file, lying in a download folder, could have named
+  `.ssh/id_ed25519` below it as its pixels. The specification already draws the line: a
+  monolithic file holds all of its data, and a header file has the suffix `.xish`. So the
+  default follows only a file that is an XML header *and* is named `.xish`; anything else
+  (monolithic, or a header under another name, such as the temporary file astropy downloads a
+  URL into) is followed only with `anywhere`. Whoever opens a `.xish` knows it is a unit of
+  several files.
+- **Windows is asked where a path leads.** The rule about the directory rests on the resolved
+  path. MSVC's `std::filesystem::canonical` follows symbolic links and junctions; MinGW's
+  takes them for what they lead to, and a link out of the directory passed for a file in it.
+  So on Windows the system is asked (`GetFinalPathNameByHandleW`), whatever compiler built
+  the library; only on a volume that has no drive letter to give is the C++ library's answer
+  taken. (Following a link *in place*, for the file that is replaced, is still the C++
+  library's: a MinGW build replaces the link there, not what it leads to. The released
+  Windows binaries are built with MSVC.) Not testable here: Wine shows the links of the system it runs on as plain
+  files. The tests of links run on CI's Windows if the runner may make symbolic links, and say
+  that they were skipped if it may not.
+- **A refusal does not answer questions.** For a symbolic link below the header's directory the
+  message does not say where it leads, and reads the same whether or not there is a file there:
+  a header that could ask "is there a file at X" of any path would be a small oracle for
+  whoever sees the messages of a service.
+- **The budget of the properties counts bytes the unit brings.** Properties may declare, in
+  total, the size of the file plus 256 MiB (so that a small header cannot ask for gigabytes).
+  For a unit, "the file" is the header plus the blocks its header names in data blocks files,
+  each once, and never more of a file than the file has. A file that is one block counts for
+  nothing: the first version counted the whole size of every file a header named, and a header
+  could raise its own limit to 8 GiB by naming a large (or sparse) file that happened to lie
+  beside it. The price: a property of more than 256 MiB stored as a file of its own is left
+  out (in a data blocks file it is read). Nobody writes such units; it is in the README. For the same reason the size of an image's pixels in another file is held against
+  the geometry before the file is read.
+- **An XML file is not read to find out that it is not XISF.** A header file begins with `<`,
+  and so does every SVG and HTML file; `--verify` of a directory opens what it finds. The root
+  element has to be `<xisf>` within the first 64 KiB, or the file is refused unread. (The first
+  version read 300 MB of SVG into 4 GiB of memory to say "root element is <svg>".)
+- **Nothing is fetched from a network**, with any setting. `url(http://...)` is `Unsupported`.
+  A converter that makes requests because a file says so is a tool for reaching into networks
+  the file's author cannot reach. `file:` URLs are local paths and fall under the setting.
+- **Only regular files** are read as data: a path to a device or a pipe would hang the reader or
+  feed it without end.
+- **A stream has no directory.** `xisfconv.astropy` copies a stream or a packed file into the
+  directory for temporary files before the library reads it. `@header_dir` would then be that
+  directory, where other people's files are. A header read that way is followed to no file,
+  and the error says to read the unit by its name. What astropy itself downloads for a URL is
+  an open file with a name in that directory, which this module cannot tell from a file of the
+  caller's; the rule about names covers it, since that name is no header file's.
+- **Names in the header.** The name of the data blocks file goes into an XML attribute inside
+  `path(...)`: parentheses get a backslash (the specification), then `& < > "` become entities
+  and a tab or line break a character reference (XML). The first version did the first and not
+  the second, and `a&b.xish` was a header no XML parser took. A name that is not valid UTF-8
+  cannot be written into a header at all, and is refused. (OpenXISF 0.5.0 writes parentheses
+  without the backslash, which is read, and does not take the backslash off when it reads.)
+- **Lenient reading, strict writing**, as everywhere: several index nodes, free elements,
+  decimal identifiers, reserved fields that are not zero (a warning), and a monolithic file
+  that names blocks in other files (a warning) are read. What cannot be right is an error: an
+  index in a circle, a node or a block beyond the end of the file, an `attachment` in a header
+  file. A monolithic file that names blocks in other files is read only with `anywhere` (see
+  above), and then with a warning. Index nodes may not lie in each other: with that, an index
+  names no more blocks than its file has room for, where 65 000 nodes pointing into one another
+  made 137 MB of index from a file of one megabyte. Limits on the index (65 536 nodes,
+  4 194 304 elements) are kept on top, and an index that could not be read is not read again
+  for every block that names it.
+- **`--verify` and the index.** What is wrong with an index and does not stop reading (a block
+  of nobody's that lies beyond the file, two blocks under one identifier) is a warning when a
+  file is converted and a failure when it is verified: verification is about the files, a
+  conversion about the image.
+- **A rewrite reads its own output back before the files have their names**, so the header
+  names `frame.xisb` while the data is in `frame.xisb.part`. The reader takes a redirection for
+  exactly that one name; it is not subject to the setting above, which is about what a header
+  sends the reader to, not about what the library wrote a moment ago.
+- **Alignment.** Written from pixels, every block starts at a multiple of 4096 bytes, as in
+  monolithic files. A rewrite aligns uncompressed blocks and lets compressed ones follow each
+  other, as it does in monolithic files and as PixInsight does. A header file states no
+  `XISF:BlockAlignmentSize`: that property describes attached blocks.
+- **The thumbnailer** takes `.xish` files where it may read the file beside the one it is
+  given. GNOME runs thumbnailers in a sandbox that holds the one file; there a header file gets
+  no preview. Not solved; listed as a limitation.
 
 ## Care with files
 
@@ -769,7 +953,7 @@ library with one line changed.
 
 ## Testing
 
-- `tests/run_tests.py` drives the built program (5711 checks at 0.15.0). The Python packages it
+- `tests/run_tests.py` drives the built program (6128 checks at 0.16.0, 6141 with OpenXISF beside it). The Python packages it
   needs are listed at its top; the `asdf` packages and the external tools (`tiffcp`, `fitsverify`,
   `pngcheck`, `fpack`/`funpack`) are used when installed and their checks skipped when not.
 - Every format is checked against an implementation that shares no code with xisfconv: astropy
@@ -791,7 +975,7 @@ library with one line changed.
   lifetimes, callbacks), a Python script that calls the API through ctypes and compares what the
   library writes and reads with astropy, the `xisf` package, asdf, tifffile and Pillow, and a
   program that reads all there is of any file, which is what gets fuzzed.
-- The Python package is tested with pytest (`python/tests`, 341 tests at 0.15.0): the same
+- The Python package is tested with pytest (`python/tests`, 387 tests at 0.16.0): the same
   comparisons with other software, made through the package, run from the source tree and from the
   installed wheel on Python 3.10 to 3.14, with the oldest NumPy and astropy the package allows and
   with the newest, and under AddressSanitizer.
@@ -834,6 +1018,21 @@ library with one line changed.
   over `xisfconv_image` and `xisfconv_write_options` in the size of 0.14, with garbage behind.
   (`xisfconv_image` ended in four bytes of padding, as `xisfconv_convert_options` did in 0.13: the
   new pointer starts behind them, and a `static_assert` says so.)
+- Distributed units (0.16.0) are tested from both sides without xisfconv: the test scripts take
+  the two files apart with `struct` and hold them against sections 9.3, 9.4 and 10.3 of the
+  specification (signature, reserved fields, the index node, positions, lengths, unused space),
+  and build units by hand in the forms a writer may choose (several index nodes, free elements,
+  decimal identifiers, files that are one block, subdirectories, names with parentheses and
+  blanks). Each way out of the header's directory has a test for each setting, in the tool, in
+  C, through ctypes with six threads that hold different settings at once, and in Python.
+- Two reviews of 0.16.0 by readers who did not write it, one of the reader and its rules for
+  following a header, one of writing, replacing files and the interfaces, found what the tests
+  had passed over, again: memory that a small or unrelated file could ask for (an SVG read
+  whole, the budget raised by naming a large file, index nodes lying in each other), the
+  monolithic file that read its neighbours, a name with `&` written into the header as it was,
+  and three ways to lose data with `--force` or in place (the header that could not follow,
+  the shared data blocks file, a temporary file that was the input's data). Each has a test
+  now; the ones that need a file that cannot be renamed run where `chattr +i` works.
 - CI builds and runs the suite on Linux, macOS and Windows.
 
 ## How changes are made

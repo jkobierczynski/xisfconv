@@ -23,13 +23,18 @@ in `DEVELOPMENT.md`.
       programs written for it run on the library; XISF properties written from Python values and
       from the C API, vectors and matrices read in the type of their elements; LZ4 and LZ4HC
       written to XISF, with a compression level (0.15.0)
+- [x] Distributed XISF units: a header file (`.xish`) and its data blocks file (`.xisb`), and
+      blocks in other files (`path(...)`), read and written by the tool, the library and the
+      Python package; packing and unpacking; a setting for which files a header is followed to
+      (0.16.0)
 - [ ] More platforms and packaging: Linux arm64 and Intel macOS release builds; Homebrew formula,
       AUR package, winget manifest; man page
 
 Smaller items, each closing a limitation listed in the README:
 
 - [ ] BigTIFF for output over 4 GiB
-- [ ] Distributed XISF units (`.xish` + `.xisb`)
+- [ ] Distributed units: several data blocks files for one unit when writing (one per image),
+      and a preview of `.xish` files in GNOME Files (its sandbox holds the header file alone)
 - [ ] JPEG output
 - [ ] TPV distortion alongside SIP
 - [ ] Recursive directory conversion (directories are accepted by `--verify` only)
@@ -107,4 +112,7 @@ Open check:
 - [ ] Check in PixInsight that a String property stored as `location="inline:base64"` is read: a
       new text with a carriage return or with white space at its ends is written that way
       (0.15.0). (PixInsight writes long Strings as attached blocks itself, when it compresses.)
+- [ ] Distributed units (0.16.0) were checked against the specification and OpenXISF 0.5.0, and
+      not with PixInsight, which opens monolithic files only: if a version of PixInsight reads
+      `.xish`, open one written by xisfconv
 - [ ] Confirm the tag-release job on macOS and Windows publishes working binaries

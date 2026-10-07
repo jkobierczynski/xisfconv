@@ -14,12 +14,14 @@ Usage: python3 tests/library_tests.py path/to/libxisfconv.so [path/to/xisfconv]
 """
 import ctypes as C
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import zlib
 
 import numpy as np
 import tifffile
@@ -188,6 +190,13 @@ codec_available = declare("codec_available", i32, i32, i32)
 rewrite = declare("rewrite", i32, ptr, text, text, ptr, ptr)
 asdf_tree_json = declare("asdf_tree_json", i32, ptr, text, ptr, size_t, C.POINTER(size_t))
 skipped_count = declare("skipped_count", size_t, ptr)
+set_external_files = declare("context_set_external_files", i32, ptr, i32)
+get_external_files = declare("context_external_files", i32, ptr)
+external_count = declare("external_count", size_t, ptr)
+external_file = declare("external_file", text, ptr, size_t)
+unit_size = declare("unit_size", u64, ptr)
+file_size = declare("file_size", u64, ptr)
+file_detail = declare("file_detail", text, ptr, text)
 
 ctx = context_new()
 
@@ -1242,6 +1251,117 @@ def test_threads():
           "each context hears only about its own files")
 
 
+def test_distributed_units():
+    """Distributed XISF units: the two files as the specification has them, and which files a
+    header is followed to, context by context."""
+    import struct
+    ERR_NOT_ALLOWED, ERR_UNSUPPORTED = 12, 4
+    HEADER_DIRECTORY, ANYWHERE, NONE = 0, 1, 2
+    d = os.path.join(TMP, "units")
+    elsewhere = os.path.join(TMP, "units-elsewhere")
+    os.makedirs(d, exist_ok=True)
+    os.makedirs(elsewhere, exist_ok=True)
+
+    # written by the library, taken apart here
+    for number, (dtype, channels, codec) in enumerate(((np.uint16, 1, CODEC_NONE), (np.float32, 3, CODEC_ZLIB), (np.uint8, 3, CODEC_ZLIB))):
+        a = image(dtype, (channels, 21, 34), number)
+        if codec != CODEC_NONE:
+            a = (np.indices(a.shape).sum(axis=0) % 7).astype(dtype)
+        path = os.path.join(d, f"w{number}.xish")
+        check(write_images(path, [a], codec=codec) == OK, f"unit {number}: written: {err()}")
+        header = open(path, "rb").read().decode()
+        raw = open(os.path.join(d, f"w{number}.xisb"), "rb").read()
+        m = re.search(r'location="path\(@header_dir/w%d\.xisb\):(0x[0-9a-f]{16})"' % number, header)
+        check(header.startswith('<?xml version="1.0" encoding="UTF-8"?>') and m and "attachment" not in header, f"unit {number}: the header file")
+        length, reserved, following = struct.unpack_from("<IIQ", raw, 16)
+        elements = [struct.unpack_from("<QQQQQ", raw, 32 + 40 * k) for k in range(length)]
+        check(raw[:16] == b"XISB0100" + bytes(8) and reserved == 0 and following == 0 and length == len(elements) >= 1,
+              f"unit {number}: the data blocks file begins with its signature and an index of one node")
+        by_id = {e[0]: e for e in elements}
+        e = by_id.get(int(m.group(1), 16)) if m else None
+        check(e is not None and e[4] == 0 and len(by_id) == len(elements), f"unit {number}: the block the header names is in the index")
+        if e:
+            stored = raw[e[1]:e[1] + e[2]]
+            compression = re.search(r'compression="([^"]*)"', header)
+            if compression:
+                name, size = compression.group(1).split(":")[:2]
+                plain = zlib.decompress(stored)
+                if name.endswith("+sh"):
+                    item = int(compression.group(1).split(":")[2])
+                    plain = np.frombuffer(plain, np.uint8).reshape(item, -1).T.tobytes()
+                check(e[3] == int(size) == len(plain), f"unit {number}: the index has the uncompressed length")
+            else:
+                plain = stored
+                check(e[3] == 0 and codec == CODEC_NONE, f"unit {number}: no uncompressed length for a block that is not compressed")
+            check(same(np.frombuffer(plain, np.dtype(dtype).newbyteorder("<")).reshape(a.shape), a), f"unit {number}: the pixels, decoded here")
+        with Opened(path) as f:
+            listed = [external_file(f.handle, k).decode() for k in range(external_count(f.handle))]
+            check(file_detail(f.handle, b"unit") == b"distributed" and len(listed) == 1 and
+                  os.path.samefile(listed[0], os.path.join(d, f"w{number}.xisb")) and external_file(f.handle, 1) == b"" and
+                  unit_size(f.handle) == len(header.encode()) + len(raw) and file_size(f.handle) == len(header.encode()),
+                  f"unit {number}: the file names its data blocks file and the size of the unit")
+            check(same(f.read(), a), f"unit {number}: read back")
+
+    # a header that leads out of its directory: each context decides for itself, also at the same time
+    pixels = image(np.uint16, (1, 9, 11), 5)
+    open(os.path.join(elsewhere, "p.dat"), "wb").write(pixels.astype("<u2").tobytes())
+    open(os.path.join(d, "p.dat"), "wb").write(pixels.astype("<u2").tobytes())
+    template = ('<?xml version="1.0" encoding="UTF-8"?>\n<xisf version="1.0" xmlns="http://www.pixinsight.com/xisf">'
+                '<Image geometry="11:9:1" sampleFormat="UInt16" colorSpace="Gray" location="%s"/></xisf>')
+    away = os.path.join(d, "away.xish")
+    open(away, "w").write(template % ("path(%s)" % os.path.abspath(os.path.join(elsewhere, "p.dat")).replace(os.sep, "/")))
+    beside = os.path.join(d, "beside.xish")
+    open(beside, "w").write(template % "path(@header_dir/p.dat)")
+    network = os.path.join(d, "network.xish")
+    open(network, "w").write(template % "url(http://example.com/p.dat)")
+
+    def reads(context, path):
+        with Opened(path, context) as f:
+            got = f.read()
+            return "read" if isinstance(got, np.ndarray) and same(got, pixels) else got
+
+    check(get_external_files(ctx) == HEADER_DIRECTORY and reads(ctx, beside) == "read" and reads(ctx, away) == ERR_NOT_ALLOWED and
+          "absolute path" in err(), f"by default a header is followed to its own directory: {err()}")
+    check(reads(ctx, network) == ERR_UNSUPPORTED, "and to no network")
+    check(set_external_files(ctx, 9) != OK and get_external_files(ctx) == HEADER_DIRECTORY, "another value is refused")
+    n = 6
+    results = [None] * n
+    wanted = [(ANYWHERE, "read", "read"), (HEADER_DIRECTORY, "read", ERR_NOT_ALLOWED), (NONE, ERR_NOT_ALLOWED, ERR_NOT_ALLOWED)]
+
+    def work(k):
+        context = context_new()
+        policy, beside_expected, away_expected = wanted[k % 3]
+        ok = set_external_files(context, policy) == OK and get_external_files(context) == policy
+        for _ in range(40):
+            ok = ok and reads(context, beside) == beside_expected and reads(context, away) == away_expected
+            out = os.path.join(d, f"thread{k}.fits")
+            co = ConvertOptions()
+            convert_options_init(C.byref(co), C.sizeof(co))
+            co.overwrite = 1
+            st = convert(context, enc(away), enc(out), C.byref(co))
+            ok = ok and st == (OK if away_expected == "read" else ERR_NOT_ALLOWED)
+        results[k] = ok
+        context_free(context)
+
+    threads = [threading.Thread(target=work, args=(k,)) for k in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    check(all(results), f"{n} threads, each with its own context and its own setting: {results}")
+    check(reads(ctx, away) == ERR_NOT_ALLOWED, "and the first context still has its own")
+    # the pixels of a file that is not followed to do not come into an output
+    out = os.path.join(d, "away.xisf")
+    check(rewrite(ctx, enc(away), enc(out), None, None) == ERR_NOT_ALLOWED and not os.path.exists(out) and
+          not [name for name in os.listdir(d) if name.endswith(".part")], "a rewrite does not pack what the header may not name")
+    check(set_external_files(ctx, ANYWHERE) == OK and rewrite(ctx, enc(away), enc(out), None, None) == OK and
+          pixels.astype("<u2").tobytes() in open(out, "rb").read() and set_external_files(ctx, HEADER_DIRECTORY) == OK,
+          "unless the context allows it")
+    report = ptr()
+    check(verify(ctx, enc(away), C.byref(report)) == OK and report_verdict(report) == 1, "a verification calls it not checked")
+    report_free(report)
+
+
 def test_silence():
     """The library prints nothing: a child process does a round of work with stdout and stderr captured."""
     src = os.path.join(TMP, "silent.fits")
@@ -1469,7 +1589,7 @@ if __name__ == "__main__":
     print("asdf + asdf-astropy:", "yes" if HAVE_ASDF else "no")
     for t in (test_write_fits, test_write_fits_tile_compressed, test_write_xisf, test_lz4_and_levels, test_write_asdf, test_write_tiff_png, test_writer_arguments, test_read_fits,
               test_read_xisf, test_smaller_pictures, test_carried_properties, test_wcs, test_wcs_forms, test_stretch, test_odd_files, test_locale, test_progress_and_cancel,
-              test_kept_messages_and_cancel_from_another_thread, test_threads, test_silence):
+              test_kept_messages_and_cancel_from_another_thread, test_threads, test_distributed_units, test_silence):
         try:
             t()
         except Exception as e:  # noqa: BLE001

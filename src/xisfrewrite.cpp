@@ -28,7 +28,7 @@ public:
     explicit HeaderEditor(const std::string& xml) : xml_(xml) {}
 
     void set(const xml::Node& node, const std::string& name, const std::string& value) {
-        const std::string text = name + "=\"" + value + "\"";  // values written here need no escaping
+        const std::string text = name + "=\"" + value + "\"";  // (a value that needs escaping comes escaped)
         for (size_t i = 0; i < node.attributes.size(); ++i) {
             if (node.attributes[i].first == name) {
                 const auto span = node.attributeSpans[i];
@@ -114,6 +114,12 @@ bool isBlockLocation(const xml::Node& node) {
     if (!location || node.name == "Data") return false;  // <Data> is the container of an embedded block
     return startsWith(*location, "attachment:") || startsWith(*location, "inline:") || *location == "embedded" ||
            startsWith(*location, "url(") || startsWith(*location, "path(");
+}
+
+// True for the location of a block that is not in the header itself: attached to a monolithic
+// file, or in another file. These are the blocks a rewrite stores again.
+bool isStoredLocation(const std::string& location) {
+    return startsWith(location, "attachment:") || isExternalXisfLocation(location);
 }
 
 // A header element that refers to a data block.
@@ -274,12 +280,13 @@ struct Fingerprint {
     std::string what;
 };
 
-void readBack(const std::string& path, const std::vector<Fingerprint>& expected, size_t imageCount) {
-    XisfFile out(path);
+void readBack(const std::string& path, const std::vector<Fingerprint>& expected, size_t imageCount,
+              const XisfBlocksRedirect* redirect) {
+    XisfFile out(path, redirect);
     if (out.images().size() != imageCount) throw Error("read-back: the output has a different number of images");
     std::vector<BlockRef> blocks;
     for (const auto& b : collectBlocks(out, {})) {
-        if (startsWith(*b.node->attr("location"), "attachment:")) blocks.push_back(b);
+        if (isStoredLocation(*b.node->attr("location"))) blocks.push_back(b);
     }
     if (blocks.size() != expected.size()) throw Error("read-back: the output has a different number of data blocks");
     for (size_t i = 0; i < blocks.size(); ++i) {
@@ -339,29 +346,36 @@ XisfRewriteResult rewriteXisf(const std::string& input, const std::string& outpu
     // the header follows once their positions and sizes are known.
     uint64_t reserve = xml.size() + 1024;
     for (const xml::Node* node : removed) reserve -= node->end - node->start;
+    size_t storedCount = 0;
     for (const BlockRef& b : blocks) {
         const std::string& location = *b.node->attr("location");
-        if (startsWith(location, "url(") || startsWith(location, "path(")) {
-            throw Error(b.what + " is stored in an external file (distributed XISF), which is not supported");
-        }
-        if (!startsWith(location, "attachment:")) continue;
+        if (!isStoredLocation(location)) continue;
+        ++storedCount;
         reserve += 320;  // location, compression and checksum attributes at their longest
-        const auto parts = split(location, ':');
-        uint64_t size = 0;
-        if (parts.size() == 3) parseUInt64(parts[2], size);
+        uint64_t size = in.storedBlockSize(*b.node);
         // Sizes a damaged header declares must not decide how much is written: a block cannot be
         // larger than the file, nor expand beyond what any codec achieves. Reading the block
         // reports such a header further down.
-        size = std::min(size, in.fileSize());
+        size = std::min(size, in.unitSize());
         if (const std::string* c = b.node->attr("compression")) {
             size = std::max(size, std::min(parseXisfCompression(*c).uncompressedSize, (size + 1) << 20));
         }
         reserve += 44 * (size / std::max<uint64_t>(1, opt.subblockSize) + 1);  // one subblocks entry per chunk
     }
-    const uint64_t firstPosition = 16 + reserve;  // each block is aligned as needed when it is written
+    // The blocks are written into the file of the output itself, behind the room for its header,
+    // or (a distributed unit) into the data blocks file, behind the room for its index.
+    const bool distributed = !opt.blocksPath.empty();
+    if (distributed && !isXisfBlocksFileName(opt.blocksName)) {
+        throw Error("the output cannot be a distributed unit under this name: a header names its data blocks file, and holds "
+                    "only names that are valid UTF-8 text; choose another output name", ErrorKind::Argument);
+    }
+    const std::string& blocksOutput = distributed ? opt.blocksPath : output;
+    const uint64_t firstPosition = distributed ? xisbIndexSize(storedCount) : 16 + reserve;  // each block is aligned as needed when it is written
+    const std::vector<uint64_t> blockIds = distributed ? newXisbIds(storedCount) : std::vector<uint64_t>();
+    std::vector<XisbOutBlock> index;
 
-    std::ofstream out(toPath(output), std::ios::binary | std::ios::trunc);
-    if (!out) throw Error("cannot create " + output, ErrorKind::Io);
+    std::ofstream out(toPath(blocksOutput), std::ios::binary | std::ios::trunc);
+    if (!out) throw Error("cannot create " + blocksOutput, ErrorKind::Io);
     writeZeros(out, firstPosition);
     uint64_t pos = firstPosition;
 
@@ -371,7 +385,7 @@ XisfRewriteResult rewriteXisf(const std::string& input, const std::string& outpu
     for (const BlockRef& b : blocks) {
         progress("rewriting", written++, blocks.size());
         const xml::Node& node = *b.node;
-        if (!startsWith(*node.attr("location"), "attachment:")) {
+        if (!isStoredLocation(*node.attr("location"))) {
             // Inline and embedded blocks stay in the header as they are.
             if (opt.verifyInput) checkImageSize(b, in.readBlock(node, true, b.what).size());
             continue;
@@ -460,11 +474,17 @@ XisfRewriteResult rewriteXisf(const std::string& input, const std::string& outpu
         if (at % kAlignment != 0) unaligned = true;
         writeZeros(out, at - pos);
         writeBytes(out, stored->data(), size);
-        if (!out) throw Error("write error on " + output, ErrorKind::Io);
+        if (!out) throw Error("write error on " + blocksOutput, ErrorKind::Io);
         pos = at + size;
         ++result.blocks;
 
-        editor.set(node, "location", "attachment:" + std::to_string(at) + ":" + std::to_string(size));
+        if (distributed) {
+            const uint64_t id = blockIds[index.size()];
+            index.push_back({id, at, size, compression.empty() ? 0 : parseXisfCompression(compression).uncompressedSize});
+            editor.set(node, "location", xmlAttributeValue(xisfBlocksFileLocation(opt.blocksName, id)));
+        } else {
+            editor.set(node, "location", "attachment:" + std::to_string(at) + ":" + std::to_string(size));
+        }
         editor.update(node, "compression", compression);
         editor.update(node, "subblocks", subblocks);
         editor.update(node, "checksum", checksum);
@@ -495,7 +515,8 @@ XisfRewriteResult rewriteXisf(const std::string& input, const std::string& outpu
             if (!id) continue;
             if (*id == "XISF:BlockAlignmentSize") {
                 // Compressed blocks are not aligned; like PixInsight, such a file states no alignment.
-                if (unaligned) editor.removeElement(*p);
+                // (Nor does a header file: nothing is attached to it.)
+                if (unaligned || distributed) editor.removeElement(*p);
                 else if (p->attr("value")) editor.update(*p, "value", std::to_string(kAlignment));
             } else if (result.compressed + result.decompressed > 0 && *id == "XISF:CompressionLevel") {
                 editor.removeElement(*p);  // the level of the original compressor no longer applies
@@ -508,28 +529,50 @@ XisfRewriteResult rewriteXisf(const std::string& input, const std::string& outpu
     }
 
     const std::string header = editor.result();
-    if (16 + header.size() > firstPosition || header.size() > 0xFFFFFFFFull) throw Error("internal error: XISF header does not fit");
-    const uint32_t len = static_cast<uint32_t>(header.size());
-    const unsigned char preamble[16] = {'X', 'I', 'S', 'F', '0', '1', '0', '0',
-                                        static_cast<unsigned char>(len), static_cast<unsigned char>(len >> 8),
-                                        static_cast<unsigned char>(len >> 16), static_cast<unsigned char>(len >> 24),
-                                        0, 0, 0, 0};
-    out.seekp(0);
-    out.write(reinterpret_cast<const char*>(preamble), 16);
-    out.write(header.data(), static_cast<std::streamsize>(header.size()));
-    out.close();
-    if (!out) throw Error("write error on " + output, ErrorKind::Io);
+    if (distributed) {
+        // The index of the data blocks file, now that it is known where the blocks are; and the
+        // header, which is a file of its own.
+        const std::vector<uint8_t> head = xisbIndexBytes(index);
+        if (index.size() != storedCount || head.size() != firstPosition) throw Error("internal error: the block index does not fit");
+        out.seekp(0);
+        out.write(reinterpret_cast<const char*>(head.data()), static_cast<std::streamsize>(head.size()));
+        out.close();
+        if (!out) throw Error("write error on " + blocksOutput, ErrorKind::Io);
+        std::ofstream headerFile(toPath(output), std::ios::binary | std::ios::trunc);
+        if (!headerFile) throw Error("cannot create " + output, ErrorKind::Io);
+        headerFile.write(header.data(), static_cast<std::streamsize>(header.size()));
+        headerFile.close();
+        if (!headerFile) throw Error("write error on " + output, ErrorKind::Io);
+    } else {
+        if (16 + header.size() > firstPosition || header.size() > 0xFFFFFFFFull) throw Error("internal error: XISF header does not fit");
+        const uint32_t len = static_cast<uint32_t>(header.size());
+        const unsigned char preamble[16] = {'X', 'I', 'S', 'F', '0', '1', '0', '0',
+                                            static_cast<unsigned char>(len), static_cast<unsigned char>(len >> 8),
+                                            static_cast<unsigned char>(len >> 16), static_cast<unsigned char>(len >> 24),
+                                            0, 0, 0, 0};
+        out.seekp(0);
+        out.write(reinterpret_cast<const char*>(preamble), 16);
+        out.write(header.data(), static_cast<std::streamsize>(header.size()));
+        out.close();
+        if (!out) throw Error("write error on " + output, ErrorKind::Io);
+    }
 
+    // (the header names the data blocks file as it will be called; for now it is where it was written)
+    const XisfBlocksRedirect redirect{opt.blocksName, opt.blocksPath};
     if (opt.readBack) {
-        readBack(output, fingerprints, opt.imageIndex ? 1 : in.images().size());
+        readBack(output, fingerprints, opt.imageIndex ? 1 : in.images().size(), distributed ? &redirect : nullptr);
         // And everything else in the file (inline and embedded blocks, image sizes) must check out.
-        const VerifyReport report = verifyXisf(output);
+        const VerifyReport report = verifyXisf(output, distributed ? &redirect : nullptr);
         if (!report.problems.empty()) throw Error("read-back: " + report.problems.front());
         result.readBack = true;
     }
-    result.changed = result.compressed + result.decompressed + result.checksums + result.checksumsRemoved > 0 || !removed.empty();
+    // Stored another way, or as the other kind of unit, or in other files than it was.
+    result.changed = result.compressed + result.decompressed + result.checksums + result.checksumsRemoved > 0 ||
+                     !removed.empty() || in.headerFile() != distributed;
     std::error_code ec;
+    result.inputSize = in.unitSize();
     result.outputSize = static_cast<uint64_t>(std::filesystem::file_size(toPath(output), ec));
+    if (distributed) result.outputSize += static_cast<uint64_t>(std::filesystem::file_size(toPath(opt.blocksPath), ec));
     return result;
 }
 
@@ -538,7 +581,7 @@ bool xisfStoredAsRequested(const std::string& path, const XisfRewriteOptions& op
     if (opt.imageIndex && (file.images().size() > 1 || *opt.imageIndex >= file.images().size())) return false;
     for (const BlockRef& b : collectBlocks(file, {})) {
         const xml::Node& node = *b.node;
-        if (!startsWith(*node.attr("location"), "attachment:")) continue;
+        if (!isStoredLocation(*node.attr("location"))) continue;
         const std::string* c = node.attr("compression");
         const std::string* sum = node.attr("checksum");
         XisfCompression comp;
@@ -554,9 +597,9 @@ bool xisfStoredAsRequested(const std::string& path, const XisfRewriteOptions& op
     return true;
 }
 
-VerifyReport verifyXisf(const std::string& path) {
+VerifyReport verifyXisf(const std::string& path, const XisfBlocksRedirect* redirect) {
     VerifyReport report;
-    XisfFile file(path);
+    XisfFile file(path, redirect, true);
     const std::vector<BlockRef> blocks = collectBlocks(file, {});
     size_t done = 0;
     for (const BlockRef& b : blocks) {
@@ -568,15 +611,37 @@ VerifyReport verifyXisf(const std::string& path) {
             else if (state == XisfChecksumState::None) ++report.unchecked;
             else report.notChecked.push_back(b.what + ": checksum of an unknown kind (" + sb.checksum.substr(0, sb.checksum.find(':')) + ")");
             checkImageSize(b, XisfFile::decodeBlock(sb, b.what).size());
+            if (sb.indexed) {
+                // What the index of the data blocks file says of the block is what the header says.
+                const uint64_t declared = sb.compression.empty() ? 0 : parseXisfCompression(sb.compression).uncompressedSize;
+                if (sb.indexUncompressedLength != declared) {
+                    report.problems.push_back(b.what + ": the index of its data blocks file has an uncompressed length of " +
+                                              std::to_string(sb.indexUncompressedLength) + ", the header " +
+                                              (declared ? "one of " + std::to_string(declared) : std::string("a block that is not compressed")));
+                }
+            }
         } catch (const Unsupported& e) {
             report.notChecked.push_back(b.what + ": " + e.what());
         } catch (const Error& e) {
             const std::string message = e.what();
+            if (e.kind == ErrorKind::NotAllowed) {
+                // (a block in a file the header is not followed to is not a damaged one)
+                report.notChecked.push_back(message.find(b.what) == std::string::npos ? b.what + ": " + message : message);
+                continue;
+            }
             report.problems.push_back(message.find(b.what) == std::string::npos ? b.what + ": " + message : message);
         }
     }
+    // What is wrong with the index of a data blocks file, whether or not a block of this header
+    // is concerned: the file is not what it was written as.
+    for (const std::string& problem : file.indexProblems()) report.problems.push_back(problem);
     report.summary = std::to_string(file.images().size()) + (file.images().size() == 1 ? " image, " : " images, ") +
                      std::to_string(blocks.size()) + (blocks.size() == 1 ? " data block" : " data blocks");
+    if (!file.externalFiles().empty()) {
+        report.summary += std::string(file.headerFile() ? ", a distributed unit with data in " : ", with data in ") +
+                          std::to_string(file.externalFiles().size()) +
+                          (file.externalFiles().size() == 1 ? " other file" : " other files");
+    }
     return report;
 }
 

@@ -41,8 +41,8 @@ those formats, use astropy or the asdf package.
 """
 
 from ._core import (ArgumentError, Cancelled, Card, ChecksumError, Error, File, FileError, FileImage, FormatError,
-                    Image, ImageIndexError, InputNotFoundError, InternalError, Keywords, NotFoundError,
-                    OutputExistsError, Properties, PropertyDict, Report, RewriteResult, StretchParams, UnsupportedError,
+                    Image, ImageIndexError, InputNotFoundError, InternalError, Keywords, NotAllowedError,
+                    NotFoundError, OutputExistsError, Properties, PropertyDict, Report, RewriteResult, StretchParams, UnsupportedError,
                     XisfconvWarning, apply_stretch, auto_stretch, codec_available, convert, detect_format,
                     library_path, library_version, open, read, read_image, rewrite, rewrite_in_place,
                     stored_as_requested, verify, wcs_flip_rows, write)
@@ -60,7 +60,7 @@ except ImportError:   # pragma: no cover
 
 __all__ = [
     "ArgumentError", "Cancelled", "Card", "ChecksumError", "Error", "File", "FileError", "FileImage", "FormatError",
-    "Image", "ImageIndexError", "InputNotFoundError", "InternalError", "Keywords", "NotFoundError",
+    "Image", "ImageIndexError", "InputNotFoundError", "InternalError", "Keywords", "NotAllowedError", "NotFoundError",
     "OutputExistsError", "Properties", "PropertyDict", "Report", "RewriteResult", "StretchParams", "UnsupportedError",
     "XisfconvWarning", "apply_stretch", "auto_stretch", "codec_available", "convert", "detect_format",
     "library_path", "library_version", "open", "read", "read_image", "rewrite", "rewrite_in_place",

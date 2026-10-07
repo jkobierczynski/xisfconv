@@ -1,4 +1,5 @@
-// Rewrites an XISF file with another block storage (compression, checksums), and verifies files.
+// Rewrites an XISF unit with another block storage (compression, checksums) or as the other
+// kind of unit (monolithic, distributed), and verifies units.
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 Jurgen Kobierczynski
 #pragma once
@@ -7,6 +8,7 @@
 #include <string>
 
 #include "common.hpp"
+#include "xisfblocks.hpp"
 
 namespace xisfconv {
 
@@ -18,11 +20,16 @@ struct XisfRewriteOptions {
     bool verifyInput = true;   // check the input's checksums and that every compressed block decodes
     bool readBack = true;      // read the written file back and compare every block with the input
     uint64_t subblockSize = 1u << 30;  // blocks larger than this are compressed in subblocks
+    // The output is a distributed unit: `output` gets the header alone and this file the data
+    // blocks, which the header names as blocksName in its own directory (see XisfWriteOptions).
+    // Empty: a monolithic file. (What the input is does not matter.)
+    std::string blocksPath;
+    std::string blocksName;
 };
 
 struct XisfRewriteResult {
-    uint64_t inputSize = 0, outputSize = 0;
-    size_t blocks = 0;            // attached data blocks written
+    uint64_t inputSize = 0, outputSize = 0;   // of the unit: its file, and the files its header names
+    size_t blocks = 0;            // data blocks written (attached, or into the data blocks file)
     size_t compressed = 0;        // blocks compressed with the requested codec
     size_t decompressed = 0;      // blocks now stored uncompressed
     size_t kept = 0;              // blocks copied as they were stored
@@ -32,19 +39,23 @@ struct XisfRewriteResult {
     bool changed = false;         // false if the output stores everything the way the input did
 };
 
-// Copies an XISF file, storing its attached data blocks as the options say. The XML header is
-// carried over as it is: only the location, compression, subblocks and checksum attributes of the
-// attached blocks change (and the XISF:Compression* metadata that describes them). Pixels,
+// Copies an XISF unit, storing the data blocks that are not in its header (attached to a
+// monolithic file, or in the files a header names) as the options say. The XML header is
+// carried over as it is: only the location, compression, subblocks and checksum attributes of
+// those blocks change (and the XISF:Compression* metadata that describes them). Pixels,
 // keywords, properties, ICC profiles, thumbnails and unknown elements are not touched.
 // With imageIndex, the other Image elements and their blocks are left out.
+// The output is a monolithic file, or (options.blocksPath) a header file and one data blocks
+// file, whatever the input is: every block of the input ends up in the output.
 XisfRewriteResult rewriteXisf(const std::string& input, const std::string& output, const XisfRewriteOptions& options);
 
-// True if every attached block of the file is already stored the way the options ask, judged by
-// the header alone (uncompressed blocks count as not compressed yet when a codec is requested).
+// True if every block of the unit that is not in its header is already stored the way the
+// options ask, judged by the header alone (uncompressed blocks count as not compressed yet when
+// a codec is requested).
 bool xisfStoredAsRequested(const std::string& path, const XisfRewriteOptions& options);
 
-// Reads every data block of an XISF file: verifies its checksum, decompresses it and, for
-// images, compares its size with the geometry.
-VerifyReport verifyXisf(const std::string& path);
+// Reads every data block of an XISF unit: verifies its checksum, decompresses it and, for
+// images, compares its size with the geometry. `redirect`: see XisfBlocksRedirect.
+VerifyReport verifyXisf(const std::string& path, const XisfBlocksRedirect* redirect = nullptr);
 
 }  // namespace xisfconv

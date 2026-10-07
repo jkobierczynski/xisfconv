@@ -25,6 +25,7 @@ import base64
 import hashlib
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -2332,7 +2333,47 @@ def test_export_from_fits_and_asdf():
 
 def xisf_header(path):
     raw = open(path, "rb").read()
+    if raw[:8] != b"XISF0100":     # an XISF header file (.xish): the header is the whole of it
+        return raw, raw.decode()
     return raw, raw[16:16 + int.from_bytes(raw[8:12], "little")].decode()
+
+
+def read_xisb(path):
+    """An XISF data blocks file, read without xisfconv: its signature and reserved field, the nodes
+    of its block index (position, reserved field, next), and its elements in the order of the index
+    as dicts (id, position, length, uncompressed, reserved, stored bytes; a free one has position 0)."""
+    raw = open(path, "rb").read()
+    out = {"signature": raw[:8], "reserved": raw[8:16], "nodes": [], "elements": [], "raw": raw}
+    at, seen = 16, set()
+    while True:
+        assert at not in seen and at + 16 <= len(raw), "the block index of %s cannot be followed" % path
+        seen.add(at)
+        length, reserved, nxt = struct.unpack_from("<IIQ", raw, at)
+        out["nodes"].append({"position": at, "length": length, "reserved": reserved, "next": nxt})
+        for k in range(length):
+            bid, pos, size, ulen, res = struct.unpack_from("<5Q", raw, at + 16 + 40 * k)
+            out["elements"].append({"id": bid, "position": pos, "length": size, "uncompressed": ulen, "reserved": res,
+                                    "stored": raw[pos:pos + size] if pos else b""})
+        if not nxt:
+            return out
+        at = nxt
+
+
+def external_block(path, loc):
+    """The stored bytes of a block that the header at `path` locates with path(...): read without xisfconv."""
+    import re
+    m = re.fullmatch(r"path\((.*)\)(?::(0[xX][0-9a-fA-F]+|[0-9]+))?", loc, re.S)
+    assert m, "not a path location: " + loc
+    name = m.group(1).replace("\\(", "(").replace("\\)", ")")
+    if name.startswith("@header_dir/"):
+        name = os.path.join(os.path.dirname(os.path.abspath(path)), *name[len("@header_dir/"):].split("/"))
+    if m.group(2) is None:
+        return open(name, "rb").read()          # the block is the whole file
+    wanted = int(m.group(2), 0)
+    found = [e for e in read_xisb(name)["elements"] if e["id"] == wanted]
+    assert len(found) == 1 and found[0]["position"], "block %s of %s" % (m.group(2), name)
+    assert len(found[0]["stored"]) == found[0]["length"], "block beyond the end of " + name
+    return found[0]["stored"]
 
 
 def xisf_blocks(path, root=None):
@@ -2350,6 +2391,8 @@ def xisf_blocks(path, root=None):
             _, pos, size = loc.split(":")
             stored = raw[int(pos):int(pos) + int(size)]
             assert len(stored) == int(size), "attachment beyond the end of " + path
+        elif loc.startswith("path("):
+            stored = external_block(path, loc)
         else:
             if loc == "embedded":
                 src = [c for c in el if c.tag.endswith("}Data") or c.tag == "Data"][0]
@@ -2383,7 +2426,7 @@ def xisf_blocks(path, root=None):
                 item = int(parts[2])
                 cnt = len(data) // item
                 data = np.frombuffer(data[:cnt * item], np.uint8).reshape(item, cnt).T.tobytes() + data[cnt * item:]
-        out.append({"tag": el.tag.split("}")[-1], "id": el.get("id"), "kind": loc.split(":")[0], "attr": attr,
+        out.append({"tag": el.tag.split("}")[-1], "id": el.get("id"), "kind": "path" if loc.startswith("path(") else loc.split(":")[0], "attr": attr,
                     "stored": stored, "data": data, "location": loc, "element": el})
     return out
 
@@ -2394,7 +2437,7 @@ def header_without_storage(hdr):
     import re
     def strip(m):
         return re.sub(r'\s+(location|compression|subblocks|checksum)="[^"]*"', "", m.group(0))
-    hdr = re.sub(r'<[^<>]*\slocation="attachment:[^<>]*>', strip, hdr)
+    hdr = re.sub(r'<[^<>]*\slocation="(?:attachment:|path\()[^<>]*>', strip, hdr)
     return re.sub(r'<Property id="XISF:(CompressionCodecs|CompressionLevel|BlockAlignmentSize)"[^>]*?(/>|>[^<]*</Property>)\s*',
                   "", hdr)
 
@@ -2420,7 +2463,60 @@ def write_xisf_blocks(path, template, blocks, align=1):
             f.write(b.payload)
 
 
-def rich_xisf(path, storage, align=1, extra_metadata=""):
+def write_xisb(path, blocks, ids, nodes=1, free=0, align=1, tail=b""):
+    """An XISF data blocks file, made without xisfconv. blocks: (stored bytes, uncompressed length);
+    the index has `nodes` nodes (the first behind the signature, the others behind the data) and
+    `free` free elements at its beginning."""
+    n = len(blocks)
+    per = max(1, -(-n // nodes))
+    groups = [list(range(i, min(i + per, n))) for i in range(0, n, per)] or [[]]
+    pos = 16 + 16 + 40 * (len(groups[0]) + free)
+    positions = []
+    for stored, _ in blocks:
+        pos = -(-pos // align) * align
+        positions.append(pos)
+        pos += len(stored)
+    node_at = [16]
+    for g in groups[1:]:
+        node_at.append(pos)
+        pos += 16 + 40 * len(g)
+    out = bytearray(pos)
+    out[:8] = b"XISB0100"
+    for number, g in enumerate(groups):
+        at = node_at[number]
+        struct.pack_into("<IIQ", out, at, len(g) + (free if number == 0 else 0), 0, node_at[number + 1] if number + 1 < len(groups) else 0)
+        k = 0
+        for f in range(free if number == 0 else 0):
+            struct.pack_into("<5Q", out, at + 16 + 40 * k, 0xF0000000 + f, 0, 0, 0, 0)
+            k += 1
+        for i in g:
+            struct.pack_into("<5Q", out, at + 16 + 40 * k, ids[i], positions[i], len(blocks[i][0]), blocks[i][1], 0)
+            k += 1
+    for (stored, _), at in zip(blocks, positions):
+        out[at:at + len(stored)] = stored
+    open(path, "wb").write(bytes(out) + tail)
+    return positions
+
+
+def write_unit(path, template, blocks, align=1, name=None, ids=None, decimal=(), **xisb):
+    """A distributed XISF unit, made without xisfconv: the header file `path` (the template, with {0},
+    {1}, ... where the attributes of block n belong) and beside it a data blocks file with the
+    blocks. `decimal`: the blocks whose identifier the header writes as a decimal number."""
+    name = name or os.path.splitext(os.path.basename(path))[0] + ".xisb"
+    ids = ids or [0x4d373e33756e480f + 977 * i for i in range(len(blocks))]
+    escaped = name.replace("(", "\\(").replace(")", "\\)")
+    attrs = []
+    for i, (b, bid) in enumerate(zip(blocks, ids)):
+        a = {"location": "path(@header_dir/%s):%s" % (escaped, bid if i in decimal else "0x%016x" % bid), **b.attrs}
+        attrs.append(" ".join(f'{k}="{v}"' for k, v in a.items()))
+    open(path, "wb").write(template.format(*attrs).encode())
+    target = os.path.join(os.path.dirname(path), *name.split("/"))
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    write_xisb(target, [(b.payload, len(b.raw) if b.codec else 0) for b in blocks], ids, align=align, **xisb)
+    return ids
+
+
+def rich_xisf(path, storage, align=1, extra_metadata="", writer=write_xisf_blocks, **writer_options):
     """A file with everything a rewrite must carry over: three images (attached, embedded, attached),
     attached and inline properties, an ICC profile, a thumbnail, comments, CDATA, entities, an
     element xisfconv does not know. `storage` gives the Block options of the attached blocks."""
@@ -2467,7 +2563,7 @@ def rich_xisf(path, storage, align=1, extra_metadata=""):
         '<Property id="XISF:CreatorApplication" type="String">PixInsight 1.9.3</Property>\n'
         '<Property id="XISF:BlockAlignmentSize" type="UInt16" value="' + str(align) + '"/>\n' + extra_metadata +
         '</Metadata>\n</xisf>\n')
-    write_xisf_blocks(path, template, blocks, align)
+    writer(path, template, blocks, align, **writer_options)
     return {"main": rgb, "mask": mask, "small": small}
 
 
@@ -2698,7 +2794,7 @@ def test_xisf_rewrite():
            'colorSpace="Gray" location="url(file:///data.xisb):16:16"/></xisf>').encode()
     open(src, "wb").write(b"XISF0100" + len(hdr).to_bytes(4, "little") + b"\0\0\0\0" + hdr)
     r = run(src, "-o", out, "-f", expect_ok=False)
-    check(r.returncode == 1 and "external file" in r.stderr, "distributed XISF is refused when rewriting")
+    check(r.returncode == 1 and "malformed location" in r.stderr, "a location that is none of the forms of the specification is refused")
     e = image_entry(a, children='<Observatory location="La Palma"/><Property id="Site" type="String" location="Roque"/>')
     write_xisf(src, [e])
     r = run(src, "-o", out, "-f", "-c")
@@ -4695,6 +4791,14 @@ def test_downsampling_and_thumbnailer():
     check(got is not None and got.shape == (85, 128, 3), "the output is PNG whatever its name")
     got, r = thumbnail(two, 16)
     check(got is not None and got.shape == (12, 16, 1), "a file with several images: the first one")
+    # the header file of a distributed unit, where the file beside it may be read
+    run(bigx, "-o", os.path.join(d, "big.xish"), "-f", "-q")
+    got, r = thumbnail(os.path.join(d, "big.xish"), 256)
+    check(got is not None and np.array_equal(got, reference) and r.stderr == "", f"thumbnail of a distributed unit: {r.stderr.strip()[-200:]}")
+    os.rename(os.path.join(d, "big.xisb"), os.path.join(d, "big-away.xisb"))
+    got, r = thumbnail(os.path.join(d, "big.xish"), 256)
+    check(got is None and r.returncode != 0 and not os.path.exists(os.path.join(d, "thumb.png.part")),
+          "... and none, with an exit status that says so, where it may not (a sandbox that holds the header alone)")
     got, r = thumbnail(os.path.join(d, "none.xisf"), 128)
     check(got is None and r.returncode != 0, "a file that is not there: no thumbnail, and an exit status that says so")
     open(os.path.join(d, "garbage.xisf"), "wb").write(b"XISF0100" + bytes(100))
@@ -4709,7 +4813,7 @@ def test_downsampling_and_thumbnailer():
     check(root.tag == ns + "mime-info" and set(defined) == {"image/x-xisf", "application/x-asdf"} and
           set(defined) <= set(types.split(";")), f"the file types the desktop does not know are defined: {sorted(defined)}")
     globs = {name: sorted(g.get("pattern") for g in t.findall(ns + "glob")) for name, t in defined.items()}
-    check(globs == {"image/x-xisf": ["*.xisf"], "application/x-asdf": ["*.asdf"]}, f"by the names of the files: {globs}")
+    check(globs == {"image/x-xisf": ["*.xisf", "*.xish"], "application/x-asdf": ["*.asdf"]}, f"by the names of the files: {globs}")
     for name, path in (("image/x-xisf", bigx), ("application/x-asdf", sources["ASDF"])):
         match = defined[name].find(ns + "magic").find(ns + "match")
         value = match.get("value").encode()
@@ -4726,11 +4830,810 @@ def test_downsampling_and_thumbnailer():
         shutil.copy(os.path.join(desktop, "xisfconv.xml"), os.path.join(base, "packages"))
         r = subprocess.run(["update-mime-database", base], capture_output=True, text=True)
         listed = open(os.path.join(base, "globs2")).read() if os.path.exists(os.path.join(base, "globs2")) else ""
-        check(r.returncode == 0 and "image/x-xisf:*.xisf" in listed and "application/x-asdf:*.asdf" in listed and
+        check(r.returncode == 0 and "image/x-xisf:*.xisf" in listed and "image/x-xisf:*.xish" in listed and "application/x-asdf:*.asdf" in listed and
               os.path.exists(os.path.join(base, "image", "x-xisf.xml")),
               f"update-mime-database takes the file: {r.stderr.strip()[-200:]}")
     else:
         skipped.append("the file types through update-mime-database")
+
+
+# ---------------------------------------------------------------- distributed XISF units
+
+# The directory with the sample programs of OpenXISF (github.com/openxisf/openxisf), another
+# implementation of the specification: where it is given, each reads what the other wrote.
+OPENXISF = os.environ.get("OPENXISF_BIN", "")
+
+
+def same_place(shown, path):
+    """True if the path a program printed is that file. (A Windows program that is run on another
+    system prints the paths of its own world: those are held against the end of the path.)"""
+    try:
+        return os.path.samefile(shown, path)
+    except OSError:
+        return shown.replace("\\", "/").split("/")[-2:] == os.path.abspath(path).replace("\\", "/").split("/")[-2:]
+
+
+def unit_structure(label, xish, rewritten=False):
+    """The files of a distributed unit xisfconv wrote, held against the specification (sections 9.3,
+    9.4 and 10.3), without xisfconv. Returns the blocks of the unit. A unit that is written from
+    pixels has every block at a multiple of 4096 bytes; one that is rewritten from another XISF
+    file has the uncompressed ones there, and the compressed ones behind each other, as in a
+    monolithic file."""
+    import re
+    raw, hdr = xisf_header(xish)
+    xisb_path = os.path.splitext(xish)[0] + ".xisb"
+    check(raw.startswith(b'<?xml version="1.0" encoding="UTF-8"?>') and raw.rstrip().endswith(b"</xisf>"),
+          f"{label}: the header file is the XML header and nothing else")
+    check("attachment:" not in hdr and "XISF:BlockAlignmentSize" not in hdr, f"{label}: nothing is attached to a header file")
+    x = read_xisb(xisb_path)
+    check(x["signature"] == b"XISB0100" and x["reserved"] == bytes(8), f"{label}: signature and reserved field of the data blocks file")
+    check(len(x["nodes"]) == 1 and x["nodes"][0] == {"position": 16, "length": len(x["elements"]), "reserved": 0, "next": 0},
+          f"{label}: a block index of one node behind the signature: {x['nodes']}")
+    blocks = xisf_blocks(xish)
+    outside = [b for b in blocks if b["kind"] == "path"]
+    name = re.escape(os.path.basename(xisb_path))
+    named = [re.fullmatch(r"path\(@header_dir/%s\):(0x[0-9a-f]{16})" % name, b["location"]) for b in outside]
+    check(all(named) and not [b for b in blocks if b["kind"] not in ("path", "inline", "embedded")],
+          f"{label}: the header names its blocks as path(@header_dir/<name>.xisb):0x<16 digits>")
+    ids = [e["id"] for e in x["elements"]]
+    check(sorted(int(m.group(1), 16) for m in named if m) == sorted(ids) and len(set(ids)) == len(ids) and 0 not in ids,
+          f"{label}: the index has the blocks the header names, each under an identifier of its own")
+    by_id = {e["id"]: e for e in x["elements"]}
+    lengths = True
+    used = bytearray(len(x["raw"]))
+    used[:32 + 40 * len(ids)] = b"\1" * (32 + 40 * len(ids))
+    for b, m in zip(outside, named):
+        e = by_id.get(int(m.group(1), 16)) if m else None
+        if not e:
+            continue
+        compression = b["attr"]["compression"]
+        lengths = lengths and e["uncompressed"] == (int(compression.split(":")[1]) if compression else 0) and e["reserved"] == 0
+        lengths = lengths and (e["position"] % 4096 == 0 or (rewritten and compression)) and e["length"] == len(b["stored"])
+        used[e["position"]:e["position"] + e["length"]] = b"\1" * e["length"]
+    check(lengths, f"{label}: each element has the length of its block, the uncompressed length of a compressed one, and an aligned position")
+    check(not any(byte for byte, taken in zip(x["raw"], used) if not taken), f"{label}: the unused space of the data blocks file is zero")
+    return blocks
+
+
+def test_distributed_units():
+    """XISF units of a header file (.xish) and the files it names (data blocks files, .xisb, and
+    others): written by xisfconv and read without it, made without it and read by it, packed into
+    monolithic files and unpacked from them; what a header may not be followed to; and files that
+    are damaged."""
+    import re
+    d = os.path.join(TMP, "distributed")
+    os.makedirs(d, exist_ok=True)
+    zstd_ok = zstandard is not None and ZSTD_BUILD
+    leftovers = lambda where: sorted(n for n in os.listdir(where) if n.endswith(".part"))   # noqa: E731
+
+    # ---- from FITS: written by xisfconv, read without it
+    variants = [(np.uint16, 1, []), (np.uint8, 3, ["--codec", "zlib", "--checksum", "sha256"]), (np.float64, 1, ["--codec", "lz4hc"]),
+                (np.uint32, 3, ["--codec", "lz4", "--checksum", "sha1"])]
+    if zstd_ok:
+        variants.append((np.float32, 3, ["-c", "--checksum", "sha512"]))
+    for number, (dtype, channels, options) in enumerate(variants):
+        label = f"FITS -> .xish ({np.dtype(dtype).name}, {channels} ch, {' '.join(options) or 'plain'})"
+        a = test_image(dtype, 61, 83, channels, 300 + number)
+        planes = as_planes(a)                                   # (C, H, W), rows top-down
+        src = os.path.join(d, f"in{number}.fits")
+        fits.PrimaryHDU(np.squeeze(planes[:, ::-1, :])).writeto(src, overwrite=True)
+        out = os.path.join(d, f"unit{number}.xish")
+        r = run(src, "-o", out, *options)
+        check(sorted(n for n in os.listdir(d) if n.startswith(f"unit{number}.")) == [f"unit{number}.xisb", f"unit{number}.xish"]
+              and not leftovers(d), f"{label}: a header file and a data blocks file, and nothing else: {r.stdout.strip()}")
+        blocks = unit_structure(label, out)
+        image = [b for b in blocks if b["tag"] == "Image"][0]
+        got = np.frombuffer(image["data"], np.dtype(dtype).newbyteorder("<")).reshape(planes.shape)
+        compare(label + ": the pixels, decoded without xisfconv", got, planes)
+        if options:
+            check(image["attr"]["compression"] is not None, f"{label}: the block in the data blocks file is compressed")
+        r = run("--verify", out)
+        check("OK" in r.stdout and "a distributed unit with data in 1 other file" in r.stdout, f"{label}: --verify: {r.stdout.strip()}")
+        back = os.path.join(d, f"back{number}.fits")
+        run(out, "-o", back, "-f", "-q")
+        compare(label + ": and back to FITS", fits_planes(back)[0], planes)
+        if OPENXISF:
+            r = subprocess.run([os.path.join(OPENXISF, "read_pixels"), out], capture_output=True, text=True)
+            means = [float(v) for v in re.findall(r"mean of channel \d+: (\S+)", r.stdout)]
+            check(r.returncode == 0 and len(means) == channels and
+                  all(abs(m - float(planes[c].astype(np.float64).mean())) <= 2e-5 * max(1.0, abs(m)) for c, m in enumerate(means)),
+                  f"{label}: OpenXISF reads the unit: {r.stdout.strip()[:200]} {r.stderr.strip()[:200]}")
+    # -t xish names the files; an output that exists is not written over, neither of the two
+    src = os.path.join(d, "in0.fits")
+    named = os.path.join(d, "named")
+    os.makedirs(named, exist_ok=True)
+    r = run(src, "-t", "xish", "-d", named)
+    check(sorted(os.listdir(named)) == ["in0.xisb", "in0.xish"] and r.stdout.strip().endswith("in0.xish"), f"-t xish: {sorted(os.listdir(named))}")
+    before = {n: open(os.path.join(named, n), "rb").read() for n in os.listdir(named)}
+    r = run(src, "-t", "xish", "-d", named, expect_ok=False)
+    check(r.returncode == 1 and "in0.xish already exists" in r.stderr, f"an existing header file is not written over: {r.stderr.strip()[:160]}")
+    os.remove(os.path.join(named, "in0.xish"))
+    r = run(src, "-t", "xish", "-d", named, expect_ok=False)
+    check(r.returncode == 1 and "in0.xisb already exists" in r.stderr and os.listdir(named) == ["in0.xisb"] and
+          open(os.path.join(named, "in0.xisb"), "rb").read() == before["in0.xisb"],
+          f"nor is an existing data blocks file, and no header is written then: {r.stderr.strip()[:160]}")
+    r = run(src, "-t", "xish", "-d", named, "-f")
+    ids_before = re.findall(rb"0x[0-9a-f]{16}", before["in0.xish"])
+    ids_after = re.findall(rb"0x[0-9a-f]{16}", open(os.path.join(named, "in0.xish"), "rb").read())
+    check(r.returncode == 0 and len(ids_after) == len(ids_before) >= 1 and not set(ids_after) & set(ids_before) and not leftovers(named),
+          "with --force both are written, with identifiers no earlier header has")
+    r = run(src, "-t", "xish", "-o", os.path.join(named, "wrong.xisf"), expect_ok=False)
+    check(r.returncode != 0 and ".xish" in r.stderr and not os.path.exists(os.path.join(named, "wrong.xisf")),
+          f"-t xish with a name that is not one of a header file: {r.stderr.strip()[:160]}")
+    r = run(src, "-o", os.path.join(named, "UPPER.XISH"))
+    check(sorted(n for n in os.listdir(named) if n.startswith("UPPER")) == ["UPPER.XISB", "UPPER.XISH"], "a name in capitals keeps them")
+
+    # ---- made without xisfconv: every form the specification has, read by xisfconv
+    storages = [("plain", {}, {}), ("zlib, shuffled, sha1", dict(codec="zlib", shuffle_item=2, checksum="sha1"), dict(nodes=3, free=2, decimal=(1, 3))),
+                ("lz4hc in subblocks", dict(codec="lz4hc", subblocks=3), dict(nodes=2, name="blöcke (1).xisb")),
+                ("lz4, sha256, in a directory below", dict(codec="lz4", checksum="sha256"), dict(nodes=6, free=1, name="sub/dir/data.xisb", align=4096))]
+    if zstd_ok:
+        storages.append(("zstd, shuffled", dict(codec="zstd", shuffle_item=2), dict(free=3, tail=b"\0" * 100)))
+    for number, (what, storage, layout) in enumerate(storages):
+        label = f"a unit made without xisfconv ({what})"
+        unit = os.path.join(d, f"made{number}.xish")
+        expected = rich_xisf(unit, storage, writer=write_unit, **layout)
+        theirs = xisf_blocks(unit)
+        r = run("--info", unit)
+        files = re.findall(r"^  data in:     (.*)$", r.stdout, re.M)
+        check("distributed unit" in r.stdout.splitlines()[0] and "in 2 files" in r.stdout and len(files) == 1 and
+              same_place(files[0], os.path.join(d, *layout.get("name", f"made{number}.xisb").split("/"))),
+              f"{label}: --info names the unit and its data blocks file: {r.stdout.splitlines()[0]} {files}")
+        r = run("--verify", unit)
+        check(r.returncode == 0 and ": OK" in r.stdout, f"{label}: --verify: {r.stdout.strip()[:300]}")
+        out = os.path.join(d, f"made{number}.fits")
+        r = run(unit, "-o", out, "-f", "-q")
+        with fits.open(out) as hdul:
+            pictures = [i for i, h in enumerate(hdul) if isinstance(h, (fits.PrimaryHDU, fits.ImageHDU))]
+        check(len(pictures) == 3, f"{label}: three images in the FITS file: {pictures}")
+        for hdu, name in zip(pictures, ("main", "mask", "small")):
+            compare(f"{label}: image {name} to FITS", fits_planes(out, hdu)[0], as_planes(expected[name]))
+        # packed into one file: every block as it was, and the header the same text
+        packed = os.path.join(d, f"packed{number}.xisf")
+        r = run(unit, "-o", packed, "-f")
+        mine = xisf_blocks(packed)
+        check([b["data"] for b in mine] == [b["data"] for b in theirs] and [b["stored"] for b in mine] == [b["stored"] for b in theirs]
+              and [b["attr"] for b in mine] == [b["attr"] for b in theirs], f"{label}: packed into a monolithic file, every block is the bytes it was")
+        check([b["kind"] for b in mine] == [("attachment" if b["kind"] == "path" else b["kind"]) for b in theirs] and
+              header_without_storage(xisf_header(packed)[1]) == header_without_storage(xisf_header(unit)[1]) and
+              "read back and compared" in r.stdout, f"{label}: ... attached where it was in another file, and the header is the same text")
+        # and unpacked again, by xisfconv, into a unit of its own making
+        again = os.path.join(d, f"again{number}.xish")
+        r = run(packed, "-o", again, "-f")
+        blocks = unit_structure(f"{label}, packed and unpacked", again, rewritten=True)
+        check([b["data"] for b in blocks] == [b["data"] for b in theirs] and [b["attr"] for b in blocks] == [b["attr"] for b in theirs] and
+              header_without_storage(xisf_header(again)[1]) == header_without_storage(xisf_header(unit)[1]),
+              f"{label}: unpacked again, the same blocks and the same header")
+        if OPENXISF:
+            r = subprocess.run([os.path.join(OPENXISF, "read_info"), again], capture_output=True, text=True)
+            check(r.returncode == 0 and "header file" in r.stdout and "31 x 23 pixels" in r.stdout and "12 x 9 pixels" in r.stdout,
+                  f"{label}: OpenXISF reads the unit xisfconv made of it: {r.stdout.strip()[:120]} {r.stderr.strip()[:200]}")
+
+    # ---- what a header is followed to, and what it is not
+    a = test_image(np.uint16, 6, 8, 1, 7)
+    pixels = as_planes(a).astype("<u2").tobytes()
+    vector = np.arange(400, dtype="<f8").tobytes()
+    template = ('<?xml version="1.0" encoding="UTF-8"?>\n<xisf version="1.0" xmlns="http://www.pixinsight.com/xisf">'
+                '<Image geometry="8:6:1" sampleFormat="UInt16" colorSpace="Gray" %s>'
+                '<Property id="P:Vector" type="F64Vector" length="400" %s/></Image></xisf>')
+    policy = os.path.join(d, "policy")
+    elsewhere = os.path.join(d, "elsewhere")
+    for directory in (policy, elsewhere, os.path.join(policy, "below")):
+        os.makedirs(directory, exist_ok=True)
+
+    def unit_of(name, image_location, vector_location='location="inline:base64">%s</Property><Property id="P:None" type="Int32" value="1"' %
+                base64.b64encode(vector).decode()):
+        path = os.path.join(policy, name)
+        open(path, "wb").write((template % (image_location, vector_location)).encode())
+        return path
+
+    def converted(unit, *options):
+        out = os.path.join(policy, "out.fits")
+        if os.path.exists(out):
+            os.remove(out)
+        r = run(unit, "-o", out, *options, expect_ok=False)
+        return r, (fits_planes(out)[0] if r.returncode == 0 and os.path.exists(out) else None)
+
+    refused = "a header is followed only to files in its own directory"
+    for where, name in ((policy, "whole.dat"), (os.path.join(policy, "below"), "whole.dat"), (elsewhere, "whole (1).dat"), (elsewhere, "with space.dat")):
+        open(os.path.join(where, name), "wb").write(pixels)
+    slashes = lambda path: os.path.abspath(path).replace(os.sep, "/")   # noqa: E731
+    outside = slashes(os.path.join(elsewhere, "whole (1).dat")).replace("(", "\\(").replace(")", "\\)")
+    cases = [
+        ("a file that is one block, beside the header", 'location="path(@header_dir/whole.dat)"', None, None),
+        ("... in a directory below", 'location="path(@header_dir/below/whole.dat)"', None, None),
+        ("... with more slashes than needed", 'location="path(@header_dir//below///whole.dat)"', None, None),
+        ("an absolute path", 'location="path(%s)"' % outside, "which the header names by an absolute path; " + refused, None),
+        ("a path that climbs out of the directory", 'location="path(@header_dir/../elsewhere/with space.dat)"',
+         "which leads out of the directory of the header; " + refused, None),
+        ("a path that climbs out and comes back", 'location="path(@header_dir/below/../../policy/whole.dat)"', "leads out of the directory", None),
+        ("a file: URL", 'location="url(file://%s%s)"' % ("" if slashes(elsewhere).startswith("/") else "/",
+                                                        slashes(os.path.join(elsewhere, "with space.dat")).replace(" ", "%20")),
+         "which the header names by a URL; " + refused, None),
+        ("a URL on a network", 'location="url(https://example.com/pixels.dat)"', "nothing is fetched from a network", "nothing is fetched from a network"),
+        ("a path that is neither", 'location="path(whole.dat)"', "neither an absolute path nor one that begins with @header_dir/",
+         "neither an absolute path nor one that begins with @header_dir/"),
+        ("a path without an end", 'location="path(@header_dir/whole.dat"', "malformed location", "malformed location"),
+        ("an identifier that is no number", 'location="path(@header_dir/whole.dat):0xZZ"', "malformed location", "malformed location"),
+        ("an identifier beyond 64 bits", 'location="path(@header_dir/whole.dat):0x10000000000000000"', "malformed location", "malformed location"),
+        ("a path of nothing", 'location="path(@header_dir/)"', "malformed location", "malformed location"),
+        ("an attachment", 'location="attachment:4096:96"', "nothing is attached to it", "nothing is attached to it"),
+    ]
+    for number, (what, location, default_error, anywhere_error) in enumerate(cases):
+        unit = unit_of(f"case{number}.xish", location)
+        r, got = converted(unit)
+        if default_error is None:
+            check(got is not None and np.array_equal(got, as_planes(a)), f"{what}: read: {r.stderr.strip()[:200]}")
+        else:
+            check(r.returncode == 1 and default_error in r.stderr and got is None and not leftovers(policy),
+                  f"{what} is not followed: {r.stderr.strip()[:260]}")
+        r, got = converted(unit, "--external-files", "anywhere")
+        if anywhere_error is None:
+            check(got is not None and np.array_equal(got, as_planes(a)), f"{what}: read with --external-files anywhere: {r.stderr.strip()[:200]}")
+        else:
+            check(r.returncode == 1 and anywhere_error in r.stderr and got is None, f"{what}: not with --external-files anywhere either: {r.stderr.strip()[:200]}")
+        r, got = converted(unit, "--external-files", "none")
+        check(r.returncode == 1 and got is None and ("no file but the header is to be opened" in r.stderr or anywhere_error and anywhere_error in r.stderr),
+              f"{what}: --external-files none: {r.stderr.strip()[:200]}")
+    r = run(unit_of("x.xish", 'location="path(@header_dir/whole.dat)"'), "--external-files", "everywhere", expect_ok=False)
+    check(r.returncode == 2 and "header-dir, anywhere or none" in r.stderr, "--external-files with another word")
+    # a link in the directory that leads out of it
+    link = os.path.join(policy, "link.dat")
+    try:
+        if os.path.lexists(link):
+            os.remove(link)
+        os.symlink(os.path.join(elsewhere, "with space.dat"), link)
+    except (OSError, NotImplementedError, AttributeError):
+        skipped.append("symbolic links (a link that leads out of the directory of a header)")
+    else:
+        unit = unit_of("link.xish", 'location="path(@header_dir/link.dat)"')
+        r, got = converted(unit)
+    if os.path.islink(link) and os.sep == "/" and "\\" in run("--info", unit).stdout.split("data in:")[1].splitlines()[0]:
+        # (a Windows program that is run on another system does not see that system's links: they are files to it)
+        skipped.append("symbolic links that lead out of the directory of a header (the program is not of this system)")
+    elif os.path.islink(link):
+        check(r.returncode == 1 and "behind a symbolic link that does not lead to a file in the directory of the header" in r.stderr and got is None and
+              "with space.dat" not in r.stderr, f"a link that leads out is not followed, and where it leads is not told: {r.stderr.strip()[:300]}")
+        # ... nor whether there is something where it leads: a link to nothing is told the same way
+        nowhere = os.path.join(policy, "nowhere.dat")
+        if os.path.lexists(nowhere):
+            os.remove(nowhere)
+        os.symlink(os.path.join(elsewhere, "no such file"), nowhere)
+        r2, got = converted(unit_of("nowhere.xish", 'location="path(@header_dir/nowhere.dat)"'))
+        check(r2.returncode == 1 and got is None and
+              r2.stderr.replace("nowhere", "link") == r.stderr, f"a link out of the directory to nothing reads the same: {r2.stderr.strip()[:300]}")
+        r, got = converted(unit, "--external-files", "anywhere")
+        check(got is not None and np.array_equal(got, as_planes(a)), "... unless that is allowed")
+        inside = os.path.join(policy, "inside.dat")
+        if os.path.lexists(inside):
+            os.remove(inside)
+        os.symlink("whole.dat", inside)
+        r, got = converted(unit_of("inside.xish", 'location="path(@header_dir/inside.dat)"'))
+        check(got is not None and np.array_equal(got, as_planes(a)), f"a link that stays in the directory is followed: {r.stderr.strip()[:200]}")
+    # a block that is one of many is left out with a warning; the image is converted
+    unit = unit_of("property.xish", 'location="path(@header_dir/whole.dat)"', 'location="path(%s)"' % outside)
+    r, got = converted(unit)
+    check(got is not None and np.array_equal(got, as_planes(a)) and "property P:Vector is left out: it is in " in r.stderr and refused in r.stderr,
+          f"a property in a file the header is not followed to is left out, with a warning: {r.stderr.strip()[:260]}")
+    r = run("--verify", unit, expect_ok=False)
+    check(r.returncode == 0 and "NOT FULLY CHECKED" in r.stdout and "P:Vector" in r.stdout, f"--verify calls it not checked: {r.stdout.strip()[:260]}")
+    r = run("--info", unit)
+    check(r.stdout.count("  data in:") == 2 and slashes(os.path.join(elsewhere, "whole (1).dat")) in r.stdout.replace("\\", "/"),
+          f"--info names the files of the unit, also one it does not read: {r.stdout[:400]}")
+    # a monolithic file holds all of its data: one that names a block in another file is not followed
+    # there by its own word, not even to the file beside it (it is what people are sent as "an image")
+    mono = os.path.join(policy, "mono.xisf")
+    hdr = (template % ('location="path(@header_dir/whole.dat)"', 'location="inline:hex">%s</Property><Property id="P:None" type="Int32" value="1"' % vector.hex())).encode()
+    open(mono, "wb").write(b"XISF0100" + len(hdr).to_bytes(4, "little") + bytes(4) + hdr)
+    r, got = converted(mono)
+    check(r.returncode == 1 and got is None and "this is a monolithic XISF file, which holds all of its data: only a header file (.xish) is followed" in r.stderr,
+          f"a monolithic file with a block in another file is not followed there: {r.stderr.strip()[:300]}")
+    r, got = converted(mono, "--external-files", "anywhere")
+    check(got is not None and np.array_equal(got, as_planes(a)) and "names data in other files" in r.stderr,
+          f"... unless a header may lead anywhere; then it is read, with a warning: {r.stderr.strip()[:200]}")
+    # the same holds for a header file that is not named as one
+    misnamed = unit_of("misnamed.xisf", 'location="path(@header_dir/whole.dat)"')
+    r, got = converted(misnamed)
+    check(r.returncode == 1 and got is None and "this header file does not have the name of one: only a header file (.xish) is followed" in r.stderr,
+          f"a header file under another name is not followed either: {r.stderr.strip()[:300]}")
+    r, got = converted(misnamed, "--external-files", "anywhere")
+    check(got is not None and np.array_equal(got, as_planes(a)), "... unless a header may lead anywhere")
+    r = run("--info", misnamed)
+    check("distributed unit" in r.stdout and "in 1 file," in r.stdout and "not read: the header is not followed there" in r.stdout,
+          f"--info says what it is and what is not read: {r.stdout[:300]}")
+    # what a file declares for its properties is held against the bytes it brings, not against a large
+    # file its header happens to name
+    big = os.path.join(policy, "big.bin")
+    with open(big, "wb") as f:
+        f.truncate(64 << 20)        # (with the 256 MiB every file is allowed, enough for the 300 MiB that are declared)
+    bomb = 'location="inline:base64" compression="zlib:314572800">%s</Property><Property id="P:None" type="Int32" value="1"' % base64.b64encode(zlib.compress(bytes(64))).decode()
+    said = "declare more data than a file of its size can hold"
+    for name, extra in (("budget.xish", ""), ("budget-named.xish", '<Extra location="path(@header_dir/big.bin)"/>')):
+        path = unit_of(name, 'location="path(@header_dir/whole.dat)"', bomb)
+        text = open(path).read().replace("</xisf>", extra + "</xisf>")
+        open(path, "w").write(text)
+        r, got = converted(path)
+        check(said in r.stderr, f"a property that declares 300 MiB in a header of a few hundred bytes ({name}): {r.stderr.strip()[:300]}")
+    os.remove(big)
+    # the pixels of an image that are a whole file of another size
+    open(os.path.join(policy, "short.dat"), "wb").write(pixels[:-2])
+    r, got = converted(unit_of("short.xish", 'location="path(@header_dir/short.dat)"'))
+    check(r.returncode == 1 and "geometry requires 96" in r.stderr, f"a file that is not the size of the image: {r.stderr.strip()[:200]}")
+    # a header whose root element has a namespace prefix is a header
+    prefixed = unit_of("prefixed.xish", 'location="path(@header_dir/whole.dat)"')
+    text = open(prefixed).read().replace('<xisf version="1.0" xmlns="http://www.pixinsight.com/xisf">', '<x:xisf version="1.0" xmlns:x="http://www.pixinsight.com/xisf">')
+    open(prefixed, "w").write(text.replace("<Image", "<x:Image").replace("</Image>", "</x:Image>").replace("<Property", "<x:Property")
+                              .replace("</Property>", "</x:Property>").replace("</xisf>", "</x:xisf>"))
+    r, got = converted(prefixed)
+    check(got is not None and np.array_equal(got, as_planes(a)), f"a header with a namespace prefix: {r.stderr.strip()[:200]}")
+    # what is no header file
+    for name, content, message in (("blocks.xisb", b"XISB0100" + bytes(24), "XISF data blocks file (.xisb)"),
+                                   ("picture.xish", b'<?xml version="1.0"?>\n<svg xmlns="http://www.w3.org/2000/svg"/>', "not an XISF header"),
+                                   ("broken.xish", b'<?xml version="1.0"?>\n<xisf version="1.0"><Image', "XML"),
+                                   ("empty.xish", b"", "too short")):
+        path = os.path.join(policy, name)
+        open(path, "wb").write(content)
+        r, got = converted(path)
+        check(r.returncode == 1 and message in r.stderr and got is None, f"{name} is no header file: {r.stderr.strip()[:200]}")
+
+    # ---- data blocks files that are damaged, or not what the header says
+    broken = os.path.join(d, "broken")
+    os.makedirs(broken, exist_ok=True)
+    simple = ('<?xml version="1.0" encoding="UTF-8"?>\n<xisf version="1.0" xmlns="http://www.pixinsight.com/xisf">'
+              '<Image geometry="8:6:1" sampleFormat="UInt16" colorSpace="Gray" {0}>'
+              '<Property id="P:Vector" type="F64Vector" length="400" {1}/></Image></xisf>')
+
+    def broken_unit(name, change=None, header=None, **layout):
+        path = os.path.join(broken, name + ".xish")
+        write_unit(path, simple, [Block(pixels), Block(vector, codec="zlib", checksum="sha1")], **layout)
+        data = os.path.join(broken, name + ".xisb")
+        if change:
+            raw = bytearray(open(data, "rb").read())
+            raw = change(raw)
+            open(data, "wb").write(bytes(raw))
+        if header:
+            text = header(open(path, "rb").read())
+            open(path, "wb").write(text)
+        out = os.path.join(broken, "out.fits")
+        if os.path.exists(out):
+            os.remove(out)
+        r = run(path, "-o", out, expect_ok=False)
+        return r, os.path.exists(out), path
+
+    r, written, good = broken_unit("good")
+    check(r.returncode == 0 and written, "the unit these are made of is read")
+
+    def poke(position, fmt, *values):
+        def change(raw):
+            struct.pack_into(fmt, raw, position, *values)
+            return raw
+        return change
+
+    first = 16 + 16      # the first element of the index
+    damage = [
+        ("truncated in the pixels", lambda raw: raw[:16 + 16 + 80 + 40], {}, "lies beyond the end of the file"),
+        ("truncated in the index", lambda raw: raw[:40], {}, "more than the file has room for"),
+        ("without its signature", lambda raw: b"XISF0100" + raw[8:], {}, "is not an XISF data blocks file"),
+        ("of a few bytes", lambda raw: raw[:10], {}, "too short to be an XISF data blocks file"),
+        ("with an index that runs in a circle", poke(16 + 8, "<Q", 16), {}, "runs in a circle"),
+        ("with a node beyond the file", poke(16 + 8, "<Q", 1 << 40), {}, "beyond the end of the file"),
+        ("with a node of more elements than fit", poke(16, "<I", 0xFFFFFFFF), {}, "more than the file has room for"),
+        ("whose block lies beyond it", poke(first + 8, "<Q", 1 << 50), {}, "lies beyond the end of the file"),
+        ("whose block has no end", poke(first + 16, "<Q", 0xFFFFFFFFFFFFFFFF), {}, "lies beyond the end of the file"),
+        ("whose block is a free element", poke(first + 8, "<QQ", 0, 0), {}, "is a free index element"),
+        ("that has another block under that identifier", poke(first, "<Q", 12345), {}, "has no block 0x4d373e33756e480f (2 in its index)"),
+    ]
+    for what, change, layout, message in damage:
+        r, written, _ = broken_unit("damaged", change, **layout)
+        check(r.returncode == 1 and message in r.stderr and not written and not leftovers(broken),
+              f"a data blocks file {what}: {r.stderr.strip()[:240]}")
+    os.remove(os.path.join(broken, "damaged.xisb"))
+    out = os.path.join(broken, "out.fits")
+    r = run(os.path.join(broken, "damaged.xish"), "-o", out, expect_ok=False)
+    check(r.returncode == 1 and "is not there" in r.stderr and "damaged.xisb" in r.stderr and not os.path.exists(out),
+          f"a unit without its data blocks file: {r.stderr.strip()[:240]}")
+    r = run("--verify", os.path.join(broken, "damaged.xish"), expect_ok=False)
+    check(r.returncode == 1 and "FAILED" in r.stdout and "is not there" in r.stdout, "--verify of such a unit fails")
+    r = run("--info", os.path.join(broken, "damaged.xish"))
+    check("in 1 file," in r.stdout and "damaged.xisb  (not there" in r.stdout, f"--info counts the files that are there: {r.stdout[:300]}")
+    # an index whose nodes lie in each other: a megabyte of them would name a gigabyte of blocks
+    def overlapping(raw):
+        end = len(raw)
+        struct.pack_into("<Q", raw, 16 + 8, end)                       # the first node leads to one at the end,
+        raw += struct.pack("<IIQ", 1, 0, 0) + bytes(40)                # which is complete,
+        struct.pack_into("<Q", raw, end + 8, 16 + 16 + 32)              # and leads to one that lies in the first
+        return raw
+    r, written, _ = broken_unit("overlap", overlapping)
+    check(r.returncode == 1 and "lies in another of its nodes" in r.stderr and not written, f"an index whose nodes overlap: {r.stderr.strip()[:240]}")
+    # two blocks under one identifier: the first is the block, and that is said
+    r, written, path = broken_unit("twice", poke(first + 40, "<Q", 0x4d373e33756e480f), header=lambda h: h.replace(b"0x4d373e33756e4be0", b"0x4d373e33756e480f"))
+    check("has the identifier of an earlier one" in r.stderr, f"two blocks under one identifier are named: {r.stderr.strip()[:200]}")
+    # the index and the header disagree about a block
+    r, written, path = broken_unit("lengths", poke(first + 40 + 24, "<Q", 1234))
+    v = run("--verify", path, expect_ok=False)
+    check(r.returncode == 0 and written and v.returncode == 1 and "has an uncompressed length of 1234, the header one of 3200" in v.stdout,
+          f"an uncompressed length in the index that is not the header's: read as the header says, and --verify names it: {v.stdout.strip()[:260]}")
+    r, written, path = broken_unit("claimed", poke(first + 24, "<Q", 96))
+    check(r.returncode == 0 and written and "calls the block compressed, the header does not" in r.stderr, "... also for a block that is not compressed")
+    # a damaged block is found by its checksum, in the other file as in this one
+    r, written, path = broken_unit("flipped", lambda raw: raw[:-5] + bytes([raw[-5] ^ 0x40]) + raw[-4:])
+    v = run("--verify", path, expect_ok=False)
+    check("checksum mismatch" in r.stderr and v.returncode == 1 and "checksum mismatch on property P:Vector" in v.stdout,
+          f"a damaged block in the data blocks file: {v.stdout.strip()[:200]}")
+    # reserved fields that are not zero are read past, and named
+    r, written, path = broken_unit("reserved", lambda raw: raw[:8] + b"\1" + raw[9:20] + b"\1" + raw[21:])
+    check(r.returncode == 0 and written and "reserved field of the file is not zero" in r.stderr and "reserved field of the index node" in r.stderr,
+          f"reserved fields that are not zero: {r.stderr.strip()[:200]}")
+
+    # ---- XISF to XISF: one kind of unit to the other, and each to itself
+    rewrite = os.path.join(d, "rewrite")
+    os.makedirs(rewrite, exist_ok=True)
+    mono = os.path.join(rewrite, "rich.xisf")
+    expected = rich_xisf(mono, dict(codec="zlib", shuffle_item=2, checksum="sha1"), align=16)
+    original = xisf_blocks(mono)
+    r = run(mono, "-t", "xish")
+    unit = os.path.join(rewrite, "rich.xish")
+    blocks = unit_structure("a monolithic file, unpacked", unit, rewritten=True)
+    check([b["stored"] for b in blocks] == [b["stored"] for b in original] and [b["attr"] for b in blocks] == [b["attr"] for b in original] and
+          header_without_storage(xisf_header(unit)[1]) == header_without_storage(xisf_header(mono)[1]) and "kept as stored" in r.stdout,
+          f"-t xish: the blocks as they were stored, the header the same text: {r.stdout.strip()}")
+    # stored another way on the way
+    for options, attribute in ((["--codec", "none", "--checksum", "none"], lambda attr: attr["compression"] is None and attr["checksum"] is None),
+                               (["--codec", "lz4hc", "--checksum", "sha256"], lambda attr: (attr["compression"] or "lz4hc").startswith("lz4hc") and attr["checksum"].startswith("sha256:"))):
+        out = os.path.join(rewrite, "other.xish")
+        r = run(mono, "-o", out, "-f", *options)
+        blocks = unit_structure(f"unpacked with {' '.join(options)}", out, rewritten=True)
+        check([b["data"] for b in blocks] == [b["data"] for b in original] and all(attribute(b["attr"]) for b in blocks if b["kind"] == "path"),
+              f"unpacked with {' '.join(options)}: the same data, stored as asked: {r.stdout.strip()}")
+        back = os.path.join(rewrite, "other.xisf")
+        r = run(out, "-o", back, "-f")
+        mine = xisf_blocks(back)
+        check([b["stored"] for b in mine] == [b["stored"] for b in blocks] and all(b["kind"] != "path" for b in mine),
+              f"... and packed again: {r.stdout.strip()}")
+    # one image of several
+    out = os.path.join(rewrite, "one.xish")
+    r = run(mono, "-o", out, "-f", "-i", "2")
+    blocks = unit_structure("one image of a file, unpacked", out, rewritten=True)
+    check(len(blocks) == 1 and blocks[0]["data"] == as_planes(expected["small"]).tobytes(), "--image with -t xish: that image and its block alone")
+    # in place: the unit is replaced by itself, in its own two files
+    work = os.path.join(rewrite, "work")
+    os.makedirs(work, exist_ok=True)
+    unit = os.path.join(work, "frame.xish")
+    run(mono, "-o", unit, "--codec", "none", "--checksum", "none")
+    plain = {n: open(os.path.join(work, n), "rb").read() for n in os.listdir(work)}
+    r = run(unit, "--in-place", "--codec", "zlib", "--checksum", "sha1")
+    blocks = unit_structure("a unit rewritten in place", unit, rewritten=True)
+    check(sorted(os.listdir(work)) == ["frame.xisb", "frame.xish"] and [b["data"] for b in blocks] == [b["data"] for b in original] and
+          len(open(os.path.join(work, "frame.xisb"), "rb").read()) < len(plain["frame.xisb"]) and "read back and compared" in r.stdout,
+          f"--in-place on a header file replaces the header and its data blocks file: {r.stdout.strip()}")
+    now = {n: open(os.path.join(work, n), "rb").read() for n in os.listdir(work)}
+    r = run(unit, "--in-place", "--codec", "zlib", "--checksum", "sha1")
+    check("left unchanged" in r.stdout and now == {n: open(os.path.join(work, n), "rb").read() for n in os.listdir(work)},
+          "... and leaves a unit alone that is stored as asked")
+    r = run(unit, "-t", "xish", expect_ok=False)
+    check(r.returncode == 1 and "--in-place" in r.stderr and now == {n: open(os.path.join(work, n), "rb").read() for n in os.listdir(work)},
+          f"a unit is not written over itself without --in-place: {r.stderr.strip()[:160]}")
+    # the data of the input is not written over: another header that would use its data blocks file
+    r = run(unit, "-o", os.path.join(work, "frame.xisb"), "-t", "xisf", "-f", expect_ok=False)
+    check(r.returncode == 1 and "a file the input reads its data from" in r.stderr and now["frame.xisb"] == open(os.path.join(work, "frame.xisb"), "rb").read(),
+          f"an output that is the data blocks file of the input: {r.stderr.strip()[:200]}")
+    shutil.copy(unit, os.path.join(work, "other.xish"))
+    os.rename(os.path.join(work, "frame.xish"), os.path.join(work, "moved.xish"))
+    r = run(os.path.join(work, "moved.xish"), "-o", os.path.join(work, "frame.xish"), "-f", expect_ok=False)
+    check(r.returncode == 1 and "is a file the input reads its data from" in r.stderr and now["frame.xisb"] == open(os.path.join(work, "frame.xisb"), "rb").read()
+          and not os.path.exists(os.path.join(work, "frame.xish")) and not leftovers(work),
+          f"an output whose data blocks file is the one the input reads: {r.stderr.strip()[:200]}")
+    # a header whose blocks are in other files than the one of its name, and in a file that is one block:
+    # in place, they all come into the data blocks file of the header's name, and the others stay
+    r = run(os.path.join(work, "moved.xish"), "--in-place", "--codec", "none", "--checksum", "none")
+    blocks = unit_structure("a unit whose data was in a file of another name, in place", os.path.join(work, "moved.xish"), rewritten=True)
+    check(sorted(os.listdir(work)) == ["frame.xisb", "moved.xisb", "moved.xish", "other.xish"] and now["frame.xisb"] == open(os.path.join(work, "frame.xisb"), "rb").read()
+          and [b["data"] for b in blocks] == [b["data"] for b in original], f"in place, the blocks come into the file of the header's name: {sorted(os.listdir(work))}")
+    r = run("--verify", os.path.join(work, "other.xish"))
+    check(": OK" in r.stdout, "... and the file they were in is still what another header reads")
+    # a data blocks file that holds more than this header names (another header's blocks) is not replaced in place
+    shared = os.path.join(rewrite, "shared")
+    os.makedirs(shared, exist_ok=True)
+    one = test_image(np.uint16, 5, 6, 1, 71)
+    two = test_image(np.uint16, 5, 6, 1, 72)
+    shape = ('<?xml version="1.0" encoding="UTF-8"?>\n<xisf version="1.0" xmlns="http://www.pixinsight.com/xisf">'
+             '<Image geometry="6:5:1" sampleFormat="UInt16" colorSpace="Gray" location="path(@header_dir/a.xisb):%d"/></xisf>')
+    write_xisb(os.path.join(shared, "a.xisb"), [(as_planes(one).astype("<u2").tobytes(), 0), (as_planes(two).astype("<u2").tobytes(), 0)], [11, 22])
+    open(os.path.join(shared, "a.xish"), "w").write(shape % 11)
+    open(os.path.join(shared, "b.xish"), "w").write(shape % 22)
+    kept = open(os.path.join(shared, "a.xisb"), "rb").read()
+    r = run(os.path.join(shared, "a.xish"), "--in-place", "--checksum", "sha1", expect_ok=False)
+    check(r.returncode == 1 and "also holds 1 block that this header does not name" in r.stderr and
+          kept == open(os.path.join(shared, "a.xisb"), "rb").read() and not leftovers(shared),
+          f"in place, a data blocks file with another header's block is not replaced: {r.stderr.strip()[:300]}")
+    r = run("--verify", os.path.join(shared, "b.xish"))
+    check(": OK" in r.stdout, "... and the other header still has its image")
+    r = run(os.path.join(shared, "a.xish"), "-o", os.path.join(shared, "a-own.xish"), "--codec", "zlib")
+    check(r.returncode == 0 and ": OK" in run("--verify", os.path.join(shared, "a-own.xish")).stdout and
+          kept == open(os.path.join(shared, "a.xisb"), "rb").read(), "under another name the unit gets a data blocks file of its own")
+    r = run(os.path.join(shared, "a.xish"), "--in-place", "--checksum", "sha1", "--force")
+    check(r.returncode == 0 and len(read_xisb(os.path.join(shared, "a.xisb"))["elements"]) == 1, "--force replaces it all the same")
+    # ... whatever way this header has of naming the file: as a whole, or by a block that is not read
+    inline = base64.b64encode(as_planes(one).astype("<u2").tobytes()).decode()
+    for name, body in (("whole", '<Image geometry="6:5:1" sampleFormat="UInt16" colorSpace="Gray" location="inline:base64">%s</Image>'
+                                 '<Extra location="path(@header_dir/whole.xisb)"/>' % inline),
+                       ("unread", '<Image geometry="6:5:1" sampleFormat="UInt16" colorSpace="Gray" location="inline:base64">%s</Image>'
+                                  '<Image geometry="6:5:1" sampleFormat="UInt16" colorSpace="Gray" location="path(@header_dir/unread.xisb):153"/>' % inline)):
+        write_xisb(os.path.join(shared, name + ".xisb"), [(as_planes(one).astype("<u2").tobytes(), 0), (as_planes(two).astype("<u2").tobytes(), 0)], [1, 2])
+        open(os.path.join(shared, name + ".xish"), "w").write(
+            '<?xml version="1.0" encoding="UTF-8"?>\n<xisf version="1.0" xmlns="http://www.pixinsight.com/xisf">%s</xisf>' % body)
+        kept = open(os.path.join(shared, name + ".xisb"), "rb").read()
+        r = run(os.path.join(shared, name + ".xish"), "--in-place", "--checksum", "sha1", "-i", "0", expect_ok=False)
+        check(r.returncode == 1 and kept == open(os.path.join(shared, name + ".xisb"), "rb").read() and not leftovers(shared) and
+              ("does not name" in r.stderr if name == "whole" else "holds none of the blocks this header names" in r.stderr),
+              f"in place, a data blocks file of others' blocks that this header names {name} is not replaced: {r.stderr.strip()[:300]}")
+    r = run(os.path.join(shared, "unread.xish"), "--in-place", "--checksum", "sha1", "-i", "0", "--force", expect_ok=False)
+    check(r.returncode == 1 and "holds none of the blocks this header names" in r.stderr and
+          kept == open(os.path.join(shared, "unread.xisb"), "rb").read(), "a file that has none of the header's blocks is not replaced with --force either")
+    # ... nor a file the header is not followed to, or one whose index cannot be read: nothing is left to the
+    # reading, which --image may never come to
+    two_images = ('<Image geometry="6:5:1" sampleFormat="UInt16" colorSpace="Gray" location="inline:base64">%s</Image>'
+                  '<Image geometry="6:5:1" sampleFormat="UInt16" colorSpace="Gray" location="%%s"/>' % inline)
+    wrap = '<?xml version="1.0" encoding="UTF-8"?>\n<xisf version="1.0" xmlns="http://www.pixinsight.com/xisf">%s</xisf>'
+    blocks_of_two = [(as_planes(one).astype("<u2").tobytes(), 0), (as_planes(two).astype("<u2").tobytes(), 0)]
+    slashed = os.path.abspath(shared).replace(os.sep, "/")
+    for name, location, options, said in (
+            ("refused", "path(@header_dir/refused.xisb):1", ["--external-files", "none"], "is not followed to it"),
+            ("absolute", "path(%s/absolute.xisb):1" % slashed, [], "is not followed to it"),
+            ("byurl", "url(file://%s%s/byurl.xisb):1" % ("" if slashed.startswith("/") else "/", slashed.replace(" ", "%20")), [], "is not followed to it"),
+            ("noindex", "path(@header_dir/noindex.xisb):1", [], "cannot be read as one")):
+        target = os.path.join(shared, name + ".xisb")
+        if name == "noindex":
+            open(target, "wb").write(b"not an index at all, " * 20)
+        else:
+            write_xisb(target, blocks_of_two, [1, 2])
+        open(os.path.join(shared, name + ".xish"), "w").write(wrap % (two_images % location))
+        kept = open(target, "rb").read()
+        r = run(os.path.join(shared, name + ".xish"), "--in-place", "--checksum", "sha1", "-i", "0", *options, expect_ok=False)
+        check(r.returncode == 1 and said in r.stderr and kept == open(target, "rb").read() and not leftovers(shared),
+              f"in place with --image, a data blocks file that is {name} is not replaced unread: {r.stderr.strip()[:300]}")
+    # a file that begins as a data blocks file and whose index cannot be followed, named as a whole
+    open(os.path.join(shared, "circle.xisb"), "wb").write(b"XISB0100" + bytes(8) + struct.pack("<IIQ", 0, 0, 16) + bytes(64))
+    open(os.path.join(shared, "circle.xish"), "w").write(wrap % (two_images % "path(@header_dir/circle.xisb)"))
+    kept = open(os.path.join(shared, "circle.xisb"), "rb").read()
+    r = run(os.path.join(shared, "circle.xish"), "--in-place", "--checksum", "sha1", "-i", "0", expect_ok=False)
+    check(r.returncode == 1 and "cannot be read as one" in r.stderr and kept == open(os.path.join(shared, "circle.xisb"), "rb").read(),
+          f"... nor one that is named as a whole and is a data blocks file nobody can read: {r.stderr.strip()[:300]}")
+    # the blocks a header names are its own whichever way it writes the file, in whatever order
+    for name, first_location, second_location, image in (
+            ("mixed1", "path(%s/mixed1.xisb):1" % slashed, "path(@header_dir/mixed1.xisb):2", "1"),
+            ("mixed2", "path(@header_dir/nothing here/../mixed2.xisb):1", "path(@header_dir/mixed2.xisb):2", "1")):
+        write_xisb(os.path.join(shared, name + ".xisb"), blocks_of_two, [1, 2])
+        both = ('<Image geometry="6:5:1" sampleFormat="UInt16" colorSpace="Gray" location="%s"/>'
+                '<Image geometry="6:5:1" sampleFormat="UInt16" colorSpace="Gray" location="%s"/>' % (first_location, second_location))
+        open(os.path.join(shared, name + ".xish"), "w").write(wrap % both)
+        r = run("--info", os.path.join(shared, name + ".xish"))
+        # (a Windows program run elsewhere takes /tmp/... and Z:\tmp\... for two files to show, which they are not to open)
+        hybrid = os.sep == "/" and "\\" in r.stdout.split("data in:")[1].splitlines()[0]
+        check("in 2 files" in r.stdout and (hybrid or ("not read" not in r.stdout and "not there" not in r.stdout)),
+              f"a file that is written two ways, of which the second is followed, is read ({name}): {r.stdout[:200]}")
+        r = run(os.path.join(shared, name + ".xish"), "--in-place", "--checksum", "sha1", "-i", image, expect_ok=False)
+        check(r.returncode == 0 and len(read_xisb(os.path.join(shared, name + ".xisb"))["elements"]) == 1,
+              f"... and replaced in place: all of its blocks are this header's ({name}): {r.stderr.strip()[:300]}")
+    # a path that goes through a link and back is the file it leads to, not the one its words spell
+    try:
+        os.makedirs(os.path.join(shared, "a"), exist_ok=True)
+        os.makedirs(os.path.join(shared, "x"), exist_ok=True)
+        if not os.path.lexists(os.path.join(shared, "a", "L")):
+            os.symlink(os.path.join("..", "x"), os.path.join(shared, "a", "L"))
+    except (OSError, NotImplementedError, AttributeError):
+        skipped.append("symbolic links (a path through a link and back)")
+    else:
+        write_xisb(os.path.join(shared, "back.xisb"), blocks_of_two, [1, 2])
+        open(os.path.join(shared, "back.xish"), "w").write(wrap % (two_images % "path(@header_dir/a/L/../back.xisb):1"))
+        kept = open(os.path.join(shared, "back.xisb"), "rb").read()
+        if os.name != "posix":
+            # (Windows takes ".." out of a path by its words before it follows any link: there the path spells another file)
+            skipped.append("a path through a link and back (on Windows, \"..\" is taken by the words of the path)")
+        elif "\\" in run("--info", os.path.join(shared, "back.xish")).stdout.split("data in:")[1].splitlines()[0]:
+            skipped.append("a path through a link and back (the program is not of this system)")
+        else:
+            for options in (["--external-files", "none"], ["--external-files", "none", "--force"]):
+                r = run(os.path.join(shared, "back.xish"), "--in-place", "--checksum", "sha1", "-i", "0", *options, expect_ok=False)
+                check(r.returncode == 1 and "is not followed to it" in r.stderr and kept == open(os.path.join(shared, "back.xisb"), "rb").read(),
+                      f"in place, a file named through a link and back is known for the file it is ({' '.join(options)}): {r.stderr.strip()[:300]}")
+            shutil.copy(os.path.join(shared, "back.xish"), os.path.join(shared, "front.xish"))
+            r = run(os.path.join(shared, "front.xish"), "-o", os.path.join(shared, "back.xish"), "-i", "0", "--force", "--external-files", "none", expect_ok=False)
+            check(r.returncode == 1 and "is a file the input reads its data from" in r.stderr and kept == open(os.path.join(shared, "back.xisb"), "rb").read(),
+                  f"... and is no output of a rewrite of the unit that names it so: {r.stderr.strip()[:300]}")
+        # in place through a link to the header from another directory: the data is beside the link
+        os.makedirs(os.path.join(shared, "linked"), exist_ok=True)
+        if not os.path.lexists(os.path.join(shared, "linked", "l.xish")):
+            os.symlink(os.path.join("..", "x", "real.xish"), os.path.join(shared, "linked", "l.xish"))
+        run(mono, "-o", os.path.join(shared, "x", "real.xish"), "-f", "-q")
+        shutil.copy(os.path.join(shared, "x", "real.xisb"), os.path.join(shared, "linked", "real.xisb"))
+        r = run(os.path.join(shared, "linked", "l.xish"), "--in-place", "--checksum", "sha256", expect_ok=False)
+        if os.sep == "/" and "\\" in run("--info", os.path.join(shared, "back.xish")).stdout.split("data in:")[1].splitlines()[0]:
+            skipped.append("in place through a link to a header (the program is not of this system)")
+        else:
+            check(r.returncode == 1 and "link from another directory" in r.stderr and
+                  ": OK" in run("--verify", os.path.join(shared, "x", "real.xish")).stdout,
+                  f"in place through a link to the header from another directory is refused: {r.stderr.strip()[:300]}")
+    # the files a unit reads are no outputs and no temporary files, of a rewrite or of a conversion
+    alias = os.path.join(rewrite, "alias")
+    os.makedirs(alias, exist_ok=True)
+    unit = os.path.join(alias, "in.xish")
+    run(mono, "-o", unit, "-q")
+    data = open(os.path.join(alias, "in.xisb"), "rb").read()
+    r = run(unit, "-o", os.path.join(alias, "in.xisb"), "-t", "fits", "-f", expect_ok=False)
+    check(r.returncode == 1 and "is a file the input reads its data from" in r.stderr and data == open(os.path.join(alias, "in.xisb"), "rb").read(),
+          f"a conversion does not write over the data of its input: {r.stderr.strip()[:200]}")
+    r = run(unit, "-o", os.path.join(alias, "in.xisb"), "-t", "xisf", expect_ok=False)
+    check(r.returncode == 1 and "is a file the input reads its data from" in r.stderr, "that is said with or without --force")
+    try:
+        os.link(os.path.join(alias, "in.xisb"), os.path.join(alias, "out.xisb.part"))
+        os.link(os.path.join(alias, "in.xisb"), os.path.join(alias, "out.fits.part"))
+    except (OSError, NotImplementedError, AttributeError):
+        skipped.append("hard links (a temporary file that is the data of the input)")
+    else:
+        for args in (["-o", os.path.join(alias, "out.xish")], ["-o", os.path.join(alias, "out.fits")]):
+            r = run(unit, *args, "-f", expect_ok=False)
+            check(r.returncode == 1 and "is a file the input reads its data from" in r.stderr and
+                  data == open(os.path.join(alias, "in.xisb"), "rb").read() and not os.path.exists(args[1]),
+                  f"a temporary file that is the data of the input is not written to ({os.path.basename(args[1])}): {r.stderr.strip()[:200]}")
+        os.remove(os.path.join(alias, "out.xisb.part"))
+        os.remove(os.path.join(alias, "out.fits.part"))
+    # two files are not replaced in one step: if one of them cannot get its name, the unit that was there stays
+    def immutable(path, on):
+        try:
+            return subprocess.run(["chattr", "+i" if on else "-i", path], capture_output=True).returncode == 0
+        except OSError:
+            return False
+    locked = os.path.join(alias, "locked.xish")
+    run(mono, "-o", locked, "-q")
+    was = {n: open(os.path.join(alias, n), "rb").read() for n in ("locked.xish", "locked.xisb")}
+    if immutable(locked, True) and immutable(locked, False):
+        for part in ("locked.xish", "locked.xisb"):
+            for args, said in (([src, "-o", locked, "-f"], "the unit that was there is as it was"),
+                               ([mono, "-o", locked, "-f", "--checksum", "sha256"], "the unit that was there is as it was"),
+                               ([locked, "--in-place", "--checksum", "sha256"], "as it was")):
+                immutable(os.path.join(alias, part), True)
+                try:
+                    r = run(*args, expect_ok=False)
+                finally:
+                    immutable(os.path.join(alias, part), False)
+                now = {n: open(os.path.join(alias, n), "rb").read() for n in was}
+                litter = sorted(n for n in os.listdir(alias) if n.startswith("locked.") and n not in was)
+                check(r.returncode == 1 and said in r.stderr and now == was and not litter,
+                      f"{part} cannot be replaced ({' '.join(os.path.basename(a) for a in args)}): the unit stays, nothing is left: "
+                      f"{r.stderr.strip()[:200]} {litter}")
+        r = run(locked, "--in-place", "--checksum", "sha256")
+        check(r.returncode == 0 and ": OK" in run("--verify", locked).stdout and
+              sorted(n for n in os.listdir(alias) if n.startswith("locked.")) == ["locked.xisb", "locked.xish"], "and is replaced when it can be")
+    else:
+        skipped.append("a unit of which one file cannot be replaced, by a file that cannot be changed (needs chattr +i, as root on ext4 and the like)")
+    # The same with renames that fail for another reason (an I/O error): each step of the replacement, and
+    # the putting back. What was there before is there after, or the message says under which name it is.
+    shim = os.path.join(alias, "rename_shim.so")
+    source = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rename_shim.c")
+    built = False
+    if sys.platform.startswith("linux") and shutil.which("cc") and os.path.exists(source):
+        built = subprocess.run(["cc", "-shared", "-fPIC", "-o", shim, source, "-ldl"], capture_output=True).returncode == 0
+        if built:   # (a program that is linked statically takes no such library: then nothing fails)
+            probe = os.path.join(alias, "probe.xisf")
+            r = subprocess.run([EXE, mono, "-o", probe, "-q"], capture_output=True, text=True,
+                               env=dict(os.environ, LD_PRELOAD=shim, XISFCONV_TEST_FAIL_RENAME=".xisf.part>.xisf"))
+            built = r.returncode == 1 and "cannot rename" in r.stderr and not os.path.exists(probe)
+            for name in ("probe.xisf", "probe.xisf.part"):
+                if os.path.exists(os.path.join(alias, name)):
+                    os.remove(os.path.join(alias, name))
+    if built:
+        def failing(rules, *args):
+            return subprocess.run([EXE, *args], capture_output=True, text=True,
+                                  env=dict(os.environ, LD_PRELOAD=shim, XISFCONV_TEST_FAIL_RENAME=rules))
+        def files(prefix):
+            return {n: open(os.path.join(alias, n), "rb").read() for n in sorted(os.listdir(alias)) if n.startswith(prefix)}
+        steps = {"setting the old data aside": ".xisb>.replaced", "the new data": ".xisb.part>.xisb", "the new header": ".xish.part>.xish"}
+        commands = {"a conversion with --force": [src, "-o", locked, "-f"], "a rewrite with --force": [mono, "-o", locked, "-f", "--checksum", "sha512"],
+                    "in place": [locked, "--in-place", "--checksum", "sha512"]}
+        run(mono, "-o", locked, "-f", "-q")
+        was = files("locked.")
+        for step, rule in steps.items():
+            for what, args in commands.items():
+                r = failing(rule, *args)
+                check(r.returncode == 1 and "as it was" in r.stderr and files("locked.") == was and ": OK" in run("--verify", locked).stdout,
+                      f"{what}, and {step} fails: the unit that was there is as it was, and nothing else is left: "
+                      f"{r.stderr.strip()[-160:]} {sorted(files('locked.'))}")
+            # ... and if the old data cannot be put back either, the message says where it is
+            if step != "setting the old data aside":
+                for what, args in commands.items():
+                    r = failing(rule + ",.replaced>.xisb", *args)
+                    now = files("locked.")
+                    check(r.returncode == 1 and "is kept as" in r.stderr and "locked.xisb.replaced" in r.stderr and "as it was" not in r.stderr.split("is kept as")[0]
+                          and now.get("locked.xisb.replaced") == was["locked.xisb"] and now["locked.xish"] == was["locked.xish"],
+                          f"{what}, {step} fails and the old data cannot be put back: it is kept, and the message says where: {r.stderr.strip()[-200:]}")
+                    v = run("--verify", locked, expect_ok=False)
+                    check(v.returncode == 1 and "locked.xisb.replaced has that block" in v.stdout and "renamed to" in v.stdout,
+                          f"... and reading the unit says what that file is: {v.stdout.strip()[-260:]}")
+                    if os.path.exists(os.path.join(alias, "locked.xisb.replaced")):
+                        os.replace(os.path.join(alias, "locked.xisb.replaced"), os.path.join(alias, "locked.xisb"))
+                    check(files("locked.") == was, "... renamed back, the unit is as it was")
+        # a new unit: nothing is left of it; a file of the header's name that was there stays
+        fresh = os.path.join(alias, "fresh.xish")
+        for step, rule in list(steps.items())[1:]:
+            r = failing(rule, src, "-o", fresh)
+            check(r.returncode == 1 and "the unit is not written" in r.stderr and not files("fresh."), f"a new unit, and {step} fails: nothing is left: {r.stderr.strip()[-160:]}")
+        open(fresh, "wb").write(b"a file that was there")
+        r = failing(".xish.part>.xish", src, "-o", fresh, "-f")
+        check(r.returncode == 1 and files("fresh.") == {"fresh.xish": b"a file that was there"}, f"a file that was there under the name of the header stays: {sorted(files('fresh.'))}")
+        os.remove(fresh)
+        # one file: the file that is there stays until the new one has its name
+        single_out = os.path.join(alias, "kept.xisf")
+        shutil.copy(mono, single_out)
+        kept = open(single_out, "rb").read()
+        r = failing(".xisf.part>.xisf", src, "-o", single_out, "-f")
+        check(r.returncode == 1 and files("kept.") == {"kept.xisf": kept}, f"a monolithic output whose rename fails leaves the file that was there: {sorted(files('kept.'))}")
+    else:
+        skipped.append("renames that fail while a unit is replaced (Linux, a C compiler, and a program that loads tests/rename_shim.c)")
+    run(mono, "-o", locked, "-f", "-q")
+    r = run(locked, "--in-place", "--checksum", "sha256", "--external-files", "none", expect_ok=False)
+    check(r.returncode == 1 and "is not followed to it: a file that is not read is not replaced" in r.stderr and "does not name" not in r.stderr and
+          "already exists" not in r.stderr and ": OK" in run("--verify", locked).stdout,
+          f"--in-place on a unit whose data may not be read says that, and replaces nothing: {r.stderr.strip()[:200]}")
+    # -t says the kind of unit in so many words: a name that says the other one is an error, either way
+    r = run(mono, "-t", "xisf", "-o", os.path.join(alias, "said.xish"), expect_ok=False)
+    check(r.returncode == 2 and "-t xisf writes one monolithic file" in r.stderr and not os.path.exists(os.path.join(alias, "said.xish")),
+          f"-t xisf with the name of a header file: {r.stderr.strip()[:200]}")
+    r = run(locked, "--in-place", "-t", "xisf", "--checksum", "sha512")
+    check(r.returncode == 0 and os.path.exists(os.path.join(alias, "locked.xisb")) and "distributed unit" in run("--verify", locked).stdout,
+          f"--in-place -t xisf on a header file is XISF to XISF as ever, and the unit stays the kind its name says: {r.stderr.strip()[:200]}")
+    # the kind of a unit goes with its name: in place it stays what it is
+    single = os.path.join(alias, "single.xisf")
+    shutil.copy(mono, single)
+    before = open(single, "rb").read()
+    r = run(single, "--in-place", "-t", "xish", expect_ok=False)
+    check(r.returncode == 1 and "--in-place keeps the kind of unit" in r.stderr and before == open(single, "rb").read() and
+          not os.path.exists(os.path.join(alias, "single.xish")), f"--in-place -t xish on a monolithic file: {r.stderr.strip()[:200]}")
+    # names a header has to write with care: every one is read back, and is XML for any reader
+    import xml.etree.ElementTree as ET
+    names = ["amp&er", "par(en)s", "a&amp;b", "semi;colon and blank", "caf\u00e9"]
+    odd = os.path.join(rewrite, "names")
+    os.makedirs(odd, exist_ok=True)
+    # (what Windows has no file names for: asked of the program, which may be a Windows program run elsewhere)
+    if os.name != "nt" and run(src, "-o", os.path.join(odd, 'pro"be.fits'), "-q", expect_ok=False).returncode == 0:
+        names += ['quo"te', "lt<gt>", "tab\there", "back\\slash(", "new\nline"]
+    for name in names:
+        for source in (mono, src):
+            out = os.path.join(odd, name + ".xish")
+            r = run(source, "-o", out, "-f", "-q", expect_ok=False)
+            v = run("--verify", out, expect_ok=False)
+            try:
+                located = [e.get("location") for e in ET.parse(out).getroot().iter() if (e.get("location") or "").startswith("path(")]
+            except ET.ParseError as e:
+                located = [str(e)]
+            wanted = "path(@header_dir/%s.xisb):0x" % name.replace("(", "\\(").replace(")", "\\)")
+            check(r.returncode == 0 and ": OK" in v.stdout and located and all(text.startswith(wanted) for text in located) and
+                  os.path.exists(os.path.join(odd, name + ".xisb")),
+                  f"a unit named {name!r} ({'rewritten' if source == mono else 'written'}): {r.stderr.strip()[:120]} {v.stdout.strip()[:160]} {located[:1]}")
+    # a directory: header files are units, data blocks files are not
+    r = run("--verify", work)
+    check(r.stdout.count(": OK") == 2 and "frame.xisb" not in r.stdout and "moved.xisb" not in r.stdout, f"--verify of a directory: {r.stdout.strip()[:300]}")
+
+    # ---- OpenXISF, if it is here: what it writes is read
+    if OPENXISF:
+        theirs = os.path.join(d, "openxisf")
+        os.makedirs(theirs, exist_ok=True)
+        unit = os.path.join(theirs, "theirs.xish")
+        r = subprocess.run([os.path.join(OPENXISF, "distributed"), unit], capture_output=True, text=True)
+        ramp = (np.arange(256 * 192) % 65536).astype(np.uint16).reshape(1, 192, 256)
+        out = os.path.join(theirs, "theirs.fits")
+        r2 = run(unit, "-o", out)
+        compare("a distributed unit OpenXISF wrote", fits_planes(out)[0], ramp)
+        v = run("--verify", unit)
+        packed = os.path.join(theirs, "packed.xisf")
+        run(unit, "-o", packed)
+        again = os.path.join(theirs, "again.xish")
+        run(packed, "-o", again)
+        r3 = subprocess.run([os.path.join(OPENXISF, "read_pixels"), again], capture_output=True, text=True)
+        check(r.returncode == 0 and ": OK" in v.stdout and r3.returncode == 0 and "mean of channel 0: %g" % ramp.mean() in r3.stdout,
+              f"... verified, packed, unpacked, and read by OpenXISF again: {r3.stdout.strip()[:160]} {r3.stderr.strip()[:160]}")
+    else:
+        skipped.append("OpenXISF reads what xisfconv wrote and the reverse (set OPENXISF_BIN to the directory of its sample programs)")
 
 
 if __name__ == "__main__":
@@ -4751,7 +5654,7 @@ if __name__ == "__main__":
               test_xisf_fits_xisf_roundtrip, test_asdf_yaml, test_asdf_hand_written, test_asdf_output,
               test_asdf_python_files, test_asdf_roundtrips, test_export_from_fits_and_asdf, test_xisf_rewrite,
               test_verify, test_fits_tile_compressed, test_fits_tile_writing, test_property_round_trip,
-              test_downsampling_and_thumbnailer):
+              test_downsampling_and_thumbnailer, test_distributed_units):
         try:
             t()
         except Exception as e:  # noqa: BLE001

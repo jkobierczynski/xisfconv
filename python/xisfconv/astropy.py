@@ -27,6 +27,14 @@ and ROWORDER says BOTTOM-UP.
 The file may be any that xisfconv reads: XISF, and ASDF or FITS too (for FITS, astropy's
 own reader does more). When reading, a file is recognized as XISF by its first bytes; when
 writing, by the extension ``.xisf``.
+
+A distributed XISF unit is read and written by the name of its header file (``.xish``): the
+data blocks are in the file beside it that the header names (``.xisb``), and writing under
+such a name writes both. A header that comes from a stream without a file name, or from a
+packed file, has no directory where its data could be looked for: reading it is an error if it
+names other files. The same holds for what astropy fetched from a URL for the caller: that
+file is in a directory for temporary files, under a name that is not a header file's, and no
+file beside it is read.
 """
 
 import atexit
@@ -151,7 +159,15 @@ def _input(source):
                     name = _copy(packed, temporary)
             except (EOFError, zlib.error, lzma.LZMAError, OSError) as e:
                 raise _core.FormatError("%s: the packed file cannot be unpacked: %s" % (shown, e)) from None
-        with _core.File(name, _shown=shown) as file:
+        # A copy is not where the file was: the header of a distributed unit names files beside
+        # itself, and beside a copy in the directory for temporary files there are other
+        # people's files. Such a header is followed to none.
+        with _core.File(name, external_files="none" if temporary else None, _shown=shown) as file:
+            if temporary and file.external_files:
+                raise _core.NotAllowedError(
+                    "%s: this XISF header has its data in other files (%s), which are looked for beside the header "
+                    "file: read a distributed unit by the name of its header file (.xish), not from a stream or a "
+                    "packed file" % (file._name, ", ".join(os.path.basename(other) for other in file.external_files)))
             yield file
     finally:
         for copy in temporary:
@@ -430,20 +446,21 @@ def write_ccddata(ccd_data, filename, hdu_mask="MASK", hdu_uncertainty="UNCERT",
 
 
 def _is_xisf(origin, path, fileobj, *args, **kwargs):
+    try:
+        name = "" if path is None else os.fsdecode(os.fspath(path)).lower()
+    except TypeError:
+        name = ""
     if fileobj is not None:
         try:
             position = fileobj.tell()
             start = fileobj.read(len(_SIGNATURE))
             fileobj.seek(position)
-            return start == _SIGNATURE
         except (OSError, AttributeError, ValueError):
             return False
-    if path is not None:
-        try:
-            return os.fsdecode(os.fspath(path)).lower().endswith(".xisf")
-        except TypeError:
-            return False
-    return False
+        # A monolithic file by its signature. The header file of a distributed unit is an XML
+        # document like many others: it is one by its name (.xish), if it begins like one.
+        return start == _SIGNATURE or (name.endswith(".xish") and start.lstrip(b"\xef\xbb\xbf \t\r\n")[:1] == b"<")
+    return name.endswith((".xisf", ".xish"))
 
 
 io_registry.register_reader("xisf", CCDData, read_ccddata, force=True)

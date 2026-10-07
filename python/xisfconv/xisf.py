@@ -27,6 +27,11 @@ Reading
     - What the library reads is read: blocks compressed in subblocks, big-endian samples, the
       "Normal" pixel storage, 64-bit integer samples, data embedded in the header, ByteArray
       and complex vectors, a vector without elements, headers with text beyond ASCII.
+    - So is a distributed unit: ``XISF("frame.xish")`` reads the header file, and the data
+      blocks from the files that header names in its own directory (``frame.xisb``). The
+      ``location`` of such a block is ``("path", path, identifier)``. A header that names a
+      file somewhere else is not followed there: :class:`xisfconv.NotAllowedError`
+      (:func:`xisfconv.open` has an argument for that).
     - Values have the type the file states: a Float64 written as ``3`` is the float 3.0, a
       Boolean written as ``1`` is True, a complex scalar is a complex number, not-a-number and
       infinity are read. A String without text is ``""``. A String that has a ``value``
@@ -50,6 +55,8 @@ Reading
 
 Writing
     - The file is written under another name and renamed when it is complete.
+    - Under a name that ends in ``.xish`` the unit is written distributed: that file is the
+      header, and the data blocks go into the file of the same name that ends in ``.xisb``.
     - An array with the channels first is written with the geometry it has (the ``xisf``
       package writes its shape in the wrong order); a 2-D array is one channel.
     - Keyword values that are text are written as FITS strings, in quotes. Numbers, ``T`` and
@@ -95,7 +102,6 @@ not XISF, an image number the file does not have) or ``NotImplementedError`` (so
 not supported), the error raised here is one of those as well.
 """
 
-import os
 import platform
 import re
 import xml.etree.ElementTree as ET
@@ -204,8 +210,17 @@ def _local(tag):
     return tag.rsplit("}", 1)[-1] if isinstance(tag, str) else ""
 
 
+_EXTERNAL = re.compile(r"(path|url)\((.*)\)(?::(0[xX][0-9a-fA-F]+|[0-9]+))?\Z", re.S)
+
+
 def _location(text):
-    """("attachment", position, size), ["inline", encoding] or ["embedded"]."""
+    """("attachment", position, size), ["inline", encoding] or ["embedded"]; for a block in
+    another file ("path", path, identifier) or ("url", URL, identifier), with None for the
+    identifier if the block is the whole file."""
+    outside = _EXTERNAL.match(text)
+    if outside:
+        kind, where, identifier = outside.groups()
+        return (kind, where, None if identifier is None else int(identifier, 0 if identifier[:2] in ("0x", "0X") else 10))
     parts = text.split(":")
     if parts[0] == "attachment" and len(parts) == 3:
         try:
@@ -229,7 +244,8 @@ class XISF:
     class of the ``xisf`` package as far as a program sees it; the documentation of the module
     says where the two differ.
 
-    What is read: monolithic XISF files, their Image elements (grayscale and colour, 8 to 64
+    What is read: monolithic XISF files and the header files of distributed units (.xish, with
+    the data blocks in the files beside it that the header names), their Image elements (grayscale and colour, 8 to 64
     bits unsigned and 32 and 64 bits floating point), FITS keywords, and the properties of the
     images and of the file: scalars, strings, time points, vectors and matrices.
     """
@@ -394,7 +410,11 @@ class XISF:
         ``geometry``
             ``(width, height, channels)``
         ``location``
-            ``("attachment", position, size)``, ``["inline", encoding]`` or ``["embedded"]``
+            ``("attachment", position, size)``, ``["inline", encoding]`` or ``["embedded"]``;
+            for a block in another file ``("path", path, identifier)`` or
+            ``("url", URL, identifier)``: the path as the header has it (it begins with
+            ``@header_dir/`` for a file beside the header), the identifier the block has in
+            the index of a data blocks file, or None if the block is the whole file
         ``compression``
             ``(codec, uncompressed size, item size)`` if the pixels are compressed; the item
             size is None without byte shuffling
@@ -480,7 +500,9 @@ class XISF:
     @staticmethod
     def write(fname, im_data, creator_app=None, image_metadata=None, xisf_metadata=None, codec=None, shuffle=False,
               level=None):
-        """Writes an image to an XISF file, replacing a file of that name.
+        """Writes an image to an XISF file, replacing a file of that name. Under a name that
+        ends in ``.xish`` a distributed unit is written: the header there, the data blocks in
+        the file of the same name that ends in ``.xisb`` (which is replaced as well).
 
         im_data
             the pixels: ``[height, width, channels]`` with 1 or 3 channels, any other 3-D array
@@ -503,7 +525,8 @@ class XISF:
         level
             the compression level: zlib 1 to 9 (6 if None), lz4hc 1 to 12 (9), zstd 1 to 22 (3).
 
-        Returns ``(bytes_written, codec)``: the size of the file, and the codec as the file
+        Returns ``(bytes_written, codec)``: the size of the file (of a distributed unit: of
+        its two files), and the codec as the file
         names it ("zstd+sh" with byte shuffling), None if the pixels are not compressed.
         """
         data = np.asarray(im_data)
@@ -547,7 +570,8 @@ class XISF:
             raise _as(NotSupportedError, e) from None
         with _core.File(fname) as file:
             stored = file[0].detail("compression")
-        return os.path.getsize(fname), (stored.split(":")[0] if stored else None)
+            size = file.unit_size     # (of a distributed unit: the header file and its data blocks file)
+        return size, (stored.split(":")[0] if stored else None)
 
 
 # --- from the dictionaries a program holds to what xisfconv writes ---------------------------

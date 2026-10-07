@@ -137,6 +137,9 @@ struct Options {
     std::string checksum;        // XISF output: sha1, sha256, sha512, sha3-256 or sha3-512
     bool checksumNone = false;   // --checksum none (XISF -> XISF: remove checksums)
     bool inPlace = false;        // XISF -> XISF: replace the input file
+    bool distributed = false;    // -t xish: XISF output is a header file (.xish) and a data blocks file (.xisb)
+    bool monolithic = false;     // -t xisf, said in so many words: one file
+    xisfconv_external_files externalFiles = XISFCONV_EXTERNAL_HEADER_DIRECTORY;   // --external-files
     bool verifyMode = false;     // --verify: check the files, convert nothing
     std::optional<std::pair<double, double>> bounds;  // FITS/ASDF input: range of floating point data
     uint64_t subblockSize = 1u << 30;
@@ -162,16 +165,20 @@ void usage(std::ostream& os) {
     os << "xisfconv " << kVersion << " - convert between PixInsight XISF, FITS and ASDF images; export TIFF and PNG\n\n"
           "Usage: xisfconv [options] <file>...\n"
           "       XISF inputs are converted to FITS (default), ASDF, TIFF or PNG, or rewritten as XISF\n"
-          "       with another compression or checksum (-t xisf);\n"
+          "       with another compression or checksum (-t xisf). An XISF input is a monolithic file\n"
+          "       (.xisf) or the header file of a distributed unit (.xish), whose data is in the\n"
+          "       files that header names (.xisb); -t xish writes such a unit, -t xisf one file;\n"
           "       FITS inputs to XISF (default), ASDF, TIFF or PNG; tile-compressed FITS (.fits.fz)\n"
           "       is read like any FITS file, -t fits writes it as a plain FITS file, and -t fits -c\n"
           "       writes a FITS file tile-compressed;\n"
           "       ASDF inputs to XISF (default), FITS, TIFF or PNG.\n"
           "       xisfconv --verify <file or directory>... checks files without converting them.\n\n"
           "Output:\n"
-          "  -t, --to <fits|asdf|tiff|png|xisf>\n"
+          "  -t, --to <fits|asdf|tiff|png|xisf|xish>\n"
           "                              output format (default: fits for XISF input, xisf for FITS and ASDF\n"
-          "                              input, or taken from -o's extension)\n"
+          "                              input, or taken from -o's extension). xish: XISF as a distributed\n"
+          "                              unit, the header in <name>.xish and the data blocks in <name>.xisb\n"
+          "                              beside it (PixInsight itself opens monolithic .xisf files only)\n"
           "  -o, --output <file>         output file name (single input only)\n"
           "  -d, --outdir <dir>          directory for output files (default: next to each input)\n"
           "  -f, --force                 overwrite existing output files\n"
@@ -217,7 +224,14 @@ void usage(std::ostream& os) {
           "                              XISF bounds and taken as black:white for TIFF and PNG (default: 0:1\n"
           "                              if the data fits, else 0:65535 if it fits, else minimum:maximum)\n"
           "      --no-verify             don't verify data block checksums (XISF -> XISF: nor read the output\n"
-          "                              back, except with --in-place)\n\n"
+          "                              back, except with --in-place)\n"
+          "      --external-files <header-dir|anywhere|none>\n"
+          "                              XISF input: which files the header may name for its data.\n"
+          "                                header-dir (default) files in the directory of the header and below\n"
+          "                                anywhere   also absolute paths, file: URLs and where links lead\n"
+          "                                none       no file but the header itself\n"
+          "                              (a header is data from somewhere: it could name any file of this\n"
+          "                              machine as the pixels of an image. Nothing is fetched from a network)\n\n"
           "XISF, ASDF and FITS output:\n"
           "      --codec <zlib|zstd|lz4|lz4hc|none>\n"
           "                              compression codec (a codec implies --compress). XISF blocks are\n"
@@ -255,7 +269,7 @@ std::optional<xisfconv_format> formatFromExtension(const std::string& path) {
     if (e == ".fits" || e == ".fit" || e == ".fts") return XISFCONV_FORMAT_FITS;
     if (e == ".tif" || e == ".tiff") return XISFCONV_FORMAT_TIFF;
     if (e == ".png") return XISFCONV_FORMAT_PNG;
-    if (e == ".xisf") return XISFCONV_FORMAT_XISF;
+    if (e == ".xisf" || e == ".xish") return XISFCONV_FORMAT_XISF;   // (.xish: the header file of a distributed unit)
     if (e == ".asdf") return XISFCONV_FORMAT_ASDF;
     return std::nullopt;
 }
@@ -272,7 +286,7 @@ std::string outputPathFor(const std::string& input, const Options& opt, xisfconv
         case XISFCONV_FORMAT_TIFF: name += ".tif"; break;
         case XISFCONV_FORMAT_PNG: name += ".png"; break;
         case XISFCONV_FORMAT_ASDF: name += ".asdf"; break;
-        default: name += ".xisf"; break;
+        default: name += opt.distributed ? ".xish" : ".xisf"; break;
     }
     return fromPath(dir / name);
 }
@@ -430,8 +444,27 @@ void printXisfInfo(const Library& lib, const std::string& path, xisfconv_file* f
     size_t headerSize = 0;
     lib.check(xisfconv_header_text(f, &header, &headerSize));
     const size_t images = xisfconv_image_count(f);
-    std::cout << path << ": XISF " << xisfconv_file_detail(f, "version") << ", " << xisfconv_file_size(f) << " bytes, header "
-              << headerSize << " bytes, " << images << " image(s)\n";
+    const size_t others = xisfconv_external_count(f);
+    size_t there = 0;   // of the files the header names: those that are there and are read
+    for (size_t k = 0; k < others; ++k) there += xisfconv_external_status(f, k) == XISFCONV_OK;
+    if (std::string(xisfconv_file_detail(f, "unit")) == "distributed") {
+        // a header file: the unit is that file and those its header names
+        std::cout << path << ": XISF " << xisfconv_file_detail(f, "version") << ", distributed unit, " << xisfconv_unit_size(f)
+                  << " bytes in " << there + 1 << (there ? " files" : " file") << ", header " << headerSize << " bytes, "
+                  << images << " image(s)\n";
+    } else {
+        std::cout << path << ": XISF " << xisfconv_file_detail(f, "version") << ", " << xisfconv_file_size(f) << " bytes, header "
+                  << headerSize << " bytes, " << images << " image(s)\n";
+    }
+    for (size_t k = 0; k < others; ++k) {
+        const xisfconv_status status = xisfconv_external_status(f, k);
+        std::cout << "  data in:     " << xisfconv_external_file(f, k)
+                  << (status == XISFCONV_OK ? ""
+                      : status == XISFCONV_ERR_NOT_ALLOWED ? "  (not read: the header is not followed there, see --external-files)"
+                      : status == XISFCONV_ERR_UNSUPPORTED ? "  (not read: nothing is fetched from a network)"
+                      : "  (not there, or not a regular file)")
+                  << "\n";
+    }
     for (size_t i = 0; i < images; ++i) {
         const xisfconv_image_info img = infoOf(lib, f, i);
         auto detail = [&](const char* name) { return std::string(xisfconv_image_detail(f, i, name)); };
@@ -551,6 +584,11 @@ void rewriteXisfInput(const Library& lib, const std::string& input, const Option
     if (opt.bin > 1 || opt.fitWidth || opt.fitHeight || opt.scale > 0) {
         throw Error("--bin and --resize make a smaller picture: they are for TIFF and PNG output");
     }
+    if (opt.inPlace && opt.distributed && lowerExt(input) != ".xish") {
+        throw Error("--in-place keeps the kind of unit, which goes with the name of the file: under this name it stays "
+                    "one monolithic file (-t xish without --in-place writes a header file and its data blocks file)");
+    }
+
     xisfconv_rewrite_options r;
     xisfconv_rewrite_options_init(&r, sizeof r);
     std::string codec;  // as it is named in the report
@@ -706,8 +744,17 @@ bool parseArgs(int argc, char** argv, Options& opt, int& exitCode) {
             else if (v == "tiff" || v == "tif") opt.format = XISFCONV_FORMAT_TIFF;
             else if (v == "png") opt.format = XISFCONV_FORMAT_PNG;
             else if (v == "xisf") opt.format = XISFCONV_FORMAT_XISF;
+            else if (v == "xish") opt.format = XISFCONV_FORMAT_XISF;
             else if (v == "asdf") opt.format = XISFCONV_FORMAT_ASDF;
-            else throw Error("unknown output format '" + v + "' (use fits, asdf, tiff, png or xisf)");
+            else throw Error("unknown output format '" + v + "' (use fits, asdf, tiff, png, xisf or xish)");
+            opt.distributed = v == "xish";
+            opt.monolithic = v == "xisf";
+        } else if (a == "--external-files") {
+            const std::string v = toLower(need(i, a));
+            if (v == "header-dir") opt.externalFiles = XISFCONV_EXTERNAL_HEADER_DIRECTORY;
+            else if (v == "anywhere") opt.externalFiles = XISFCONV_EXTERNAL_ANYWHERE;
+            else if (v == "none") opt.externalFiles = XISFCONV_EXTERNAL_NONE;
+            else throw Error("--external-files expects header-dir, anywhere or none");
         } else if (a == "-o" || a == "--output") opt.output = need(i, a);
         else if (a == "-d" || a == "--outdir") opt.outdir = need(i, a);
         else if (a == "-b" || a == "--bits") {
@@ -820,7 +867,20 @@ bool parseArgs(int argc, char** argv, Options& opt, int& exitCode) {
     if (opt.inPlace && (!opt.output.empty() || !opt.outdir.empty())) throw Error("--in-place cannot be combined with -o or -d");
     if (!opt.output.empty() && opt.inputs.size() > 1) throw Error("-o/--output can only be used with a single input");
     if (!opt.output.empty() && !opt.format && !formatFromExtension(opt.output)) {
-        throw Error("cannot infer output format from '" + opt.output + "'; add --to fits|asdf|tiff|png|xisf");
+        throw Error("cannot infer output format from '" + opt.output + "'; add --to fits|asdf|tiff|png|xisf|xish");
+    }
+    // The kind of an XISF unit goes with the name of its file: .xish is a header file, any
+    // other name a monolithic file.
+    if (!opt.output.empty() && opt.format && *opt.format == XISFCONV_FORMAT_XISF) {
+        const bool header = lowerExt(opt.output) == ".xish";
+        if (opt.distributed && !header) {
+            throw Error("-t xish writes a header file, whose name ends in .xish (and its data blocks into the file of "
+                        "that name that ends in .xisb): '" + opt.output + "' is no such name");
+        }
+        if (opt.monolithic && header) {
+            throw Error("-t xisf writes one monolithic file, and '" + opt.output + "' is the name of a header file: use "
+                        "-t xish, or leave -t out (the kind of unit goes with the name), or give another name");
+        }
     }
     if (!opt.outdir.empty() && !fs::is_directory(toPath(opt.outdir))) throw Error("output directory does not exist: " + opt.outdir);
     return true;
@@ -941,6 +1001,7 @@ int run(int argc, char** argv) {
     }
     Library lib;
     lib.quiet = opt.quiet;
+    xisfconv_context_set_external_files(lib.ctx, opt.externalFiles);
     if (opt.verifyMode) return verifyFiles(lib, opt);
     int failures = 0;
     for (const auto& input : opt.inputs) {

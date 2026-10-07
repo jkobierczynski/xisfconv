@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <ctime>
 #include <fstream>
+#include <functional>
 #include <set>
 
 #include "codecs.hpp"
@@ -115,6 +116,7 @@ struct Block {
     uint64_t size = 0;
     std::vector<uint8_t> owned;
     std::string attributes;         // compression / subblocks / checksum, each with a leading space
+    uint64_t uncompressed = 0;      // the size before compression, if the block is stored compressed
 };
 
 // `raw`: the bytes to store, `itemSize` the size of the numbers they consist of (1 if none).
@@ -145,6 +147,7 @@ void prepareBlock(const uint8_t* raw, size_t rawSize, size_t itemSize, const Xis
             block.owned.swap(stored);
             block.data = block.owned.data();
             block.size = block.owned.size();
+            block.uncompressed = rawSize;
             block.attributes += " compression=\"" + opt.codec + (shuffle ? "+sh" : "") + ":" + std::to_string(rawSize) +
                                 (shuffle ? ":" + std::to_string(itemSize) : "") + "\"";
             if (chunks > 1) block.attributes += " subblocks=\"" + subblocks + "\"";
@@ -167,7 +170,7 @@ uint64_t alignUp(uint64_t v) { return (v + kAlignment - 1) / kAlignment * kAlign
 struct PropertyWriter {
     const XisfWriteOptions& opt;
     std::vector<Block>& blocks;
-    const std::vector<uint64_t>& positions;
+    const std::function<std::string(size_t)>& location;   // of a block that is not in the header, by its number
     bool layout;       // the first pass: blocks are prepared
     size_t next = 0;   // the block the next attached property uses
 
@@ -178,8 +181,7 @@ struct PropertyWriter {
             prepareBlock(data, size, itemSize, opt, blocks.back());
         }
         const size_t at = next++;
-        return " location=\"attachment:" + std::to_string(at < positions.size() ? positions[at] : 0) + ":" +
-               std::to_string(blocks[at].size) + "\"" + blocks[at].attributes + "/>\n";
+        return " location=\"" + location(at) + "\"" + blocks[at].attributes + "/>\n";
     }
 
     // (the header is built more than once: what there is to say is said the first time)
@@ -258,10 +260,22 @@ void writeXisf(const std::string& path, const std::vector<XisfOutImage>& images,
         ids.push_back(makeIdentifier(images[i].id, i, usedIds));
     }
 
+    const bool distributed = !opt.blocksPath.empty();
+    if (distributed && !isXisfBlocksFileName(opt.blocksName)) {
+        throw Error("the output cannot be a distributed unit under this name: a header names its data blocks file, and holds "
+                    "only names that are valid UTF-8 text; choose another output name", ErrorKind::Argument);
+    }
     const std::string created = utcTimestamp();
     bool layout = true;   // the first header that is built finds out which properties are attached
-    auto buildHeader = [&](const std::vector<uint64_t>& positions) {
-        PropertyWriter properties{opt, blocks, positions, layout, images.size()};
+    std::vector<uint64_t> positions(images.size(), 0);
+    std::vector<uint64_t> blockIds;   // distributed: the identifier of each block in the data blocks file
+    // Where a block is that is not in the header: attached to this file, or in the data blocks file.
+    const std::function<std::string(size_t)> location = [&](size_t at) {
+        if (distributed) return xmlAttributeValue(xisfBlocksFileLocation(opt.blocksName, at < blockIds.size() ? blockIds[at] : 0));
+        return "attachment:" + std::to_string(at < positions.size() ? positions[at] : 0) + ":" + std::to_string(blocks[at].size);
+    };
+    auto buildHeader = [&]() {
+        PropertyWriter properties{opt, blocks, location, layout, images.size()};
         std::string x;
         x += "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
         x += "<!--\nExtensible Image Serialization Format - XISF version 1.0\nCreated with xisfconv " +
@@ -280,7 +294,7 @@ void writeXisf(const std::string& path, const std::vector<XisfOutImage>& images,
             }
             x += std::string(" colorSpace=\"") + (img.rgb ? "RGB" : "Gray") + "\"";
             if (!hostIsLittleEndian() && sampleBytes(px.format) > 1) x += " byteOrder=\"big\"";
-            x += " location=\"attachment:" + std::to_string(positions[i]) + ":" + std::to_string(blocks[i].size) + "\"";
+            x += " location=\"" + location(i) + "\"";
             x += blocks[i].attributes + ">\n";
             for (const auto& k : img.keywords) {
                 x += "<FITSKeyword name=\"" + xmlEscape(k.name) + "\" value=\"" + xmlEscape(k.value) +
@@ -305,7 +319,10 @@ void writeXisf(const std::string& path, const std::vector<XisfOutImage>& images,
             x += "<Property id=\"XISF:CreatorApplication\" type=\"String\">" + xmlText(opt.creatorApplication, false) + "</Property>\n";
             x += "<Property id=\"XISF:CreatorModule\" type=\"String\">xisfconv " + std::string(kVersion) + "</Property>\n";
         }
-        x += "<Property id=\"XISF:BlockAlignmentSize\" type=\"UInt16\" value=\"" + std::to_string(kAlignment) + "\"/>\n";
+        // (the alignment of the blocks attached to a monolithic file; a header file has none)
+        if (!distributed) {
+            x += "<Property id=\"XISF:BlockAlignmentSize\" type=\"UInt16\" value=\"" + std::to_string(kAlignment) + "\"/>\n";
+        }
         if (!opt.codec.empty()) {
             x += "<Property id=\"XISF:CompressionCodecs\" type=\"String\">" + opt.codec +
                  (opt.shuffle ? "+sh" : "") + "</Property>\n";
@@ -317,12 +334,57 @@ void writeXisf(const std::string& path, const std::vector<XisfOutImage>& images,
         return x;
     };
 
+    const auto writeBlocks = [&](std::ofstream& out, const std::string& name, uint64_t pos) {
+        const std::vector<char> zeros(kAlignment, 0);
+        for (size_t i = 0; i < blocks.size(); ++i) {
+            if (positions[i] > pos) out.write(zeros.data(), static_cast<std::streamsize>(positions[i] - pos));
+            // Write in pieces: some platforms limit a single write to 2 GiB.
+            uint64_t done = 0;
+            while (done < blocks[i].size) {
+                const uint64_t n = std::min<uint64_t>(blocks[i].size - done, 1u << 30);
+                out.write(reinterpret_cast<const char*>(blocks[i].data + done), static_cast<std::streamsize>(n));
+                done += n;
+            }
+            pos = positions[i] + blocks[i].size;
+            if (!out) throw Error("write error on " + name, ErrorKind::Io);
+        }
+        out.close();
+        if (!out) throw Error("write error on " + name, ErrorKind::Io);
+    };
+
+    if (distributed) {
+        // The header is the whole of its file. The blocks go into the data blocks file, behind an
+        // index of one node that has them all, each under an identifier the header names it by.
+        std::string header = buildHeader();   // (finds out which properties have a block there)
+        blockIds = newXisbIds(blocks.size());
+        header = buildHeader();
+        positions.assign(blocks.size(), 0);
+        std::vector<XisbOutBlock> index(blocks.size());
+        uint64_t p = alignUp(xisbIndexSize(blocks.size()));
+        for (size_t i = 0; i < blocks.size(); ++i) {
+            positions[i] = p;
+            index[i] = {blockIds[i], p, blocks[i].size, blocks[i].uncompressed};
+            p = alignUp(p + blocks[i].size);
+        }
+        std::ofstream data(toPath(opt.blocksPath), std::ios::binary | std::ios::trunc);
+        if (!data) throw Error("cannot create " + opt.blocksPath, ErrorKind::Io);
+        const std::vector<uint8_t> head = xisbIndexBytes(index);
+        data.write(reinterpret_cast<const char*>(head.data()), static_cast<std::streamsize>(head.size()));
+        writeBlocks(data, opt.blocksPath, head.size());
+
+        std::ofstream out(toPath(path), std::ios::binary | std::ios::trunc);
+        if (!out) throw Error("cannot create " + path, ErrorKind::Io);
+        out.write(header.data(), static_cast<std::streamsize>(header.size()));
+        out.close();
+        if (!out) throw Error("write error on " + path, ErrorKind::Io);
+        return;
+    }
+
     // Attachment positions depend on the header length, which depends on the positions' digits:
     // iterate until stable (it settles in two or three rounds).
-    std::vector<uint64_t> positions(images.size(), 0);
     std::string header;
     for (int round = 0; round < 8; ++round) {
-        header = buildHeader(positions);
+        header = buildHeader();
         std::vector<uint64_t> next(blocks.size());
         uint64_t p = alignUp(16 + header.size());
         for (size_t i = 0; i < blocks.size(); ++i) {
@@ -344,22 +406,7 @@ void writeXisf(const std::string& path, const std::vector<XisfOutImage>& images,
                                         0, 0, 0, 0};
     out.write(reinterpret_cast<const char*>(preamble), 16);
     out.write(header.data(), static_cast<std::streamsize>(header.size()));
-    uint64_t pos = 16 + header.size();
-    const std::vector<char> zeros(kAlignment, 0);
-    for (size_t i = 0; i < blocks.size(); ++i) {
-        if (positions[i] > pos) out.write(zeros.data(), static_cast<std::streamsize>(positions[i] - pos));
-        // Write in pieces: some platforms limit a single write to 2 GiB.
-        uint64_t done = 0;
-        while (done < blocks[i].size) {
-            const uint64_t n = std::min<uint64_t>(blocks[i].size - done, 1u << 30);
-            out.write(reinterpret_cast<const char*>(blocks[i].data + done), static_cast<std::streamsize>(n));
-            done += n;
-        }
-        pos = positions[i] + blocks[i].size;
-        if (!out) throw Error("write error on " + path, ErrorKind::Io);
-    }
-    out.close();
-    if (!out) throw Error("write error on " + path, ErrorKind::Io);
+    writeBlocks(out, path, 16 + header.size());
 }
 
 }  // namespace xisfconv

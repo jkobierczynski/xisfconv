@@ -61,6 +61,7 @@ add_library(xisfconv_core
   src/xml.cpp
   src/codecs.cpp
   src/xisf.cpp
+  src/xisfblocks.cpp
   src/xisfrewrite.cpp
   src/xisfwrite.cpp
   src/convert.cpp

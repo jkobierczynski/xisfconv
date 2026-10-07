@@ -52,7 +52,7 @@
 #include <stdint.h>
 
 #define XISFCONV_VERSION_MAJOR 0
-#define XISFCONV_VERSION_MINOR 15
+#define XISFCONV_VERSION_MINOR 16
 #define XISFCONV_VERSION_PATCH 0
 
 #if defined(XISFCONV_STATIC)
@@ -92,6 +92,8 @@ enum {
     XISFCONV_ERR_BUFFER      = 9,  /* the caller's buffer is too small */
     XISFCONV_ERR_NOT_FOUND   = 10, /* no such keyword or property, no ICC profile, no astrometric solution */
     XISFCONV_ERR_CANCELLED   = 11, /* the progress handler asked to stop */
+    XISFCONV_ERR_NOT_ALLOWED = 12, /* the header of a distributed XISF unit names a file it is not followed
+                                      to (see xisfconv_context_set_external_files; since 0.16) */
     XISFCONV_ERR_INTERNAL    = 99  /* a bug in the library */
 };
 
@@ -166,6 +168,41 @@ XISFCONV_API void xisfconv_context_set_progress_handler(xisfconv_context *ctx, x
  * A handler, if one is set, is called all the same. The messages add up over the calls until
  * xisfconv_context_clear_messages: a caller that keeps them has to clear them. */
 XISFCONV_API void xisfconv_context_keep_messages(xisfconv_context *ctx, int32_t keep);
+
+/* Distributed XISF units (since 0.16). An XISF unit is one monolithic file (.xisf), or it is
+ * distributed: a header file (.xish), which is the XML header and nothing else, and the files
+ * that header names, where its data blocks are. Those are XISF data blocks files (.xisb), which
+ * hold many blocks behind an index, or any other files, each of which is one block. Every
+ * function that takes an XISF file takes the header file of a distributed unit, and reads the
+ * others as the header says. (PixInsight itself reads and writes monolithic files only.)
+ *
+ * A header is data that came from somewhere, and it says which files are read: one that names
+ * /etc/passwd as the pixels of an image would have a conversion copy that file into its
+ * output. So a header is followed only as far as the context allows:
+ *   XISFCONV_EXTERNAL_HEADER_DIRECTORY  (default) to files in the directory of the header and
+ *       below it, named with path(@header_dir/...); where such a path leads out of that
+ *       directory (through .. or a symbolic link), it is not followed. And only a header file
+ *       is followed, one that is named as the specification names it (.xish): a monolithic
+ *       file holds all of its data, so one that names another file (.xisf, or whatever a
+ *       program was handed as "an image") is not followed there
+ *   XISFCONV_EXTERNAL_ANYWHERE          also to absolute paths, file: URLs and what links lead
+ *       to, and from any XISF file
+ *   XISFCONV_EXTERNAL_NONE              to no file but the header itself
+ * A block in a file the header is not followed to is not read: XISFCONV_ERR_NOT_ALLOWED where
+ * it is asked for (the pixels of an image), a warning where it is one of many (a property).
+ * Nothing is ever fetched from a network: a block at an http: or ftp: URL is
+ * XISFCONV_ERR_UNSUPPORTED. The setting holds for the files that are opened after it is made;
+ * a file that is open keeps the one it was opened with. XISFCONV_ERR_ARGUMENT for another value.
+ * The setting is a rule for honest use, not a sandbox: it does not hold against somebody who
+ * changes the directory while a file is read. */
+typedef int32_t xisfconv_external_files;
+enum {
+    XISFCONV_EXTERNAL_HEADER_DIRECTORY = 0,
+    XISFCONV_EXTERNAL_ANYWHERE         = 1,
+    XISFCONV_EXTERNAL_NONE             = 2
+};
+XISFCONV_API xisfconv_status xisfconv_context_set_external_files(xisfconv_context *ctx, xisfconv_external_files which);
+XISFCONV_API xisfconv_external_files xisfconv_context_external_files(const xisfconv_context *ctx);
 XISFCONV_API size_t xisfconv_context_message_count(const xisfconv_context *ctx);
 /* A kept message: its level, the file it is about (NULL if none) and its text. Any out pointer
  * may be NULL. The strings are valid until the next call in the context or
@@ -352,7 +389,10 @@ XISFCONV_API xisfconv_status xisfconv_keywords_fits_text(const xisfconv_keywords
 typedef struct xisfconv_file xisfconv_file;
 
 /* Looks at the first bytes of the file: FITS and ASDF are recognized by their signature, XISF
- * by its. XISFCONV_ERR_FORMAT if it is none of them, XISFCONV_ERR_IO if it cannot be read. */
+ * by its (a monolithic file) or by being an XML document whose root element is xisf (the header
+ * file of a distributed unit). XISFCONV_ERR_FORMAT if it is none of them (an XISF data blocks
+ * file, .xisb, is none: it is read through its header file), XISFCONV_ERR_IO if it cannot be
+ * read. */
 XISFCONV_API xisfconv_status xisfconv_detect_format(xisfconv_context *ctx, const char *path, xisfconv_format *out);
 
 /* A file that is neither FITS nor ASDF is taken for XISF, so that the XISF reader says what is
@@ -364,8 +404,25 @@ XISFCONV_API xisfconv_format xisfconv_file_format(const xisfconv_file *file);
 XISFCONV_API uint64_t xisfconv_file_size(const xisfconv_file *file);
 XISFCONV_API size_t xisfconv_image_count(const xisfconv_file *file);
 
+/* The files the header of an XISF unit names beside itself (since 0.16): how many, and for each
+ * where it is looked for, an absolute path, or the URL if it is not a local file. Each file is
+ * listed once, in the order of the header, whether or not it is there and may be read. 0 and
+ * "" for a monolithic file that names none, and for FITS and ASDF. Owned by the file. */
+XISFCONV_API size_t xisfconv_external_count(const xisfconv_file *file);
+XISFCONV_API const char *xisfconv_external_file(const xisfconv_file *file, size_t index);
+/* Whether that file is read: XISFCONV_OK if it is there and the header is followed to it, else
+ * what reading a block of it gives: XISFCONV_ERR_IO (it is not there, or is no regular file),
+ * XISFCONV_ERR_NOT_ALLOWED (the header is not followed to it) or XISFCONV_ERR_UNSUPPORTED (it
+ * is on a network). XISFCONV_ERR_INDEX for an index beyond the count. As it was when the file
+ * was opened. */
+XISFCONV_API xisfconv_status xisfconv_external_status(const xisfconv_file *file, size_t index);
+/* The size of the file together with those files, as far as they are there and may be read;
+ * xisfconv_file_size for a file that names none. (Since 0.16.) */
+XISFCONV_API uint64_t xisfconv_unit_size(const xisfconv_file *file);
+
 /* Details of a file as text, by name; "" if the file has no such detail.
- *   XISF  "version" (of the format, "1.0")
+ *   XISF  "version" (of the format, "1.0"); since 0.16 "unit": "monolithic" (a .xisf file) or
+ *         "distributed" (the header file of a distributed unit, .xish)
  *   ASDF  "format" (versions of the format and standard, number of blocks) */
 XISFCONV_API const char *xisfconv_file_detail(const xisfconv_file *file, const char *name);
 
@@ -837,7 +894,12 @@ XISFCONV_API void xisfconv_convert_options_init(xisfconv_convert_options *option
 
 /* Writes to "<output>.part" and renames when complete, so a failed call leaves no half-written
  * file under the final name. options may be NULL for the defaults. Refuses an output that is
- * the input file. */
+ * the input file.
+ * XISF output under a name that ends in .xish is a distributed unit (since 0.16): that file gets
+ * the header, and the data blocks go into the file of the same name that ends in .xisb, which
+ * the header names by path(@header_dir/...). Both are written under "<name>.part" first; the
+ * data blocks file is renamed first, the header last. An existing file of either name is
+ * overwritten only with `overwrite`. */
 XISFCONV_API xisfconv_status xisfconv_convert(xisfconv_context *ctx, const char *input, const char *output,
                                               const xisfconv_convert_options *options);
 
@@ -859,35 +921,53 @@ typedef struct xisfconv_rewrite_options {
 
 typedef struct xisfconv_rewrite_result {
     size_t struct_size;
-    uint64_t input_size;
+    uint64_t input_size;        /* of the unit: the file, and the files its header names */
     uint64_t output_size;
-    uint64_t blocks;            /* attached data blocks written */
+    uint64_t blocks;            /* data blocks written (attached, or into the data blocks file) */
     uint64_t compressed;        /* blocks compressed with the requested codec */
     uint64_t decompressed;      /* blocks now stored uncompressed */
     uint64_t kept;              /* blocks copied as they were stored */
     uint64_t checksums;         /* checksums computed for the output */
     uint64_t checksums_removed;
     int32_t read_back;          /* the output was read back and matched */
-    int32_t changed;            /* 0: the input already stored everything as requested */
+    int32_t changed;            /* 0: the input already stored everything as requested, in a
+                                   unit of the same kind */
 } xisfconv_rewrite_result;
 
 XISFCONV_API void xisfconv_rewrite_options_init(xisfconv_rewrite_options *options, size_t struct_size);
 XISFCONV_API void xisfconv_rewrite_result_init(xisfconv_rewrite_result *result, size_t struct_size);
 
-/* result may be NULL. */
+/* result may be NULL.
+ * The input is a monolithic file or the header file of a distributed unit, and so is the output,
+ * by its name (since 0.16): under a name that ends in .xish the unit is written distributed, the
+ * header there and every data block in the file of the same name that ends in .xisb; under any
+ * other name it is one monolithic file with every block attached. So a rewrite with the default
+ * options packs a distributed unit into one file, or unpacks a file into a header and its data.
+ * The blocks of the input that are in other files (whatever files: several data blocks files,
+ * files that are one block each) all end up in the output. XISFCONV_ERR_ARGUMENT for an output
+ * that is one of the files the input reads. */
 XISFCONV_API xisfconv_status xisfconv_rewrite(xisfconv_context *ctx, const char *input, const char *output,
                                               const xisfconv_rewrite_options *options,
                                               xisfconv_rewrite_result *result);
 
 /* Replaces the file: written next to it, read back and compared (always), flushed, then
  * renamed over the original. A file that is already stored as requested is left alone
- * (result->changed = 0). A read-only file is refused; a symbolic link is followed. */
+ * (result->changed = 0). A read-only file is refused; a symbolic link is followed.
+ * A distributed unit (since 0.16) is replaced by its header file and the data blocks file of the
+ * header's name (.xisb), which then holds every block; other files the header named before are
+ * left where they are. Two files cannot be replaced in one step: the data blocks file that is
+ * there is set aside ("<name>.xisb.replaced"), the new files take their places, and if one of
+ * them cannot, it is put back and the unit is as it was. A data blocks file that holds blocks
+ * this header does not name (those of another header) is replaced only with options->overwrite:
+ * XISFCONV_ERR_EXISTS without it, and the same for one whose index cannot be read. One that
+ * holds none of the blocks this header names is not the header's and is not replaced at all
+ * (XISFCONV_ERR_FORMAT), nor is one the header is not followed to (XISFCONV_ERR_NOT_ALLOWED). */
 XISFCONV_API xisfconv_status xisfconv_rewrite_in_place(xisfconv_context *ctx, const char *path,
                                                        const xisfconv_rewrite_options *options,
                                                        xisfconv_rewrite_result *result);
 
-/* *out = 1 if every attached block is already stored the way the options ask, judged by the
- * header alone. */
+/* *out = 1 if every block that is not in the header (attached, or in another file) is already
+ * stored the way the options ask, judged by the header alone. */
 XISFCONV_API xisfconv_status xisfconv_stored_as_requested(xisfconv_context *ctx, const char *path,
                                                           const xisfconv_rewrite_options *options, int32_t *out);
 
@@ -1009,7 +1089,10 @@ typedef struct xisfconv_writer xisfconv_writer;
 
 /* Collects images, then writes them in one go: XISF images, FITS HDUs, ASDF HDU list, TIFF
  * pages. PNG holds one image: of several, the first is written and a warning says so. Nothing is
- * written before xisfconv_writer_finish. options may be NULL for the defaults. */
+ * written before xisfconv_writer_finish. options may be NULL for the defaults.
+ * XISF under a name that ends in .xish is written as a distributed unit, as by xisfconv_convert
+ * (since 0.16): with options->format left at XISFCONV_FORMAT_AUTO such a name means XISF. (Another
+ * format that is asked for by options->format is written as that format, in the one file.) */
 XISFCONV_API xisfconv_status xisfconv_writer_new(xisfconv_context *ctx, const char *path,
                                                  const xisfconv_write_options *options, xisfconv_writer **out);
 XISFCONV_API xisfconv_status xisfconv_writer_add_image(xisfconv_writer *writer, const xisfconv_image *image);
