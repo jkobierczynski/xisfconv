@@ -8,6 +8,7 @@
 #include <fstream>
 #include <functional>
 #include <set>
+#include <utility>
 
 #include "codecs.hpp"
 #include "xisf.hpp"
@@ -198,7 +199,10 @@ struct PropertyWriter {
             return {};
         }
         std::string x = "<Property id=\"" + xmlText(p.id) + "\" type=\"" + xmlText(p.type) + "\"";
-        for (const auto& extra : {std::make_pair("comment", &p.comment), std::make_pair("format", &p.format)}) {
+        // (an array, not a braced list of std::make_pair: GCC 14 warns that the pairs of such a
+        // list may dangle, which they do not, -Wdangling-reference)
+        const std::pair<const char*, const std::string*> extras[] = {{"comment", &p.comment}, {"format", &p.format}};
+        for (const auto& extra : extras) {
             if (extra.second->empty()) continue;
             if (!isXmlText(*extra.second)) {
                 note("property " + p.id + ": its " + extra.first + " is not text that XML can hold; characters are replaced");

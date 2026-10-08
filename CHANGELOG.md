@@ -32,6 +32,11 @@ Added
   `xisfconv_image_info` and as the detail `cfaPattern`. Python: `format` and `detect_format`
   give `"dng"`.
 
+Fixed
+- GCC 14 warned of a possibly dangling reference (`-Wdangling-reference`) in the code that writes
+  XISF properties to XISF and ASDF files; a false alarm, written another way so that the build is
+  free of warnings again.
+
 Changed
 - A TIFF file given as input is said to be one ("a TIFF file that is not a DNG file") instead of
   "not an XISF 1.0 file (bad signature)".

@@ -7,6 +7,7 @@
 #include <fstream>
 #include <limits>
 #include <set>
+#include <utility>
 
 #include "codecs.hpp"
 #include "yaml.hpp"
@@ -317,7 +318,10 @@ std::string propertyEntry(const Property& p, const std::string& indent, Property
         return {};
     }
     if (p.block) e += ", block: true";   // a String that XISF keeps in a data block
-    for (const auto& extra : {std::make_pair("comment", &p.comment), std::make_pair("format", &p.format)}) {
+    // (an array, not a braced list of std::make_pair: GCC 14 warns that the pairs of such a
+    // list may dangle, which they do not, -Wdangling-reference)
+    const std::pair<const char*, const std::string*> extras[] = {{"comment", &p.comment}, {"format", &p.format}};
+    for (const auto& extra : extras) {
         if (extra.second->empty()) continue;
         if (!isValidUtf8(*extra.second)) warn("property " + p.id + ": its " + extra.first + " is not UTF-8 text; characters are replaced");
         e += std::string(", ") + extra.first + ": " + yamlText(*extra.second);
