@@ -1850,7 +1850,7 @@ xisfconv_status xisfconv_wcs_flip_rows(xisfconv_keywords* kw, uint64_t image_hei
 // built against it hands over its whole struct, and what its padding holds is nobody's business.
 static_assert(sizeof(void*) != 8 || (offsetof(xisfconv_convert_options, reserved) == 100 &&
                                      offsetof(xisfconv_convert_options, fit_width) == 104 &&
-                                     offsetof(xisfconv_convert_options, reserved2) + 4 == sizeof(xisfconv_convert_options)),
+                                     offsetof(xisfconv_convert_options, debayer) + 4 == sizeof(xisfconv_convert_options)),
               "xisfconv_convert_options: a field where an older layout had padding, or padding at the end");
 
 void xisfconv_convert_options_init(xisfconv_convert_options* options, size_t struct_size) {
@@ -1908,6 +1908,7 @@ xisfconv_status xisfconv_convert(xisfconv_context* ctx, const char* input, const
         c.downsample.fitWidth = o.fit_width;
         c.downsample.fitHeight = o.fit_height;
         c.downsample.scale = o.scale;
+        c.debayer = o.debayer != 0;
         const Format format = outputFormat(o.output_format, output);
         mustBeReadable(input);
         const InputFormat kind = detectInputFormat(input);

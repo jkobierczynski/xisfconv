@@ -210,7 +210,7 @@ class ConvertOptions(Structure):
         ("fit_height", c_uint64),
         ("scale", c_double),
         ("bin", c_int32),
-        ("reserved2", c_int32),
+        ("debayer", c_int32),
     ]
 
 

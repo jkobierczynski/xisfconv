@@ -7005,6 +7005,209 @@ def test_dng():
     check(not agreed, f"LibRaw reads the same raw images and patterns from the DNG files: {agreed}")
 
 
+def debayer_reference(mosaic, colours):
+    """Bilinear demosaicing written down without xisfconv: `colours` holds 0, 1, 2 (R, G, B) for every pixel. A
+    pixel keeps its own colour; each other colour is the mean of its neighbours of that colour among the eight
+    around it that are in the image, integers rounded to the nearest (halves up), floating point as doubles with
+    the samples that are not finite left out (NaN where none is)."""
+    h, w = mosaic.shape
+    out = np.zeros((h, w, 3), mosaic.dtype)
+    integer = np.issubdtype(mosaic.dtype, np.integer)
+    for y in range(h):
+        for x in range(w):
+            for c in range(3):
+                if colours[y, x] == c:
+                    out[y, x, c] = mosaic[y, x]
+                    continue
+                values = [int(mosaic[yy, xx]) if integer else float(mosaic[yy, xx])
+                          for yy in range(max(0, y - 1), min(h, y + 2)) for xx in range(max(0, x - 1), min(w, x + 2))
+                          if (yy, xx) != (y, x) and colours[yy, xx] == c]
+                if not integer:
+                    values = [v for v in values if np.isfinite(v)]
+                n = len(values)
+                out[y, x, c] = (sum(values) + n // 2) // n if integer else sum(v / n for v in values) if n else np.nan
+    return out
+
+
+def colour_map(pattern, h, w, x_offset=0, y_offset=0):
+    """The colour (0 R, 1 G, 2 B) of every pixel of an image of h x w whose first pixel is at (x_offset, y_offset)
+    of a 2 x 2 pattern."""
+    cells = ["RGB".index(ch) for ch in pattern]
+    return np.array([[cells[2 * ((y + y_offset) % 2) + (x + x_offset) % 2] for x in range(w)] for y in range(h)])
+
+
+def test_debayer():
+    """--debayer: a colour picture of a mosaic, for TIFF and PNG; checked against debayer_reference."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import dng_files as D
+    d = os.path.join(TMP, "debayer")
+    os.makedirs(d)
+    rng = np.random.default_rng(31)
+
+    def mosaic(dtype, h, w):
+        if np.issubdtype(dtype, np.floating):
+            return rng.random((h, w)).astype(dtype)
+        top = np.iinfo(dtype).max
+        a = rng.integers(0, top, (h, w), dtype=dtype, endpoint=True)
+        a.flat[0], a.flat[-1] = top, top      # (sums beyond the type: the mean must still be right)
+        if h > 2:
+            a[1, :] = top
+        return a
+
+    def tiff(path, *flags):
+        out = path + ".tif"
+        r = tool(path, "-t", "tiff", "-o", out, "-f", "--debayer", *flags)
+        return (tifffile.imread(out) if r.returncode == 0 else None), r
+
+    # FITS: BAYERPAT for the rows as stored (bottom-up unless ROWORDER says otherwise), in every pattern, both
+    # parities of the height, with offsets
+    for pattern in ("RGGB", "BGGR", "GRBG", "GBRG"):
+        for h, rows in ((10, "BOTTOM-UP"), (9, "BOTTOM-UP"), (9, "TOP-DOWN")):
+            for xo, yo in ((0, 0), (1, 0), (0, 1), (1, 1)):
+                a = mosaic(np.uint16, h, 12)
+                hdu = fits.PrimaryHDU(a)
+                hdu.header["BAYERPAT"] = pattern
+                if xo or yo:
+                    hdu.header["XBAYROFF"], hdu.header["YBAYROFF"] = xo, yo
+                if rows == "TOP-DOWN":
+                    hdu.header["ROWORDER"] = "TOP-DOWN"
+                path = os.path.join(d, f"f-{pattern}-{h}-{rows}-{xo}{yo}.fits")
+                hdu.writeto(path)
+                colours = colour_map(pattern, h, 12, xo, yo)   # of the rows as stored
+                if rows == "BOTTOM-UP":                        # the picture is top-down
+                    a, colours = a[::-1], colours[::-1]
+                got, r = tiff(path)
+                check(got is not None and got.shape == (h, 12, 3) and got.dtype == np.uint16 and
+                      np.array_equal(got, debayer_reference(a, colours)),
+                      f"--debayer of FITS, BAYERPAT {pattern}, {h} rows {rows}, offsets {xo},{yo}: {r.stderr.strip()[-200:]}")
+    # every sample format, through XISF's ColorFilterArray and through BAYERPAT
+    for dtype in (np.uint8, np.uint16, np.uint32, np.uint64, np.float32, np.float64):
+        a = mosaic(dtype, 7, 10)
+        for how, children in (("ColorFilterArray", '<ColorFilterArray pattern="GBRG" width="2" height="2"/>'),
+                              ("BAYERPAT", '<FITSKeyword name="BAYERPAT" value="\'GBRG\'" comment=""/>')):
+            path = os.path.join(d, f"x-{np.dtype(dtype).name}-{how}.xisf")
+            write_xisf(path, [image_entry(a[:, :, None], children=children)])
+            got, r = tiff(path)
+            want = debayer_reference(a, colour_map("GBRG", 7, 10))
+            ok = got is not None and got.shape == (7, 10, 3) and got.dtype == dtype
+            if ok:
+                ok = np.array_equal(got, want) if np.issubdtype(dtype, np.integer) else \
+                    np.allclose(got, want, rtol=4 * np.finfo(dtype).eps, atol=0, equal_nan=True)
+            check(ok and "debayered (GBRG, bilinear)" in r.stderr,
+                  f"--debayer of XISF {np.dtype(dtype).name} by its {how}: {r.stderr.strip()[-200:]}")
+    # floating point samples that are not finite are left out of the means; values near the largest double
+    for label, a in (("NaN and Inf", np.where(np.arange(64).reshape(8, 8) % 9 == 0, np.nan, rng.random((8, 8)))),
+                     ("a corner of NaN", np.pad(np.full((2, 2), np.nan), ((0, 6), (0, 6)), constant_values=0.25)),
+                     ("Inf beside values", np.where(np.arange(64).reshape(8, 8) % 7 == 3, np.inf, rng.random((8, 8)))),
+                     ("values near the largest double", np.full((6, 6), 1.7e308))):
+        path = os.path.join(d, "float-" + label.replace(" ", "-") + ".fits")
+        hdu = fits.PrimaryHDU(a)
+        hdu.header["BAYERPAT"], hdu.header["ROWORDER"] = "RGGB", "TOP-DOWN"
+        hdu.writeto(path)
+        got, r = tiff(path, "--bounds", "0:1")
+        want = debayer_reference(a, colour_map("RGGB", *a.shape))
+        check(got is not None and got.dtype == np.float64 and np.allclose(got, want, rtol=1e-15, atol=0, equal_nan=True) and
+              np.array_equal(np.isnan(got), np.isnan(want)),
+              f"--debayer of floating point, {label}: {r.stderr.strip()[-200:]}")
+    # XISF: several images, --image, PNG, a saved STF of the mosaic, an ICC profile of the mosaic
+    a, b = mosaic(np.uint16, 6, 8), mosaic(np.uint16, 6, 8)
+    cfa = '<ColorFilterArray pattern="BGGR" width="2" height="2"/>'
+    path = os.path.join(d, "two.xisf")
+    write_xisf(path, [image_entry(a[:, :, None], children=cfa), image_entry(b[:, :, None])])
+    got, r = tiff(path)
+    pages = tifffile.TiffFile(path + ".tif").pages if got is not None else []
+    check(len(pages) == 2 and np.array_equal(pages[0].asarray(), debayer_reference(a, colour_map("BGGR", 6, 8))) and
+          pages[0].photometric == 2 and pages[1].asarray().shape == (6, 8) and "image 1: not debayered" in r.stderr,
+          f"--debayer of an XISF file of two images, one with a pattern: {r.stderr.strip()[-200:]}")
+    r = tool(path, "-t", "png", "--image", "0", "--debayer", "-o", path + ".png", "-f")
+    png, depth, _ = decode_png(path + ".png") if r.returncode == 0 else (None, 0, None)
+    check(png is not None and depth == 16 and np.array_equal(png, debayer_reference(a, colour_map("BGGR", 6, 8))),
+          f"--debayer to PNG of the image chosen with --image: {r.stderr.strip()[-200:]}")
+    flat = np.full((6, 8, 1), 1000, np.uint16)
+    stf = '<DisplayFunction m="0.01:0.5:0.5:0.5" s="0:0:0:0" h="1:1:1:1" l="0:0:0:0" r="1:1:1:1" name="STF"/>'
+    path = os.path.join(d, "stf.xisf")
+    write_xisf(path, [image_entry(flat, children=cfa + stf)])
+    for flags in (("--stretch=stf",), ("-s",)):
+        got, r = tiff(path, *flags)
+        check(got is not None and got.shape == (6, 8, 3) and np.all(got == got[:, :, :1]) and got[0, 0, 0] > 30000,
+              f"--debayer {flags[0]} with the saved STF of the mosaic: each colour stretched as the mosaic: "
+              f"{None if got is None else got[0, 0]} {r.stderr.strip()[-200:]}")
+    icc = bytes(128) + b"\0" * 4   # (a profile only in name: what matters is that it is not passed on)
+    path = os.path.join(d, "icc.xisf")
+    write_xisf(path, [image_entry(a[:, :, None], children=cfa + f'<ICCProfile location="inline:base64">{base64.b64encode(icc).decode()}</ICCProfile>')])
+    for target in ("tif", "png"):
+        r = tool(path, "-o", path + "." + target, "--debayer", "-f")
+        if target == "tif":
+            given = 34675 in tifffile.TiffFile(path + ".tif").pages[0].tags if r.returncode == 0 else True
+        else:
+            given = b"iCCP" in open(path + ".png", "rb").read() if r.returncode == 0 else True
+        check(r.returncode == 0 and not given and "its ICC profile, of the one-channel mosaic, is not given to the colour picture" in r.stderr,
+              f"--debayer to {target}: the ICC profile of the mosaic is left out, with a warning: {r.stderr.strip()[-200:]}")
+    # other integer types from FITS, and an offset given as a negative number
+    for dtype in (np.uint8, np.int16, np.int32):
+        a = (mosaic(np.uint8, 7, 9).astype(dtype) * 3) if dtype != np.uint8 else mosaic(np.uint8, 7, 9)
+        path = os.path.join(d, f"fits-{np.dtype(dtype).name}.fits")
+        hdu = fits.PrimaryHDU(a)
+        hdu.header["BAYERPAT"], hdu.header["XBAYROFF"], hdu.header["YBAYROFF"] = "GRBG", -1, -3
+        hdu.writeto(path)
+        got, r = tiff(path)
+        want = debayer_reference(a[::-1].astype(np.int64), colour_map("GRBG", 7, 9, 1, 1)[::-1])
+        check(got is not None and got.shape == (7, 9, 3) and np.array_equal(got.astype(np.int64), want),
+              f"--debayer of FITS {np.dtype(dtype).name}, offsets -1 and -3: {None if got is None else got.dtype} {r.stderr.strip()[-200:]}")
+    # DNG: its own pattern; X-Trans is not interpolated
+    raw = D.bayer_scene(12, 16, 14, 2)
+    path = os.path.join(d, "IMG_0001.dng")
+    D.write_dng(path, raw, bits=14, pattern="GRBG", compression=7, tile=(16, 16))
+    got, r = tiff(path)
+    check(got is not None and np.array_equal(got, debayer_reference(raw, colour_map("GRBG", 12, 16))),
+          f"--debayer of DNG by its CFAPattern: {r.stderr.strip()[-200:]}")
+    r = tool(path, "-t", "png", "-o", path + ".png", "-f", "--debayer", "-s", "-b", "u8")
+    png, depth, _ = decode_png(path + ".png") if r.returncode == 0 else (None, 0, None)
+    check(r.returncode == 0 and png.shape == (12, 16, 3) and depth == 8 and " c2 " in r.stderr,
+          f"--debayer to PNG with a stretch: an RGB picture, stretched in three channels: {r.stderr.strip()[-300:]}")
+    path = os.path.join(d, "xt.dng")
+    D.write_dng(path, D.bayer_scene(12, 18, 14, 3), bits=14, pattern=D.XTRANS, pattern_size=(6, 6))
+    got, r = tiff(path)
+    check(r.returncode == 0 and got.shape == (12, 18) and "not debayered: its colour filter pattern is 6 x 6" in r.stderr,
+          f"--debayer of X-Trans: written as it is, with a warning: {r.stderr.strip()[-200:]}")
+    # with a smaller picture: the picture is made of the colour image
+    a = mosaic(np.uint16, 20, 24)
+    path = os.path.join(d, "binned.fits")
+    hdu = fits.PrimaryHDU(a)
+    hdu.header["BAYERPAT"] = "RGGB"
+    hdu.header["ROWORDER"] = "TOP-DOWN"
+    hdu.writeto(path)
+    got, r = tiff(path, "--bin", "2")
+    colourful = debayer_reference(a, colour_map("RGGB", 20, 24))
+    check(got is not None and got.shape == (10, 12, 3) and
+          all(picture_matches(got[:, :, c], colourful[:, :, c], 10, 12) for c in range(3)),
+          f"--debayer with --bin 2: the colour image binned: {r.stderr.strip()[-200:]}")
+    # what is not a mosaic, or has no pattern to use: written as it is, with a warning
+    for label, header, data, text in (
+            ("no BAYERPAT", {}, mosaic(np.uint16, 6, 8), "not debayered: it has no colour filter pattern"),
+            ("a pattern without blue", {"BAYERPAT": "RGGR"}, mosaic(np.uint16, 6, 8), "is not a 2 x 2 pattern of R, G and B"),
+            ("a pattern of 3 letters", {"BAYERPAT": "RGB"}, mosaic(np.uint16, 6, 8), "is not a 2 x 2 pattern of R, G and B"),
+            ("an offset that is no whole number", {"BAYERPAT": "RGGB", "XBAYROFF": 0.5}, mosaic(np.uint16, 6, 8), "is not a whole number"),
+            ("one row", {"BAYERPAT": "RGGB"}, mosaic(np.uint16, 1, 8), "smaller than 2 x 2 pixels"),
+            ("three planes", {"BAYERPAT": "RGGB"}, rng.integers(0, 1000, (3, 6, 8), dtype=np.uint16), "it has 3 channels")):
+        path = os.path.join(d, "plain-" + label.replace(" ", "-") + ".fits")
+        hdu = fits.PrimaryHDU(data)
+        for k, v in header.items():
+            hdu.header[k] = v
+        hdu.writeto(path)
+        got, r = tiff(path)
+        check(r.returncode == 0 and text in r.stderr and "warning" in r.stderr and got is not None and
+              got.size == data.size, f"--debayer, {label}: written as it is, and said why: {r.stderr.strip()[-200:]}")
+    # data formats keep the mosaic
+    for target in ("fits", "xisf", "asdf"):
+        r = tool(os.path.join(d, "binned.fits"), "-t", target, "--debayer", "-f")
+        check(r.returncode == 1 and "--debayer makes a colour picture: it is for TIFF and PNG output" in r.stderr,
+              f"--debayer to {target}: refused: {r.stderr.strip()[-200:]}")
+    xisf = os.path.join(d, "x-uint16-BAYERPAT.xisf")
+    r = tool(xisf, "-t", "xisf", "--debayer", "-o", os.path.join(d, "again.xisf"))
+    check(r.returncode == 1 and "--debayer makes a colour picture" in r.stderr, f"--debayer, XISF -> XISF: refused: {r.stderr.strip()}")
+
+
 if __name__ == "__main__":
     print("xisfconv:", EXE)
     print(subprocess.run([EXE, "--version"], capture_output=True, text=True).stdout.strip())
@@ -7023,7 +7226,7 @@ if __name__ == "__main__":
               test_xisf_fits_xisf_roundtrip, test_asdf_yaml, test_asdf_hand_written, test_asdf_output,
               test_asdf_python_files, test_asdf_roundtrips, test_export_from_fits_and_asdf, test_xisf_rewrite,
               test_verify, test_fits_tile_compressed, test_fits_tile_writing, test_property_round_trip,
-              test_downsampling_and_thumbnailer, test_distributed_units, test_directories_and_patterns, test_dng,
+              test_downsampling_and_thumbnailer, test_distributed_units, test_directories_and_patterns, test_dng, test_debayer,
               test_documents):
         try:
             t()

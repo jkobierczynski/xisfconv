@@ -150,6 +150,7 @@ struct Options {
     bool propertyKeywords = true;
     bool properties = true;      // take XISF properties along to FITS and ASDF, and use those such a file carries
     uint64_t bin = 1;            // TIFF and PNG output: n x n pixels become one
+    bool debayer = false;        // TIFF and PNG output: a colour picture of a mosaic
     uint64_t fitWidth = 0, fitHeight = 0;   // ... the picture fits that many pixels
     double scale = 0;            // ... the picture is that fraction of the image
     bool verify = true;
@@ -222,6 +223,9 @@ void usage(std::ostream& os) {
           "                                1024x768   it fits a box of that size, its proportions kept\n"
           "                                50%        half the width and half the height\n"
           "                              (never larger than the image; made before a stretch is applied)\n"
+          "      --debayer               TIFF and PNG output: a colour picture of the mosaic of a colour camera\n"
+          "                              (bilinear, by the 2 x 2 pattern of BAYERPAT, or of the file), before\n"
+          "                              --bin, --resize and --stretch; without white balance\n"
           "      --top-down              XISF and DNG input: keep the top-down row order in FITS and ASDF output\n"
           "                              (ROWORDER='TOP-DOWN') instead of the FITS convention, bottom-up\n"
           "                              FITS and ASDF input: the rows are stored top-down\n"
@@ -393,6 +397,7 @@ xisfconv_convert_options conversionOptions(const Options& opt, xisfconv_format f
     c.property_keywords = opt.propertyKeywords;
     c.properties = opt.properties;
     c.bin = static_cast<int32_t>(opt.bin);
+    c.debayer = opt.debayer;
     c.fit_width = opt.fitWidth;
     c.fit_height = opt.fitHeight;
     c.scale = opt.scale;
@@ -614,6 +619,7 @@ void rewriteXisfInput(const Library& lib, const std::string& input, const Option
     if (opt.bin > 1 || opt.fitWidth || opt.fitHeight || opt.scale > 0) {
         throw Error("--bin and --resize make a smaller picture: they are for TIFF and PNG output");
     }
+    if (opt.debayer) throw Error("--debayer makes a colour picture: it is for TIFF and PNG output");
     if (opt.inPlace && opt.distributed && lowerExt(input) != ".xish") {
         throw Error("--in-place keeps the kind of unit, which goes with the name of the file: under this name it stays "
                     "one monolithic file (-t xish without --in-place writes a header file and its data blocks file)");
@@ -852,6 +858,7 @@ bool parseArgs(int argc, char** argv, Options& opt, int& exitCode) {
             if (!parseUInt64(v, n) || n == 0) throw Error("invalid subblock size");
             opt.subblockSize = n;
         }
+        else if (a == "--debayer") opt.debayer = true;
         else if (a == "--bin") {
             uint64_t n;
             const std::string v = need(i, a);

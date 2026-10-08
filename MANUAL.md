@@ -33,6 +33,7 @@ say what to know before reading those.
 - [TIFF and PNG from FITS and ASDF input](#tiff-and-png-from-fits-and-asdf-input)
 - [Stretch for viewing](#stretch-for-viewing)
 - [Smaller pictures](#smaller-pictures)
+- [Colour pictures of a mosaic (`--debayer`)](#colour-pictures-of-a-mosaic---debayer)
 - [Previews in the file manager](#previews-in-the-file-manager)
 - [Sample conversion](#sample-conversion)
 - [The library (libxisfconv)](#the-library-libxisfconv)
@@ -57,6 +58,7 @@ xisfconv -t png -s -b u8 --resize 1024 lights/ -d previews/   # previews of a wh
 xisfconv -t tiff -s -b u8 integration.xisf     # stretched 8-bit TIFF for GIMP
 xisfconv -t png -s -b u8 integration.xisf      # stretched 8-bit PNG for the web
 xisfconv -t png -s -b u8 light_0001.fits       # quick look at a raw FITS frame
+xisfconv -t png -s -b u8 --debayer IMG_0001.dng # ... in colour, of a colour camera's frame
 xisfconv -t png -s -b u8 --resize 1024 *.xisf  # previews, the longest side 1024 pixels
 xisfconv -c --in-place *.xisf                 # recompress XISF files with zstd, replacing them
 xisfconv -c --in-place archive/               # ... every XISF file below archive/
@@ -92,6 +94,8 @@ xisfconv [options] <file or directory>...   # any of XISF, FITS, ASDF -> any oth
       --bin <n>               TIFF and PNG: a smaller picture, n x n pixels averaged into one
       --resize <size>         TIFF and PNG: a smaller picture: 256 (the longest side), 1024x768 (a box
                               to fit) or 50%; never larger than the image; made before a stretch
+      --debayer               TIFF and PNG: a colour picture of a colour camera's mosaic (bilinear,
+                              by its 2 x 2 pattern); before --bin, --resize and a stretch
       --top-down              from XISF and DNG: keep the top-down row order in FITS/ASDF (default: bottom-up)
                               from FITS/ASDF: the rows are stored top-down
       --bottom-up             from FITS/ASDF: the rows are stored bottom-up, whatever ROWORDER says
@@ -779,6 +783,35 @@ The options `-s` and `--stretch[=auto|linked|unlinked|stf]`.
   refused there: with a smaller image the WCS, the astrometric solution and the colour filter
   pattern would all have to change with it.
 
+## Colour pictures of a mosaic (`--debayer`)
+
+`--debayer`, for TIFF and PNG output.
+
+A one-shot colour camera records one colour in each pixel, through a pattern of red, green and
+blue filters. Its frames are a mosaic: one grey plane, and a picture of it shows a fine
+checkerboard. `--debayer` makes a colour picture of it.
+
+- **The pattern** is the one the file states for the image: XISF's `ColorFilterArray`, the
+  `CFAPattern` of a DNG file; else the keyword `BAYERPAT` (`RGGB`, `BGGR`, `GRBG`, `GBRG`), with
+  `XBAYROFF` and `YBAYROFF` where the image begins at an odd column or row of the pattern. As
+  everywhere in xisfconv, `BAYERPAT` describes the rows as they are stored: for a bottom-up FITS
+  file, its first row is the bottom of the picture.
+- **Bilinear interpolation**: a pixel keeps the colour it recorded, and each colour it did not
+  record is the mean of its neighbours of that colour (the four around it, or two, or the four
+  diagonal ones; at the edges, those that are in the image). Integers are rounded to the nearest
+  value. Simple, and exactly what it says; edges and stars show a little colour fringing that a
+  stacking program's demosaicing avoids.
+- **Order**: the colour picture comes first, then `--bin` or `--resize`, then `--stretch` (linked
+  or unlinked, on the three colours), then `--bits`.
+- **No white balance and no colour matrix**: the colours are those of the sensor's filters. A
+  daylight frame looks green, as raw data does; an unlinked stretch (`--stretch=unlinked`)
+  balances the three colours for a look.
+- Patterns of 2 x 2 only: an X-Trans frame (6 x 6), or an image without a pattern, or one that
+  already has three channels, is written as it is, with a warning that says why (a folder of
+  monochrome and colour frames can be converted in one run).
+- For pictures only. XISF, FITS and ASDF output keep the mosaic with its pattern, which is what
+  calibration (darks, flats) and stacking need; `--debayer` is refused there.
+
 ## Previews in the file manager
 
 On Linux.
@@ -1092,6 +1125,7 @@ Good to know:
   as it was (the processing history does not mention the stretch).
 - Files with XISF properties read by xisfconv 0.12 or older: the tables of a FITS file are
   reported as skipped HDUs, and the matrices in an ASDF tree are taken for images.
+- `--debayer` is bilinear, for 2 x 2 patterns, without white balance, for TIFF and PNG only.
 - `--bin` and `--resize` make TIFF and PNG pictures only. The previews are made from the pixels;
   a thumbnail that PixInsight stored in an XISF file is not used. The thumbnailer entry has been
   run as a command, not yet inside a file manager.

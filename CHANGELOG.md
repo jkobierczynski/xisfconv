@@ -9,10 +9,21 @@ in [`DEVELOPMENT.md`](DEVELOPMENT.md).
 Under "changed" stands what makes the same command, or the same call, do something else than
 before.
 
-## 0.18.0 (8 October 2026)
+## 0.18.1 (8 October 2026)
 
-**DNG input.** The raw image of a DNG file, the format some cameras write themselves and Adobe
-DNG Converter makes of the raw files of every other camera.
+**Colour pictures of a mosaic.**
+
+Added
+- `--debayer`, for TIFF and PNG output: a colour picture of the mosaic of a one-shot colour
+  camera (DNG, or FITS and XISF frames with `BAYERPAT` or a colour filter array), by bilinear
+  interpolation of its 2 x 2 pattern, before `--bin`, `--resize` and `--stretch`; no white
+  balance. In the library, the field `debayer` of `xisfconv_convert_options` (it was reserved),
+  and `debayer=True` for `xisfconv.convert` in Python.
+
+## 0.18.0 (8 October 2026), released
+
+**DNG input.** The raw image of a DNG file, the format some
+cameras write themselves and Adobe DNG Converter makes of the raw files of every other camera.
 
 Added
 - DNG files are read, by the tool, the library and the Python package: the raw image as the

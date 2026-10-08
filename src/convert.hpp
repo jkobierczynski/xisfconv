@@ -66,4 +66,14 @@ DownsampledSize downsampledSize(const Downsample& how, uint64_t width, uint64_t 
 // mean of 64-bit samples, integers or floating point, is right to their last bit or two.
 void downsample(PixelBuffer& px, const DownsampledSize& size);
 
+// Demosaicing, for TIFF and PNG export (--debayer). `pattern` is a 2 x 2 colour filter pattern of
+// R, G and B, row by row, relative to the first pixel of the image as it is held now ("RGGB"),
+// with each of the three colours in it. Turns a one-channel mosaic of at least 2 x 2 pixels into
+// three planes R, G, B by bilinear interpolation: a pixel keeps the colour it recorded, and each
+// colour it did not record is the mean of the pixels of that colour among its eight neighbours
+// (at the edges, those that are in the image). Integers are rounded to the nearest value (halves
+// up), exactly; floating point samples are averaged as doubles, those that are not finite (NaN,
+// Inf) left out (NaN where no neighbour of a colour is finite). The sample format stays.
+void debayerBilinear(PixelBuffer& px, const std::string& pattern);
+
 }  // namespace xisfconv

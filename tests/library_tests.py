@@ -103,7 +103,7 @@ class ConvertOptions(C.Structure):
                 ("codec", i32), ("checksum", i32), ("subblock_size", u64), ("row_order", i32), ("property_keywords", i32),
                 ("wcs", i32), ("sip_order", i32), ("verify_checksums", i32), ("use_bounds", i32), ("overwrite", i32),
                 ("lower_bound", f64), ("upper_bound", f64), ("properties", i32), ("reserved", i32), ("fit_width", u64),
-                ("fit_height", u64), ("scale", f64), ("bin", i32), ("reserved2", i32)]
+                ("fit_height", u64), ("scale", f64), ("bin", i32), ("debayer", i32)]
 
 
 class WriteOptions(C.Structure):
@@ -884,6 +884,16 @@ def test_read_dng():
     with fits.open(os.path.join(TMP, "dng.fits")) as h:
         check(st == OK and h[0].header.get("ROWORDER", "BOTTOM-UP") == "BOTTOM-UP" and h[0].header["BAYERPAT"].strip() == "BGGR" and
               np.array_equal(h[0].data, raw[::-1]), "DNG to FITS, bottom-up by default, the pattern turned")
+    co = ConvertOptions()
+    convert_options_init(C.byref(co), C.sizeof(co))
+    check(co.debayer == 0, "debayer is 0 by default")
+    co.debayer = 1
+    st = convert(ctx, enc(path), enc(os.path.join(TMP, "dng-colour.tif")), C.byref(co))
+    picture = tifffile.imread(os.path.join(TMP, "dng-colour.tif")) if st == OK else None
+    check(st == OK and picture.shape == (20, 26, 3) and picture[0, 1, 0] == raw[0, 1] and picture[0, 0, 1] == raw[0, 0],
+          f"debayer = 1: an RGB picture of the mosaic, each pixel keeping the colour it recorded: {st} {err()}")
+    st = convert(ctx, enc(path), enc(os.path.join(TMP, "dng-colour.fits")), C.byref(co))
+    check(st == ERR_ARGUMENT and "for TIFF and PNG output" in err(), f"debayer = 1 to FITS: an argument error: {st} {err()}")
     r = ptr()
     check(verify(ctx, enc(path), C.byref(r)) == OK and report_verdict(r) == 0 and report_format(r) == FORMAT_DNG, "DNG: verified")
     report_free(r)
@@ -944,8 +954,8 @@ def test_smaller_pictures():
         check(st == OK and got.shape == (6, 9, 3), f"{name}: all of them together: the smallest ({None if got is None else got.shape})")
         st, got = picture(fit_width=500, fit_height=500, scale=1.0, bin=1)
         check(st == OK and np.array_equal(got, a), f"{name}: nothing that asks for a smaller picture leaves the image as it is")
-        st, got = picture(reserved=12345, reserved2=-7)
-        check(st == OK and np.array_equal(got, a), f"{name}: the reserved fields are not looked at")
+        st, got = picture(reserved=12345)
+        check(st == OK and np.array_equal(got, a), f"{name}: the reserved field is not looked at")
         st, _ = picture(target="small.fits", scale=1.0)
         check(st == ERR_ARGUMENT, f"{name}: scale = 1 asks for a picture too, which FITS is not")
         for target in ("small.fits", "small.asdf", "small.fits.fz"):

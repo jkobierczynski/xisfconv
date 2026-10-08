@@ -78,3 +78,17 @@ def test_convert_and_errors(tmp_path, tool):
         xisfconv.open(lossy)
     report = xisfconv.verify(lossy)
     assert report.verdict == "not fully checked" and "lossy DNG" in report.not_checked[0]
+
+
+def test_debayer(tmp_path):
+    raw = D.bayer_scene(10, 12, 12, 4)
+    path = tmp_path / "a.dng"
+    D.write_dng(path, raw, bits=12, pattern="BGGR")
+    xisfconv.convert(path, tmp_path / "colour.tif", debayer=True)
+    tifffile = pytest.importorskip("tifffile")
+    picture = tifffile.imread(tmp_path / "colour.tif")
+    assert picture.shape == (10, 12, 3) and picture.dtype == np.uint16
+    assert picture[0, 0, 2] == raw[0, 0] and picture[1, 1, 0] == raw[1, 1]      # B and R where they were recorded
+    assert picture[1, 0, 1] == raw[1, 0] and picture[0, 0, 0] == raw[1, 1]      # G; R at the corner from its one neighbour
+    with pytest.raises(xisfconv.Error, match="for TIFF and PNG output"):
+        xisfconv.convert(path, tmp_path / "colour.xisf", debayer=True)

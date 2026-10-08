@@ -54,7 +54,7 @@
 
 #define XISFCONV_VERSION_MAJOR 0
 #define XISFCONV_VERSION_MINOR 18
-#define XISFCONV_VERSION_PATCH 0
+#define XISFCONV_VERSION_PATCH 1
 
 #if defined(XISFCONV_STATIC)
 #  define XISFCONV_API
@@ -907,7 +907,16 @@ typedef struct xisfconv_convert_options {
     uint64_t fit_height;
     double scale;
     int32_t bin;
-    int32_t reserved2;                    /* not used */
+
+    /* --debayer: 1 makes a colour picture of the mosaic of a one-shot colour camera, for TIFF and
+     * PNG output (XISFCONV_ERR_ARGUMENT for the other formats). (Since 0.18.1; up to 0.18.0 this
+     * field was reserved.) The pattern is a 2 x 2 pattern of R, G and B: the image's colour filter
+     * array (XISF ColorFilterArray, DNG), else BAYERPAT with XBAYROFF and YBAYROFF, for the rows as
+     * stored. Each colour a pixel did not record is the mean of its neighbours of that colour
+     * (bilinear interpolation), before a smaller picture is made and before a stretch; no white
+     * balance. An image without such a pattern, or of more than one channel, is written as it is,
+     * with a warning. Default 0. */
+    int32_t debayer;
 } xisfconv_convert_options;
 
 XISFCONV_API void xisfconv_convert_options_init(xisfconv_convert_options *options, size_t struct_size);

@@ -60,7 +60,8 @@ xisfconv --info light_0001.xisf               # geometry, codecs, FITS keywords,
 - **`--verify`** checks XISF, FITS, ASDF and DNG files, and whole directories of them, without
   converting anything.
 - **TIFF and PNG** for looking at: PixInsight's screen stretch (`--stretch`), a sample format of
-  choice (`--bits`), smaller pictures (`--bin`, `--resize`), and previews in Linux file managers.
+  choice (`--bits`), smaller pictures (`--bin`, `--resize`), colour pictures of a colour camera's
+  frames (`--debayer`), and previews in Linux file managers.
 - **Careful with files**: output is written under another name and renamed when it is complete,
   nothing is overwritten unless asked, no file is written twice in a run or over a file the run
   reads, a rewrite is read back and compared before it replaces anything, and the header of a

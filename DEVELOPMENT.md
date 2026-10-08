@@ -400,6 +400,7 @@ brought are in the sections below.
 | | | A logo at the top of the README (`docs/logo.svg`) |
 | 8 October | 0.17.0 | Whole folders: a directory as input, `--skip-existing`, and patterns expanded by the program |
 | | 0.18.0 | DNG input: the raw image of a DNG file, with its colour filter pattern and the exposure |
+| | 0.18.1 | `--debayer`: colour pictures of a mosaic, for TIFF and PNG |
 
 ## Purpose and scope
 
@@ -1014,6 +1015,37 @@ them. The choices:
   files, whose image data is cut off): the headers and keywords are read, and the missing data
   is reported.
 
+### `--debayer` (0.18.1)
+
+- **For pictures only.** Demosaicing is the first step of processing, not of reading: a stacking
+  program wants the mosaic, calibrated first, and makes its own colour. So XISF, FITS and ASDF
+  output keep the mosaic and refuse the option, as they refuse `--bin`.
+- **Bilinear.** It is defined in one sentence, which is also the test's oracle (written out in
+  the test with Python integers): a pixel keeps its colour, the others are the mean of its
+  neighbours of that colour within the image. Integers are rounded half up, exactly: the mean is
+  taken as quotients and remainders, so 64-bit samples do not overflow. Better methods (VNG,
+  AMaZE) give fewer fringes and are a matter for later (`TODO.md`).
+- **Before the smaller picture and the stretch.** A mosaic binned 2 x 2 would mix the colours;
+  the colour image binned is what larger colour pixels would have recorded. The stretch then
+  sees three colours, linked or unlinked.
+- **Which pattern.** The file's own (`ColorFilterArray`, DNG's `CFAPattern`) before `BAYERPAT`;
+  `XBAYROFF` and `YBAYROFF` move the pattern by whole pixels. The pattern describes the rows as
+  stored, as everywhere here, and is turned with them when the picture is turned top-down.
+- **What cannot be interpolated is written as it is, with a warning, not refused**: a folder holds
+  monochrome and colour frames, and a run on it should not fail for the monochrome ones.
+- **No white balance.** DNG files carry one (`AsShotNeutral`), FITS files do not: one rule for
+  every input, and `--stretch=unlinked` balances the colours for a look.
+- **The C API**: the field took the place of `reserved2` at the end of `xisfconv_convert_options`,
+  which `_init` set to 0 and which was not read: a program built against 0.14 to 0.18.0 that left it
+  as `_init` set it gets what it got; one that put something else there, against "not used",
+  now gets a colour picture.
+- **What the review found**: the saved STF of a one-channel image stretched only the red of the
+  colour picture (its other two channels are the identity): the STF of the mosaic is now used
+  for each colour. A grey ICC profile went along with the colour picture, which PNG forbids: it is
+  left out, with a warning. Floating point means could overflow near the largest double, and one
+  NaN made its eight neighbours NaN: values are divided before they are summed, and samples that
+  are not finite are left out of the means, as `--bin` leaves them out.
+
 ## Care with files
 
 - Output is written to `<name>.part` and renamed when complete. An existing `.part` file is not
@@ -1591,7 +1623,7 @@ library with one line changed.
   Python. What they print is held against what they must print for those files (most lines word
   for word, numbers that depend on the arithmetic of the machine by their form and range), and
   what they write is read back.
-- `tests/run_tests.py` drives the built program (6492 checks at 0.18.0 when run as root with rawpy and imagecodecs installed, 13 more with OpenXISF beside it). The Python packages it
+- `tests/run_tests.py` drives the built program (6579 checks at 0.18.1 when run as root with rawpy and imagecodecs installed, 13 more with OpenXISF beside it). The Python packages it
   needs are listed at its top; the `asdf` packages and the external tools (`tiffcp`, `fitsverify`,
   `pngcheck`, `fpack`/`funpack`) are used when installed and their checks skipped when not.
 - Every format is checked against an implementation that shares no code with xisfconv: astropy

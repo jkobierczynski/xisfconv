@@ -2,7 +2,7 @@
 .\" Copyright (C) 2026 Jurgen Kobierczynski
 .\" The manual page of the command line tool. Its options are those of "xisfconv --help", and its
 .\" version that of include/xisfconv.h: tests/run_tests.py holds both against the program.
-.TH XISFCONV 1 "2026-10-08" "xisfconv 0.18.0" "User Commands"
+.TH XISFCONV 1 "2026-10-08" "xisfconv 0.18.1" "User Commands"
 .SH NAME
 xisfconv \- convert between PixInsight XISF, FITS and ASDF images; read DNG; export TIFF and PNG
 .SH SYNOPSIS
@@ -224,6 +224,20 @@ is
 .B 50%
 (half the width and half the height). The picture is never larger than the image, and it is made
 before a stretch is applied.
+.TP
+.B \-\-debayer
+TIFF and PNG output: a colour picture of the mosaic of a one-shot colour camera, by bilinear
+interpolation of its 2 x 2 colour filter pattern (that of the file, else
+.B BAYERPAT
+with
+.B XBAYROFF
+and
+.BR YBAYROFF ),
+before
+.BR \-\-bin ,
+.B \-\-resize
+and a stretch. No white balance is applied. An image without such a pattern is written as it is,
+with a warning. XISF, FITS and ASDF output keep the mosaic.
 .TP
 .B \-\-top\-down
 XISF and DNG input: keep the top-down row order in FITS and ASDF output

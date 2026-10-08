@@ -189,6 +189,7 @@ _OPTION_WORDS = [
     ("--image", "image"),
     ("--top-down", 'row_order="top-down"'),
     ("--no-properties", "properties=False"),
+    ("--debayer", "debayer=True"),
     ("--bin and --resize", "bin, resize and scale"),
     ("--bin", "bin"),
     ("--resize", "resize"),
@@ -2944,7 +2945,7 @@ def _smaller(bin, resize, scale):   # noqa: A002
 def convert(input, output, *, format=None, sample_format=None, image=None, stretch=None, codec=None, checksum=None,
             subblock_size=None, row_order=None, property_keywords=True, wcs=True, sip_order=3, verify=True, bounds=None,
             overwrite=False, progress=None, properties=True, bin=1, resize=None, scale=None,
-            external_files=None):   # noqa: A002 - the names of the command line
+            external_files=None, debayer=False):   # noqa: A002 - the names of the command line
     """Converts a file, as the command line tool does: XISF to FITS, ASDF, TIFF or PNG; FITS
     and ASDF to XISF, to each other, or to TIFF or PNG; FITS to FITS to pack a file
     (``codec=True``: tile-compressed) or to unpack one. (XISF to XISF is :func:`rewrite`.)
@@ -3000,6 +3001,11 @@ def convert(input, output, *, format=None, sample_format=None, image=None, stret
         of the pixels it covers, taken of the image as it is stored: before a stretch. A
         picture is never larger than the image. With ``bin`` and one of the others the
         blocks come first; with ``resize`` and ``scale`` the picture is the smaller of the two.
+    debayer
+        ``--debayer``: a colour picture of the mosaic of a one-shot colour camera, for TIFF and
+        PNG output (bilinear, by the image's 2 x 2 pattern of R, G and B, or BAYERPAT; before
+        ``bin``, ``resize`` and a stretch; no white balance). An image without such a pattern is
+        written as it is, with a warning. (Since 0.18.1.)
     """
     options = _lib.struct(_lib.ConvertOptions, _library.xisfconv_convert_options_init)
     options.output_format = _output_format(format)
@@ -3019,6 +3025,7 @@ def convert(input, output, *, format=None, sample_format=None, image=None, stret
     options.overwrite = int(bool(overwrite))
     options.properties = int(bool(properties))
     options.bin, options.fit_width, options.fit_height, options.scale = _smaller(bin, resize, scale)
+    options.debayer = int(bool(debayer))
     context = _Context.borrow()
     with context.lock:
         context.about(input, other=output, external_files=external_files)

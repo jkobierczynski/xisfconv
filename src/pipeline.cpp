@@ -5,6 +5,7 @@
 #include "pipeline.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -45,6 +46,11 @@ bool hasKeyword(const std::vector<FitsKeyword>& kw, const std::string& name) {
 
 FitsKeyword* findKeyword(std::vector<FitsKeyword>& kw, const std::string& name) {
     for (auto& k : kw)
+        if (toUpper(trim(k.name)) == name) return &k;
+    return nullptr;
+}
+const FitsKeyword* findKeyword(const std::vector<FitsKeyword>& kw, const std::string& name) {
+    for (const auto& k : kw)
         if (toUpper(trim(k.name)) == name) return &k;
     return nullptr;
 }
@@ -131,6 +137,71 @@ void downsampleIsForPictures(const ConvertOptions& opt, Format format) {
     if (opt.downsample.any() && format != Format::Tiff && format != Format::Png) {
         throw Error("--bin and --resize make a smaller picture: they are for TIFF and PNG output", ErrorKind::Argument);
     }
+}
+
+// --debayer makes a colour picture of the mosaic of a one-shot colour camera; data keeps its mosaic.
+void debayerIsForPictures(const ConvertOptions& opt, Format format) {
+    if (opt.debayer && format != Format::Tiff && format != Format::Png) {
+        throw Error("--debayer makes a colour picture: it is for TIFF and PNG output (XISF, FITS and ASDF keep the "
+                    "mosaic, with its pattern, for calibration and stacking)", ErrorKind::Argument);
+    }
+}
+
+// The 2 x 2 colour filter pattern of an image, relative to its first pixel as stored: from the
+// pattern the file states for it (XISF's ColorFilterArray, DNG), else from BAYERPAT with
+// XBAYROFF and YBAYROFF (the pattern begins that many pixels to the left and up). "" if there is
+// none that --debayer can use, and `why` says why.
+std::string bayerPatternOf(const std::vector<FitsKeyword>& keywords, const std::string& cfa, int cfaWidth, int cfaHeight,
+                           std::string& why) {
+    std::string pattern;
+    int xOffset = 0, yOffset = 0;
+    if (!cfa.empty()) {
+        if (cfaWidth != 2 || cfaHeight != 2) {
+            why = "its colour filter pattern is " + std::to_string(cfaWidth) + " x " + std::to_string(cfaHeight) + " (" + cfa +
+                  "), and only 2 x 2 patterns are interpolated";
+            return {};
+        }
+        pattern = cfa;
+    } else if (const FitsKeyword* bp = findKeyword(keywords, "BAYERPAT")) {
+        pattern = toUpper(trim(fitsUnquote(bp->value)));
+        for (const char* key : {"XBAYROFF", "YBAYROFF"}) {
+            if (const FitsKeyword* k = findKeyword(keywords, key)) {
+                double v = 0;
+                if (!parseDouble(k->value, v) || v != std::floor(v) || std::fabs(v) > 1e9) {
+                    why = std::string(key) + " = " + trim(k->value) + " is not a whole number";
+                    return {};
+                }
+                (key[0] == 'X' ? xOffset : yOffset) = static_cast<int>(std::fabs(std::fmod(v, 2.0)));
+            }
+        }
+    } else {
+        why = "it has no colour filter pattern (no BAYERPAT keyword)";
+        return {};
+    }
+    if (pattern.size() != 4 || pattern.find_first_not_of("RGB") != std::string::npos || pattern.find('R') == std::string::npos ||
+        pattern.find('G') == std::string::npos || pattern.find('B') == std::string::npos) {
+        why = "its colour filter pattern \"" + pattern + "\" is not a 2 x 2 pattern of R, G and B";
+        return {};
+    }
+    std::string shifted(4, ' ');
+    for (int y = 0; y < 2; ++y)
+        for (int x = 0; x < 2; ++x) shifted[static_cast<size_t>(2 * y + x)] = pattern[static_cast<size_t>(2 * ((y + yOffset) % 2) + (x + xOffset) % 2)];
+    return shifted;
+}
+
+// --debayer on one image: the mosaic becomes RGB, or a warning says why it stays as it is.
+// `pattern` is that of the pixels as they are now. Returns true if the image is RGB now.
+bool debayerForPicture(PixelBuffer& px, const std::string& pattern, const std::string& why, const std::string& label) {
+    std::string reason = why;
+    if (px.channels != 1) reason = "it has " + std::to_string(px.channels) + " channels, a mosaic has one";
+    else if (!pattern.empty() && (px.width < 2 || px.height < 2)) reason = "it is smaller than 2 x 2 pixels";
+    if (px.channels != 1 || pattern.empty() || px.width < 2 || px.height < 2) {
+        warn(label + ": not debayered: " + reason);
+        return false;
+    }
+    debayerBilinear(px, pattern);
+    info(label + ": debayered (" + pattern + ", bilinear)");
+    return true;
 }
 
 // Makes the image the picture that was asked for, if one was. Returns what happened, for the
@@ -755,6 +826,7 @@ void flipKeywordRows(std::vector<FitsKeyword>& keywords, uint64_t height) {
 void convertXisfFile(const std::string& input, const std::string& outPath, Format format, const ConvertOptions& opt) {
     if (format == Format::Xisf) throw Error("XISF to XISF is a rewrite, not a conversion", ErrorKind::Argument);
     downsampleIsForPictures(opt, format);
+    debayerIsForPictures(opt, format);
     const FitsWriteOptions fitsOptions = format == Format::Fits ? fitsStorage(opt, outPath) : FitsWriteOptions();
     if (format == Format::Asdf) asdfCodec(opt);   // (said before anything is read)
     XisfFile file(input);
@@ -792,19 +864,31 @@ void convertXisfFile(const std::string& input, const std::string& outPath, Forma
     std::vector<PixelBuffer> buffers;
     std::vector<std::string> stretchNotes;  // HISTORY text per converted image
     std::vector<std::pair<double, double>> shrunk;   // pixels of each picture per pixel of its image, in width and height
+    std::vector<bool> colour;                        // an RGB picture (an RGB image, or a mosaic debayered)
+    std::vector<bool> debayered;                     // ... a mosaic debayered
     buffers.reserve(indices.size());
     for (size_t idx : indices) {
         progress("reading", buffers.size(), indices.size());
         const XisfImage& img = file.images()[idx];
         PixelBuffer px = file.readPixels(idx, opt.verify);
-        // A smaller picture is made of the image as it is stored: the mean of linear data is
-        // what larger pixels would have recorded. A stretch comes after, on the picture.
+        bool rgb = img.colorSpace != "Gray", madeRgb = false;
+        if (opt.debayer) {
+            // (XISF rows are top-down, as the picture's: the pattern is that of the pixels as they are)
+            std::string why;
+            const std::string pattern = bayerPatternOf(img.keywords, img.cfa.present ? img.cfa.pattern : std::string(),
+                                                       img.cfa.width, img.cfa.height, why);
+            if (debayerForPicture(px, pattern, why, "image " + std::to_string(idx))) rgb = madeRgb = true;
+        }
+        colour.push_back(rgb);
+        debayered.push_back(madeRgb);
+        // A smaller picture is made of the image as it is stored (after demosaicing): the mean of
+        // linear data is what larger pixels would have recorded. A stretch comes after, on the picture.
         double perPixelX = 1, perPixelY = 1;
         const std::string smaller = makeSmaller(px, opt.downsample, perPixelX, perPixelY);
         if (!smaller.empty()) info("image " + std::to_string(idx) + ": " + smaller);
         shrunk.emplace_back(perPixelX, perPixelY);
         if (opt.stretch != Stretch::None) {
-            const size_t colorChannels = img.colorSpace == "Gray" ? 1 : 3;
+            const size_t colorChannels = rgb ? 3 : 1;
             std::vector<StretchParams> params;
             std::string how;
             const DisplayFunction& df = img.displayFunction;
@@ -812,7 +896,8 @@ void convertXisfFile(const std::string& input, const std::string& outPath, Forma
                                    (opt.stretch == Stretch::Auto || opt.stretch == Stretch::Stored);
             if (useStored) {
                 for (size_t c = 0; c < std::min<size_t>(colorChannels, px.channels); ++c) {
-                    params.push_back({df.s[c], df.m[c], df.h[c], df.l[c], df.r[c]});
+                    const size_t k = madeRgb ? 0 : c;   // (the STF of a mosaic is that of its one channel: for each colour)
+                    params.push_back({df.s[k], df.m[k], df.h[k], df.l[k], df.r[k]});
                 }
                 how = "PixInsight STF";
             } else {
@@ -841,7 +926,7 @@ void convertXisfFile(const std::string& input, const std::string& outPath, Forma
                 convertSampleFormat(px, SampleFormat::UInt16, opt.stretch == Stretch::None ? img.lowerBound : 0,
                                     opt.stretch == Stretch::None ? img.upperBound : 1);
             }
-            const uint64_t colorCh = (img.colorSpace != "Gray" && px.channels >= 3) ? 3 : 1;
+            const uint64_t colorCh = (rgb && px.channels >= 3) ? 3 : 1;
             if (px.channels > colorCh + 1) {
                 warn("PNG: keeping " + std::to_string(colorCh + 1) + " of " + std::to_string(px.channels) +
                      " channels (color + alpha)");
@@ -911,9 +996,11 @@ void convertXisfFile(const std::string& input, const std::string& outPath, Forma
                 const XisfImage& img = file.images()[idx];
                 TiffPage page;
                 page.pixels = &buffers[n];
-                page.rgb = img.colorSpace != "Gray";
+                page.rgb = colour[n];
                 if (img.colorSpace == "CIELab") warn("CIELab image written as RGB samples without color conversion");
-                if (img.hasIccProfile) {
+                if (img.hasIccProfile && debayered[n]) {
+                    warn("image " + std::to_string(idx) + ": its ICC profile, of the one-channel mosaic, is not given to the colour picture");
+                } else if (img.hasIccProfile) {
                     try {
                         page.iccProfile = file.readIccProfile(idx, opt.verify);
                     } catch (const Error& e) {
@@ -934,8 +1021,10 @@ void convertXisfFile(const std::string& input, const std::string& outPath, Forma
             const XisfImage& img = file.images()[indices[0]];
             PngImage png;
             png.pixels = &buffers[0];
-            png.rgb = img.colorSpace != "Gray" && buffers[0].channels >= 3;
-            if (img.hasIccProfile) {
+            png.rgb = colour[0] && buffers[0].channels >= 3;
+            if (img.hasIccProfile && debayered[0]) {
+                warn("image " + std::to_string(indices[0]) + ": its ICC profile, of the one-channel mosaic, is not given to the colour picture");
+            } else if (img.hasIccProfile) {
                 try {
                     png.iccProfile = file.readIccProfile(indices[0], opt.verify);
                 } catch (const Error& e) {
@@ -970,6 +1059,7 @@ void convertFitsOrAsdfFile(const std::string& input, InputFormat kind, const std
                     ErrorKind::Argument);
     }
     downsampleIsForPictures(opt, format);
+    debayerIsForPictures(opt, format);
     if (opt.stretch == Stretch::Stored) {
         throw Error(std::string(inputName) + " files carry no saved STF; use --stretch, --stretch=linked or --stretch=unlinked",
                     ErrorKind::NotFound);
@@ -1073,6 +1163,16 @@ void writeImageSet(FitsFile& fits, const ImageSetOrigin& source, const std::stri
             const std::string label = "image " + std::to_string(idx);
             const bool topDown = opt.rowOrderGiven ? !opt.bottomUp : img.topDown;
             if (!topDown) flipVertical(px);
+            if (opt.debayer) {
+                // the pattern is that of the rows as stored: turned with them
+                std::string why;
+                std::string pattern = bayerPatternOf(img.keywords, img.cfaPattern, img.cfaWidth, img.cfaHeight, why);
+                if (!topDown && !pattern.empty()) pattern = flipPatternRows(pattern, 2, 2, px.height);
+                if (debayerForPicture(px, pattern, why, label) && !img.iccProfile.empty()) {
+                    warn(label + ": its ICC profile, of the one-channel mosaic, is not given to the colour picture");
+                    img.iccProfile.clear();
+                }
+            }
             double perPixelX = 1, perPixelY = 1;
             const std::string smaller = makeSmaller(px, opt.downsample, perPixelX, perPixelY);   // before a stretch, as from XISF
             if (!smaller.empty() && img.hasNaN) {

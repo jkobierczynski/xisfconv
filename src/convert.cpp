@@ -398,6 +398,105 @@ void downsamplePlane(const T* src, uint64_t stride, T* dst, const std::vector<Sp
 
 }  // namespace
 
+namespace {
+
+template <typename T>
+void debayerPlanes(const T* src, uint64_t width, uint64_t height, const int colour[2][2], T* out) {
+    const uint64_t plane = width * height;
+    for (uint64_t y = 0; y < height; ++y) {
+        for (uint64_t x = 0; x < width; ++x) {
+            const int own = colour[y & 1][x & 1];
+            const T v = src[y * width + x];
+            for (int c = 0; c < 3; ++c) {
+                T result;
+                if (c == own) {
+                    result = v;
+                } else {
+                    // the neighbours of colour c (with a 2 x 2 pattern that holds c and an image of
+                    // at least 2 x 2 pixels, every window of 3 x 3 cut by the edges holds one);
+                    // floating point samples that are not finite are left out, as from --bin
+                    uint64_t n = 0;
+                    for (uint64_t yy = y ? y - 1 : 0; yy <= y + 1 && yy < height; ++yy) {
+                        for (uint64_t xx = x ? x - 1 : 0; xx <= x + 1 && xx < width; ++xx) {
+                            if ((yy == y && xx == x) || colour[yy & 1][xx & 1] != c) continue;
+                            if constexpr (std::is_floating_point<T>::value) {
+                                if (!std::isfinite(src[yy * width + xx])) continue;
+                            }
+                            ++n;
+                        }
+                    }
+                    double sum = 0;
+                    uint64_t quotients = 0, remainders = 0;
+                    for (uint64_t yy = y ? y - 1 : 0; yy <= y + 1 && yy < height; ++yy) {
+                        for (uint64_t xx = x ? x - 1 : 0; xx <= x + 1 && xx < width; ++xx) {
+                            if ((yy == y && xx == x) || colour[yy & 1][xx & 1] != c) continue;
+                            const T w = src[yy * width + xx];
+                            if constexpr (std::is_floating_point<T>::value) {
+                                // (each divided first: a sum of values near the largest double would overflow)
+                                if (std::isfinite(w)) sum += static_cast<double>(w) / static_cast<double>(n);
+                            } else {
+                                quotients += static_cast<uint64_t>(w) / n;
+                                remainders += static_cast<uint64_t>(w) % n;
+                            }
+                        }
+                    }
+                    if constexpr (std::is_floating_point<T>::value) {
+                        result = n ? static_cast<T>(sum) : std::numeric_limits<T>::quiet_NaN();
+                    } else {
+                        // the sum is n * quotients + remainders: its mean, rounded half up, is
+                        // quotients + (remainders + n / 2) / n, with nothing that can overflow
+                        result = static_cast<T>(quotients + (remainders + n / 2) / n);
+                    }
+                }
+                out[static_cast<uint64_t>(c) * plane + y * width + x] = result;
+            }
+        }
+    }
+}
+
+}  // namespace
+
+void debayerBilinear(PixelBuffer& px, const std::string& pattern) {
+    if (px.channels != 1) throw Error("--debayer: the image has " + std::to_string(px.channels) + " channels, not one", ErrorKind::Argument);
+    if (px.width < 2 || px.height < 2) throw Error("--debayer: an image smaller than 2 x 2 pixels", ErrorKind::Argument);
+    int colour[2][2];
+    bool seen[3] = {false, false, false};
+    if (pattern.size() != 4) throw Error("--debayer: a pattern of 2 x 2 is needed, not \"" + pattern + "\"", ErrorKind::Argument);
+    for (int k = 0; k < 4; ++k) {
+        const char ch = pattern[static_cast<size_t>(k)];
+        const int c = ch == 'R' ? 0 : ch == 'G' ? 1 : ch == 'B' ? 2 : -1;
+        if (c < 0) throw Error("--debayer: a pattern of R, G and B is needed, not \"" + pattern + "\"", ErrorKind::Argument);
+        colour[k / 2][k % 2] = c;
+        seen[c] = true;
+    }
+    if (!seen[0] || !seen[1] || !seen[2]) {
+        throw Error("--debayer: the pattern \"" + pattern + "\" lacks a colour", ErrorKind::Argument);
+    }
+    const size_t sb = sampleBytes(px.format);
+    std::vector<uint8_t> out(static_cast<size_t>(checkedMul(px.planeSamples(), 3, "the size of the image")) * sb);
+    const uint8_t* src = px.data.data();
+    switch (px.format) {
+        case SampleFormat::UInt8: debayerPlanes(src, px.width, px.height, colour, out.data()); break;
+        case SampleFormat::UInt16:
+            debayerPlanes(reinterpret_cast<const uint16_t*>(src), px.width, px.height, colour, reinterpret_cast<uint16_t*>(out.data()));
+            break;
+        case SampleFormat::UInt32:
+            debayerPlanes(reinterpret_cast<const uint32_t*>(src), px.width, px.height, colour, reinterpret_cast<uint32_t*>(out.data()));
+            break;
+        case SampleFormat::UInt64:
+            debayerPlanes(reinterpret_cast<const uint64_t*>(src), px.width, px.height, colour, reinterpret_cast<uint64_t*>(out.data()));
+            break;
+        case SampleFormat::Float32:
+            debayerPlanes(reinterpret_cast<const float*>(src), px.width, px.height, colour, reinterpret_cast<float*>(out.data()));
+            break;
+        case SampleFormat::Float64:
+            debayerPlanes(reinterpret_cast<const double*>(src), px.width, px.height, colour, reinterpret_cast<double*>(out.data()));
+            break;
+    }
+    px.data = std::move(out);
+    px.channels = 3;
+}
+
 void downsample(PixelBuffer& px, const DownsampledSize& size) {
     if (!size.changes || size.width == 0 || size.height == 0 || px.width == 0 || px.height == 0) return;
     if (size.useWidth > px.width || size.useHeight > px.height || size.width > size.useWidth || size.height > size.useHeight) {
