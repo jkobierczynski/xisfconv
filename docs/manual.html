@@ -9,7 +9,7 @@
 <title>xisfconv library manual: C, C++ and Python</title>
 <meta name="description" content="How to read and write PixInsight XISF images with libxisfconv from C, C++ and Python, with example programs run on a real frame and the complete API reference.">
 <meta name="generator" content="docs/make_manual.py">
-<meta name="xisfconv-manual-sources" content="850cef5b2b4c11244db948eb496b698a9c9869c58b0b82c92764e6b511ca4218">
+<meta name="xisfconv-manual-sources" content="a4e284fabd352c423d1729da3852224da0b98290321d3e2de9b84438614f669f">
 <script>
 (function () {
   var root = document.documentElement;
@@ -250,7 +250,7 @@ pre.decl { padding: 0.8rem 1rem; overflow-x: auto; background: var(--panel); bor
 <nav class="side" aria-label="Manual">
   <div>
     <a class="brand" href="#top">xisfconv</a>
-    <p class="brand-version">Library manual, 0.16.0</p>
+    <p class="brand-version">Library manual, 0.17.0</p>
   </div>
   <p class="side-label" id="language-label">Show the examples in</p>
   <div class="switch" role="group" aria-labelledby="language-label">
@@ -266,7 +266,7 @@ pre.decl { padding: 0.8rem 1rem; overflow-x: auto; background: var(--panel); bor
 <main id="top">
 
 <header class="hero">
-  <p class="hero-version">libxisfconv 0.16.0, the library manual</p>
+  <p class="hero-version">libxisfconv 0.17.0, the library manual</p>
   <h1>Reading and writing XISF images from C, C++ and Python</h1>
   <p class="lede">libxisfconv reads PixInsight XISF, FITS and ASDF images into arrays and writes arrays as XISF, FITS, ASDF, TIFF or
   PNG. This manual shows how to use it from each of the three languages, with programs that ran on one real frame.
@@ -344,7 +344,7 @@ be used with <code>pkg-config --static</code>; the CMake package is installed wi
 <div class="code plain"><pre><code>pip<span class="t-w"> </span>install<span class="t-w"> </span>.<span class="t-w">                    </span><span class="t-c1"># from a checkout: builds the library and installs the package</span>
 pip<span class="t-w"> </span>install<span class="t-w"> </span><span class="t-s2">&quot;.[astropy]&quot;</span><span class="t-w">         </span><span class="t-c1"># the same, with astropy</span></code></pre></div>
 <p>The package needs Python 3.10 or later and NumPy. It brings its own copy of the library, so nothing else has to be
-installed. At the time of version 0.16.0 the package is not on PyPI yet; once it is, <code>pip install xisfconv</code>
+installed. At the time of version 0.17.0 the package is not on PyPI yet; once it is, <code>pip install xisfconv</code>
 does the same without a checkout.</p>
 
 <h3 id="first">A first program</h3>
@@ -2183,7 +2183,7 @@ wrote compat.xisf</samp></pre></div>
 
 <!-- ============================================================================================ -->
 <h2 id="c-reference">C API reference</h2>
-<p class="part-lede">The declarations of <code>xisfconv.h</code>, version 0.16.0, in the order of the header. C++ programs use the same ones.</p>
+<p class="part-lede">The declarations of <code>xisfconv.h</code>, version 0.17.0, in the order of the header. C++ programs use the same ones.</p>
 <p>Two things of the header are not listed below. The macros <code>XISFCONV_VERSION_MAJOR</code>,
 <code>XISFCONV_VERSION_MINOR</code> and <code>XISFCONV_VERSION_PATCH</code> are the version a program was compiled with;
 <code>xisfconv_version</code> gives the one it runs with. And a program that links the static library defines
@@ -2805,7 +2805,7 @@ TimePoint                        a date, or a date and a time, of ISO 8601:
 
 <!-- ============================================================================================ -->
 <h2 id="python-reference">Python API reference</h2>
-<p class="part-lede">The package <code>xisfconv</code>, version 0.16.0: its functions and classes with their own documentation.</p>
+<p class="part-lede">The package <code>xisfconv</code>, version 0.17.0: its functions and classes with their own documentation.</p>
 <div class="doc"><p>xisfconv: PixInsight XISF images as NumPy arrays, and conversion between XISF, FITS and ASDF.</p><p>Reading:</p><div class="code small"><pre><code><span class="t-kn">import</span><span class="t-w"> </span><span class="t-nn">xisfconv</span>
 
 <span class="t-n">data</span> <span class="t-o">=</span> <span class="t-n">xisfconv</span><span class="t-o">.</span><a href="#py-read"><span class="t-n">read</span></a><span class="t-p">(</span><span class="t-s2">&quot;m31.xisf&quot;</span><span class="t-p">)</span>              <span class="t-c1"># [height, width] or [height, width, channels]</span>

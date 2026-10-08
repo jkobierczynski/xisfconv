@@ -2988,11 +2988,10 @@ def test_verify():
     check(r.returncode == 1 and "FAILED" in r.stdout and "not an XISF" in r.stdout, "--verify on a file of another kind")
     r = verify(os.path.join(d, "missing.xisf"))
     check(r.returncode == 1 and "FAILED" in r.stdout, "--verify on a missing file")
-    # a directory where a file is meant (--verify takes directories; --info and conversion do not)
-    for arguments in (["--info", d], [d, "-o", os.path.join(d, "from-directory.fits")]):
-        r = subprocess.run([EXE] + arguments, capture_output=True, text=True)
-        check(r.returncode == 1 and "is a directory, not a file" in r.stderr and not os.path.exists(os.path.join(d, "from-directory.fits")),
-              f"a directory given as a file is called a directory: {r.stderr.strip()}")
+    # a directory where one file is meant (a directory stands for its files since 0.17: test_directories_and_patterns)
+    r = subprocess.run([EXE, d, "-o", os.path.join(d, "from-directory.fits")], capture_output=True, text=True)
+    check(r.returncode == 2 and "is a directory" in r.stderr and not os.path.exists(os.path.join(d, "from-directory.fits")),
+          f"a directory given with -o is called a directory: {r.stderr.strip()}")
     # an output name that is a directory is not replaced by the output, with or without --force
     taken = os.path.join(d, "taken.fits")
     os.mkdir(taken)
@@ -5640,6 +5639,581 @@ def test_distributed_units():
         skipped.append("OpenXISF reads what xisfconv wrote and the reverse (set OPENXISF_BIN to the directory of its sample programs)")
 
 
+def tool(*args, cwd=None):
+    """Runs the program, in a directory of its own if one is given. Returns the finished process."""
+    return subprocess.run([EXE, *args], cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+
+
+def files_below(root):
+    """Every file below a directory, as its path below it with "/" between the parts."""
+    out = []
+    for where, _, names in os.walk(root):
+        out += [os.path.relpath(os.path.join(where, n), root).replace(os.sep, "/") for n in names]
+    return sorted(out)
+
+
+def as_one_file(path):
+    """The bytes of a file xisfconv wrote, without the one thing that differs from run to run: the time an
+    XISF file says it was made at."""
+    import re
+    return re.sub(rb'(id="XISF:CreationTime" type="TimePoint" value=")[^"]*', rb"\1", open(path, "rb").read())
+
+
+KIND_OF_NAME = {".xisf": "xisf", ".xish": "xish", ".fits": "fits", ".fit": "fits", ".fts": "fits", ".fz": "fz", ".asdf": "asdf"}
+
+
+def outputs_expected(files, target, compress=False):
+    """What a conversion of a directory to `target` writes, written down without xisfconv: {input: output} for
+    the files of the directory that are images by their names, are not hidden and are not yet what is made."""
+    written = {"fits": "fz" if compress else "fits"}.get(target, target)
+    ending = {"fits": ".fits.fz" if compress else ".fits", "tiff": ".tif"}.get(target, "." + target)
+    out = {}
+    for f in files:
+        kind = KIND_OF_NAME.get(os.path.splitext(f)[1].lower())
+        if kind is None or kind == written or any(part.startswith(".") for part in f.split("/")):
+            continue
+        stem = f[:-len(".fits.fz")] if f.lower().endswith(".fits.fz") else os.path.splitext(f)[0]
+        out[f] = stem + ending
+    return out
+
+
+def pattern_matches(pattern, name):
+    """The rule for patterns, written down a second time: * any characters, ? one, everything else itself, and
+    a dot at the start of a name only for a dot at the start of the pattern."""
+    import re
+    if name.startswith(".") and not pattern.startswith("."):
+        return False
+    rx = "".join(".*" if c == "*" else "." if c == "?" else re.escape(c) for c in pattern)
+    return re.fullmatch(rx, name, re.S | (re.I if os.name == "nt" else 0)) is not None
+
+
+def test_directories_and_patterns():
+    """Directories and patterns as inputs: a directory converts as its files do one by one, the files that are
+    what is asked for already are passed over, the tree is kept below -d; a pattern stands for the names it
+    matches, on every system; and a run writes no file twice and none over a file it reads."""
+    import random
+    import re
+    base = os.path.join(TMP, "directories")
+    os.makedirs(base)
+    windows = os.name == "nt"
+    rel = lambda p: p.replace("/", os.sep)   # noqa: E731
+
+    # ---- a tree as a project has it: frames of every kind in nested directories, and what is none
+    tree = os.path.join(base, "tree")
+    for sub in ("night1/darks", "night2", ".cache"):
+        os.makedirs(os.path.join(tree, rel(sub)))
+    odd = "Sp ace [Ha] é.fts"            # a blank, brackets and a letter outside ASCII in a name
+    seed = [200]
+
+    def image(dtype, channels=1):
+        seed[0] += 1
+        return test_image(dtype, 20, 30, channels, seed[0])
+
+    def xisf_file(path, dtype=np.uint16, channels=1):
+        write_xisf(os.path.join(tree, rel(path)), [image_entry(image(dtype, channels))])
+
+    def fits_file(path, dtype=np.uint16):
+        fits.PrimaryHDU(np.squeeze(as_planes(image(dtype)))).writeto(os.path.join(tree, rel(path)))
+
+    xisf_file("m31.xisf", np.float32, 3)
+    xisf_file("night1/light_001.xisf")
+    xisf_file("night1/light_002.xisf", np.uint8)
+    fits_file("night1/darks/dark.fit")
+    fits_file("night2/flat.fits", np.float32)
+    fits_file("night2/" + odd, np.int16)
+    fits.HDUList([fits.PrimaryHDU(), fits.CompImageHDU(np.squeeze(as_planes(image(np.uint16))), compression_type="RICE_1")]).writeto(
+        os.path.join(tree, rel("night2/packed.fits.fz")))
+    xisf_file("night2/seed_a.xisf", np.uint16, 3)
+    xisf_file("night2/seed_u.xisf", np.float64)
+    run(os.path.join(tree, rel("night2/seed_a.xisf")), "-o", os.path.join(tree, rel("night2/tree.asdf")), "-q")
+    run(os.path.join(tree, rel("night2/seed_u.xisf")), "-o", os.path.join(tree, rel("night2/unit.xish")), "-q")
+    os.remove(os.path.join(tree, rel("night2/seed_a.xisf")))
+    os.remove(os.path.join(tree, rel("night2/seed_u.xisf")))
+    xisf_file(".cache/hidden.xisf")
+    open(os.path.join(tree, rel("night1/._light_001.xisf")), "wb").write(b"\x00\x05\x16\x07 what macOS leaves on other file systems")
+    open(os.path.join(tree, "notes.txt"), "w").write("M 31, two nights\n")
+    open(os.path.join(tree, rel("night1/table.csv")), "w").write("frame,fwhm\n1,2.3\n")
+    before = files_below(tree)
+    check(len(before) == 14 and "night2/unit.xisb" in before, f"the tree of the tests is there: {before}")
+
+    def fresh(name):
+        where = os.path.join(base, name)
+        shutil.copytree(tree, where, copy_function=shutil.copy)   # (copy2 asks Windows for what Wine does not have)
+        return where
+
+    def lines_of(r):
+        return [line for line in r.stdout.splitlines() if " -> " in line]
+
+    def summary_of(r):
+        m = re.search(r"^(\d+) files? (?:converted|done), (\d+) passed over, (\d+) failed$", r.stdout, re.M)
+        return tuple(int(v) for v in m.groups()) if m else None
+
+    # ---- a directory to each format: the files that are not that format yet, each as it converts alone
+    for number, (target, flags) in enumerate([("fits", []), ("fits", ["-c"]), ("xisf", []), ("xish", []), ("asdf", []), ("tiff", []),
+                                              ("png", ["-b", "u8"]), ("xisf", ["--codec", "zlib", "--checksum", "sha1"])]):
+        label = f"a directory, -t {target} {' '.join(flags)}".rstrip()
+        where = fresh(f"to{number}")
+        expected = outputs_expected(before, target, compress="-c" in flags)
+        r = tool("-t", target, *flags, where)
+        after = files_below(where)
+        new = sorted(set(after) - set(before))
+        made = sorted(expected.values()) + sorted(v[:-1] + "b" for v in expected.values() if v.endswith(".xish"))
+        passed = sum(1 for f in before if KIND_OF_NAME.get(os.path.splitext(f)[1].lower()) and f not in expected
+                     and not any(part.startswith(".") for part in f.split("/")))
+        check(r.returncode == 0 and new == sorted(made) and len(expected) >= 4,
+              f"{label}: writes the {len(expected)} files expected and nothing else: {new} for {sorted(made)}; {r.stderr[-300:]}")
+        told = [(a, b) for a, b in (line.split(": ")[0].split(" -> ") for line in lines_of(r))]
+        wanted = [(os.path.join(where, rel(f)), os.path.join(where, rel(expected[f]))) for f in sorted(expected)]
+        check(told == wanted, f"{label}: says so for each, in the order of the names: {told[:3]} ... for {wanted[:3]} ...")
+        check(summary_of(r) == (len(expected), passed, 0) and r.stderr.count("passed over") == (1 if passed else 0),
+              f"{label}: ends with the counts ({len(expected)} converted, {passed} passed over): {r.stdout.splitlines()[-1:]} "
+              f"{[line for line in r.stderr.splitlines() if 'passed over' in line]}")
+        check(all(open(os.path.join(where, rel(f)), "rb").read() == open(os.path.join(tree, rel(f)), "rb").read() for f in before),
+              f"{label}: leaves every file that was there as it was")
+        alone = os.path.join(base, f"alone{number}")
+        os.makedirs(alone)
+        different = []
+        for k, f in enumerate(sorted(expected)):
+            single = os.path.join(alone, f"{k}{os.path.splitext(expected[f])[1] if not expected[f].endswith('.fits.fz') else '.fits.fz'}")
+            run(os.path.join(tree, rel(f)), "-t", target, *flags, "-o", single, "-q")
+            got = os.path.join(where, rel(expected[f]))
+            if target == "xish":      # the blocks of a unit get identifiers of their own each time: the images are compared
+                run(got, "-o", single + ".a.fits", "-q")
+                run(single, "-o", single + ".b.fits", "-q")
+                got, single = single + ".a.fits", single + ".b.fits"
+            if as_one_file(got) != as_one_file(single):
+                different.append(f)
+        check(not different, f"{label}: each output is what the file converts to when it is named alone: {different}")
+        check(not [f for f in after if f.endswith(".part")], f"{label}: no temporary file is left")
+
+    # ---- below -d the files keep their places, and the tree itself is not written to
+    where = fresh("mirror")
+    out = os.path.join(base, "mirror-out")
+    os.makedirs(out)
+    expected = outputs_expected(before, "fits")
+    r = tool("-t", "fits", where + os.sep, "-d", out)      # (a directory may be given with its separator at the end)
+    check(r.returncode == 0 and files_below(out) == sorted(expected.values()) and files_below(where) == before,
+          f"-d: the outputs are below it at the places of their inputs, and nowhere else: {files_below(out)}; {r.stderr[-300:]}")
+    r2 = tool("-t", "fits", where, "-d", out)
+    check(r2.returncode == 1 and summary_of(r2) == (0, 3, len(expected)) and r2.stderr.count("already exists") == len(expected) and
+          "--skip-existing" in r2.stdout.splitlines()[-1] and f"({len(expected)} outputs were there already" in r2.stdout,
+          f"-d, once more: nothing is written over, and the last line says what to do about it: {r2.stdout.splitlines()[-2:]}")
+    # the directory of the outputs, inside the directory that is read: it is not searched
+    inside = os.path.join(where, "converted")
+    os.makedirs(inside)
+    r = tool("-t", "fits", where, "-d", inside, "-q")
+    again = tool("-t", "png", "-b", "u8", where, "-d", inside)
+    pictures = sorted(f for f in files_below(inside) if f.endswith(".png"))
+    check(r.returncode == 0 and again.returncode == 0 and sorted(f for f in files_below(inside) if f.endswith(".fits")) == sorted(expected.values())
+          and pictures == sorted(outputs_expected(before, "png").values()),
+          f"-d inside the directory: what was written there is not taken for input the next time: {pictures}; {again.stderr[-300:]}")
+
+    # ---- without -t: a directory of one format goes the way a file of it goes; one of both is not guessed at
+    where = fresh("default")
+    r = tool(where)
+    check(r.returncode == 2 and files_below(where) == before and "4 XISF and 5 FITS or ASDF files" in r.stderr and "say with -t" in r.stderr
+          and r.stdout == "", f"a directory of XISF and of FITS without -t: nothing is done, exit status 2: {r.stderr.strip()}")
+    r = tool(os.path.join(where, "night1", "darks"))
+    check(r.returncode == 0 and "night1/darks/dark.xisf" in files_below(where) and summary_of(r) == (1, 0, 0),
+          f"a directory of FITS files without -t: to XISF: {r.stdout.strip()} {r.stderr[-200:]}")
+    os.remove(os.path.join(where, "night1", "darks", "dark.xisf"))
+    os.remove(os.path.join(where, "night1", "darks", "dark.fit"))
+    r = tool(os.path.join(where, "night1"), "-c")
+    check(r.returncode == 0 and sorted(set(files_below(where)) - set(before)) == ["night1/light_001.fits.fz", "night1/light_002.fits.fz"],
+          f"a directory of XISF files without -t: to FITS (with -c tile-compressed): {sorted(set(files_below(where)) - set(before))}")
+    empty = os.path.join(base, "empty")
+    os.makedirs(os.path.join(empty, "sub"))
+    open(os.path.join(empty, "readme.txt"), "w").write("nothing here\n")
+    r = tool(empty)
+    check(r.returncode == 0 and "no XISF, FITS or ASDF files found" in r.stderr and summary_of(r) == (0, 0, 0),
+          f"a directory without images: a warning, and nothing to do: {r.stderr.strip()}")
+    for flags, why in ((["-o", os.path.join(base, "one.fits")], "-o with a directory"),):
+        r = tool(where, *flags)
+        check(r.returncode == 2 and "-d" in r.stderr and not os.path.exists(os.path.join(base, "one.fits")), f"{why}: refused: {r.stderr.strip()}")
+    for flags in (["--skip-existing", "--force"], ["--skip-existing", "--in-place"]):
+        r = tool(where, *flags)
+        check(r.returncode == 2 and "--skip-existing" in r.stderr, f"{' '.join(flags)}: refused: {r.stderr.strip()}")
+
+    # ---- --skip-existing: what is there is left, what was added is converted
+    where = fresh("skip")
+    expected = outputs_expected(before, "fits")
+    first = tool("-t", "fits", where, "--skip-existing")
+    stamps = {f: (os.path.getmtime(os.path.join(where, rel(f))), open(os.path.join(where, rel(f)), "rb").read()) for f in files_below(where)}
+    xisf_new = os.path.join(where, "night1", "light_003.xisf")
+    write_xisf(xisf_new, [image_entry(test_image(np.uint16, 20, 30, 1, 299))])
+    second = tool("-t", "fits", where, "--skip-existing")
+    unchanged = all(stamps[f] == (os.path.getmtime(os.path.join(where, rel(f))), open(os.path.join(where, rel(f)), "rb").read()) for f in stamps)
+    check(first.returncode == 0 and summary_of(first) == (len(expected), 3, 0) and second.returncode == 0 and
+          summary_of(second) == (1, 3 + 2 * len(expected), 0) and lines_of(second) == [f"{xisf_new} -> {xisf_new[:-5]}.fits"] and unchanged and
+          second.stdout.count("exists; passed over") == len(expected) and "--force" not in second.stdout,
+          f"--skip-existing: the second run converts the one new file and touches nothing else: {second.stdout.splitlines()[-3:]}")
+    quiet = tool("-t", "fits", where, "--skip-existing", "-q")
+    check(quiet.returncode == 0 and quiet.stdout == "" and quiet.stderr == "", f"... and with -q says nothing: {quiet.stdout!r} {quiet.stderr!r}")
+
+    # ---- --in-place: the XISF files of the directory, each where it is
+    where = fresh("inplace")
+    r = tool("--in-place", "--codec", "zlib", "--checksum", "sha256", where)
+    changed = sorted(f for f in before if open(os.path.join(where, rel(f)), "rb").read() != open(os.path.join(tree, rel(f)), "rb").read())
+    stored = [all((b["attr"]["checksum"] or "").replace("-", "").startswith("sha256:") for b in xisf_blocks(os.path.join(where, rel(f))))
+              for f in ("m31.xisf", "night1/light_001.xisf", "night1/light_002.xisf", "night2/unit.xish")]
+    check(r.returncode == 0 and changed == ["m31.xisf", "night1/light_001.xisf", "night1/light_002.xisf", "night2/unit.xisb", "night2/unit.xish"]
+          and files_below(where) == before and summary_of(r) == (4, 5, 0) and all(stored),
+          f"--in-place on a directory: its XISF files and units are rewritten, the rest is passed over: {changed} {r.stdout.splitlines()[-1:]} "
+          f"{stored} {r.stderr[-300:]}")
+    check(all(": OK" in tool("--verify", os.path.join(where, rel(f))).stdout for f in changed if not f.endswith(".xisb")),
+          "... and each of them verifies")
+
+    # ---- --info and --verify take a directory as the list of its files
+    r = tool("--info", tree)
+    heads = [line.split(": ")[0] for line in r.stdout.splitlines() if re.match(r".*: (XISF 1\.0|FITS|ASDF)", line)]
+    check(r.returncode == 0 and heads == [os.path.join(tree, rel(f)) for f in sorted(outputs_expected(before, "png"))] and summary_of(r) is None,
+          f"--info on a directory: every image file of it, hidden ones left out: {len(heads)} files")
+    r = tool("--verify", tree)
+    check(r.returncode == 1 and r.stdout.count(": OK") == 10 and "._light_001.xisf: FAILED" in r.stdout and "10 files OK, 1 failed" in r.stdout,
+          f"--verify on a directory checks hidden files too, as it did: {r.stdout.splitlines()[-1:]}")
+
+    # ---- no file is written twice in a run, and none over a file the run reads
+    g = os.path.join(base, "guards")
+    os.makedirs(os.path.join(g, "a"))
+    os.makedirs(os.path.join(g, "b"))
+    for sub, value in (("a", 11), ("b", 22)):
+        fits.PrimaryHDU(np.full((6, 8), value, np.uint16)).writeto(os.path.join(g, sub, "frame.fits"))
+    out = os.path.join(g, "out")
+    os.makedirs(out)
+    for flags in ([], ["--force"], ["--skip-existing"]):
+        shutil.rmtree(out)
+        os.makedirs(out)
+        r = tool(os.path.join(g, "a", "frame.fits"), os.path.join(g, "b", "frame.fits"), "-t", "tiff", "-d", out, *flags)
+        check(r.returncode == 1 and files_below(out) == ["frame.tif"] and int(tifffile.imread(os.path.join(out, "frame.tif"))[0, 0]) == 11 and
+              "was written in this run already, from " + os.path.join(g, "a", "frame.fits") in r.stderr and len(lines_of(r)) == 1,
+              f"two inputs with one output {flags}: the first is written, the second refused: {r.stderr.strip()[:200]}")
+    r = tool(os.path.join(g, "a"), os.path.join(g, "b"), "-d", out, "-f")
+    check(r.returncode == 1 and summary_of(r) == (1, 0, 1) and "was written in this run already" in r.stderr,
+          f"two directories with a file of one name, into one directory: the same: {r.stdout.splitlines()[-1:]}")
+    pair = os.path.join(g, "pair")
+    os.makedirs(pair)
+    fits.PrimaryHDU(np.full((6, 8), 5, np.uint16)).writeto(os.path.join(pair, "frame.fits"))
+    write_xisf(os.path.join(pair, "frame.xisf"), [image_entry(test_image(np.uint16, 6, 8, 1, 298))])
+    kept = {n: open(os.path.join(pair, n), "rb").read() for n in os.listdir(pair)}
+    for flags in ([], ["--force"]):
+        r = tool(os.path.join(pair, "frame.fits"), os.path.join(pair, "frame.xisf"), *flags)
+        check(r.returncode == 1 and r.stderr.count("is an input of this run and is not written over") == 2 and
+              {n: open(os.path.join(pair, n), "rb").read() for n in os.listdir(pair)} == kept,
+              f"a file and its counterpart, each to the other {flags}: neither is written over: {r.stderr.strip()[:160]}")
+    r = tool(os.path.join(pair, "frame.fits"), os.path.join(pair, "frame.xisf"), "--skip-existing")
+    check(r.returncode == 0 and r.stdout.count("exists; passed over") == 2 and
+          {n: open(os.path.join(pair, n), "rb").read() for n in os.listdir(pair)} == kept, "... and with --skip-existing both are passed over")
+
+    # ---- patterns: an argument with * or ? that names no file
+    p = fresh("patterns")
+    for name in ("M31 [Ha].xisf", "M31 H.xisf", "café.xisf", "cafe.xisf", ".dot.xisf"):
+        write_xisf(os.path.join(p, name), [image_entry(test_image(np.uint8, 4, 5, 1, 297))])
+
+    def matched(*args, cwd=p):
+        r = tool("--info", *args, cwd=cwd)
+        return [line.split(": ")[0].replace(os.sep, "/") for line in r.stdout.splitlines() if re.match(r".*: (XISF 1\.0|FITS|ASDF)", line)], r
+
+    for pattern, names in (
+            ("*.xisf", ["M31 H.xisf", "M31 [Ha].xisf", "cafe.xisf", "café.xisf", "m31.xisf"]),
+            ("night1/*.xisf", ["night1/light_001.xisf", "night1/light_002.xisf"]),
+            ("night?/*.fi*", ["night1/darks/dark.fit"][:0] + ["night2/flat.fits", "night2/packed.fits.fz"]),
+            ("night*/*/*", ["night1/darks/dark.fit"]),
+            ("*/light_00?.xisf", ["night1/light_001.xisf", "night1/light_002.xisf"]),
+            ("M31 [Ha]*", ["M31 [Ha].xisf"]),                       # a bracket is a bracket
+            ("caf?.xisf", ["cafe.xisf", "café.xisf"]),            # ? is one character, of however many bytes
+            ("caf??.xisf", []),
+            (".*.xisf", [".dot.xisf"]),                             # a dot at the start only for a dot
+            ("*1", ["night1/light_001.xisf", "night1/light_002.xisf", "night1/darks/dark.fit"]),   # a directory: what is in it
+            ("./m3?.*", ["./m31.xisf"]),
+            ("n*2/unit.xish", ["night2/unit.xish"])):
+        got, r = matched(pattern)
+        wanted = sorted(names) if pattern != "*1" else ["night1/darks/dark.fit", "night1/light_001.xisf", "night1/light_002.xisf"]
+        check(got == wanted and (r.returncode == 0) == bool(names), f"the pattern {pattern}: {got} for {wanted}; {r.stderr.strip()[:200]}")
+    got, r = matched(os.path.join(p, "night1", "*.xisf"), cwd=base)
+    check(got == [os.path.join(p, "night1", n).replace(os.sep, "/") for n in ("light_001.xisf", "light_002.xisf")],
+          f"a pattern with an absolute path: {got}")
+    got, r = matched("*.XISF")
+    check(len(got) == (5 if windows else 0) and (r.returncode == 0) == windows,
+          f"letters match as the system compares names (here: {'whatever their case' if windows else 'as they are written'}): {got}")
+    r = tool("-t", "tiff", "*.nothing", "night1/*.xisf", "zz*/x?", "-d", ".", cwd=p)
+    check(r.returncode == 1 and r.stderr.count(": no file matches this pattern") == 2 and summary_of(r) == (2, 0, 2) and
+          sorted(f for f in files_below(p) if f.endswith(".tif")) == ["light_001.tif", "light_002.tif"],
+          f"patterns that match nothing are errors, and the rest is converted (a pattern's files are not kept in a tree below -d): "
+          f"{r.stdout.splitlines()[-1:]} {r.stderr.strip()[:200]}")
+    r = tool("--verify", "night2/*.fits*", "*.none", cwd=p)
+    check(r.returncode == 1 and r.stdout.count(": OK") == 2 and "2 files OK, 1 failed" in r.stdout, f"--verify takes patterns: {r.stdout.splitlines()[-1:]}")
+    r = tool("*.xisf", "-o", "one.fits", cwd=p)
+    check(r.returncode == 2 and "single input" in r.stderr and not os.path.exists(os.path.join(p, "one.fits")),
+          f"-o with a pattern of several files: refused: {r.stderr.strip()}")
+    r = tool("café.*", "-o", "one.fits", "-q", cwd=p)
+    check(r.returncode == 0 and os.path.exists(os.path.join(p, "one.fits")), f"-o with a pattern of one file: {r.stderr.strip()}")
+    if not windows:
+        literal = os.path.join(p, "what?.xisf")
+        shutil.copy(os.path.join(p, "cafe.xisf"), literal)
+        shutil.copy(os.path.join(p, "cafe.xisf"), os.path.join(p, "whatX.xisf"))
+        got, r = matched("what?.xisf")
+        check(got == ["what?.xisf"], f"a file that is called what?.xisf is that file, not a pattern: {got}")
+        os.remove(literal)
+        got, r = matched("what?.xisf")
+        check(got == ["whatX.xisf"], f"... and a pattern once it is gone: {got}")
+    else:
+        got, r = matched("night1\\*.xisf")
+        check(got == ["night1/light_001.xisf", "night1/light_002.xisf"], f"Windows: a pattern behind a backslash: {got}")
+        long_form = "\\\\?\\" + os.path.abspath(p)
+        got, r = matched(long_form + "\\caf?.xisf", cwd=base)
+        check(got == [(long_form + "\\" + n).replace("\\", "/") for n in ("cafe.xisf", "café.xisf")],
+              f"Windows: a pattern behind a long path (\\\\?\\): {got} {r.stderr.strip()[:200]}")
+        got, r = matched(long_form + "\\cafe.xisf", cwd=base)
+        check(len(got) == 1, f"Windows: the question mark of a long path is no wildcard: {got} {r.stderr.strip()[:200]}")
+        got, r = matched(long_form + "\\missing.xisf", cwd=base)
+        check(r.returncode == 1 and "no file matches" not in r.stderr and "missing.xisf" in r.stderr,
+              f"Windows: ... also not for a file that is not there: {r.stderr.strip()[:200]}")
+        r = tool("/?", cwd=p)
+        check(r.returncode == 0 and r.stdout.startswith("xisfconv ") and "Usage:" in r.stdout, f"Windows: /? asks for the help: {r.stdout[:60]!r}")
+
+    got, r = matched("night*/")
+    check(got == ["night1/darks/dark.fit", "night1/light_001.xisf", "night1/light_002.xisf", "night2/Sp ace [Ha] é.fts", "night2/flat.fits",
+                  "night2/packed.fits.fz", "night2/tree.asdf", "night2/unit.xish"], f"a pattern that ends in a separator means directories: {got}")
+    open(os.path.join(p, "nightly.fits"), "wb").write(open(os.path.join(p, "night2", "flat.fits"), "rb").read())
+    got, r = matched("night*/")
+    got2, r2 = matched("night*")
+    check("nightly.fits" not in got and len(got) == 8 and "nightly.fits" in got2 and len(got2) == 9,
+          f"... and not a file of such a name, which the pattern without it takes: {len(got)}, {len(got2)}")
+    os.remove(os.path.join(p, "nightly.fits"))
+    if hasattr(os, "mkfifo"):
+        os.mkfifo(os.path.join(p, "night1", "pipe.xisf"))
+        try:
+            r = subprocess.run([EXE, "--info", "night1/*.xisf"], cwd=p, capture_output=True, text=True, timeout=120)
+            check(r.returncode == 0 and "pipe.xisf" not in r.stdout + r.stderr, f"a pattern does not stand for a pipe: {r.stderr.strip()[:200]}")
+        except subprocess.TimeoutExpired:
+            check(False, "a pattern does not stand for a pipe: the program waits on it")
+        os.remove(os.path.join(p, "night1", "pipe.xisf"))
+
+    # ---- a name twice, a picture of an earlier run among the inputs, the directory of the outputs under a pattern
+    q = fresh("again")
+    r = tool("-t", "tiff", "m31.xisf", "./m31.xisf", os.path.join(q, "m31.xisf"), cwd=q)
+    check(r.returncode == 0 and len(lines_of(r)) == 1 and "m31.tif" in files_below(q),
+          f"a file that is given three times is converted once: {r.stdout.strip()} {r.stderr.strip()[:200]}")
+    r = tool("-t", "png", "-b", "u8", "night1", os.path.join("night1", "light_001.xisf"), "night1" + os.sep, cwd=q)
+    check(r.returncode == 0 and summary_of(r) == (3, 0, 0),
+          f"... and a directory with one of its files, and once more: {r.stdout.splitlines()[-1:]} {r.stderr.strip()[:200]}")
+    r = tool("-t", "tiff", "-f", "m31.xisf", "m31.tif", cwd=q)
+    check(r.returncode == 1 and lines_of(r) == ["m31.xisf -> m31.tif"] and "error: m31.tif: " in r.stderr and "is an input of this run" not in r.stderr,
+          f"a picture of an earlier run among the inputs is an error of its own and does not keep its source from being converted: "
+          f"{r.stderr.strip()[:200]}")
+    os.makedirs(os.path.join(q, "out"))
+    for name in ("notes.txt", "m31.tif"):     # ("*" brings along what is there, as a shell's does; here only images and directories)
+        os.remove(os.path.join(q, name))
+    first = tool("-t", "fits", "*", "-d", "out", cwd=q)
+    second = tool("-t", "tiff", "*", "-d", "out", "-f", cwd=q)
+    pictures = sorted(f for f in files_below(os.path.join(q, "out")) if f.endswith(".tif"))
+    wanted = sorted(v.split("/", 1)[1] if "/" in v else v for v in outputs_expected(before, "tiff").values())
+    check(first.returncode == 0 and second.returncode == 0 and "out: the directory of the outputs (-d) is not searched" in second.stderr and
+          not [f for f in files_below(q) if f.startswith("out/out/")] and pictures == wanted,
+          f"a pattern that also matches the directory of the outputs does not mean it: {pictures} for {wanted}; "
+          f"{second.stdout.splitlines()[-1:]} {second.stderr.strip()[-300:]}")
+    os.makedirs(os.path.join(q, "night1", "pictures"))
+    other_spelling = os.path.join("night1", "..", "night1", "pictures")
+    r = tool("-t", "fits", "night1", "-d", other_spelling, cwd=q)       # (FITS files there, which a search below night1 would find)
+    r2 = tool("-t", "tiff", "night1", "-d", other_spelling, "-f", cwd=q)
+    r3 = tool("-t", "tiff", "night1", "-d", other_spelling, "-f", cwd=q)
+    check(r.returncode == 0 and r2.returncode == 0 and r3.returncode == 0 and summary_of(r) == (2, 1, 0) and summary_of(r3) == (3, 0, 0) and
+          not [f for f in files_below(q) if "pictures/pictures" in f] and "outputs were there" not in r3.stdout,
+          f"the directory of the outputs is known under another spelling, and --force gets no hint about outputs in the way: "
+          f"{r3.stdout.splitlines()[-1:]} {[f for f in files_below(q) if 'pictures' in f]}")
+
+    # ---- the guards go by the file, not by how its name is written
+    g2 = os.path.join(base, "spellings")
+    os.makedirs(os.path.join(g2, "pair"))
+    fits.PrimaryHDU(np.full((6, 8), 5, np.uint16)).writeto(os.path.join(g2, "pair", "frame.fits"))
+    write_xisf(os.path.join(g2, "pair", "frame.xisf"), [image_entry(test_image(np.uint16, 6, 8, 1, 295))])
+    pair_was = {n: open(os.path.join(g2, "pair", n), "rb").read() for n in os.listdir(os.path.join(g2, "pair"))}
+    spellings = [("a relative and an absolute name", [os.path.join(g2, "pair", "frame.fits"), "frame.xisf"], os.path.join(g2, "pair")),
+                 ("a name through ..", [os.path.join("pair", "frame.fits"), os.path.join("pair", "..", "pair", "frame.xisf")], g2)]
+    if hasattr(os, "symlink") and not windows:
+        os.symlink(os.path.join(g2, "pair"), os.path.join(g2, "link"))
+        spellings.append(("a name through a link to the directory", [os.path.join("link", "frame.fits"), os.path.join("pair", "frame.xisf")], g2))
+    for what, names, cwd in spellings:
+        r = tool("-f", *names, cwd=cwd)
+        check(r.returncode == 1 and r.stderr.count("is an input of this run") == 2 and
+              {n: open(os.path.join(g2, "pair", n), "rb").read() for n in os.listdir(os.path.join(g2, "pair"))} == pair_was,
+              f"an output that is an input, {what}: not written over: {r.stderr.strip()[:160]}")
+    for sub in ("d1", "d2", "out"):
+        os.makedirs(os.path.join(g2, sub))
+    for sub, name, value in (("d1", "Frame.fits", 11), ("d2", "frame.fits", 22)):
+        fits.PrimaryHDU(np.full((6, 8), value, np.uint16)).writeto(os.path.join(g2, sub, name))
+    open(os.path.join(g2, "CaseProbe"), "w").close()
+    one_name = os.path.exists(os.path.join(g2, "caseprobe"))
+    r = tool(os.path.join("d1", "Frame.fits"), os.path.join("d2", "frame.fits"), "-t", "tiff", "-d", "out", "-f", cwd=g2)
+    made = files_below(os.path.join(g2, "out"))
+    if one_name:      # Windows, and macOS as it comes: the two names are one name there
+        check(r.returncode == 1 and made == ["Frame.tif"] and int(tifffile.imread(os.path.join(g2, "out", "Frame.tif"))[0, 0]) == 11 and
+              "was written in this run already" in r.stderr,
+              f"two outputs whose names differ in their case, where that is one name: the second is refused: {made} {r.stderr.strip()[:160]}")
+    else:
+        check(r.returncode == 0 and made == ["Frame.tif", "frame.tif"], f"two outputs whose names differ in their case, where those are two names: {made}")
+    if hasattr(os, "link") and not windows:
+        hard = os.path.join(g2, "hard")
+        os.makedirs(hard)
+        fits.PrimaryHDU(np.full((6, 8), 7, np.uint16)).writeto(os.path.join(hard, "other.fits"))
+        os.link(os.path.join(hard, "other.fits"), os.path.join(hard, "frame.fits"))
+        write_xisf(os.path.join(hard, "frame.xisf"), [image_entry(test_image(np.uint16, 6, 8, 1, 294))])
+        hard_was = {n: open(os.path.join(hard, n), "rb").read() for n in os.listdir(hard)}
+        r = tool("-f", "frame.xisf", "other.fits", "-t", "fits", cwd=hard)
+        check(r.returncode == 1 and "frame.xisf: its output frame.fits is an input of this run" in r.stderr and
+              {n: open(os.path.join(hard, n), "rb").read() for n in hard_was} == hard_was and
+              os.path.samefile(os.path.join(hard, "other.fits"), os.path.join(hard, "frame.fits")),
+              f"an output that is another name of an input (a hard link): not written over: {r.stderr.strip()[:200]}")
+        # a link that leads nowhere, where an output would go: it is something that is there
+        dangling = os.path.join(g2, "dangling")
+        os.makedirs(dangling)
+        write_xisf(os.path.join(dangling, "a.xisf"), [image_entry(test_image(np.uint16, 6, 8, 1, 293))])
+        os.symlink(os.path.join(g2, "nowhere.dat"), os.path.join(dangling, "a.fits"))
+        r = tool(dangling)
+        r2 = tool(dangling, "--skip-existing")
+        check(r.returncode == 1 and "is a link that leads nowhere" in r.stderr and r2.returncode == 0 and summary_of(r2) == (0, 1, 0) and
+              os.path.islink(os.path.join(dangling, "a.fits")) and not os.path.exists(os.path.join(g2, "nowhere.dat")),
+              f"an output name that is a link to nowhere is not taken for free: {r.stderr.strip()[:160]}")
+    if hasattr(os, "symlink") and not windows:
+        # an output name that is a link to a file: written over with --force, and then it is the output of this run
+        lk = os.path.join(g2, "linked-out")
+        for sub in ("a", "b", "out"):
+            os.makedirs(os.path.join(lk, sub))
+        for sub, value in (("a", 1), ("b", 2)):
+            fits.PrimaryHDU(np.full((6, 8), value, np.uint16)).writeto(os.path.join(lk, sub, "x.fits"))
+        open(os.path.join(lk, "other.tif"), "wb").write(b"a file the link leads to")
+        os.symlink(os.path.join(lk, "other.tif"), os.path.join(lk, "out", "x.tif"))
+        r = tool("-t", "tiff", "-d", "out", "-f", os.path.join("a", "x.fits"), os.path.join("b", "x.fits"), cwd=lk)
+        check(r.returncode == 1 and "was written in this run already" in r.stderr and
+              int(tifffile.imread(os.path.join(lk, "out", "x.tif"))[0, 0]) == 1,
+              f"two inputs with one output whose name was a link: the second is refused all the same: {r.stderr.strip()[:200]}")
+        # a link to a file of a directory is a name of its own; the first mention of a file decides where its output goes
+        sl = os.path.join(g2, "sl")
+        os.makedirs(os.path.join(sl, "n1"))
+        write_xisf(os.path.join(sl, "n1", "a.xisf"), [image_entry(test_image(np.uint16, 6, 8, 1, 291))])
+        os.symlink("a.xisf", os.path.join(sl, "n1", "current.xisf"))
+        r = tool("-t", "tiff", sl)
+        check(r.returncode == 0 and summary_of(r) == (2, 0, 0) and sorted(os.listdir(os.path.join(sl, "n1"))) ==
+              ["a.tif", "a.xisf", "current.tif", "current.xisf"], f"a link to a file of the directory has an output of its own: {r.stdout.splitlines()[-1:]}")
+        for args, place in (([os.path.join(sl, "n1", "a.xisf"), sl], "a.fits"), ([sl, os.path.join(sl, "n1", "a.xisf")], os.path.join("n1", "a.fits"))):
+            out = os.path.join(g2, "first-" + str(len(place)))
+            os.makedirs(out)
+            r = tool("-t", "fits", *args, "-d", out, "-q")
+            check(r.returncode == 0 and os.path.exists(os.path.join(out, place)) and len(files_below(out)) == 2,
+                  f"a file named alone and found in a directory: converted once, where its first mention puts it ({place}): {files_below(out)}")
+    if hasattr(os, "link") and not windows:
+        hl = os.path.join(g2, "hl")
+        os.makedirs(os.path.join(hl, "out"))
+        write_xisf(os.path.join(hl, "a.xisf"), [image_entry(test_image(np.uint16, 6, 8, 1, 290))])
+        os.link(os.path.join(hl, "a.xisf"), os.path.join(hl, "out", "a.xisf"))
+        r = tool("-t", "xisf", "--codec", "zlib", "a.xisf", "-d", "out", "--skip-existing", cwd=hl)
+        check(r.returncode == 0 and "exists; passed over" in r.stdout and os.path.samefile(os.path.join(hl, "a.xisf"), os.path.join(hl, "out", "a.xisf")),
+              f"--skip-existing, and the output is another name of the input: passed over: {r.stdout.strip()} {r.stderr.strip()[:160]}")
+    pics = os.path.join(g2, "pictures")
+    os.makedirs(pics)
+    write_xisf(os.path.join(pics, "m31.xisf"), [image_entry(test_image(np.uint16, 6, 8, 1, 289))])
+    run(os.path.join(pics, "m31.xisf"), "-q")
+    open(os.path.join(pics, "m31.tif"), "wb").write(b"a picture of an earlier run")
+    r = tool("-t", "fits", "--skip-existing", "*", cwd=pics)
+    check(r.returncode == 1 and "error: m31.tif: " in r.stderr and "m31.tif: " not in r.stdout and "m31.xisf: m31.fits exists; passed over" in r.stdout,
+          f"--skip-existing, and a picture among the inputs: an error of its own, not passed over: {r.stderr.strip()[:200]} {r.stdout.strip()[-200:]}")
+
+    # a file that fails leaves no directory behind below -d
+    broken = os.path.join(g2, "broken")
+    os.makedirs(os.path.join(broken, "deep", "deeper"))
+    open(os.path.join(broken, "deep", "deeper", "junk.xisf"), "wb").write(b"XISF0100 and nothing that follows")
+    write_xisf(os.path.join(broken, "good.xisf"), [image_entry(test_image(np.uint16, 6, 8, 1, 292))])
+    os.makedirs(os.path.join(g2, "out2"))
+    r = tool(broken, "-d", os.path.join(g2, "out2"))
+    check(r.returncode == 1 and summary_of(r) == (1, 0, 1) and sorted(os.listdir(os.path.join(g2, "out2"))) == ["good.fits"],
+          f"a file that fails leaves no empty directory below -d: {sorted(os.listdir(os.path.join(g2, 'out2')))}")
+    r = tool(empty, "-q")
+    check(r.returncode == 0 and r.stdout == "" and r.stderr == "", f"-q: a directory without images says nothing: {r.stderr!r}")
+
+    # ---- a directory whose listing breaks off (an I/O error half way): that is said, and it is an error
+    shim = os.path.join(base, "shim.so")
+    source = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rename_shim.c")
+    flat = os.path.join(base, "flat")
+    os.makedirs(flat)
+    for k in range(6):
+        write_xisf(os.path.join(flat, f"f{k}.xisf"), [image_entry(test_image(np.uint8, 4, 5, 1, 280 + k))])
+    loaded = False
+    if sys.platform.startswith("linux") and shutil.which("cc") and os.path.exists(source):
+        if subprocess.run(["cc", "-shared", "-fPIC", "-o", shim, source, "-ldl"], capture_output=True).returncode == 0:
+            # Is the library taken by the program? Its rename() says so, which has nothing to do with directories. (A program
+            # that is linked statically takes no such library, and one built with AddressSanitizer refuses it.)
+            probe = subprocess.run([EXE, os.path.join(flat, "f0.xisf"), "-o", os.path.join(base, "probe.tif")], capture_output=True, text=True,
+                                   env=dict(os.environ, LD_PRELOAD=shim, XISFCONV_TEST_FAIL_RENAME=".tif.part>.tif"))
+            loaded = probe.returncode == 1 and "cannot rename" in probe.stderr and not os.path.exists(os.path.join(base, "probe.tif"))
+    if loaded:
+        for what, args in (("a conversion", ["-t", "tiff", flat]), ("--verify", ["--verify", flat]),
+                           ("a pattern", ["--verify", os.path.join(flat, "f*.xisf")])):
+            r = subprocess.run([EXE, *args], capture_output=True, text=True,
+                               env=dict(os.environ, LD_PRELOAD=shim, XISFCONV_TEST_FAIL_READDIR="5"))
+            seen = r.stdout.count(" -> ") + r.stdout.count(": OK")
+            check(r.returncode == 1 and 0 < seen < 6 and "Input/output error" in r.stderr + r.stdout,
+                  f"{what}, and the listing of the directory breaks off: an error, exit status 1 ({seen} of 6 files were seen): "
+                  f"{(r.stderr + r.stdout).strip()[-200:]}")
+            for n in os.listdir(flat):
+                if n.endswith(".tif"):
+                    os.remove(os.path.join(flat, n))
+        r = subprocess.run([EXE, "-t", "tiff", os.path.join(flat, "f*.xisf")], capture_output=True, text=True,
+                           env=dict(os.environ, LD_PRELOAD=shim, XISFCONV_TEST_FAIL_READDIR="0"))
+        check(r.returncode == 1 and summary_of(r) == (0, 0, 1) and "no file matches" not in r.stderr and "Input/output error" in r.stderr,
+              f"a pattern whose directory cannot be listed at all: one error, that one: {r.stderr.strip()[:200]} {r.stdout.strip()[-80:]}")
+    else:
+        skipped.append("a directory whose listing breaks off (Linux, a C compiler, and a program that loads tests/rename_shim.c)")
+
+    # the rule held against its second writing-down, on names and patterns drawn at random
+    names_dir = os.path.join(base, "names")
+    os.makedirs(names_dir)
+    rng = random.Random(20261008)
+    letters = ["a", "b", "A", ".", "[", "]", "_", " ", "é", "É", "中"]
+    for _ in range(60):
+        name = "".join(rng.choice(letters) for _ in range(rng.randint(0, 4))).lstrip(" ") + "x"
+        open(os.path.join(names_dir, name), "w").close()
+    there = os.listdir(names_dir)
+    wrong, tried = [], 0
+    while tried < 160:
+        pattern = "".join(rng.choice(letters + ["*", "*", "?", "?"]) for _ in range(rng.randint(1, 5))).strip(" ")
+        if not ("*" in pattern or "?" in pattern) or pattern.startswith("-"):
+            continue
+        tried += 1
+        r = tool("--verify", pattern, cwd=names_dir)
+        got = [line[:-len(": FAILED")] for line in r.stdout.splitlines() if line.endswith(": FAILED") and not line.startswith("  ")]
+        wanted = sorted(n for n in there if pattern_matches(pattern, n))
+        if got != wanted or (not wanted) != ("no file matches this pattern" in r.stderr):
+            wrong.append((pattern, got, wanted))
+    check(len(there) > 30 and not wrong, f"{tried} patterns drawn at random match what the rule says, in the order of the names: {ascii(wrong[:3])}")
+
+    # ---- links and directories that cannot be read
+    if hasattr(os, "symlink") and not windows:
+        where = fresh("links")
+        outside = os.path.join(base, "outside")
+        os.makedirs(outside)
+        write_xisf(os.path.join(outside, "far.xisf"), [image_entry(test_image(np.uint16, 4, 5, 1, 296))])
+        os.symlink(outside, os.path.join(where, "linked-dir"))
+        os.symlink(os.path.join(outside, "far.xisf"), os.path.join(where, "linked.xisf"))
+        os.symlink(where, os.path.join(where, "night1", "up"))                 # a circle
+        r = tool("-t", "tiff", where)
+        new = sorted(set(files_below(where)) - set(before))
+        told = [line.split(" -> ")[0][len(where) + 1:] for line in lines_of(r)]
+        check(r.returncode == 0 and "linked.tif" in new and told == sorted(list(outputs_expected(before, "tiff")) + ["linked.xisf"]) and
+              files_below(outside) == ["far.xisf"],
+              f"a link to a file is the file, a link to a directory is not followed: {told}")
+        if os.geteuid() != 0:
+            locked = os.path.join(where, "night2")
+            os.chmod(locked, 0)
+            try:
+                r = tool("-t", "png", "-b", "u8", where)
+            finally:
+                os.chmod(locked, 0o755)
+            check(r.returncode == 1 and "night2: " in r.stderr and summary_of(r) is not None and summary_of(r)[0] >= 4 and summary_of(r)[2] == 1,
+                  f"a directory that cannot be read is an error, and the others are converted: {r.stdout.splitlines()[-1:]} {r.stderr.strip()[-200:]}")
+        else:
+            skipped.append("a directory that cannot be read (the tests run as root, which reads everything)")
+
+
 def markdown_headings(text):
     """The anchors GitHub gives the headings of a Markdown document."""
     import re
@@ -5969,7 +6543,8 @@ if __name__ == "__main__":
               test_xisf_fits_xisf_roundtrip, test_asdf_yaml, test_asdf_hand_written, test_asdf_output,
               test_asdf_python_files, test_asdf_roundtrips, test_export_from_fits_and_asdf, test_xisf_rewrite,
               test_verify, test_fits_tile_compressed, test_fits_tile_writing, test_property_round_trip,
-              test_downsampling_and_thumbnailer, test_distributed_units, test_documents):
+              test_downsampling_and_thumbnailer, test_distributed_units, test_directories_and_patterns,
+              test_documents):
         try:
             t()
         except Exception as e:  # noqa: BLE001

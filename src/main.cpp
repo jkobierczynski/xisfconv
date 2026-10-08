@@ -11,7 +11,9 @@
 #include <limits>
 #include <locale>
 #include <new>
+#include <map>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -24,6 +26,8 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <sys/stat.h>
 #endif
 
 #include "xisfconv.h"
@@ -152,6 +156,7 @@ struct Options {
     bool wcs = true;
     int sipOrder = 3;
     bool force = false;
+    bool skipExisting = false;   // an input whose output is there already is passed over
     bool info = false;
     bool dumpHeader = false;
     bool treeJson = false;  // undocumented: print the parsed ASDF tree as JSON (for the tests)
@@ -163,7 +168,7 @@ const char* const kVersion = xisfconv_version();
 
 void usage(std::ostream& os) {
     os << "xisfconv " << kVersion << " - convert between PixInsight XISF, FITS and ASDF images; export TIFF and PNG\n\n"
-          "Usage: xisfconv [options] <file>...\n"
+          "Usage: xisfconv [options] <file or directory>...\n"
           "       XISF inputs are converted to FITS (default), ASDF, TIFF or PNG, or rewritten as XISF\n"
           "       with another compression or checksum (-t xisf). An XISF input is a monolithic file\n"
           "       (.xisf) or the header file of a distributed unit (.xish), whose data is in the\n"
@@ -172,6 +177,10 @@ void usage(std::ostream& os) {
           "       is read like any FITS file, -t fits writes it as a plain FITS file, and -t fits -c\n"
           "       writes a FITS file tile-compressed;\n"
           "       ASDF inputs to XISF (default), FITS, TIFF or PNG.\n"
+          "       A directory stands for the XISF, FITS and ASDF files in it and below it: those that are\n"
+          "       not yet what is written are converted (-t says what; a directory of one format needs\n"
+          "       no -t). An argument with * or ? that names no file is a pattern for the names it\n"
+          "       matches, on every system (cmd and PowerShell leave patterns to the program).\n"
           "       xisfconv --verify <file or directory>... checks files without converting them.\n\n"
           "Output:\n"
           "  -t, --to <fits|asdf|tiff|png|xisf|xish>\n"
@@ -180,8 +189,11 @@ void usage(std::ostream& os) {
           "                              unit, the header in <name>.xish and the data blocks in <name>.xisb\n"
           "                              beside it (PixInsight itself opens monolithic .xisf files only)\n"
           "  -o, --output <file>         output file name (single input only)\n"
-          "  -d, --outdir <dir>          directory for output files (default: next to each input)\n"
+          "  -d, --outdir <dir>          directory for output files (default: next to each input). The files\n"
+          "                              of a directory given as input keep their places below it\n"
           "  -f, --force                 overwrite existing output files\n"
+          "      --skip-existing         leave an output that exists as it is and pass its input over, so\n"
+          "                              that a run on a directory converts what was added since the last one\n"
           "      --in-place              XISF -> XISF: replace the input file. The new file is written next\n"
           "                              to it, read back and compared, and only then takes its place\n\n"
           "Conversion:\n"
@@ -727,6 +739,15 @@ bool parseArgs(int argc, char** argv, Options& opt, int& exitCode) {
     bool endOfOptions = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
+#ifdef _WIN32
+        // "/?" asks a Windows program what it does. (As a pattern it would be every name of one
+        // letter in the root of the drive.)
+        if (!endOfOptions && a == "/?") {
+            usage(std::cout);
+            exitCode = 0;
+            return false;
+        }
+#endif
         if (endOfOptions || a.empty() || a[0] != '-' || a == "-") {
             opt.inputs.push_back(a);
             continue;
@@ -849,6 +870,7 @@ bool parseArgs(int argc, char** argv, Options& opt, int& exitCode) {
             opt.sipOrder = static_cast<int>(n);
         }
         else if (a == "-f" || a == "--force") opt.force = true;
+        else if (a == "--skip-existing") opt.skipExisting = true;
         else if (a == "--in-place") opt.inPlace = true;
         else if (a == "--verify") opt.verifyMode = true;
         else if (a == "-I" || a == "--info") opt.info = true;
@@ -865,6 +887,8 @@ bool parseArgs(int argc, char** argv, Options& opt, int& exitCode) {
     if (opt.codecNone) opt.compress = false;
     if (opt.verifyMode) return true;
     if (opt.inPlace && (!opt.output.empty() || !opt.outdir.empty())) throw Error("--in-place cannot be combined with -o or -d");
+    if (opt.skipExisting && opt.force) throw Error("--skip-existing leaves outputs that exist and --force writes over them: give one of the two");
+    if (opt.skipExisting && opt.inPlace) throw Error("--skip-existing is for outputs under names of their own; --in-place replaces the input itself");
     if (!opt.output.empty() && opt.inputs.size() > 1) throw Error("-o/--output can only be used with a single input");
     if (!opt.output.empty() && !opt.format && !formatFromExtension(opt.output)) {
         throw Error("cannot infer output format from '" + opt.output + "'; add --to fits|asdf|tiff|png|xisf|xish");
@@ -886,11 +910,236 @@ bool parseArgs(int argc, char** argv, Options& opt, int& exitCode) {
     return true;
 }
 
-// ---------------------------------------------------------------- --verify
+// ---------------------------------------------------------------- patterns and directories
 
-// Collects the XISF, FITS and ASDF files in and below a directory. Directories that cannot be
-// read are reported in `errors`.
-void findImageFiles(const fs::path& directory, std::vector<std::string>& found, std::vector<std::string>& errors, int depth = 0) {
+// The characters of a name, for comparing. A byte that is not UTF-8 counts as a character of its own.
+std::u32string codePoints(const std::string& text) {
+    std::u32string out;
+    for (size_t i = 0; i < text.size();) {
+        const unsigned char c = static_cast<unsigned char>(text[i]);
+        const size_t length = c < 0x80 ? 1 : (c >> 5) == 0x6 ? 2 : (c >> 4) == 0xE ? 3 : (c >> 3) == 0x1E ? 4 : 0;
+        char32_t value = length == 1 ? c : length ? static_cast<char32_t>(c & (0xFF >> (length + 1))) : 0;
+        bool whole = length && i + length <= text.size();
+        for (size_t k = 1; whole && k < length; ++k) {
+            const unsigned char next = static_cast<unsigned char>(text[i + k]);
+            whole = (next & 0xC0) == 0x80;
+            value = (value << 6) | (next & 0x3F);
+        }
+        if (whole) {
+            out += value;
+            i += length;
+        } else {
+            out += static_cast<char32_t>(0x110000 + c);   // no character has this number
+            ++i;
+        }
+    }
+    return out;
+}
+
+// A character as this system compares names: Windows takes "A" and "a" for one.
+char32_t folded(char32_t c) {
+#ifdef _WIN32
+    if (c < 0x10000 && !(c >= 0xD800 && c < 0xE000)) {
+        const wchar_t in = static_cast<wchar_t>(c);
+        wchar_t upper = in;
+        if (LCMapStringW(LOCALE_INVARIANT, LCMAP_UPPERCASE, &in, 1, &upper, 1) == 1) return upper;
+    }
+#endif
+    return c;
+}
+
+bool hasWildcard(const std::string& text) { return text.find_first_of("*?") != std::string::npos; }
+
+// True if `name` is one of the names the pattern stands for: * is any characters, also none, and
+// ? is exactly one; every other character is itself ("[" and "]" too, which Windows has in names
+// and its shells do not take for anything). As in the shells of Unix, a name that begins with a
+// dot is matched only by a pattern that begins with one.
+bool matchesPattern(const std::string& pattern, const std::string& name) {
+    if (!name.empty() && name[0] == '.' && (pattern.empty() || pattern[0] != '.')) return false;
+    const std::u32string p = codePoints(pattern), n = codePoints(name);
+    const size_t none = std::u32string::npos;
+    size_t pi = 0, ni = 0, star = none, mark = 0;
+    while (ni < n.size()) {
+        if (pi < p.size() && p[pi] == U'*') {
+            star = pi++;
+            mark = ni;
+        } else if (pi < p.size() && (p[pi] == U'?' || folded(p[pi]) == folded(n[ni]))) {
+            ++pi;
+            ++ni;
+        } else if (star != none) {   // let the last * take one character more
+            pi = star + 1;
+            ni = ++mark;
+        } else {
+            return false;
+        }
+    }
+    while (pi < p.size() && p[pi] == U'*') ++pi;
+    return pi == p.size();
+}
+
+bool isSeparator(char c) {
+#ifdef _WIN32
+    return c == '/' || c == '\\';
+#else
+    return c == '/';
+#endif
+}
+
+// An argument as a pattern is read: the root, which is taken as it stands, the parts behind it,
+// and whether it ends in a separator. The root is cut off by hand: std::filesystem does not agree
+// with itself across compilers on what the root of "\\?\C:\dir" is, and joins such paths wrongly.
+struct PatternPath {
+    std::string root;                 // "", "/", "C:", "C:\", "\\server\share\", "\\?\C:\", "\\?\UNC\server\share\"
+    std::vector<std::string> parts;   // the names between the separators
+    bool directory = false;           // it ends in a separator: directories are meant
+};
+
+PatternPath splitPattern(const std::string& text) {
+    PatternPath out;
+    size_t at = 0;
+#ifdef _WIN32
+    const auto partEnd = [&](size_t from) {
+        from = std::min(from, text.size());
+        while (from < text.size() && !isSeparator(text[from])) ++from;
+        return from;
+    };
+    if (text.size() >= 2 && isSeparator(text[0]) && isSeparator(text[1])) {
+        size_t end = partEnd(2);                         // the server, or "?" or "."
+        const std::string first = text.substr(2, end - 2);
+        size_t more = 1;                                 // one more part is of the root: the share, or the drive
+        if (first == "?" || first == ".") {
+            const size_t next = partEnd(end + 1);
+            if (end < text.size() && toLower(text.substr(end + 1, next - end - 1)) == "unc") more = 3;   // UNC, server, share
+        }
+        for (size_t k = 0; k < more && end < text.size(); ++k) end = partEnd(end + 1);
+        at = end < text.size() ? end + 1 : end;
+    } else if (text.size() >= 2 && text[1] == ':' && std::isalpha(static_cast<unsigned char>(text[0]))) {
+        at = text.size() > 2 && isSeparator(text[2]) ? 3 : 2;   // "C:\dir", or "C:dir" in the current directory of C:
+    } else if (!text.empty() && isSeparator(text[0])) {
+        at = 1;
+    }
+#else
+    while (at < text.size() && text[at] == '/') ++at;
+#endif
+    out.root = text.substr(0, at);
+    std::string part;
+    for (; at < text.size(); ++at) {
+        if (!isSeparator(text[at])) {
+            part += text[at];
+        } else if (!part.empty()) {
+            out.parts.push_back(part);
+            part.clear();
+        }
+    }
+    if (!part.empty()) out.parts.push_back(part);
+    out.directory = !out.parts.empty() && isSeparator(text.back());
+    return out;
+}
+
+// A name in a directory, as one path.
+std::string joined(const std::string& directory, const std::string& name) {
+    if (directory.empty() || isSeparator(directory.back())) return directory + name;
+#ifdef _WIN32
+    if (directory.size() == 2 && directory[1] == ':') return directory + name;   // "C:" + "name": in the current directory of C:
+    return directory + '\\' + name;
+#else
+    return directory + '/' + name;
+#endif
+}
+
+// True for an argument that is taken as a pattern: one with * or ? behind its root that is not
+// the name of something that is there. (On Unix a file may be called "what?.xisf", and then
+// that file is meant; and the "\\?\" a long Windows path begins with is no wildcard.)
+bool isPattern(const std::string& argument) {
+    bool wildcard = false;
+    for (const auto& part : splitPattern(argument).parts) wildcard = wildcard || hasWildcard(part);
+    if (!wildcard) return false;
+    std::error_code ec;
+    return !fs::exists(fs::symlink_status(toPath(argument), ec));
+}
+
+// The names a pattern stands for, those of each directory in their order: files and
+// directories, and only directories if the pattern ends in a separator. (Not a pipe or a device,
+// which a directory is not searched for either.) The wildcards may be in any part of the path:
+// "night*/lights/*.xisf". A directory that is there and cannot be read goes to `errors`.
+std::vector<std::string> expandPattern(const std::string& argument, std::vector<std::string>& errors) {
+    const PatternPath pattern = splitPattern(argument);
+    std::vector<std::string> found{pattern.root};
+    for (size_t k = 0; k < pattern.parts.size() && !found.empty(); ++k) {
+        const std::string& part = pattern.parts[k];
+        const bool last = k + 1 == pattern.parts.size();
+        std::vector<std::string> next;
+        for (const auto& base : found) {
+            if (!hasWildcard(part)) {
+                next.push_back(joined(base, part));
+                continue;
+            }
+            const std::string shown = base.empty() ? std::string(".") : base;
+            std::error_code ec;
+            if (!fs::is_directory(toPath(shown), ec)) continue;
+            std::vector<std::string> here;
+            fs::directory_iterator it(toPath(shown), ec);
+            for (const fs::directory_iterator end; !ec && it != end; it.increment(ec)) {
+                try {
+                    const std::string name = fromPath(it->path().filename());
+                    if (!matchesPattern(part, name)) continue;
+                    std::error_code entryError;
+                    if (!last && !it->is_directory(entryError)) continue;   // more of the path follows: it leads on through directories
+                    here.push_back(name);
+                } catch (const std::exception&) {
+                    // (a name that cannot be written as UTF-8: no pattern stands for it)
+                }
+            }
+            if (ec) errors.push_back(shown + ": " + ec.message());
+            std::sort(here.begin(), here.end());
+            for (const auto& name : here) next.push_back(joined(base, name));
+        }
+        found.swap(next);
+    }
+    std::vector<std::string> names;
+    for (const auto& name : found) {
+        std::error_code ec;
+        const fs::file_status status = fs::status(toPath(name), ec);
+        if (fs::is_directory(status) || (!pattern.directory && fs::is_regular_file(status))) names.push_back(name);
+    }
+    return names;
+}
+
+// An argument as it is meant.
+struct Name {
+    std::string path;
+    bool matched = false;   // it is one of the names a pattern stands for
+};
+
+// The arguments as they are meant: a pattern replaced by the names it matches. A pattern that
+// matches nothing goes to `unmatched`.
+std::vector<Name> expandPatterns(const std::vector<std::string>& arguments, std::vector<std::string>& unmatched,
+                                 std::vector<std::string>& errors, bool& expanded) {
+    std::vector<Name> names;
+    for (const auto& argument : arguments) {
+        if (!isPattern(argument)) {
+            names.push_back({argument, false});
+            continue;
+        }
+        expanded = true;
+        const size_t errorsBefore = errors.size();
+        const std::vector<std::string> matched = expandPattern(argument, errors);
+        if (matched.empty() && errors.size() == errorsBefore) unmatched.push_back(argument);   // (else that error says it)
+        for (const auto& name : matched) names.push_back({name, true});
+    }
+    return names;
+}
+
+// How a directory is searched.
+struct Search {
+    bool hidden = true;                 // take names that begin with a dot as well
+    const fs::path* outputs = nullptr;  // a directory that is not searched: the one the outputs go to
+};
+
+// Collects the XISF, FITS and ASDF files in and below a directory, by their names. Directories
+// that cannot be read are reported in `errors`. A link to a directory is not followed.
+void findImageFiles(const fs::path& directory, const Search& search, std::vector<std::string>& found, std::vector<std::string>& errors,
+                    int depth = 0) {
     std::error_code ec;
     fs::directory_iterator it(directory, ec);
     if (ec || depth > 64) {
@@ -898,14 +1147,13 @@ void findImageFiles(const fs::path& directory, std::vector<std::string>& found, 
         return;
     }
     std::vector<fs::path> directories;
-    for (const fs::directory_iterator end; it != end; it.increment(ec)) {
-        if (ec) {
-            errors.push_back(fromPath(directory) + ": " + ec.message());
-            break;
-        }
+    for (const fs::directory_iterator end; !ec && it != end; it.increment(ec)) {
         try {
             std::error_code entryError;
+            const std::string leaf = fromPath(it->path().filename());
+            if (!search.hidden && !leaf.empty() && leaf[0] == '.') continue;
             if (it->is_directory(entryError) && !it->is_symlink(entryError)) {
+                if (search.outputs && fs::equivalent(it->path(), *search.outputs, entryError)) continue;
                 directories.push_back(it->path());
             } else if (it->is_regular_file(entryError)) {
                 const std::string name = fromPath(it->path());
@@ -918,23 +1166,216 @@ void findImageFiles(const fs::path& directory, std::vector<std::string>& found, 
             errors.push_back(fromPath(directory) + ": " + e.what());
         }
     }
+    // (An iterator that fails stands at the end: the listing stopped short, and that is said.)
+    if (ec) errors.push_back(fromPath(directory) + ": " + ec.message());
     std::sort(directories.begin(), directories.end());
-    for (const auto& sub : directories) findImageFiles(sub, found, errors, depth + 1);
+    for (const auto& sub : directories) findImageFiles(sub, search, found, errors, depth + 1);
 }
 
+// What a file is, by its name: the kinds a conversion makes one of the other of.
+enum class Kind { XisfFile, XisfUnit, Fits, PackedFits, Asdf };
+
+Kind kindOfName(const std::string& path) {
+    const std::string extension = lowerExt(path);
+    if (extension == ".xish") return Kind::XisfUnit;
+    if (extension == ".fz") return Kind::PackedFits;
+    const auto format = formatFromExtension(path);
+    return format == XISFCONV_FORMAT_FITS ? Kind::Fits : format == XISFCONV_FORMAT_ASDF ? Kind::Asdf : Kind::XisfFile;
+}
+
+bool isXisf(Kind kind) { return kind == Kind::XisfFile || kind == Kind::XisfUnit; }
+
+// The kind of file a conversion to `format` writes with these options; none for a picture.
+std::optional<Kind> kindWritten(const Options& opt, xisfconv_format format) {
+    switch (format) {
+        case XISFCONV_FORMAT_FITS: return opt.compress ? Kind::PackedFits : Kind::Fits;
+        case XISFCONV_FORMAT_ASDF: return Kind::Asdf;
+        case XISFCONV_FORMAT_XISF: return opt.distributed ? Kind::XisfUnit : Kind::XisfFile;
+        default: return std::nullopt;
+    }
+}
+
+std::string countOfKind(size_t n, Kind kind) {
+    const char* what = kind == Kind::XisfFile ? "monolithic XISF file" : kind == Kind::XisfUnit ? "distributed XISF unit"
+                       : kind == Kind::Fits ? "FITS file" : kind == Kind::PackedFits ? "tile-compressed FITS file" : "ASDF file";
+    return std::to_string(n) + " " + what + (n == 1 ? "" : "s");
+}
+
+// One file to work on.
+struct Input {
+    std::string path;
+    std::string below;   // found in a directory that was given: where it is below that directory ("night1/darks")
+    xisfconv_format format = XISFCONV_FORMAT_XISF;   // what its first bytes say it is
+    bool image = false;  // ... and whether they say that it is one of the three formats at all
+};
+
+// What a run works on.
+struct Plan {
+    std::vector<Input> inputs;
+    std::vector<std::string> errors;   // directories that could not be read
+    size_t passedOver = 0;             // files of directories that are what is written already
+    bool many = false;                 // a directory or a pattern was given: the run ends with its counts
+};
+
+// Where a file found below `directory` is, below it: "" for a file of the directory itself.
+std::string placeBelow(const fs::path& directory, const fs::path& file) {
+    auto d = directory.begin();
+    auto f = file.begin();
+    while (d != directory.end() && f != file.end() && *d == *f) {   // ("lights/" ends in an empty part)
+        ++d;
+        ++f;
+    }
+    fs::path rest;
+    for (; f != file.end(); ++f) rest /= *f;
+    return fromPath(rest.parent_path());
+}
+
+// The files of a directory that this run works on. A file that is named is converted whatever
+// it is; of a directory, the files that are not yet what is written.
+void planDirectory(const std::string& directory, const Options& opt, Plan& plan) {
+    Search search;
+    search.hidden = false;
+    const fs::path outputs = toPath(opt.outdir);
+    if (!opt.outdir.empty()) search.outputs = &outputs;
+    std::vector<std::string> found;
+    findImageFiles(toPath(directory), search, found, plan.errors);
+    std::sort(found.begin(), found.end());
+    if (found.empty()) {
+        if (!opt.quiet) std::cerr << "warning: " << directory << ": no XISF, FITS or ASDF files found\n";
+        return;
+    }
+    size_t xisf = 0;
+    for (const auto& file : found) xisf += isXisf(kindOfName(file));
+    const bool reads = opt.info || opt.dumpHeader || opt.treeJson;
+    if (!reads && !opt.inPlace && !opt.format && xisf && xisf != found.size()) {
+        throw Error(directory + " holds " + std::to_string(xisf) + " XISF and " + std::to_string(found.size() - xisf) +
+                    " FITS or ASDF " + (found.size() - xisf == 1 ? "file" : "files") + ": say with -t what to make of them "
+                    "(-t fits converts what is not FITS, -t xisf what is not XISF)");
+    }
+    std::map<Kind, size_t> passed;
+    for (const auto& file : found) {
+        const Kind kind = kindOfName(file);
+        if (!reads) {
+            if (opt.inPlace) {
+                if (!isXisf(kind)) {
+                    ++passed[kind];
+                    continue;
+                }
+            } else {
+                const xisfconv_format format = opt.format ? *opt.format : isXisf(kind) ? XISFCONV_FORMAT_FITS : XISFCONV_FORMAT_XISF;
+                const std::optional<Kind> written = kindWritten(opt, format);
+                if (written && *written == kind) {
+                    ++passed[kind];
+                    continue;
+                }
+            }
+        }
+        plan.inputs.push_back({file, placeBelow(toPath(directory), toPath(file))});
+    }
+    for (const auto& entry : passed) {
+        plan.passedOver += entry.second;
+        if (!opt.quiet) {
+            std::cerr << "info: " << directory << ": " << countOfKind(entry.second, entry.first) << " passed over ("
+                      << (opt.inPlace ? "--in-place rewrites XISF files" : "that is what is written") << ")\n";
+        }
+    }
+}
+
+// A name for telling whether two paths are one file: absolute, without "." and "..", links
+// followed as far as the path exists, and in the letters this system compares names by.
+std::u32string sameFileKey(const std::string& path) {
+    std::error_code ec;
+    const fs::path absolute = fs::absolute(toPath(path), ec);
+    fs::path whole = ec ? toPath(path) : fs::weakly_canonical(absolute, ec);
+    if (ec) whole = absolute.lexically_normal();
+    std::u32string key = codePoints(fromPath(whole));
+    for (auto& c : key) c = folded(c);
+    return key;
+}
+
+// A name for telling whether two paths are one name: as sameFileKey, but a link at the end of
+// the path is not followed.
+std::u32string nameKey(const std::string& path) {
+    std::error_code ec;
+    const fs::path absolute = fs::absolute(toPath(path), ec);
+    if (ec) return sameFileKey(path);
+    fs::path whole = fs::weakly_canonical(absolute.parent_path(), ec);
+    whole = ec ? absolute.lexically_normal() : whole / absolute.filename();
+    std::u32string key = codePoints(fromPath(whole));
+    for (auto& c : key) c = folded(c);
+    return key;
+}
+
+// The file a name leads to, where the system has a number for that. Two names may be one file
+// without looking it: on a disk that takes "Frame.fits" and "frame.fits" for one name (macOS as
+// it comes, a camera's card), and through a hard link.
+using FileId = std::pair<uint64_t, uint64_t>;
+
+std::optional<FileId> fileId(const std::string& path) {
+#ifndef _WIN32
+    struct stat status;
+    if (::stat(path.c_str(), &status) == 0) return FileId(static_cast<uint64_t>(status.st_dev), static_cast<uint64_t>(status.st_ino));
+#else
+    (void)path;   // (sameFileKey compares names as Windows does)
+#endif
+    return std::nullopt;
+}
+
+Plan planInputs(const std::vector<Name>& names, const Options& opt) {
+    Plan plan;
+    for (const auto& name : names) {
+        std::error_code ec;
+        if (!fs::is_directory(toPath(name.path), ec)) {
+            plan.inputs.push_back({name.path, std::string()});
+            continue;
+        }
+        if (!opt.output.empty()) throw Error("-o/--output names one file, and " + name.path + " is a directory: give a directory with -d");
+        plan.many = true;
+        // A pattern that also matches the directory of the outputs ("*" with "-d out") does not mean it.
+        if (name.matched && !opt.outdir.empty() && fs::equivalent(toPath(name.path), toPath(opt.outdir), ec)) {
+            if (!opt.quiet) std::cerr << "info: " << name.path << ": the directory of the outputs (-d) is not searched\n";
+            continue;
+        }
+        planDirectory(name.path, opt, plan);
+    }
+    // An input that is given twice (a directory and a file of it, "a.xisf ./a.xisf") is one input,
+    // the first mention of it. (A link to a file is a name of its own, with an output of its own.)
+    std::set<std::u32string> seen;
+    std::vector<Input> once;
+    for (auto& in : plan.inputs) {
+        if (seen.insert(nameKey(in.path)).second) once.push_back(std::move(in));
+    }
+    plan.inputs.swap(once);
+    if (!opt.output.empty() && plan.inputs.size() > 1) throw Error("-o/--output can only be used with a single input");
+    return plan;
+}
+
+// The format a file is converted to, as the options and its own format say.
+xisfconv_format formatFor(xisfconv_format input, const Options& opt) {
+    if (opt.format) return *opt.format;
+    if (!opt.output.empty()) {
+        if (const auto f = formatFromExtension(opt.output)) return *f;
+    }
+    return input == XISFCONV_FORMAT_XISF ? XISFCONV_FORMAT_FITS : XISFCONV_FORMAT_XISF;
+}
+
+// ---------------------------------------------------------------- --verify
+
 // --verify: checks every file (and the image files in every directory) given.
-int verifyFiles(const Library& lib, const Options& opt) {
+// (`unmatched`: how many patterns among the arguments matched nothing; they are reported already.)
+int verifyFiles(const Library& lib, const Options& opt, const std::vector<Name>& names, size_t unmatched) {
     std::vector<std::string> files, errors;
-    for (const auto& input : opt.inputs) {
+    for (const auto& name : names) {
+        const std::string& input = name.path;
         std::error_code ec;
         if (!fs::is_directory(toPath(input), ec)) {
             files.push_back(input);
             continue;
         }
         std::vector<std::string> found;
-        findImageFiles(toPath(input), found, errors);
+        findImageFiles(toPath(input), Search(), found, errors);
         std::sort(found.begin(), found.end());
-        if (found.empty()) std::cerr << "warning: " << input << ": no XISF, FITS or ASDF files found\n";
+        if (found.empty() && !opt.quiet) std::cerr << "warning: " << input << ": no XISF, FITS or ASDF files found\n";
         files.insert(files.end(), found.begin(), found.end());
     }
 
@@ -981,13 +1422,138 @@ int verifyFiles(const Library& lib, const Options& opt) {
         xisfconv_report_free(report);
     }
     for (const auto& e : errors) std::cout << e << ": FAILED (cannot be read)\n";
-    failed += errors.size();
-    if ((files.size() + errors.size() > 1) && !opt.quiet) {
+    failed += errors.size() + unmatched;
+    if ((files.size() + errors.size() + unmatched > 1) && !opt.quiet) {
         std::cout << "\n" << plural(ok, "file") << " OK, ";
         if (partly) std::cout << partly << " not fully checked, ";
         std::cout << failed << " failed\n";
     }
     return failed ? 1 : 0;
+}
+
+// Directories that were made for an output and are not needed after all: they are taken away
+// again, the deepest first, if nothing is in them.
+void removeEmpty(const std::vector<fs::path>& made) {
+    for (auto it = made.rbegin(); it != made.rend(); ++it) {
+        std::error_code ec;
+        fs::remove(*it, ec);
+    }
+}
+
+int convertFiles(const Library& lib, Options& opt) {
+    // What the arguments stand for: patterns first, then the files of the directories.
+    std::vector<std::string> unmatched, unreadable;
+    bool expanded = false;
+    const std::vector<Name> names = expandPatterns(opt.inputs, unmatched, unreadable, expanded);
+    opt.inputs.clear();
+    for (const auto& e : unreadable) std::cerr << "error: " << e << "\n";
+    for (const auto& pattern : unmatched) std::cerr << "error: " << pattern << ": no file matches this pattern\n";
+    if (opt.verifyMode) return verifyFiles(lib, opt, names, unmatched.size() + unreadable.size());
+    Plan plan;
+    try {
+        plan = planInputs(names, opt);
+    } catch (const Error& e) {   // (nothing has been read or written yet)
+        std::cerr << "xisfconv: " << e.what() << "\n";
+        return 2;
+    }
+    for (const auto& e : plan.errors) std::cerr << "error: " << e << "\n";
+    size_t failures = unmatched.size() + unreadable.size() + plan.errors.size(), done = 0, passedOver = plan.passedOver, inTheWay = 0;
+
+    // A run that writes files under names of their own does not write a file twice, and not over
+    // a file it reads: of two inputs with one output name the second is refused, with or without
+    // --force, and so is an input whose output is another input. An input is a file that is one
+    // of the three formats: a picture of an earlier run that "*" brought along is not read, and
+    // does not stand in the way of the file it is made from.
+    const bool converts = !(opt.info || opt.dumpHeader || opt.treeJson || opt.inPlace);
+    std::set<std::u32string> inputKeys;
+    std::set<FileId> inputIds;
+    std::map<std::u32string, std::string> written;
+    std::map<FileId, std::u32string> writtenIds;   // the same outputs, by the file they became
+    for (auto& in : plan.inputs) {
+        // A file that is neither FITS nor ASDF goes to the XISF reader, which says what is wrong with it.
+        in.image = xisfconv_detect_format(lib.ctx, in.path.c_str(), &in.format) == XISFCONV_OK;
+        if (!in.image) in.format = XISFCONV_FORMAT_XISF;
+        if (converts && in.image) {
+            inputKeys.insert(sameFileKey(in.path));
+            if (const auto id = fileId(in.path)) inputIds.insert(*id);
+        }
+    }
+    for (const auto& in : plan.inputs) {
+        const std::string& input = in.path;
+        std::vector<fs::path> made;   // directories made for this output
+        try {
+            Options own = opt;
+            if (!in.below.empty() && !opt.outdir.empty()) own.outdir = fromPath(toPath(opt.outdir) / toPath(in.below));
+            std::u32string key;
+            std::string planned;
+            // (A file that is no image goes straight to the reader, which says what it is not.)
+            if (converts && in.image) {
+                planned = outputPathFor(input, own, formatFor(in.format, own));
+                key = sameFileKey(planned);
+                const std::optional<FileId> id = fileId(planned), ownId = fileId(input);
+                const bool nameItself = key == sameFileKey(input);           // (the library says what it thinks of that)
+                const bool itself = nameItself || (id && id == ownId);       // ... and of a second name of the input
+                // Two inputs with one output: the second is refused, whatever else is asked for.
+                auto before = written.find(key);
+                if (before == written.end() && id) {
+                    const auto same = writtenIds.find(*id);
+                    if (same != writtenIds.end()) before = written.find(same->second);
+                }
+                if (before != written.end()) {
+                    throw Error("its output " + planned + " was written in this run already, from " + before->second +
+                                ": two inputs cannot have one output (convert them in runs of their own, or into "
+                                "directories of their own with -d)");
+                }
+                std::error_code ec;
+                const bool there = !nameItself && fs::exists(fs::symlink_status(toPath(planned), ec));
+                if (opt.skipExisting && there) {
+                    if (!opt.quiet) std::cout << input << ": " << planned << " exists; passed over\n";
+                    ++passedOver;
+                    continue;
+                }
+                if (!itself && (inputKeys.count(key) || (id && inputIds.count(*id)))) {
+                    throw Error("its output " + planned + " is an input of this run and is not written over: convert the "
+                                "formats in runs of their own (-t), or give another directory for the outputs (-d)");
+                }
+                if (there && !opt.force && !fs::exists(toPath(planned), ec)) {   // (the library would take the name for free)
+                    throw Error(planned + " is a link that leads nowhere; it is not replaced (use --force to overwrite)");
+                }
+                inTheWay += there && !itself && !opt.force;
+                if (own.outdir != opt.outdir) {
+                    // the directories below -d that are not there yet
+                    std::vector<fs::path> missing;
+                    for (fs::path d = toPath(own.outdir); !d.empty() && !fs::exists(d, ec); d = d.parent_path()) missing.push_back(d);
+                    made.assign(missing.rbegin(), missing.rend());
+                    fs::create_directories(toPath(own.outdir), ec);
+                    if (ec) throw Error("the directory " + own.outdir + " could not be made (" + ec.message() + ")");
+                }
+            }
+            if (in.format == XISFCONV_FORMAT_XISF) convertXisfInput(lib, input, own);
+            else convertFitsOrAsdfInput(lib, input, in.format == XISFCONV_FORMAT_ASDF, own);
+            if (converts && in.image) {
+                written[key] = input;
+                if (const auto id = fileId(planned)) writtenIds[*id] = key;
+            }
+            ++done;
+        } catch (const std::bad_alloc&) {
+            std::cerr << "error: " << input << ": out of memory\n";
+            ++failures;
+            removeEmpty(made);
+        } catch (const std::exception& e) {
+            std::cerr << "error: " << input << ": " << e.what() << "\n";
+            ++failures;
+            removeEmpty(made);
+        }
+    }
+    if ((plan.many || expanded) && !opt.quiet && !(opt.info || opt.dumpHeader || opt.treeJson)) {
+        std::cout << "\n" << done << (done == 1 ? " file " : " files ") << (opt.inPlace ? "done" : "converted") << ", " << passedOver
+                  << " passed over, " << failures << " failed\n";
+        if (inTheWay) {
+            std::cout << "(" << inTheWay << (inTheWay == 1 ? " output was" : " outputs were") << " there already and not written over: "
+                      << "--skip-existing passes such inputs over, --force replaces the outputs)\n";
+        }
+    }
+    return failures ? 1 : 0;
 }
 
 int run(int argc, char** argv) {
@@ -999,30 +1565,29 @@ int run(int argc, char** argv) {
         std::cerr << "xisfconv: " << e.what() << "\n";
         return 2;
     }
-    Library lib;
-    lib.quiet = opt.quiet;
-    xisfconv_context_set_external_files(lib.ctx, opt.externalFiles);
-    if (opt.verifyMode) return verifyFiles(lib, opt);
-    int failures = 0;
-    for (const auto& input : opt.inputs) {
-        try {
-            // A file that is neither FITS nor ASDF goes to the XISF reader, which says what is wrong with it.
-            xisfconv_format kind = XISFCONV_FORMAT_XISF;
-            if (xisfconv_detect_format(lib.ctx, input.c_str(), &kind) != XISFCONV_OK) kind = XISFCONV_FORMAT_XISF;
-            if (kind == XISFCONV_FORMAT_XISF) convertXisfInput(lib, input, opt);
-            else convertFitsOrAsdfInput(lib, input, kind == XISFCONV_FORMAT_ASDF, opt);
-        } catch (const std::bad_alloc&) {
-            std::cerr << "error: " << input << ": out of memory\n";
-            ++failures;
-        } catch (const std::exception& e) {
-            std::cerr << "error: " << input << ": " << e.what() << "\n";
-            ++failures;
-        }
+    try {
+        Library lib;
+        lib.quiet = opt.quiet;
+        xisfconv_context_set_external_files(lib.ctx, opt.externalFiles);
+        return convertFiles(lib, opt);
+    } catch (const std::bad_alloc&) {
+        std::cerr << "xisfconv: out of memory\n";
+        return 1;
+    } catch (const std::exception& e) {   // (a name the system has and this program cannot write down, where none is expected)
+        std::cerr << "xisfconv: " << e.what() << "\n";
+        return 1;
     }
-    return failures ? 1 : 0;
 }
 
 }  // namespace
+
+#if defined(_WIN32) && defined(__MINGW32__)
+// The program expands patterns itself (expandPattern), the same way whatever compiler built it:
+// the runtime of MinGW is told not to.
+extern "C" {
+int _dowildcard = 0;
+}
+#endif
 
 #ifdef _WIN32
 // The arguments arrive as UTF-16 and are handed on as UTF-8, which is what the library expects;

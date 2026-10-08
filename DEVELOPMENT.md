@@ -26,6 +26,7 @@ The decisions:
 - [Format conventions](#format-conventions)
 - [XISF properties in FITS and ASDF](#xisf-properties-in-fits-and-asdf)
 - [Distributed XISF units (0.16.0)](#distributed-xisf-units-0160)
+- [Directories and patterns (0.17.0)](#directories-and-patterns-0170)
 - [Care with files](#care-with-files)
 - [Structure of the code](#structure-of-the-code)
 - [The library (libxisfconv)](#the-library-libxisfconv)
@@ -221,6 +222,25 @@ that fails on request (`tests/rename_shim.c`, loaded into the program on Linux):
 replacing a unit, the files that were there must still be there. With `OPENXISF_BIN` set to the
 directory of OpenXISF's sample programs, each side reads what the other wrote.
 
+Directories and patterns have two oracles. What a run on a directory writes is held against a
+rule written down a second time in the test script (which files are images by their names, which
+are passed over for each `-t`, where each output goes), and every output against the same file
+converted alone: the bytes must be the same, but for the time an XISF file says it was made at.
+The tree of the tests has every kind of file, nested folders, a name with a blank, brackets and a
+letter outside ASCII, a hidden folder, the `._` file macOS leaves behind, and files that are no
+images. The matching of patterns is held against a regular expression built from the same rule, on
+names and patterns drawn at random from an alphabet that has the dot, the bracket, upper and lower
+case and letters of two and three bytes; the order of the names counts. The links (a link to a
+file, to a directory, a circle) are tested where there are links, and the parts that are about
+Windows (case, the backslash, the `\\?\` of a long path, `/?`) run there and under Wine. A
+directory whose listing breaks off half way is made with a `readdir` that fails on request, in
+`tests/rename_shim.c`. The new code was mutated, one rule at a time (43 mutants), and the tests
+had to fail each time, with two exceptions. Leaving out the check that a pattern leads on through
+directories only costs time. And the identity of a written output (device and inode) is reached
+only where two names that differ in case are one name and the comparison of names does not see
+it: a case-insensitive disk under Linux. The tests try two such names on Windows and macOS, where
+the names already compare equal; no test reaches that code.
+
 The documents are held against the program, so that they cannot fall behind it unnoticed: the man
 page must have the options of `xisfconv --help`, in its order and with the values an option takes;
 the man page, `CITATION.cff` and the first section of `CHANGELOG.md` must name the version of the
@@ -377,6 +397,7 @@ brought are in the sections below.
 | | | The README condensed; `MANUAL.md` for the tool; this file extended with the steps |
 | | | The documents around the program: the changelog, how to report and to contribute, the citation file, the man page, and the layout of the properties in FITS and ASDF for other programs |
 | | | A logo at the top of the README (`docs/logo.svg`) |
+| 8 October | 0.17.0 | Whole folders: a directory as input, `--skip-existing`, and patterns expanded by the program |
 
 ## Purpose and scope
 
@@ -818,6 +839,106 @@ them. The choices:
 - **The thumbnailer** takes `.xish` files where it may read the file beside the one it is
   given. GNOME runs thumbnailers in a sandbox that holds the one file; there a header file gets
   no preview. Not solved; listed as a limitation.
+
+## Directories and patterns (0.17.0)
+
+- **In the tool, not in the library.** The library converts a file; which files, is the caller's
+  matter, and a program has `glob` and `os.walk` or their like. The tool is where a person types
+  the name of a folder.
+- **A directory is the list of its files, each converted as if it were named.** That is the whole
+  model, and it gives the test its oracle. Two rules are added to it, and both are about not
+  writing what nobody asked for.
+- **Of a directory, a file that already is what is written is passed over.** A folder of XISF
+  masters usually holds the raw frames of the camera as well, as `.fit` or `.fits`, and "each as
+  if it were named" would make every one of them an error (a FITS file is not converted to FITS),
+  so that a run that did all it was asked ends with hundreds of errors and status 1. The rule
+  goes by kind, and the kinds are finer than the formats: a monolithic XISF file and a
+  distributed unit are two, plain and tile-compressed FITS are two, because `-t xish` on a folder
+  is how one unpacks it and `-t fits -c` how one packs it. The kind goes by the name, since that
+  is known without opening ten thousand files; the conversion still reads each file and goes by
+  what it finds.
+- **The rule is the same with `-d` and without.** With `-d`, XISF files could be rewritten into
+  the other directory (FITS files could not: that is an error anyway), and "everything as XISF
+  into `export/`" could be read as including them. One rule that does not depend on another
+  option is worth more than that reading: the note says what was passed over, and a pattern
+  names the files for whoever wants them rewritten.
+- **`--force` is not stopped by the rule.** A file that is passed over is replaced if another file
+  of the folder converts to its name (`frame.xisf` to `frame.fits`). The program cannot tell an
+  output of an earlier run, which `--force` is there to replace, from a file of the camera with
+  the same name; the manual says so.
+- **A directory of both XISF and FITS without `-t` is refused.** A file has a default direction
+  (XISF to FITS, FITS to XISF); for a folder that holds both, the default would convert each to
+  the other. Nothing is read, the message has the counts and the two commands, and the status is
+  2, as for every command line that cannot be carried out as it stands.
+- **Below `-d` a file keeps its place below the directory that was given**, not below its
+  parent: `lights/ -d export/` gives `export/night1/a.fits`, the way `rsync -a lights/ export/`
+  does it and not the way `cp -r` does. Two directories given in one run then write into one
+  tree; files of one name collide, and a collision is an error (below).
+- **The directory of the outputs is not searched**, where it lies inside a directory that is
+  converted or a pattern matches it. Otherwise a second run with `-d` inside the tree would find
+  the outputs of the first and convert them a level deeper, and `xisfconv * -d out` would take
+  `out` for an input. Named as an input, it is one: that was asked for.
+- **An input is a file of the three formats.** Only those count for the guard against writing
+  over an input. A pattern brings along what it matches, as a shell does, and `*` on a second run
+  brings the pictures of the first: they are errors of their own (not an image), and must not keep
+  the image they were made from from being converted again, which the first version of the guard
+  did. A file given twice, under two spellings or as a directory and a file of it, is one input.
+- **Names that begin with a dot are passed over in a conversion, and not by `--verify`.** macOS
+  writes a `._frame.xisf` beside every `frame.xisf` on a disk that is not its own, and disks go
+  between a Mac at the telescope and a PC at the desk; those files are no images, and a run that
+  fails on each of them teaches nobody anything. `--verify` is there to say what is wrong in a
+  folder, so it looks at everything, as it did.
+- **An output that exists stays an error, and `--skip-existing` is the way to run again.** The
+  default is that of a single file, where a silent skip would hide that nothing was done. For a
+  folder the second run is the normal case, so there is an option for it and the last line of a
+  run names it. It goes by the name: comparing dates would be a second rule to explain (which
+  date, of a file copied from another disk?), and `--force` does the other thing.
+- **No file is written twice in a run, and none over a file the run reads, `--force` or not.**
+  With one file per command this could not happen; with a folder it is the first accident:
+  `frame.xisf` and `frame.fits` in one folder both make `frame.png`, and two nights hold a
+  `light_001`. `--force` means "replace what was there before I started", not "let the second
+  input replace the first". That changes what `xisfconv -f a.xisf a.fits` does (it converted each
+  over the other); it is in the changelog.
+- **Patterns are expanded on every system, not only on Windows.** The reason is Windows: cmd and
+  PowerShell hand `*.xisf` to the program as it is. One rule for all systems can be tested on all
+  of them, and on Unix it does something useful for a pattern in quotes. It cannot do harm there:
+  an argument that is the name of something that is there is never a pattern.
+- **`*` and `?`, and nothing else.** Brackets are in file names on Windows (`M31 [Ha].xisf`), and
+  its shells do not read them as anything. A dot at the start of a name is matched only by a dot,
+  as the shells of Unix have it, which also keeps `*.xisf` from matching `._frame.xisf`.
+- **The matching is the program's own**, not `FindFirstFile`: Windows also matches the short
+  (8.3) name of a file, so that `*.fit` finds `frame.fits`. Letters are compared as Windows
+  compares names, in upper case by the invariant table (`LCMapStringW`), and as they are written
+  elsewhere. MinGW's runtime, which would expand patterns before `main` in its own way, is told
+  not to (`_dowildcard`), so that a build with either compiler does the same.
+- **The root of a pattern is cut off by hand.** `std::filesystem` does not agree with itself on
+  `\\?\C:\dir\*.xisf`: libstdc++ (MinGW) sees no root in it and the `?` became a wildcard, MSVC's
+  library sees the root `\\?` and joining a part to it dropped the prefix. The review found both;
+  the program now takes `\\?\C:\`, `\\?\UNC\server\share\`, `\\server\share\`, `C:\` and `C:`
+  as the root and joins names with strings. `/?` is the help, as Windows programs have it.
+- **Two names, one file.** The guards compare names made absolute, with links followed, and on
+  Windows in its letters; elsewhere they also compare what the system says the file is (device
+  and inode), because a disk may take `Frame.fits` and `frame.fits` for one name (a card from a
+  camera under Linux) where the names differ. A written output is remembered by its name and by
+  the file it became: an output name that was a link to another file is a file of its own after
+  `--force`, and the second review found that the first version then let a second input write
+  over it.
+- **A file given twice is converted once**, by the name it was given, a link at the end of the
+  path not followed: `a.xisf ./a.xisf` is one input, a link `current.xisf` to `a.xisf` another.
+  The first mention decides where the output goes below `-d`.
+- **Two reviews, by readers who did not write the code**, with the tool to run and the task of
+  losing data with it. The first found no run that loses data without `--force`, and found what
+  the tests had passed over: the long form of Windows paths, which neither standard library
+  takes apart the same way; a listing of a directory that breaks off and is not reported (in
+  `--verify` since 0.8); a pattern that matches a pipe and waits on it; `*` with `-d out` taking
+  `out` for an input; a picture of an earlier run among the inputs keeping its source from being
+  converted; a file given twice taken for two; a link that leads nowhere taken for a free name;
+  and claims in these documents that the program contradicts (a FITS file is not converted to
+  FITS: naming one is an error, not a copy). The second review found the same of the fixes: a
+  written output whose name had been a link, a picture brought by `*` going through the guards,
+  one listing that failed counted as two errors. Each finding has a test.
+- **Left out, and written into `TODO.md`**: a run that only says what it would do, converting
+  again what changed, several files at a time.
 
 ## Care with files
 
@@ -1395,7 +1516,7 @@ library with one line changed.
   Python. What they print is held against what they must print for those files (most lines word
   for word, numbers that depend on the arithmetic of the machine by their form and range), and
   what they write is read back.
-- `tests/run_tests.py` drives the built program (6170 checks at 0.16.0, 6183 with OpenXISF beside it). The Python packages it
+- `tests/run_tests.py` drives the built program (6289 checks at 0.17.0 when run as root, 6302 with OpenXISF beside it). The Python packages it
   needs are listed at its top; the `asdf` packages and the external tools (`tiffcp`, `fitsverify`,
   `pngcheck`, `fpack`/`funpack`) are used when installed and their checks skipped when not.
 - Every format is checked against an implementation that shares no code with xisfconv: astropy

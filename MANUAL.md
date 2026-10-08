@@ -15,6 +15,7 @@ say what to know before reading those.
 
 - [Examples](#examples)
 - [Options](#options)
+- [Directories and patterns](#directories-and-patterns)
 - [Reading XISF](#reading-xisf)
 - [FITS output](#fits-output)
 - [Astrometry (WCS) from PixInsight plate solutions](#astrometry-wcs-from-pixinsight-plate-solutions)
@@ -47,11 +48,15 @@ xisfconv -c light_0001.fits                   # -> light_0001.xisf (zstd-compres
 xisfconv -t asdf M31_integration.xisf         # -> M31_integration.asdf
 xisfconv observation.asdf                     # -> observation.xisf
 xisfconv -t tiff -c -b u16 *.xisf -d export/  # batch to 16-bit Deflate TIFFs
+xisfconv -t fits lights/                      # every XISF file below lights/ -> a FITS file next to it
+xisfconv -t fits lights/ --skip-existing      # ... and later again: what was added since
+xisfconv -t png -s -b u8 --resize 1024 lights/ -d previews/   # previews of a whole tree, in the same folders below previews/
 xisfconv -t tiff -s -b u8 integration.xisf     # stretched 8-bit TIFF for GIMP
 xisfconv -t png -s -b u8 integration.xisf      # stretched 8-bit PNG for the web
 xisfconv -t png -s -b u8 light_0001.fits       # quick look at a raw FITS frame
 xisfconv -t png -s -b u8 --resize 1024 *.xisf  # previews, the longest side 1024 pixels
 xisfconv -c --in-place *.xisf                 # recompress XISF files with zstd, replacing them
+xisfconv -c --in-place archive/               # ... every XISF file below archive/
 xisfconv -t xish light_0001.xisf              # -> light_0001.xish + light_0001.xisb (a distributed unit)
 xisfconv light_0001.xish -t xisf              # ... and packed into one file again
 xisfconv --verify ~/astro/2026                # check every XISF, FITS and ASDF file below a folder
@@ -61,14 +66,18 @@ xisfconv --info light_0001.xisf               # geometry, codecs, FITS keywords,
 ## Options
 
 ```
-xisfconv [options] <file>...      # any of XISF, FITS, ASDF -> any other of them, or TIFF/PNG
+xisfconv [options] <file or directory>...   # any of XISF, FITS, ASDF -> any other of them, or TIFF/PNG
+                                            # a directory: the image files in it and below it
+                                            # an argument with * or ? that names no file: a pattern
 
   -t, --to <fits|asdf|tiff|png|xisf|xish>
                               output format (default: fits for XISF input, xisf for FITS and ASDF input)
                               xish: XISF as a distributed unit, <name>.xish and <name>.xisb
   -o, --output <file>         output file name (single input only)
-  -d, --outdir <dir>          directory for output files (default: next to each input)
+  -d, --outdir <dir>          directory for output files (default: next to each input); the files
+                              of a directory given as input keep their places below it
   -f, --force                 overwrite existing output files
+      --skip-existing         leave an output that exists as it is and pass its input over
       --in-place              XISF -> XISF: replace the input file (after reading the new one back)
   -b, --bits <fmt>            output sample format: u8, u16, u32, f32, f64 (default: as stored)
   -i, --image <n>             convert only image n (0-based); default: all images
@@ -117,6 +126,100 @@ interrupted run, or another file) is not overwritten unless `--force` is given, 
 is the input itself. An output name that is a directory or a device (`/dev/null`) is refused, with
 or without `--force`: the output would take its place. With several inputs, a failing file is
 reported and the rest are still converted (exit status 1).
+
+A run writes no file twice and none over a file it reads. Of two inputs that would get one output
+name (`a/frame.fits` and `b/frame.fits` into one directory, or `frame.xisf` and `frame.fits` to
+`frame.png`) the first is converted and the second is an error, with or without `--force`: the
+second would otherwise replace the first without a word. And an input whose output is another
+input of the same run (`xisfconv frame.xisf frame.fits`, each to the other) is an error as well.
+Up to 0.16 `--force` did both.
+
+## Directories and patterns
+
+Whole folders, and `*.xisf` on Windows.
+
+- **A directory stands for the image files in it and below it**: the files named `.xisf`, `.xish`
+  (the header of a distributed unit; its `.xisb` belongs to it), `.fits`, `.fit`, `.fts`,
+  `.fits.fz` and `.asdf`, in the order of their names. Each is converted as it would be if it were
+  named alone, with the same output.
+- **Of a directory, the files that are not yet what is asked for are converted**; a file that is
+  named on the command line is converted whatever it is. `-t` says what is made, and with it a
+  file of that kind is passed over:
+
+  | | converts | passes over |
+  |---|---|---|
+  | `-t fits` | XISF, ASDF, and tile-compressed FITS (unpacked) | `.fits`, `.fit`, `.fts` |
+  | `-t fits -c` | XISF, ASDF, and plain FITS (packed) | `.fits.fz` |
+  | `-t xisf` | FITS, ASDF, and distributed units (packed into one file) | `.xisf` |
+  | `-t xish` | FITS, ASDF, and monolithic XISF files (unpacked) | `.xish` |
+  | `-t asdf` | XISF and FITS | `.asdf` |
+  | `-t tiff`, `-t png` | every image file | |
+
+  That is why `xisfconv -t fits lights/` can be run on a folder that already holds FITS frames from
+  the camera: they are passed over, where each of them, named alone, would be an error (a FITS
+  file is not converted to FITS; it can only be packed or unpacked). A note says how many files
+  were passed over and why. What a file is goes by its name here; the conversion itself reads the
+  file and goes by what it finds.
+- **With `--force`, a file that is passed over can still be replaced**: by the output of another
+  file of the folder that has its name. `frame.xisf` with `-t fits -f` replaces the `frame.fits`
+  beside it, which xisfconv cannot tell from the camera's own `frame.fits`. Without `--force` it
+  is not replaced.
+- **Without `-t`**, a directory of XISF files is converted to FITS and a directory of FITS and
+  ASDF files to XISF, as a file of each is. A directory that holds both is not guessed at: nothing
+  is read, the message says how many of each there are, and the exit status is 2. (Converting
+  each to the other would double a folder of raw frames.)
+- **Outputs are written next to their inputs.** With `-d`, the files of a directory keep their
+  places below it: `xisfconv -t fits lights/ -d export/` writes `lights/night1/a.xisf` to
+  `export/night1/a.fits`, and makes `export/night1` if it is not there (and takes it away again
+  if the file fails and it stays empty). The directory given with `-d` is not searched for inputs
+  where it lies inside a directory that is converted, or where a pattern matches it (`-d out *`);
+  named as an input, it is one. Files that are named, or matched by a pattern, are written into
+  `-d` itself, as before.
+- **`--skip-existing`** leaves an output that is there already as it is and passes its input
+  over, without an error: a run on a directory then converts what was added since the last one.
+  It goes by the name alone and does not compare dates: an input that changed after it was
+  converted is not converted again (`--force` replaces every output). Without either option an
+  output that exists is an error, as for a single file, and the last line of the run says so. A
+  `.part` file that an interrupted run left behind is in the way of its output: delete it. A
+  link that leads nowhere, under the name of an output, is something that is there: it is not
+  replaced without `--force`.
+- **`--in-place`** on a directory rewrites its XISF files and distributed units, each where it
+  is, and passes the rest over. `--info` and `--dump-header` print every image file of a
+  directory. `--verify` has taken directories since 0.8; it now takes patterns as well, and a
+  directory whose listing breaks off is a failure there too.
+- **What is passed over in a directory without being counted**: files of other names; files and
+  directories whose names begin with a dot (`.Trash`, and the `._frame.xisf` that macOS leaves on
+  disks of other file systems, which are not images); links to directories, which are not
+  followed (a link to a file is that file). `--verify` does look at files with a dot: it is there
+  to find what is wrong.
+- **A run on a directory ends with its counts**: `12 files converted, 3 passed over, 0 failed`.
+  The exit status is 1 if a file failed or a directory could not be read (also when its listing
+  breaks off half way), and the others are converted all the same. A file that is given twice (a
+  directory and a file in it, `a.xisf ./a.xisf`) is converted once, where its first mention puts
+  the output: `xisfconv lights/n1/a.xisf lights -d out` writes `out/a.fits`, the other order
+  `out/n1/a.fits`. A link to a file is a name of its own and has an output of its own.
+- **A pattern**: an argument with `*` or `?` that is not the name of something that is there
+  stands for the names it matches, in their order. `*` is any characters, also none; `?` is
+  exactly one character; every other character is itself. The shells of Unix do this before the
+  program starts; cmd and PowerShell do not, so the program does it, and it does it on every
+  system. (On Unix that is for a pattern in quotes, `xisfconv 'lights/*.xisf'`, which helps where
+  a folder has more files than a command line takes.) The wildcards may be in any part of the
+  path, `night*/lights/*.xisf`. A pattern that matches a directory stands for that directory; one
+  that ends in a separator (`night*/`) matches directories only. A pattern stands for files and
+  directories, not for a pipe or a device. It brings along every file it matches, as the shells
+  do: `*` also matches `notes.txt` and the pictures of an earlier run, and each of them is an
+  error of its own (it does not keep the image it was made from from being converted). A pattern
+  that matches nothing is an error, and the other inputs are still converted.
+  - Brackets are not special: `M31 [Ha].xisf` is a name on Windows, and its shells give `[` no
+    meaning.
+  - A name that begins with a dot is matched only by a pattern that begins with a dot, as in the
+    shells of Unix.
+  - Letters match as the system compares names on Windows, whatever their case; elsewhere as they
+    are written, character by character. (macOS may store a letter with an accent as two
+    characters; a pattern with that letter written as one does not match it there.)
+  - On Windows the long form of a path (`\\?\C:\...`) and the name of a share
+    (`\\server\share\...`) are taken as they stand, and `xisfconv /?` shows the help.
+  - On Unix a file may be called `what?.xisf`. If there is such a file, the argument is that file.
 
 ## Reading XISF
 
@@ -960,8 +1063,17 @@ Good to know:
 - XISF → XISF does not move blocks between the header (inline, embedded) and attachments. Replacing a
   file in place gives it a new inode: other hard links to the old file keep the old content.
 - FITS output carries no CHECKSUM/DATASUM keywords yet; `--verify` checks them where a file has them.
-- On Windows the shell does not expand `*.xisf`; name the files, or use a directory with `--verify`.
-  File names are handled as Unicode there (the console is switched to UTF-8 while the tool runs).
+- Directories: what a file is goes by its name when a directory is searched, so a tile-compressed
+  FITS file that is named `.fits` counts as a plain one, and a file without one of the extensions
+  is not found (name it, and it is read whatever it is called). To rewrite XISF files into another
+  directory, name them (`lights/*.xisf`): of a directory, the files that already are what is
+  written are passed over. The files are converted one after the other. `--skip-existing` does
+  not compare dates.
+- Patterns: `*` and `?` only; `**` is `*`, and there are no brackets or braces. A file whose name
+  has a `*` or `?` in it (Unix) cannot be matched by a pattern that would have to quote it; it
+  can be named.
+- On Windows, file names are handled as Unicode (the console is switched to UTF-8 while the tool
+  runs).
 - The PixInsight spline distortion model is approximated by SIP polynomials, not carried over exactly.
 - Please report any file that fails to convert, ideally with `xisfconv --info` output.
 

@@ -9,6 +9,43 @@ in [`DEVELOPMENT.md`](DEVELOPMENT.md).
 Under "changed" stands what makes the same command, or the same call, do something else than
 before.
 
+## 0.17.0 (8 October 2026)
+
+**Whole folders, and patterns on Windows.**
+
+Added
+- A directory as input: `xisfconv -t fits lights/` converts the image files in `lights` and below
+  it. The files that already are what is asked for are passed over (with `-t fits`, the FITS
+  frames of the folder), where each would be an error; a directory of one format needs no `-t`,
+  and one that holds both XISF and FITS or ASDF files is refused without it. `--in-place`,
+  `--info` and `--dump-header` take directories as well.
+- With `-d`, the files of a directory keep their places below it, and the folders are made as
+  needed.
+- `--skip-existing`: an output that exists is left as it is and its input passed over, so that a
+  later run on the same folder converts what was added.
+- Patterns: an argument with `*` or `?` that names no file stands for the names it matches. That
+  makes `xisfconv *.xisf` work in cmd and PowerShell, which do not expand patterns; on Unix it
+  applies to a pattern in quotes. `--verify` takes patterns too. On Windows, `xisfconv /?` shows
+  the help.
+- A run on a directory or a pattern ends with its counts: files converted, passed over, failed.
+
+Changed
+- Two inputs with one output name: the second is an error. Up to 0.16 it was one only without
+  `--force`, and with `--force` the second replaced the output of the first.
+- An input whose output is another input of the same run (`xisfconv -f frame.xisf frame.fits`) is
+  an error. Up to 0.16 `--force` converted each over the other.
+- A directory given where a file is meant is no longer an error ("is a directory, not a file"):
+  it is converted. With `-o` it is refused, with exit status 2.
+- A file given twice (`a.xisf ./a.xisf`, or a directory and a file of it) is converted once. Up to
+  0.16 the second was an error ("already exists"), and with `--force` it was converted again.
+- An output name that is a link leading nowhere is not replaced without `--force`. Up to 0.16 the
+  link was taken for free.
+- `-q` also silences the warning that a directory given to `--verify` holds no image files.
+
+Fixed
+- `--verify` on a directory whose listing broke off half way (an I/O error) checked what it had
+  read and said nothing of the rest: it is an error now.
+
 ## 0.16.0 (7 October 2026), released
 
 **Distributed XISF units.** An XISF unit may be one file, or a header file (`.xish`) and the files

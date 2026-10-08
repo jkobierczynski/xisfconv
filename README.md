@@ -19,6 +19,7 @@ xisfconv -c light_0001.fits                   # -> light_0001.xisf (zstd-compres
 xisfconv -t asdf M31_integration.xisf         # -> M31_integration.asdf
 xisfconv observation.asdf                     # -> observation.xisf
 xisfconv -t tiff -c -b u16 *.xisf -d export/  # batch to 16-bit Deflate TIFFs
+xisfconv -t fits lights/                      # every XISF file below lights/ -> a FITS file next to it
 xisfconv -t tiff -s -b u8 integration.xisf     # stretched 8-bit TIFF for GIMP
 xisfconv -t png -s -b u8 integration.xisf      # stretched 8-bit PNG for the web
 xisfconv -t png -s -b u8 light_0001.fits       # quick look at a raw FITS frame
@@ -46,14 +47,18 @@ xisfconv --info light_0001.xisf               # geometry, codecs, FITS keywords,
   along through FITS and ASDF and come back as they were.
 - **XISF → XISF**: another compression, checksums added or removed, one image of several, in place
   if asked; a distributed unit packed into one file and the reverse.
+- **Whole folders**: a directory is converted with what is below it, the files that already are
+  what is asked for passed over, the tree kept below `-d`, and on a later run only what was added
+  (`--skip-existing`). `*.xisf` works in cmd and PowerShell too: the program expands patterns
+  itself.
 - **`--verify`** checks XISF, FITS and ASDF files, and whole directories of them, without
   converting anything.
 - **TIFF and PNG** for looking at: PixInsight's screen stretch (`--stretch`), a sample format of
   choice (`--bits`), smaller pictures (`--bin`, `--resize`), and previews in Linux file managers.
 - **Careful with files**: output is written under another name and renamed when it is complete,
-  nothing is overwritten unless asked, a rewrite is read back and compared before it replaces
-  anything, and the header of a distributed unit is followed only to files in its own directory
-  unless told otherwise.
+  nothing is overwritten unless asked, no file is written twice in a run or over a file the run
+  reads, a rewrite is read back and compared before it replaces anything, and the header of a
+  distributed unit is followed only to files in its own directory unless told otherwise.
 - **Few dependencies**: zlib, and libzstd if it is there. The readers and writers of every format
   are in the source.
 
@@ -156,7 +161,7 @@ from xisfconv.xisf import XISF                      # the interface of the xisf 
 
 ## Status
 
-Version 0.16. The files it writes were checked against PixInsight 1.9.3, astropy, CFITSIO's tools,
+Version 0.17. The files it writes were checked against PixInsight 1.9.3, astropy, CFITSIO's tools,
 the `xisf` package, Python's `asdf` and OpenXISF, each where it applies:
 [what was verified](MANUAL.md#verified-against-pixinsight) and [what is known not to
 work](MANUAL.md#limitations) are written down. The interfaces of the library may still change

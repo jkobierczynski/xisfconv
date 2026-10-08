@@ -34,6 +34,10 @@ in `DEVELOPMENT.md`.
       issue templates, `CITATION.cff`, a man page (`man/xisfconv.1`, installed with the tool), and
       the layout of the XISF properties in FITS and ASDF as a document for other programs
       (`docs/xisf-properties-in-fits-and-asdf.md`, with `examples/wcs_digest.py`) (0.16.0)
+- [x] Whole folders: a directory as input, converted with what is below it, the files that
+      already are what is asked for passed over, the tree kept below `-d`, `--skip-existing`;
+      and patterns (`*.xisf`) expanded by the program, so that they work in cmd and PowerShell
+      (0.17.0)
 - [ ] More platforms and packaging: Linux arm64 and Intel macOS release builds; Homebrew formula,
       AUR package, winget manifest
 
@@ -44,8 +48,8 @@ Smaller items, each closing a limitation listed in `MANUAL.md`:
       and a preview of `.xish` files in GNOME Files (its sandbox holds the header file alone)
 - [ ] JPEG output
 - [ ] TPV distortion alongside SIP
-- [ ] Recursive directory conversion (directories are accepted by `--verify` only)
-- [ ] Wildcard expansion on Windows (`*.xisf` is not expanded by cmd or PowerShell)
+- [ ] Directories: a run that shows what it would do and does nothing (`--dry-run`); converting
+      again what changed since its output was written (by the dates); several files at a time
 - [ ] Write CHECKSUM / DATASUM keywords in FITS output
 - [ ] Read HCOMPRESS_1 tile compression
 - [ ] Tile-compressed FITS output: quantized floating point as an option (lossy, fpack's default

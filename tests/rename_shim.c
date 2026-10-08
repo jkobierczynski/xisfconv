@@ -8,10 +8,18 @@
  * behind it fails with EIO; every other rename is the system's. Nothing of this is in the program
  * or in the library.
  *
+ * And a readdir() that fails on request, for a directory whose listing breaks off:
+ *
+ *   XISFCONV_TEST_FAIL_READDIR=5 LD_PRELOAD=./rename_shim.so xisfconv ...
+ *
+ * The first 5 entries the program reads (of all directories together, "." and ".." among them) are
+ * the system's; every reading after them fails with EIO.
+ *
  * SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (C) 2026 Jurgen Kobierczynski
  */
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <stdio.h>
@@ -45,4 +53,30 @@ int rename(const char *from, const char *to) {
         return -1;
     }
     return system_rename(from, to);
+}
+
+static int readdir_is_to_fail(void) {
+    static long read_so_far;
+    const char *limit = getenv("XISFCONV_TEST_FAIL_READDIR");
+    return limit && ++read_so_far > atol(limit);
+}
+
+struct dirent *readdir(DIR *directory) {
+    static struct dirent *(*system_readdir)(DIR *);
+    if (!system_readdir) system_readdir = (struct dirent *(*)(DIR *))dlsym(RTLD_NEXT, "readdir");
+    if (readdir_is_to_fail()) {
+        errno = EIO;
+        return NULL;
+    }
+    return system_readdir(directory);
+}
+
+struct dirent64 *readdir64(DIR *directory) {
+    static struct dirent64 *(*system_readdir64)(DIR *);
+    if (!system_readdir64) system_readdir64 = (struct dirent64 *(*)(DIR *))dlsym(RTLD_NEXT, "readdir64");
+    if (readdir_is_to_fail()) {
+        errno = EIO;
+        return NULL;
+    }
+    return system_readdir64(directory);
 }

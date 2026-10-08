@@ -2,13 +2,13 @@
 .\" Copyright (C) 2026 Jurgen Kobierczynski
 .\" The manual page of the command line tool. Its options are those of "xisfconv --help", and its
 .\" version that of include/xisfconv.h: tests/run_tests.py holds both against the program.
-.TH XISFCONV 1 "2026-10-07" "xisfconv 0.16.0" "User Commands"
+.TH XISFCONV 1 "2026-10-08" "xisfconv 0.17.0" "User Commands"
 .SH NAME
 xisfconv \- convert between PixInsight XISF, FITS and ASDF images; export TIFF and PNG
 .SH SYNOPSIS
 .B xisfconv
 .RI [ options ]
-.IR file ...
+.IR "file or directory" ...
 .br
 .B xisfconv \-\-verify
 .IR "file or directory" ...
@@ -59,7 +59,44 @@ writes it as a plain FITS file, and
 writes a FITS file tile-compressed.
 .PP
 With several inputs, each is converted on its own; a file that fails is reported and the others
-are still converted.
+are still converted. No file is written twice in a run, and none over a file the run reads: of two
+inputs with one output name the second is refused.
+.PP
+A directory stands for the image files in it and below it, by their names
+.RI ( .xisf ,
+.IR .xish ,
+.IR .fits ,
+.IR .fit ,
+.IR .fts ,
+.I .fits.fz
+and
+.IR .asdf ),
+in the order of the names. Of a directory, the files that are not yet what is written are
+converted: with
+.B "\-t fits"
+the FITS files of a folder are passed over, which named alone would each be an error. With
+.BR \-\-force ,
+a file that is passed over is still replaced by the output of another file of its name
+.RI ( frame.xisf
+to
+.IR frame.fits ).
+Without
+.BR \-t ,
+a directory of one format is converted as a file of it is, and one that holds both XISF files and
+FITS or ASDF files is refused, so that the direction is said and not guessed. Names that begin
+with a dot are passed over, and links to directories are not followed.
+.PP
+An argument with
+.B *
+or
+.B ?
+that is not the name of something that is there is a pattern, and stands for the names it matches:
+.B *
+is any characters,
+.B ?
+exactly one. The program does this on every system, because the shells of Windows leave it to
+the program; on Unix it applies to a pattern given in quotes. The wildcards may be in any part of
+the path. A pattern that matches nothing is an error.
 .SH OPTIONS
 .SS Output
 .TP
@@ -92,14 +129,24 @@ files only.)
 The name of the output file, for a single input.
 .TP
 .BR \-d ", " \-\-outdir " \fIdir\fR"
-The directory for the output files. The default is next to each input.
+The directory for the output files. The default is next to each input. The files of a directory
+given as input keep their places below
+.IR dir .
+It is not searched for inputs where it lies inside a directory that is converted, or where a
+pattern matches it.
 .TP
 .BR \-f ", " \-\-force
 Overwrite output files that exist.
 .TP
+.B \-\-skip\-existing
+Leave an output that exists as it is and pass its input over, without an error: a run on a
+directory then converts what was added since the last one. Only the name is looked at, not the
+dates.
+.TP
 .B \-\-in\-place
 XISF to XISF: replace the input file. The new file is written next to it, read back and compared,
-and only then takes its place. A file that is already stored as asked is left alone.
+and only then takes its place. A file that is already stored as asked is left alone. Of a
+directory, the XISF files are rewritten and the others passed over.
 .SS Conversion
 .TP
 .BR \-b ", " \-\-bits " \fIformat\fR"
@@ -297,8 +344,9 @@ found no damage.
 .B 1
 A file could not be read, converted or written, or
 .B \-\-verify
-found a damaged one. The other files were still processed. What only the file shows ends this way
-too: a codec its output format does not have,
+found a damaged one, or a pattern matched nothing, or a directory could not be read. The other
+files were still processed. What only the file shows ends this way too: a codec its output format
+does not have,
 .B \-\-in\-place
 on a file that is not XISF.
 .TP
@@ -306,7 +354,9 @@ on a file that is not XISF.
 The command line was refused before a file was read: an option that does not exist, a value an
 option does not take, options that exclude each other, no input,
 .B \-o
-with more than one input, an output directory that is not there.
+with more than one input or with a directory, an output directory that is not there, a directory
+with both XISF and FITS files without
+.BR \-t .
 .SH FILES
 .TP
 .IB name .part
@@ -355,6 +405,17 @@ xisfconv \-\-verify ~/astro/2026
 .fi
 .RE
 .PP
+A FITS file for every XISF file of a tree, next to it, and on a later day for those that were
+added; previews of the whole tree, in the same folders below another one:
+.PP
+.RS
+.nf
+xisfconv \-t fits lights/
+xisfconv \-t fits lights/ \-\-skip\-existing
+xisfconv \-t png \-s \-b u8 \-\-resize 1024 lights/ \-d previews/
+.fi
+.RE
+.PP
 Write a distributed unit, and pack it into one file again:
 .PP
 .RS
@@ -364,10 +425,18 @@ xisfconv light_0001.xish \-t xisf \-o packed.xisf
 .fi
 .RE
 .SH NOTES
-On Windows the shell does not expand
-.IR *.xisf :
-name the files, or give a directory to
-.BR \-\-verify .
+In a pattern, brackets are not special
+.RI ( "M31 [Ha].xisf"
+is a name on Windows), a name that begins with a dot is matched only by a pattern that begins with
+one, and letters match as the system compares names: on Windows whatever their case. On Unix, an
+argument that is the name of a file is that file, whatever characters it has.
+.PP
+What a file of a directory is goes by its name; a file that is named on the command line is read
+and converted whatever it is called, and whatever it is: to rewrite XISF files into another
+directory, name them or give a pattern. A pattern brings along every file it matches, as a shell
+does, and one that is no image is an error of its own. On Windows,
+.B "xisfconv /?"
+shows the help.
 .PP
 A header of a distributed unit that names a file outside its own directory is refused unless
 .B "\-\-external\-files anywhere"
