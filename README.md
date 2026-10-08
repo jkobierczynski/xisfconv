@@ -8,7 +8,8 @@
 # xisfconv
 
 A small, dependency-light command-line converter between PixInsight **XISF**, **FITS** and **ASDF**,
-in every direction, with **TIFF** and **PNG** export from all three. The same code is available as a
+in every direction, with **TIFF** and **PNG** export from all three, and a reader of the raw images
+of **DNG** files (camera raw). The same code is available as a
 library, **libxisfconv**, with a plain C API for C, C++ and other languages, and as a
 **Python package** that reads and writes the images as NumPy arrays and works with astropy.
 
@@ -18,6 +19,7 @@ xisfconv -c M31_integration.xisf              # -> M31_integration.fits.fz (tile
 xisfconv -c light_0001.fits                   # -> light_0001.xisf (zstd-compressed)
 xisfconv -t asdf M31_integration.xisf         # -> M31_integration.asdf
 xisfconv observation.asdf                     # -> observation.xisf
+xisfconv IMG_0001.dng                         # -> IMG_0001.xisf: the camera's raw image, not demosaiced
 xisfconv -t tiff -c -b u16 *.xisf -d export/  # batch to 16-bit Deflate TIFFs
 xisfconv -t fits lights/                      # every XISF file below lights/ -> a FITS file next to it
 xisfconv -t tiff -s -b u8 integration.xisf     # stretched 8-bit TIFF for GIMP
@@ -27,7 +29,7 @@ xisfconv -t png -s -b u8 --resize 1024 *.xisf  # previews, the longest side 1024
 xisfconv -c --in-place *.xisf                 # recompress XISF files with zstd, replacing them
 xisfconv -t xish light_0001.xisf              # -> light_0001.xish + light_0001.xisb (a distributed unit)
 xisfconv light_0001.xish -t xisf              # ... and packed into one file again
-xisfconv --verify ~/astro/2026                # check every XISF, FITS and ASDF file below a folder
+xisfconv --verify ~/astro/2026                # check every XISF, FITS, ASDF and DNG file below a folder
 xisfconv --info light_0001.xisf               # geometry, codecs, FITS keywords, properties
 ```
 
@@ -41,6 +43,10 @@ xisfconv --info light_0001.xisf               # geometry, codecs, FITS keywords,
 - **FITS** in both directions, with the keywords carried over, the rows turned to the convention
   of each format, and tile-compressed files (`.fits.fz`) read and written without loss.
 - **ASDF** in both directions, in the layout astropy's `asdf` packages read as an HDU list.
+- **DNG** read: the raw image as the sensor recorded it (cut to its active area, not demosaiced),
+  with its colour filter pattern (Bayer or X-Trans) and the exposure (camera, time, exposure
+  time, ISO) as keywords; uncompressed, lossless JPEG and Deflate. A DNG file of any camera is
+  made by Adobe's free DNG Converter.
 - **Astrometry**: a PixInsight plate solution becomes WCS keywords with SIP distortion, and WCS
   keywords become the solution properties PixInsight reads.
 - **XISF properties** (processing history, instrument, observation, the astrometric solution) go
@@ -51,7 +57,7 @@ xisfconv --info light_0001.xisf               # geometry, codecs, FITS keywords,
   what is asked for passed over, the tree kept below `-d`, and on a later run only what was added
   (`--skip-existing`). `*.xisf` works in cmd and PowerShell too: the program expands patterns
   itself.
-- **`--verify`** checks XISF, FITS and ASDF files, and whole directories of them, without
+- **`--verify`** checks XISF, FITS, ASDF and DNG files, and whole directories of them, without
   converting anything.
 - **TIFF and PNG** for looking at: PixInsight's screen stretch (`--stretch`), a sample format of
   choice (`--bits`), smaller pictures (`--bin`, `--resize`), and previews in Linux file managers.
@@ -97,7 +103,7 @@ not on PyPI yet.
 
 **The command line.** `xisfconv --help` lists the options; the examples above are most of what is
 needed day to day. The output format follows `-t` or the name given with `-o`; without either, XISF
-becomes FITS, and FITS and ASDF become XISF. [`MANUAL.md`](MANUAL.md) has every option and what
+becomes FITS, and FITS, ASDF and DNG become XISF. [`MANUAL.md`](MANUAL.md) has every option and what
 each conversion does.
 
 **From C and C++.** Everything the tool does is done by the library, through

@@ -67,7 +67,7 @@ def check(cond, msg):
 
 OK, ERR_ARGUMENT, ERR_IO, ERR_FORMAT, ERR_UNSUPPORTED, ERR_CHECKSUM, ERR_MEMORY, ERR_INDEX, ERR_EXISTS, ERR_BUFFER, \
     ERR_NOT_FOUND, ERR_CANCELLED = range(12)
-FORMAT_AUTO, FORMAT_XISF, FORMAT_FITS, FORMAT_ASDF, FORMAT_TIFF, FORMAT_PNG = range(6)
+FORMAT_AUTO, FORMAT_XISF, FORMAT_FITS, FORMAT_ASDF, FORMAT_TIFF, FORMAT_PNG, FORMAT_DNG = range(7)
 AS_STORED, UINT8, UINT16, UINT32, UINT64, FLOAT32, FLOAT64 = range(7)
 ROWS_DEFAULT, ROWS_TOP_DOWN, ROWS_BOTTOM_UP = range(3)
 CODEC_NONE, CODEC_ZLIB, CODEC_LZ4, CODEC_LZ4HC, CODEC_ZSTD, CODEC_DEFAULT = range(6)
@@ -197,6 +197,8 @@ external_file = declare("external_file", text, ptr, size_t)
 unit_size = declare("unit_size", u64, ptr)
 file_size = declare("file_size", u64, ptr)
 file_detail = declare("file_detail", text, ptr, text)
+detect_format = declare("detect_format", i32, ptr, text, C.POINTER(i32))
+report_format = declare("report_format", i32, ptr)
 
 ctx = context_new()
 
@@ -831,6 +833,60 @@ def test_read_fits():
         d1 = f.read(1, rows=ROWS_BOTTOM_UP)
         check(same(d0, a[None]) and same(d1, b[:, ::-1, :]) and same(d2, c.astype(np.uint16)[None]), "FITS: each image, read in any order")
         check(f.read(3) == ERR_INDEX, "FITS: no fourth image")
+
+
+def test_read_dng():
+    """DNG files written by tests/dng_files.py: the raw image, its pattern and its keywords through the API."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import dng_files as D
+    raw = D.bayer_scene(20, 26, 14, 4)
+    path = os.path.join(TMP, "r.dng")
+    D.write_dng(path, raw, bits=14, compression=7, tile=(16, 16), pattern="GRBG", black=[600, 601, 602, 603])
+    kind = i32(-1)
+    check(detect_format(ctx, enc(path), C.byref(kind)) == OK and kind.value == FORMAT_DNG, f"DNG: detected: {kind.value}")
+    with Opened(path) as f:
+        info = f.info()
+        check(file_format(f.handle) == FORMAT_DNG and image_count(f.handle) == 1 and info.width == 26 and info.height == 20 and
+              info.channels == 1 and info.row_order == ROWS_TOP_DOWN and info.row_order_declared == 1 and info.bitpix == 16,
+              "DNG: one image, its size, rows top-down")
+        check(info.has_cfa == 1 and (info.cfa_width, info.cfa_height) == (2, 2) and info.cfa_pattern == b"GRBG" and
+              f.detail("cfaPattern") == "GRBG" and f.detail("source") == "IFD 0 / SubIFD 0",
+              f"DNG: the colour filter array in the image info: {info.cfa_pattern} {f.detail('cfaPattern')}")
+        check(file_detail(f.handle, b"format") == b"DNG 1.4.0.0, Canon EOS R5 (dng_files.py)" and skipped_count(f.handle) == 1,
+              f"DNG: the file's details: {file_detail(f.handle, b'format')}")
+        cards = {n: v.strip() for n, v, c in f.cards()}
+        check(cards.get("BAYERPAT") == "'GRBG    '" and cards.get("BLKLEVEL") == "601.5" and cards.get("INSTRUME") == "'Canon EOS R5'",
+              f"DNG: keywords: {cards}")
+        d = f.read()
+        check(same(d, raw[None]) and same(f.read(rows=ROWS_BOTTOM_UP), raw[None, ::-1]) and f.info().data_known == 1,
+              "DNG: the raw image, in both row orders")
+        as8 = f.read(dtype=np.uint8)
+        check(isinstance(as8, np.ndarray) and np.abs(as8.astype(np.float64) - raw[None] / 257.0).max() <= 0.5 + 1e-9,
+              "DNG: read as 8 bits like any 16-bit image")
+    co = ConvertOptions()
+    convert_options_init(C.byref(co), C.sizeof(co))
+    co.output_format = FORMAT_DNG
+    st = convert(ctx, enc(path), enc(os.path.join(TMP, "r2.dng")), C.byref(co))
+    check(st == ERR_ARGUMENT and "DNG is read, not written" in err(), f"DNG: not written: {st} {err()}")
+    st = convert(ctx, enc(path), enc(os.path.join(TMP, "r3.dng")), None)
+    check(st == ERR_ARGUMENT and "DNG is read, not written" in err(), f"DNG: not written, by the name either: {st} {err()}")
+    co.output_format = FORMAT_FITS
+    co.row_order = ROWS_TOP_DOWN
+    st = convert(ctx, enc(path), enc(os.path.join(TMP, "dng.fits")), C.byref(co))
+    with fits.open(os.path.join(TMP, "dng.fits")) as h:
+        check(st == OK and h[0].header["ROWORDER"] == "TOP-DOWN" and h[0].header["BAYERPAT"].strip() == "GRBG" and
+              np.array_equal(h[0].data, raw), "DNG to FITS, the rows kept top-down")
+    co.row_order = ROWS_DEFAULT
+    st = convert(ctx, enc(path), enc(os.path.join(TMP, "dng.fits")), C.byref(co))
+    check(st == ERR_EXISTS, "DNG to FITS: an output that exists")
+    co.overwrite = 1
+    st = convert(ctx, enc(path), enc(os.path.join(TMP, "dng.fits")), C.byref(co))
+    with fits.open(os.path.join(TMP, "dng.fits")) as h:
+        check(st == OK and h[0].header.get("ROWORDER", "BOTTOM-UP") == "BOTTOM-UP" and h[0].header["BAYERPAT"].strip() == "BGGR" and
+              np.array_equal(h[0].data, raw[::-1]), "DNG to FITS, bottom-up by default, the pattern turned")
+    r = ptr()
+    check(verify(ctx, enc(path), C.byref(r)) == OK and report_verdict(r) == 0 and report_format(r) == FORMAT_DNG, "DNG: verified")
+    report_free(r)
 
 
 def test_read_xisf():
@@ -1588,7 +1644,7 @@ if __name__ == "__main__":
     print("xisfconv:", EXE or "(not given: the comparison with the tool's --stretch is skipped)")
     print("asdf + asdf-astropy:", "yes" if HAVE_ASDF else "no")
     for t in (test_write_fits, test_write_fits_tile_compressed, test_write_xisf, test_lz4_and_levels, test_write_asdf, test_write_tiff_png, test_writer_arguments, test_read_fits,
-              test_read_xisf, test_smaller_pictures, test_carried_properties, test_wcs, test_wcs_forms, test_stretch, test_odd_files, test_locale, test_progress_and_cancel,
+              test_read_dng, test_read_xisf, test_smaller_pictures, test_carried_properties, test_wcs, test_wcs_forms, test_stretch, test_odd_files, test_locale, test_progress_and_cancel,
               test_kept_messages_and_cancel_from_another_thread, test_threads, test_distributed_units, test_silence):
         try:
             t()

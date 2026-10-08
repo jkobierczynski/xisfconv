@@ -27,6 +27,7 @@ say what to know before reading those.
 - [Verifying files](#verifying-files)
 - [ASDF output](#asdf-output)
 - [ASDF input](#asdf-input)
+- [DNG input](#dng-input)
 - [TIFF output](#tiff-output)
 - [PNG output](#png-output)
 - [TIFF and PNG from FITS and ASDF input](#tiff-and-png-from-fits-and-asdf-input)
@@ -47,6 +48,8 @@ xisfconv -c M31_integration.xisf              # -> M31_integration.fits.fz (tile
 xisfconv -c light_0001.fits                   # -> light_0001.xisf (zstd-compressed)
 xisfconv -t asdf M31_integration.xisf         # -> M31_integration.asdf
 xisfconv observation.asdf                     # -> observation.xisf
+xisfconv IMG_0001.dng                         # -> IMG_0001.xisf: the camera's raw image, not demosaiced
+xisfconv -t fits raw/                         # every DNG (and XISF, ASDF) file below raw/ -> FITS
 xisfconv -t tiff -c -b u16 *.xisf -d export/  # batch to 16-bit Deflate TIFFs
 xisfconv -t fits lights/                      # every XISF file below lights/ -> a FITS file next to it
 xisfconv -t fits lights/ --skip-existing      # ... and later again: what was added since
@@ -59,7 +62,7 @@ xisfconv -c --in-place *.xisf                 # recompress XISF files with zstd,
 xisfconv -c --in-place archive/               # ... every XISF file below archive/
 xisfconv -t xish light_0001.xisf              # -> light_0001.xish + light_0001.xisb (a distributed unit)
 xisfconv light_0001.xish -t xisf              # ... and packed into one file again
-xisfconv --verify ~/astro/2026                # check every XISF, FITS and ASDF file below a folder
+xisfconv --verify ~/astro/2026                # check every XISF, FITS, ASDF and DNG file below a folder
 xisfconv --info light_0001.xisf               # geometry, codecs, FITS keywords, properties
 ```
 
@@ -67,11 +70,12 @@ xisfconv --info light_0001.xisf               # geometry, codecs, FITS keywords,
 
 ```
 xisfconv [options] <file or directory>...   # any of XISF, FITS, ASDF -> any other of them, or TIFF/PNG
+                                            # DNG -> any of XISF, FITS, ASDF, TIFF, PNG
                                             # a directory: the image files in it and below it
                                             # an argument with * or ? that names no file: a pattern
 
   -t, --to <fits|asdf|tiff|png|xisf|xish>
-                              output format (default: fits for XISF input, xisf for FITS and ASDF input)
+                              output format (default: fits for XISF input, xisf for FITS, ASDF, DNG)
                               xish: XISF as a distributed unit, <name>.xish and <name>.xisb
   -o, --output <file>         output file name (single input only)
   -d, --outdir <dir>          directory for output files (default: next to each input); the files
@@ -88,7 +92,7 @@ xisfconv [options] <file or directory>...   # any of XISF, FITS, ASDF -> any oth
       --bin <n>               TIFF and PNG: a smaller picture, n x n pixels averaged into one
       --resize <size>         TIFF and PNG: a smaller picture: 256 (the longest side), 1024x768 (a box
                               to fit) or 50%; never larger than the image; made before a stretch
-      --top-down              from XISF: keep XISF's top-down row order in FITS/ASDF (default: bottom-up)
+      --top-down              from XISF and DNG: keep the top-down row order in FITS/ASDF (default: bottom-up)
                               from FITS/ASDF: the rows are stored top-down
       --bottom-up             from FITS/ASDF: the rows are stored bottom-up, whatever ROWORDER says
       --no-property-keywords  from XISF: don't derive missing keywords from XISF properties
@@ -114,7 +118,7 @@ xisfconv [options] <file or directory>...   # any of XISF, FITS, ASDF -> any oth
       --verify                check the files, and the image files in the directories, given;
                               converts nothing; exit status 1 if a file is damaged
   -I, --info                  print image geometry, keywords and properties; no conversion
-      --dump-header           print the raw XML header (XISF), all keywords (FITS) or the YAML tree (ASDF)
+      --dump-header           print the raw XML header (XISF), all keywords (FITS, DNG) or the YAML tree (ASDF)
   -q, --quiet                 suppress warnings
 ```
 
@@ -140,19 +144,19 @@ Whole folders, and `*.xisf` on Windows.
 
 - **A directory stands for the image files in it and below it**: the files named `.xisf`, `.xish`
   (the header of a distributed unit; its `.xisb` belongs to it), `.fits`, `.fit`, `.fts`,
-  `.fits.fz` and `.asdf`, in the order of their names. Each is converted as it would be if it were
-  named alone, with the same output.
+  `.fits.fz`, `.asdf` and `.dng`, in the order of their names (and of any case: `.DNG`, `.FITS`).
+  Each is converted as it would be if it were named alone, with the same output.
 - **Of a directory, the files that are not yet what is asked for are converted**; a file that is
   named on the command line is converted whatever it is. `-t` says what is made, and with it a
   file of that kind is passed over:
 
   | | converts | passes over |
   |---|---|---|
-  | `-t fits` | XISF, ASDF, and tile-compressed FITS (unpacked) | `.fits`, `.fit`, `.fts` |
-  | `-t fits -c` | XISF, ASDF, and plain FITS (packed) | `.fits.fz` |
-  | `-t xisf` | FITS, ASDF, and distributed units (packed into one file) | `.xisf` |
-  | `-t xish` | FITS, ASDF, and monolithic XISF files (unpacked) | `.xish` |
-  | `-t asdf` | XISF and FITS | `.asdf` |
+  | `-t fits` | XISF, ASDF, DNG, and tile-compressed FITS (unpacked) | `.fits`, `.fit`, `.fts` |
+  | `-t fits -c` | XISF, ASDF, DNG, and plain FITS (packed) | `.fits.fz` |
+  | `-t xisf` | FITS, ASDF, DNG, and distributed units (packed into one file) | `.xisf` |
+  | `-t xish` | FITS, ASDF, DNG, and monolithic XISF files (unpacked) | `.xish` |
+  | `-t asdf` | XISF, FITS and DNG | `.asdf` |
   | `-t tiff`, `-t png` | every image file | |
 
   That is why `xisfconv -t fits lights/` can be run on a folder that already holds FITS frames from
@@ -164,8 +168,8 @@ Whole folders, and `*.xisf` on Windows.
   file of the folder that has its name. `frame.xisf` with `-t fits -f` replaces the `frame.fits`
   beside it, which xisfconv cannot tell from the camera's own `frame.fits`. Without `--force` it
   is not replaced.
-- **Without `-t`**, a directory of XISF files is converted to FITS and a directory of FITS and
-  ASDF files to XISF, as a file of each is. A directory that holds both is not guessed at: nothing
+- **Without `-t`**, a directory of XISF files is converted to FITS and a directory of FITS, ASDF
+  and DNG files to XISF, as a file of each is. A directory that holds both is not guessed at: nothing
   is read, the message says how many of each there are, and the exit status is 2. (Converting
   each to the other would double a folder of raw frames.)
 - **Outputs are written next to their inputs.** With `-d`, the files of a directory keep their
@@ -568,8 +572,8 @@ Files named like `image.fits.fz`.
 The option `--verify <file or directory>...`
 
 - Reads every file completely without converting anything and says whether it is intact. A
-  directory stands for the `.xisf`, `.fits`/`.fit`/`.fts`, `.fits.fz` and `.asdf` files in it and
-  below it.
+  directory stands for the `.xisf`, `.fits`/`.fit`/`.fts`, `.fits.fz`, `.asdf` and `.dng` files in
+  it and below it.
 - XISF: every data block (pixels, properties, ICC profile, thumbnail; attached, inline, embedded or
   in another file of a distributed unit) has its checksum verified where it has one, is decompressed, and for images compared with the
   size the geometry requires.
@@ -577,6 +581,11 @@ The option `--verify <file or directory>...`
   file has them (most capture programs do not write them; astropy and CFITSIO can). Every tile of
   a tile-compressed image is decompressed.
 - ASDF: the tree is parsed, and every binary block has its MD5 checksum verified and is decompressed.
+- DNG: the raw image is read completely, every strip or tile decompressed. The MD5 digest of the
+  raw data that cameras and Adobe DNG Converter store (`NewRawImageDigest`) is not computed (it
+  is taken over the data in a form of the DNG SDK's own): such a file is `NOT FULLY CHECKED`, and
+  so is one whose raw image is stored in a way xisfconv does not read (lossy DNG, JPEG XL). The
+  previews are not read.
 - One line per file, `OK` with what was checked or `FAILED` with the reasons; with several files a
   count at the end. The exit status is 1 if any file failed (or a directory could not be read), so
   it can be used in scripts. `-q` prints the failures only. A file with a part xisfconv cannot
@@ -650,6 +659,48 @@ An ASDF file is converted to XISF by default, or to FITS with `-t fits`.
   behind the Python library, in how plain values become numbers, logicals or strings.
   `--dump-header` prints the tree.
 - FITS ↔ ASDF is a repackaging: same HDUs, same keywords, rows left in the order they are stored in.
+
+## DNG input
+
+A DNG file (Adobe's Digital Negative, which some cameras write themselves and Adobe DNG Converter
+makes of the raw files of every other camera) is converted to XISF by default, or to FITS, ASDF,
+TIFF or PNG. What is read is its raw image: the samples of the sensor as the camera recorded them,
+for a calibration and stacking program to work on.
+
+- **Nothing is done to the samples but what the file says is part of reading them**: the image is
+  cut to the area of the sensor that saw light (`ActiveArea`; the masked border is left out), and
+  the file's linearization table is applied where it has one. It is not demosaiced, no black
+  level is taken off, no white balance or colour matrix is applied, and the orientation the
+  camera was held in is not applied either: calibration frames (darks, flats, bias) must be taken
+  the same way, and a demosaicing program wants the mosaic as the sensor has it.
+- **The colour filter array**: a mosaic image becomes a grayscale image with its pattern. In XISF
+  that is the `ColorFilterArray` element, of any size (a Bayer pattern is 2 x 2, Fujifilm's X-Trans
+  6 x 6), as PixInsight writes it for the raw frames it reads itself. In FITS (and in XISF as well)
+  a 2 x 2 RGB pattern is also the keyword `BAYERPAT`, which Siril and PixInsight read. A pattern of
+  another size or of other colours (X-Trans, CMYG) has no keyword: in FITS and ASDF output it is
+  not recorded at all, so convert such files to XISF. A DNG file of a camera that
+  stores colour planes (`LinearRaw`: an iPhone's ProRAW, or a file Adobe DNG Converter has
+  demosaiced) gives an RGB image.
+- **Rows**: DNG rows are top-down, as XISF, TIFF and PNG have them. FITS and ASDF output has them
+  bottom-up, the FITS convention, with `BAYERPAT` turned to match (`--top-down` keeps them as they
+  are, with `ROWORDER = 'TOP-DOWN'`), as from XISF.
+- **Samples**: 16-bit unsigned integers, whatever the camera's precision (10, 12 or 14 bits are
+  the most common; the values are not scaled). Samples of more than 16 bits become 32-bit integers.
+- **Keywords** from the file's own tags and its EXIF directory: `INSTRUME` (make and model of the
+  camera), `DATE-OBS` (the time the exposure began, in UTC when the camera recorded its offset from
+  UTC, with fractions of a second; without that offset the camera's clock is written as `DATE-LOC`,
+  since its time zone is not known), `EXPTIME`, `ISOSPEED`, `FOCALLEN`, `BAYERPAT`, `BLKLEVEL` (the
+  black level; the mean where the file gives one per position of the pattern) and `WHTLEVEL` (the
+  largest value a sample can have).
+- **Compression**: uncompressed (samples of 1 to 16, 24 and 32 bits, packed as DNG packs them),
+  lossless JPEG (as cameras and Adobe DNG Converter write it: the lossless process of the JPEG
+  standard, with every predictor, point transforms and restart markers; in tiles or strips), and
+  Deflate (with and without the predictors of DNG). Lossy DNG and JPEG XL compression are not read
+  (a lossy DNG no longer holds what the sensor recorded); floating point DNG files (HDR merges) are
+  not read.
+- `--info` shows the raw image, its pattern and keywords, and what else the file holds (previews,
+  masks), which are not read. `--verify` reads the raw image completely.
+- Nothing is written as DNG.
 
 ## TIFF output
 
@@ -1054,6 +1105,13 @@ Good to know:
   arrays, tables and structured or complex data types are skipped with a message; bzip2- and
   Blosc-compressed blocks are not read. Line breaks written as U+0085, U+2028 or U+2029 inside the
   tree are not recognized as such.
+- DNG input: the raw image only, as it was recorded (see [DNG input](#dng-input)): no
+  demosaicing, black level, white balance, colour matrix, lens corrections or orientation; the
+  camera's opcode lists (`OpcodeList1` to `3`: corrections for bad pixels, lens shading and
+  distortion that a raw converter applies) are not applied. Not read: lossy DNG, JPEG XL
+  compression, floating point data, BigTIFF, a colour filter layout that is not rectangular
+  (`CFALayout` other than 1; Fujifilm's old SuperCCD), a second raw image (the first one is read),
+  the `NewRawImageDigest` (not computed by `--verify`). The maker notes are not read.
 - ASDF output always uses the FITS HDU list layout described above; it does not write generalized WCS
   (gwcs) objects or instrument-specific data models.
 - A compression level and byte shuffling can be chosen when an image is written from memory (the

@@ -1,4 +1,4 @@
-// xisfconv - convert PixInsight XISF images to FITS, ASDF, TIFF or PNG, and FITS or ASDF images to XISF.
+// xisfconv - convert PixInsight XISF images to FITS, ASDF, TIFF or PNG, and FITS, ASDF or DNG images to XISF.
 // The command line tool. It uses the library through its C API (xisfconv.h) and nothing else.
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Jurgen Kobierczynski
@@ -167,7 +167,7 @@ struct Options {
 const char* const kVersion = xisfconv_version();
 
 void usage(std::ostream& os) {
-    os << "xisfconv " << kVersion << " - convert between PixInsight XISF, FITS and ASDF images; export TIFF and PNG\n\n"
+    os << "xisfconv " << kVersion << " - convert between PixInsight XISF, FITS and ASDF images; read DNG; export TIFF and PNG\n\n"
           "Usage: xisfconv [options] <file or directory>...\n"
           "       XISF inputs are converted to FITS (default), ASDF, TIFF or PNG, or rewritten as XISF\n"
           "       with another compression or checksum (-t xisf). An XISF input is a monolithic file\n"
@@ -176,16 +176,18 @@ void usage(std::ostream& os) {
           "       FITS inputs to XISF (default), ASDF, TIFF or PNG; tile-compressed FITS (.fits.fz)\n"
           "       is read like any FITS file, -t fits writes it as a plain FITS file, and -t fits -c\n"
           "       writes a FITS file tile-compressed;\n"
-          "       ASDF inputs to XISF (default), FITS, TIFF or PNG.\n"
-          "       A directory stands for the XISF, FITS and ASDF files in it and below it: those that are\n"
+          "       ASDF inputs to XISF (default), FITS, TIFF or PNG;\n"
+          "       DNG inputs (camera raw) to XISF (default), FITS, ASDF, TIFF or PNG: the raw image as the\n"
+          "       sensor recorded it, not demosaiced, with the colour filter pattern and the exposure.\n"
+          "       A directory stands for the XISF, FITS, ASDF and DNG files in it and below it: those that are\n"
           "       not yet what is written are converted (-t says what; a directory of one format needs\n"
           "       no -t). An argument with * or ? that names no file is a pattern for the names it\n"
           "       matches, on every system (cmd and PowerShell leave patterns to the program).\n"
           "       xisfconv --verify <file or directory>... checks files without converting them.\n\n"
           "Output:\n"
           "  -t, --to <fits|asdf|tiff|png|xisf|xish>\n"
-          "                              output format (default: fits for XISF input, xisf for FITS and ASDF\n"
-          "                              input, or taken from -o's extension). xish: XISF as a distributed\n"
+          "                              output format (default: fits for XISF input, xisf for FITS, ASDF and\n"
+          "                              DNG input, or taken from -o's extension). xish: XISF as a distributed\n"
           "                              unit, the header in <name>.xish and the data blocks in <name>.xisb\n"
           "                              beside it (PixInsight itself opens monolithic .xisf files only)\n"
           "  -o, --output <file>         output file name (single input only)\n"
@@ -220,7 +222,7 @@ void usage(std::ostream& os) {
           "                                1024x768   it fits a box of that size, its proportions kept\n"
           "                                50%        half the width and half the height\n"
           "                              (never larger than the image; made before a stretch is applied)\n"
-          "      --top-down              XISF input: keep XISF's top-down row order in FITS and ASDF output\n"
+          "      --top-down              XISF and DNG input: keep the top-down row order in FITS and ASDF output\n"
           "                              (ROWORDER='TOP-DOWN') instead of the FITS convention, bottom-up\n"
           "                              FITS and ASDF input: the rows are stored top-down\n"
           "      --bottom-up             FITS and ASDF input: the rows are stored bottom-up, whatever ROWORDER says\n"
@@ -258,11 +260,11 @@ void usage(std::ostream& os) {
           "                              PixInsight opens files with sha1, sha256 and sha512 checksums only\n\n"
 
           "Inspection:\n"
-          "      --verify                check the integrity of the files (and of the XISF, FITS and ASDF\n"
+          "      --verify                check the integrity of the files (and of the XISF, FITS, ASDF and DNG\n"
           "                              files in the directories) given: checksums are verified, compressed\n"
           "                              data is decompressed, sizes are compared. Exit status 1 on a failure\n"
           "  -I, --info                  print image geometry, keywords and properties; no conversion\n"
-          "      --dump-header           print the raw XML header (XISF), all keywords (FITS) or the YAML tree\n"
+          "      --dump-header           print the raw XML header (XISF), all keywords (FITS, DNG) or the YAML tree\n"
           "                              (ASDF); no conversion\n\n"
           "  -q, --quiet                 suppress warnings\n"
           "  -h, --help                  show this help\n"
@@ -283,6 +285,7 @@ std::optional<xisfconv_format> formatFromExtension(const std::string& path) {
     if (e == ".png") return XISFCONV_FORMAT_PNG;
     if (e == ".xisf" || e == ".xish") return XISFCONV_FORMAT_XISF;   // (.xish: the header file of a distributed unit)
     if (e == ".asdf") return XISFCONV_FORMAT_ASDF;
+    if (e == ".dng") return XISFCONV_FORMAT_DNG;   // (read, never written)
     return std::nullopt;
 }
 
@@ -585,6 +588,21 @@ void printAsdfInfo(const Library& lib, const std::string& path, xisfconv_file* f
     for (size_t s = 0; s < xisfconv_skipped_count(f); ++s) std::cout << "\nSkipped " << xisfconv_skipped_text(f, s) << "\n";
 }
 
+// DNG: the raw image, and what the other images of the file are.
+void printDngInfo(const Library& lib, const std::string& path, xisfconv_file* f) {
+    std::cout << path << ": " << xisfconv_file_detail(f, "format") << ", " << xisfconv_file_size(f) << " bytes\n";
+    const xisfconv_image_info img = infoOf(lib, f, 0);
+    std::cout << "\nRaw image at " << xisfconv_image_detail(f, 0, "source") << ": " << img.width << " x " << img.height << " x "
+              << img.channels << ", " << xisfconv_image_detail(f, 0, "storage") << "\n";
+    std::cout << "  rows:        top-down\n";
+    if (img.has_cfa) {
+        std::cout << "  CFA:         " << xisfconv_image_detail(f, 0, "cfaPattern") << " (" << img.cfa_width << "x" << img.cfa_height
+                  << ")\n";
+    }
+    printKeywords(cardsOf(lib, f, 0));
+    for (size_t s = 0; s < xisfconv_skipped_count(f); ++s) std::cout << "\nSkipped " << xisfconv_skipped_text(f, s) << "\n";
+}
+
 // ---------------------------------------------------------------- converting
 
 // XISF -> XISF: the same file with its data blocks stored another way.
@@ -687,8 +705,9 @@ void convertXisfInput(const Library& lib, const std::string& input, const Option
     if (!opt.quiet) std::cout << input << " -> " << outPath << "\n";
 }
 
-// Converts a FITS or ASDF file. Both readers deliver the images in the same form.
-void convertFitsOrAsdfInput(const Library& lib, const std::string& input, bool asdfInput, const Options& opt) {
+// Converts a FITS, ASDF or DNG file. The readers deliver the images in the same form.
+void convertFitsOrAsdfInput(const Library& lib, const std::string& input, xisfconv_format inputFormat, const Options& opt) {
+    const bool asdfInput = inputFormat == XISFCONV_FORMAT_ASDF;
     if (asdfInput && opt.treeJson) {
         size_t size = 0;
         lib.check(xisfconv_asdf_tree_json(lib.ctx, input.c_str(), nullptr, 0, &size));
@@ -714,6 +733,7 @@ void convertFitsOrAsdfInput(const Library& lib, const std::string& input, bool a
     if (opt.info || opt.dumpHeader) {
         const OpenFile file(lib, input);
         if (asdfInput) printAsdfInfo(lib, input, file.file);
+        else if (inputFormat == XISFCONV_FORMAT_DNG) printDngInfo(lib, input, file.file);
         else printFitsInfo(lib, input, file.file);
         return;
     }
@@ -892,6 +912,9 @@ bool parseArgs(int argc, char** argv, Options& opt, int& exitCode) {
     if (!opt.output.empty() && opt.inputs.size() > 1) throw Error("-o/--output can only be used with a single input");
     if (!opt.output.empty() && !opt.format && !formatFromExtension(opt.output)) {
         throw Error("cannot infer output format from '" + opt.output + "'; add --to fits|asdf|tiff|png|xisf|xish");
+    }
+    if (!opt.output.empty() && !opt.format && formatFromExtension(opt.output) == XISFCONV_FORMAT_DNG) {
+        throw Error(opt.output + ": DNG is read, not written; add --to fits|asdf|tiff|png|xisf|xish");
     }
     // The kind of an XISF unit goes with the name of its file: .xish is a header file, any
     // other name a monolithic file.
@@ -1136,7 +1159,7 @@ struct Search {
     const fs::path* outputs = nullptr;  // a directory that is not searched: the one the outputs go to
 };
 
-// Collects the XISF, FITS and ASDF files in and below a directory, by their names. Directories
+// Collects the XISF, FITS, ASDF and DNG files in and below a directory, by their names. Directories
 // that cannot be read are reported in `errors`. A link to a directory is not followed.
 void findImageFiles(const fs::path& directory, const Search& search, std::vector<std::string>& found, std::vector<std::string>& errors,
                     int depth = 0) {
@@ -1158,7 +1181,8 @@ void findImageFiles(const fs::path& directory, const Search& search, std::vector
             } else if (it->is_regular_file(entryError)) {
                 const std::string name = fromPath(it->path());
                 const auto format = formatFromExtension(name);   // image.fits.fz is FITS, too
-                if (format && (*format == XISFCONV_FORMAT_XISF || *format == XISFCONV_FORMAT_FITS || *format == XISFCONV_FORMAT_ASDF)) {
+                if (format && (*format == XISFCONV_FORMAT_XISF || *format == XISFCONV_FORMAT_FITS || *format == XISFCONV_FORMAT_ASDF ||
+                               *format == XISFCONV_FORMAT_DNG)) {
                     found.push_back(name);
                 }
             }
@@ -1173,14 +1197,16 @@ void findImageFiles(const fs::path& directory, const Search& search, std::vector
 }
 
 // What a file is, by its name: the kinds a conversion makes one of the other of.
-enum class Kind { XisfFile, XisfUnit, Fits, PackedFits, Asdf };
+enum class Kind { XisfFile, XisfUnit, Fits, PackedFits, Asdf, Dng };   // (a DNG file is never written)
 
 Kind kindOfName(const std::string& path) {
     const std::string extension = lowerExt(path);
     if (extension == ".xish") return Kind::XisfUnit;
     if (extension == ".fz") return Kind::PackedFits;
     const auto format = formatFromExtension(path);
-    return format == XISFCONV_FORMAT_FITS ? Kind::Fits : format == XISFCONV_FORMAT_ASDF ? Kind::Asdf : Kind::XisfFile;
+    return format == XISFCONV_FORMAT_FITS ? Kind::Fits : format == XISFCONV_FORMAT_ASDF ? Kind::Asdf
+           : format == XISFCONV_FORMAT_DNG    ? Kind::Dng
+                                              : Kind::XisfFile;
 }
 
 bool isXisf(Kind kind) { return kind == Kind::XisfFile || kind == Kind::XisfUnit; }
@@ -1197,7 +1223,8 @@ std::optional<Kind> kindWritten(const Options& opt, xisfconv_format format) {
 
 std::string countOfKind(size_t n, Kind kind) {
     const char* what = kind == Kind::XisfFile ? "monolithic XISF file" : kind == Kind::XisfUnit ? "distributed XISF unit"
-                       : kind == Kind::Fits ? "FITS file" : kind == Kind::PackedFits ? "tile-compressed FITS file" : "ASDF file";
+                       : kind == Kind::Fits ? "FITS file" : kind == Kind::PackedFits ? "tile-compressed FITS file"
+                       : kind == Kind::Asdf ? "ASDF file" : "DNG file";
     return std::to_string(n) + " " + what + (n == 1 ? "" : "s");
 }
 
@@ -1241,7 +1268,7 @@ void planDirectory(const std::string& directory, const Options& opt, Plan& plan)
     findImageFiles(toPath(directory), search, found, plan.errors);
     std::sort(found.begin(), found.end());
     if (found.empty()) {
-        if (!opt.quiet) std::cerr << "warning: " << directory << ": no XISF, FITS or ASDF files found\n";
+        if (!opt.quiet) std::cerr << "warning: " << directory << ": no XISF, FITS, ASDF or DNG files found\n";
         return;
     }
     size_t xisf = 0;
@@ -1249,7 +1276,7 @@ void planDirectory(const std::string& directory, const Options& opt, Plan& plan)
     const bool reads = opt.info || opt.dumpHeader || opt.treeJson;
     if (!reads && !opt.inPlace && !opt.format && xisf && xisf != found.size()) {
         throw Error(directory + " holds " + std::to_string(xisf) + " XISF and " + std::to_string(found.size() - xisf) +
-                    " FITS or ASDF " + (found.size() - xisf == 1 ? "file" : "files") + ": say with -t what to make of them "
+                    " FITS, ASDF or DNG " + (found.size() - xisf == 1 ? "file" : "files") + ": say with -t what to make of them "
                     "(-t fits converts what is not FITS, -t xisf what is not XISF)");
     }
     std::map<Kind, size_t> passed;
@@ -1375,7 +1402,7 @@ int verifyFiles(const Library& lib, const Options& opt, const std::vector<Name>&
         std::vector<std::string> found;
         findImageFiles(toPath(input), Search(), found, errors);
         std::sort(found.begin(), found.end());
-        if (found.empty() && !opt.quiet) std::cerr << "warning: " << input << ": no XISF, FITS or ASDF files found\n";
+        if (found.empty() && !opt.quiet) std::cerr << "warning: " << input << ": no XISF, FITS, ASDF or DNG files found\n";
         files.insert(files.end(), found.begin(), found.end());
     }
 
@@ -1405,7 +1432,9 @@ int verifyFiles(const Library& lib, const Options& opt, const std::vector<Name>&
             continue;
         }
         const xisfconv_format format = xisfconv_report_format(report);
-        const char* kind = format == XISFCONV_FORMAT_FITS ? "FITS" : format == XISFCONV_FORMAT_ASDF ? "ASDF" : "XISF";
+        const char* kind = format == XISFCONV_FORMAT_FITS ? "FITS" : format == XISFCONV_FORMAT_ASDF ? "ASDF"
+                           : format == XISFCONV_FORMAT_DNG  ? "DNG"
+                                                            : "XISF";
         const size_t notChecked = xisfconv_report_not_checked_count(report);
         const size_t verified = xisfconv_report_verified(report), unchecked = xisfconv_report_unchecked(report);
         const bool complete = notChecked == 0;
@@ -1470,7 +1499,7 @@ int convertFiles(const Library& lib, Options& opt) {
     std::map<std::u32string, std::string> written;
     std::map<FileId, std::u32string> writtenIds;   // the same outputs, by the file they became
     for (auto& in : plan.inputs) {
-        // A file that is neither FITS nor ASDF goes to the XISF reader, which says what is wrong with it.
+        // A file that is neither FITS, ASDF nor DNG goes to the XISF reader, which says what is wrong with it.
         in.image = xisfconv_detect_format(lib.ctx, in.path.c_str(), &in.format) == XISFCONV_OK;
         if (!in.image) in.format = XISFCONV_FORMAT_XISF;
         if (converts && in.image) {
@@ -1529,7 +1558,7 @@ int convertFiles(const Library& lib, Options& opt) {
                 }
             }
             if (in.format == XISFCONV_FORMAT_XISF) convertXisfInput(lib, input, own);
-            else convertFitsOrAsdfInput(lib, input, in.format == XISFCONV_FORMAT_ASDF, own);
+            else convertFitsOrAsdfInput(lib, input, in.format, own);
             if (converts && in.image) {
                 written[key] = input;
                 if (const auto id = fileId(planned)) writtenIds[*id] = key;

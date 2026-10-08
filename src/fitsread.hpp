@@ -47,6 +47,10 @@ struct FitsImage {
     // turned to the pixels first and from there to the file, a number would be computed twice
     // and not come back as it was.)
     std::optional<bool> wcsTopDown;
+    // DNG input only: the colour filter array, a letter per cell (R, G, B, C, M, Y, W), row after
+    // row of cfaWidth by cfaHeight cells, relative to the first pixel of the image.
+    std::string cfaPattern;
+    int cfaWidth = 0, cfaHeight = 0;
 };
 
 struct FitsFile {

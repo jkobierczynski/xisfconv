@@ -19,6 +19,7 @@ Optional:     pip install asdf asdf-astropy asdf-compression  (without them the 
               libtiff tools (tiffcp), fitsverify and pngcheck, used as extra independent checkers;
               fpack and funpack (CFITSIO) as a second source of tile-compressed FITS files.
               Without tiffcp and imagecodecs, compressed float TIFF checks are skipped.
+              pip install rawpy: LibRaw reads the DNG files the tests write (tests/dng_files.py) too.
 Usage: python3 tests/run_tests.py path/to/xisfconv
 """
 import base64
@@ -3016,7 +3017,7 @@ def test_verify():
     empty = os.path.join(d, "empty")
     os.makedirs(empty, exist_ok=True)
     r = verify(empty)
-    check(r.returncode == 0 and "no XISF, FITS or ASDF files found" in r.stderr, "--verify on a directory without image files")
+    check(r.returncode == 0 and "no XISF, FITS, ASDF or DNG files found" in r.stderr, "--verify on a directory without image files")
     if os.name == "posix" and os.geteuid() != 0:   # (root reads every directory)
         locked = os.path.join(tree, "locked")
         os.makedirs(locked, exist_ok=True)
@@ -5811,7 +5812,7 @@ def test_directories_and_patterns():
     # ---- without -t: a directory of one format goes the way a file of it goes; one of both is not guessed at
     where = fresh("default")
     r = tool(where)
-    check(r.returncode == 2 and files_below(where) == before and "4 XISF and 5 FITS or ASDF files" in r.stderr and "say with -t" in r.stderr
+    check(r.returncode == 2 and files_below(where) == before and "4 XISF and 5 FITS, ASDF or DNG files" in r.stderr and "say with -t" in r.stderr
           and r.stdout == "", f"a directory of XISF and of FITS without -t: nothing is done, exit status 2: {r.stderr.strip()}")
     r = tool(os.path.join(where, "night1", "darks"))
     check(r.returncode == 0 and "night1/darks/dark.xisf" in files_below(where) and summary_of(r) == (1, 0, 0),
@@ -5825,7 +5826,7 @@ def test_directories_and_patterns():
     os.makedirs(os.path.join(empty, "sub"))
     open(os.path.join(empty, "readme.txt"), "w").write("nothing here\n")
     r = tool(empty)
-    check(r.returncode == 0 and "no XISF, FITS or ASDF files found" in r.stderr and summary_of(r) == (0, 0, 0),
+    check(r.returncode == 0 and "no XISF, FITS, ASDF or DNG files found" in r.stderr and summary_of(r) == (0, 0, 0),
           f"a directory without images: a warning, and nothing to do: {r.stderr.strip()}")
     for flags, why in ((["-o", os.path.join(base, "one.fits")], "-o with a directory"),):
         r = tool(where, *flags)
@@ -6525,6 +6526,485 @@ def test_documents():
           f"... and xisfconv takes the solution of the keywords then, and that of the properties otherwise: {center}, {kept}")
 
 
+def test_dng():
+    """DNG input: files written byte by byte by tests/dng_files.py, decoded here with numpy; the lossless JPEG
+    encoder held against libjpeg (imagecodecs), and the raw images against LibRaw (rawpy) where they are installed."""
+    import re
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import dng_files as D
+    try:
+        import imagecodecs as ic
+        ic.jpeg8_decode   # noqa: B018
+    except (ImportError, AttributeError):
+        ic = None
+    try:
+        import rawpy
+    except ImportError:
+        rawpy = None
+    d = os.path.join(TMP, "dng")
+    os.makedirs(d)
+    n = [0]
+
+    def name(stem="raw"):
+        n[0] += 1
+        return os.path.join(d, "%s%03d.dng" % (stem, n[0]))
+
+    def expected(raw, kw):
+        e = np.asarray(raw)
+        if kw.get("linearization") is not None:
+            table = np.asarray(kw["linearization"])
+            e = table[np.minimum(e, len(table) - 1)]   # (the last entry for samples beyond the table)
+        if kw.get("active_area") is not None:
+            t, l, b, r = kw["active_area"]
+            e = e[t:b, l:r]
+        return e if e.ndim == 3 else e[:, :, None]
+
+    def to_xisf(path, *flags):
+        out = path[:-4] + ".xisf"
+        r = tool(path, "-o", out, "-f", *flags)
+        return (read_xisf_any(out) if r.returncode == 0 else None), r
+
+    def same(label, raw, **kw):
+        """Writes a DNG file and checks that the XISF image made of it holds the raw image."""
+        path = name()
+        D.write_dng(path, raw, **kw)
+        got, r = to_xisf(path)
+        want = expected(raw, kw)
+        ok = got is not None and got.shape == want.shape and np.array_equal(got, want) and \
+            got.dtype == (np.uint32 if kw.get("bits", 16) > 16 and kw.get("linearization") is None else np.uint16)
+        check(ok, f"DNG {label}: the raw image as it was written ({None if got is None else (got.shape, got.dtype)}; "
+                  f"{r.stderr.strip()[-300:]})")
+        return path
+
+    def fails(label, path, *texts, status=1):
+        r = tool(path, "-o", path[:-4] + ".xisf", "-f")
+        v = tool("--verify", path)
+        said = r.stderr + r.stdout
+        check(r.returncode == status and all(t in said for t in texts) and "FAILED" in v.stdout and v.returncode == 1 and
+              not os.path.exists(path[:-4] + ".xisf"),
+              f"DNG {label}: refused ({r.returncode}), saying {texts}: {said.strip()[-300:]} / {v.stdout.strip()[-200:]}")
+
+    def unsupported(label, path, *texts):
+        """Not read, and not called damaged: --verify says NOT FULLY CHECKED."""
+        r = tool(path, "-o", path[:-4] + ".xisf", "-f")
+        v = tool("--verify", path)
+        said = r.stderr + r.stdout
+        check(r.returncode == 1 and all(t in said for t in texts) and "NOT FULLY CHECKED" in v.stdout and v.returncode == 0 and
+              all(t in v.stdout for t in texts) and not os.path.exists(path[:-4] + ".xisf"),
+              f"DNG {label}: not read, saying {texts}, and not called damaged: {said.strip()[-300:]} / {v.stdout.strip()[-300:]}")
+
+    # ---- the lossless JPEG encoder of the tests, against libjpeg
+    if ic is not None:
+        wrong = []
+        for bits in (2, 8, 12, 16):
+            for p in range(1, 8):
+                for pt in (0, 1, 3):
+                    if pt >= bits - 1:
+                        continue
+                    a = (D.bayer_scene(9, 16, bits, p) >> pt) << pt
+                    for comps in (1, 2, 4):
+                        s = a.reshape(9, -1, comps) if comps > 1 else a
+                        for restart in (0, 2):
+                            j = D.ljpeg(s, bits, predictor=p, transform=pt, restart_lines=restart,
+                                        table="skewed" if restart else "flat", tables_per_component=comps == 2)
+                            if not np.array_equal(ic.jpeg8_decode(j).reshape(s.shape), s):
+                                wrong.append((bits, p, pt, comps, restart))
+        edge = np.array([[0, 32768, 0, 65535, 1, 32769]], np.uint16)   # differences of 32768: category 16
+        check(not wrong and np.array_equal(ic.jpeg8_decode(D.ljpeg(edge, 16)), edge),
+              f"the lossless JPEG encoder of the tests agrees with libjpeg: {wrong[:5]}")
+    else:
+        skipped.append("the lossless JPEG encoder of the tests against libjpeg (pip install imagecodecs)")
+
+    # ---- uncompressed samples of every size, both byte orders, strips and tiles
+    for bits in list(range(1, 17)) + [24, 32]:
+        for order in "<>":
+            raw = D.bayer_scene(13, 22, bits, bits)
+            same(f"{bits}-bit samples, {'II' if order == '<' else 'MM'}, strips of 4 lines", raw, bits=bits, order=order,
+                 rows_per_strip=4)
+    for tile in ((16, 16), (32, 8), (8, 32)):
+        same(f"uncompressed tiles of {tile}, the image not a whole number of them", D.bayer_scene(21, 37, 12, 7),
+             bits=12, tile=tile)
+    same("one strip of more lines than the image", D.bayer_scene(10, 12, 16), rows_per_strip=1000)
+
+    # ---- Deflate, with and without predictors
+    for bits in (8, 16, 32):
+        for predictor in (1, 2, 34892, 34893):
+            for tile in ((None, 5), (16, 16)):
+                same(f"Deflate, {bits} bits, predictor {predictor}, {'strips' if tile[0] is None else 'tiles'}",
+                     D.bayer_scene(19, 33, bits, predictor), bits=bits, compression=8, predictor=predictor, tile=tile)
+
+    same("Deflate, 12-bit samples packed", D.bayer_scene(19, 33, 12, 1), bits=12, compression=8, tile=(16, 16))
+    path = name()
+    D.write_dng(path, D.bayer_scene(19, 33, 12, 1), bits=12, compression=8, predictor=2)
+    unsupported("Deflate, a predictor with 12-bit samples", path, "predictor 2 with 12-bit samples")
+
+    # ---- lossless JPEG
+    for p in range(1, 8):
+        same(f"lossless JPEG, predictor {p}, tiles", D.bayer_scene(40, 52, 14, p), bits=14, compression=7, tile=(16, 16),
+             jpeg=dict(predictor=p))
+    for shape in ("same", "two", "tall", "valid"):
+        for order in "<>":
+            same(f"lossless JPEG tiles as {shape}, {order}", D.bayer_scene(36, 50, 12, 3), bits=12, order=order,
+                 compression=7, tile=(16, 12), jpeg=dict(shape=shape, predictor=6))
+    raw = (D.bayer_scene(30, 40, 16, 4) >> 2) << 2
+    same("lossless JPEG with a point transform", raw, bits=16, compression=7, tile=(16, 16), jpeg=dict(transform=2))
+    same("lossless JPEG with restart markers and long codes", D.bayer_scene(30, 40, 15, 5), bits=15, compression=7,
+         rows_per_strip=12, jpeg=dict(restart_lines=3, table="skewed", fill_ff=True))
+    same("lossless JPEG with more than eight restart intervals (RST0 again after RST7)", D.bayer_scene(30, 40, 12, 6), bits=12,
+         compression=7, rows_per_strip=30, jpeg=dict(restart_lines=2))
+    same("lossless JPEG with 2-bit samples", D.bayer_scene(20, 24, 2, 5), bits=2, compression=7, tile=(16, 16))
+    same("lossless JPEG with a table per component and other segments before the frame", D.bayer_scene(20, 24, 12, 6),
+         bits=12, compression=7, tile=(16, 16),
+         jpeg=dict(shape="two", tables_per_component=True, markers_before=b"\xFF\xFE\x00\x05abc\xFF\xE1\x00\x02"))
+    edge = np.zeros((8, 16), np.uint16)
+    edge[:, 1::2] = 32768
+    edge[3, 5], edge[6, 6] = 65535, 1
+    same("lossless JPEG with differences of 32768", edge, bits=16, compression=7, tile=(16, 8))
+    if ic is not None and hasattr(ic, "ljpeg_encode"):
+        same("lossless JPEG made by imagecodecs", D.bayer_scene(40, 48, 16, 9), bits=16, compression=7, tile=(16, 16),
+             jpeg=dict(shape="imagecodecs"))
+    else:
+        skipped.append("DNG with lossless JPEG made by imagecodecs (pip install imagecodecs)")
+
+    # ---- LinearRaw: planes of colour, not a filter array
+    rgb = np.stack([D.bayer_scene(14, 20, 12, k) for k in range(3)], axis=2)
+    for kw in (dict(), dict(compression=8, tile=(16, 16)), dict(compression=7, tile=(16, 16)),
+               dict(compression=7, rows_per_strip=5, jpeg=dict(predictor=5, restart_lines=1))):
+        path = same(f"LinearRaw, 3 samples a pixel, {kw}", rgb, bits=12, photometric="linear", **kw)
+    out = path[:-4] + ".xisf"
+    check('colorSpace="RGB"' in xisf_header(out)[1] and "ColorFilterArray" not in xisf_header(out)[1],
+          "LinearRaw: an RGB image in XISF, without a colour filter array")
+    four = np.stack([D.bayer_scene(10, 12, 16, k) for k in range(4)], axis=2)
+    same("LinearRaw, 4 samples a pixel", four, photometric="linear", compression=7, tile=(16, 16))
+
+    # ---- what is done to the samples: the active area, the linearization table; and nothing else
+    lin = [min(65535, (i * i) // 3 + 5) for i in range(1024)]
+    same("active area", D.bayer_scene(30, 40, 14, 2), bits=14, active_area=(3, 5, 27, 38), black=[512, 510, 511, 513])
+    same("linearization table", D.bayer_scene(20, 30, 10, 2), bits=10, linearization=lin, compression=7, tile=(16, 16))
+    same("a linearization table shorter than the samples (the last entry for those above it)", D.bayer_scene(20, 30, 12, 2),
+         bits=12, linearization=lin[:300])
+    same("a linearization table for samples of 32 bits: 16-bit values", D.bayer_scene(12, 14, 32, 2) % 500, bits=32,
+         linearization=lin)
+    same("a linearization table for LinearRaw", rgb % 1024, bits=12, photometric="linear", linearization=lin)
+
+    # ---- the raw image among the others
+    raw = D.bayer_scene(16, 24, 12, 11)
+    for kw in (dict(raw_in_ifd0=True), dict(second_raw=True),
+               dict(more_ifds=[{254: (D.LONG, 1), 256: (D.LONG, 4), 257: (D.LONG, 4), 262: (D.SHORT, 2)}])):
+        path = same(f"the raw image among other directories {list(kw)}", raw, bits=12, **kw)
+    r = tool("-I", path)
+    check(r.returncode == 0 and "Skipped IFD 0: a preview of 12 x 8 (uncompressed), not read" in r.stdout and
+          "SubIFD 1: a preview of 4 x 4" in r.stdout and "Raw image at IFD 0 / SubIFD 0: 24 x 16 x 1" in r.stdout,
+          f"--info lists the raw image and what else the file holds: {r.stdout.strip()[-400:]}")
+    path = name()
+    D.write_dng(path, raw, bits=12, second_raw=True)
+    r = tool("-I", path)
+    check("SubIFD 1: a second raw image of 24 x 16 (uncompressed), not read" in r.stdout, f"a second raw image is named: {r.stdout[-300:]}")
+
+    # ---- the colour filter array, and the keywords
+    raw = D.bayer_scene(24, 30, 14, 12)
+    for pattern in ("RGGB", "BGGR", "GRBG", "GBRG"):
+        path = name()
+        D.write_dng(path, raw, bits=14, pattern=pattern)
+        got, r = to_xisf(path)
+        hdr = xisf_header(path[:-4] + ".xisf")[1]
+        kws = {k: unq(v[0]["value"]) for k, v in xisf_keywords(path[:-4] + ".xisf").items()}
+        check(f'<ColorFilterArray pattern="{pattern}" width="2" height="2"' in hdr and kws.get("BAYERPAT") == pattern,
+              f"CFA {pattern}: the ColorFilterArray element and BAYERPAT in XISF: {re.findall('<ColorFilterArray[^>]*>', hdr)} {kws.get('BAYERPAT')}")
+        flipped = pattern[2:] + pattern[:2]
+        for flags, rows, bay in (((), "BOTTOM-UP", flipped), (("--top-down",), "TOP-DOWN", pattern)):
+            r = tool(path, "-t", "fits", "-o", path[:-4] + ".fits", "-f", *flags)
+            with fits.open(path[:-4] + ".fits") as hdul:
+                h = hdul[0].header
+                data = hdul[0].data
+            check(r.returncode == 0 and h.get("BAYERPAT", "").strip() == bay and h.get("ROWORDER", "BOTTOM-UP") == rows and
+                  np.array_equal(data, raw[::-1] if rows == "BOTTOM-UP" else raw),
+                  f"CFA {pattern} to FITS {flags}: rows {rows}, BAYERPAT {bay}: {h.get('BAYERPAT')} {h.get('ROWORDER')}")
+    path = name()
+    D.write_dng(path, D.bayer_scene(25, 30, 14, 12), bits=14, pattern="GRBG")   # an odd height: the pattern turned
+    r = tool(path, "-t", "fits", "-o", path[:-4] + ".fits", "-f")
+    check(fits.getheader(path[:-4] + ".fits").get("BAYERPAT", "").strip() == "GRBG",
+          "an odd number of lines: BAYERPAT bottom-up is the pattern itself")
+    xt = D.bayer_scene(24, 36, 14, 13)
+    path = same("X-Trans (6 x 6)", xt, bits=14, pattern=D.XTRANS, pattern_size=(6, 6), compression=7, tile=(12, 12))
+    letters = "".join("RGB"[k] for k in D.XTRANS)
+    hdr = xisf_header(path[:-4] + ".xisf")[1]
+    check(f'<ColorFilterArray pattern="{letters}" width="6" height="6"' in hdr and
+          "BAYERPAT" not in xisf_keywords(path[:-4] + ".xisf"),
+          f"X-Trans: a ColorFilterArray of 6 x 6 in XISF, and no BAYERPAT: {re.findall('<ColorFilterArray[^>]*>', hdr)}")
+    r = tool(path, "-I")
+    check(f"CFA:         {letters} (6x6)" in r.stdout, f"--info: the X-Trans pattern: {r.stdout[-500:]}")
+    path = name()
+    D.write_dng(path, xt[:23], bits=14, pattern=D.XTRANS, pattern_size=(6, 6))
+    r = tool(path, "-t", "xisf", "--bottom-up", "-o", path[:-4] + ".xisf", "-f")
+    check(f'pattern="{letters}"' in xisf_header(path[:-4] + ".xisf")[1] and np.array_equal(read_xisf_any(path[:-4] + ".xisf")[:, :, 0], xt[:23]),
+          "--bottom-up says nothing about a DNG file: its rows are top-down")
+    # the cells of CFAPattern are colours, CFAPlaneColor the colours of the planes in their order
+    for pattern, planes, size, want in (([3, 4, 5, 1, 5, 1, 3, 4], [3, 4, 5, 1], (2, 4), "CMYGYGCM"),
+                                        ([0, 1, 1, 2], [2, 1, 0], (2, 2), "RGGB"), ([6, 1, 1, 6], [6, 1], (2, 2), "WGGW")):
+        path = same(f"a pattern of the colours {pattern}, the planes {planes}", D.bayer_scene(16, 16, 12, 1), bits=12,
+                    pattern=pattern, pattern_size=size, plane_color=planes)
+        check(f'<ColorFilterArray pattern="{want}" width="{size[0]}" height="{size[1]}"' in xisf_header(path[:-4] + ".xisf")[1],
+              f"... the pattern is {want}: {re.findall('<ColorFilterArray[^>]*>', xisf_header(path[:-4] + '.xisf')[1])}")
+
+    def keywords(path):
+        r = tool(path, "-t", "fits", "-o", path[:-4] + ".fits", "-f")
+        if r.returncode:
+            return {"error": r.stderr}
+        h = fits.getheader(path[:-4] + ".fits")
+        return {k: h[k] for k in ("INSTRUME", "DATE-OBS", "DATE-LOC", "EXPTIME", "ISOSPEED", "FOCALLEN", "BLKLEVEL", "WHTLEVEL",
+                                  "BAYERPAT") if k in h}
+    path = name()
+    D.write_dng(path, raw, bits=14, black=[512, 510, 511, 513], white=16000)
+    k = keywords(path)
+    check(k == {"INSTRUME": "Canon EOS R5", "DATE-OBS": "2026-03-14T20:05:09.25", "EXPTIME": 0.004, "ISOSPEED": 800,
+                "FOCALLEN": 135.0, "BLKLEVEL": 511.5, "WHTLEVEL": 16000, "BAYERPAT": "GBRG"},
+          f"the keywords of a DNG file: {k}")
+    for exif, camera, want, date in (
+            ({36881: None}, ("Canon", "Canon EOS R5"), {"DATE-LOC": "2026-03-14T22:05:09.25", "INSTRUME": "Canon EOS R5"}, "DATE-LOC"),
+            ({36881: (D.ASCII, "-09:30"), 37521: None, 36867: (D.ASCII, "2026:12:31 20:00:00")}, ("NIKON CORPORATION", "NIKON Z 6"),
+             {"DATE-OBS": "2027-01-01T05:30:00", "INSTRUME": "NIKON CORPORATION NIKON Z 6"}, "DATE-OBS"),
+            ({36867: (D.ASCII, "    :  :     :  :  ")}, ("SONY", "ILCE-7M3"), {"INSTRUME": "SONY ILCE-7M3"}, None),
+            ({36867: (D.ASCII, "2026:02:29 10:00:00")}, ("SONY", "ILCE-7M3"), {}, None),      # (2026 is no leap year)
+            ({36867: (D.ASCII, "2028:02:29 23:59:59"), 36881: (D.ASCII, "-01:00")}, ("SONY", "ILCE-7M3"),
+             {"DATE-OBS": "2028-03-01T00:59:59.25"}, "DATE-OBS"),
+            ({33434: (D.RATIONAL, [(30, 1)]), 34855: (D.SHORT, 0)}, ("", ""), {"EXPTIME": 30.0, "INSTRUME": "Canon EOS R5"}, "DATE-OBS")):
+        path = name()
+        D.write_dng(path, raw, bits=14, exif=exif, camera=camera)
+        k = keywords(path)
+        check(all(k.get(key) == value for key, value in want.items()) and
+              [key for key in ("DATE-OBS", "DATE-LOC") if key in k] == ([date] if date else []) and
+              ("ISOSPEED" not in k) == (34855 in exif),
+              f"keywords from EXIF {exif} and {camera}: {k}")
+    path = name()
+    D.write_dng(path, raw, bits=14, exif=False, black=64)
+    k = keywords(path)
+    check(set(k) == {"INSTRUME", "BLKLEVEL", "BAYERPAT"} and k["BLKLEVEL"] == 64, f"a file without EXIF: {k}")
+
+    # ---- every output; the tool around it
+    path = name()
+    raw = D.bayer_scene(20, 30, 12, 21)
+    D.write_dng(path, raw, bits=12, compression=7, tile=(16, 16))
+    for target, ending in (("asdf", ".asdf"), ("tiff", ".tif"), ("png", ".png")):
+        r = tool(path, "-t", target, "-f")
+        out = path[:-4] + ending
+        ok = r.returncode == 0 and os.path.exists(out)
+        if ok and target == "tiff":
+            ok = np.array_equal(tifffile.imread(out), raw)
+        elif ok and target == "png":
+            png, depth, _ = decode_png(out)
+            ok = depth == 16 and np.array_equal(png.reshape(raw.shape), raw)
+        elif ok and target == "asdf" and HAVE_ASDF:
+            ok = np.array_equal(open_asdf(out)[0][0][0], raw[::-1])
+        check(ok, f"DNG to {target}: {r.stderr.strip()[-200:]}")
+    r = tool(path, "-t", "png", "-s", "-b", "u8", "-o", path[:-4] + "-s.png", "-f")
+    check(r.returncode == 0 and "linked auto-STF" in r.stderr, f"DNG to PNG with a stretch: {r.stderr.strip()[-200:]}")
+    r = tool(path, "-f")
+    check(r.returncode == 0 and r.stdout.strip().endswith(path[:-4] + ".xisf") and "warning" not in r.stderr and
+          "info: skipped IFD 0: a preview" in r.stderr, f"a DNG file is converted to XISF by default, its preview no warning: {r.stderr}")
+    r = tool(path, "-I")
+    check(r.returncode == 0 and "DNG 1.4.0.0, Canon EOS R5 (dng_files.py)" in r.stdout and "JPEG (lossless), 4 tiles of 16 x 16" in r.stdout and
+          "rows:        top-down" in r.stdout and "CFA:         BGGR (2x2)" not in r.stdout and "CFA:         RGGB (2x2)" in r.stdout,
+          f"--info of a DNG file: {r.stdout[:500]}")
+    r = tool("--verify", path)
+    check(r.returncode == 0 and ": OK (DNG, raw image 30 x 20, JPEG (lossless), 4 tiles of 16 x 16; 1 other image not read; no checksums in the file)" in r.stdout,
+          f"--verify of a DNG file: {r.stdout.strip()}")
+    path = name()
+    D.write_dng(path, raw, bits=12, digest=True)
+    r = tool("--verify", path)
+    check(r.returncode == 0 and "NOT FULLY CHECKED" in r.stdout and "NewRawImageDigest" in r.stdout,
+          f"--verify of a DNG file with a digest of its raw data: not computed, and said so: {r.stdout.strip()}")
+    r = tool(path, "-o", path[:-4] + ".dng.out.dng")
+    check(r.returncode == 2 and "DNG is read, not written" in r.stderr, f"-o with a .dng name: {r.stderr.strip()}")
+    r = tool(path, "-t", "dng")
+    check(r.returncode == 2 and "unknown output format 'dng'" in r.stderr, f"-t dng: {r.stderr.strip()}")
+    plain = os.path.join(d, "plain.dng")
+    tifffile.imwrite(plain, np.zeros((4, 5), np.uint16))
+    r = tool(plain)
+    check(r.returncode == 1 and "a TIFF file that is not a DNG file" in r.stderr, f"a TIFF file named .dng: {r.stderr.strip()}")
+
+    # ---- a directory of DNG files, patterns
+    night = os.path.join(d, "night")
+    os.makedirs(os.path.join(night, "sub"))
+    for k, sub in enumerate(("", "", "sub")):
+        D.write_dng(os.path.join(night, sub, "IMG_%04d.DNG" % k), D.bayer_scene(8, 10, 12, k), bits=12)
+    r = tool(night)
+    check(r.returncode == 0 and files_below(night) == ["IMG_0000.DNG", "IMG_0000.xisf", "IMG_0001.DNG", "IMG_0001.xisf",
+                                                      "sub/IMG_0002.DNG", "sub/IMG_0002.xisf"],
+          f"a directory of DNG files: each converted to XISF: {files_below(night)} {r.stderr.strip()[-200:]}")
+    r = tool(night)
+    check(r.returncode == 2 and "holds 3 XISF and 3 FITS, ASDF or DNG files" in r.stderr, f"... and with XISF beside them, -t is asked for: {r.stderr.strip()}")
+    r = tool("-t", "fits", night)
+    check(r.returncode == 1 and len([f for f in files_below(night) if f.endswith(".fits")]) == 3 and
+          r.stderr.count("was written in this run already") == 3,
+          f"... -t fits: a DNG file and an XISF file of one name have one output: the second is refused: "
+          f"{files_below(night)} {r.stderr.strip()[-300:]}")
+    r = tool("--verify", os.path.join(night, "*.DNG"))
+    check(r.returncode == 0 and r.stdout.count(": OK (DNG, ") == 2, f"a pattern of DNG files: {r.stdout.strip()}")
+
+    # ---- what is not read
+    raw = D.bayer_scene(10, 12, 12, 1)
+    path = name()
+    D.write_dng(path, raw, bits=12, compression=34892)
+    unsupported("lossy", path, "lossy DNG")
+    for comp, text in ((52546, "JPEG XL"), (5, "compression 5"), (6, "compression 6")):
+        path = name()
+        D.write_dng(path, raw, bits=12, compression=comp)
+        unsupported(f"compression {comp}", path, text)
+    for extra, text in (({339: (D.SHORT, 3)}, "floating-point DNG data"), ({339: (D.SHORT, 2)}, "sample format 2"),
+                        ({266: (D.SHORT, 2)}, "FillOrder 2"), ({50711: (D.SHORT, 2)}, "not rectangular"),
+                        ({317: (D.SHORT, 3)}, "predictor 3"), ({258: (D.SHORT, 17)}, "17-bit samples with uncompressed")):
+        path = name()
+        D.write_dng(path, raw, bits=12, extra_raw=extra)
+        unsupported(f"{extra}", path, text)
+    path = name()
+    D.write_dng(path, np.stack([raw] * 3, axis=2), bits=12, photometric="linear", extra_raw={284: (D.SHORT, 2)})
+    unsupported("planes", path, "stored plane by plane")
+    path = name()
+    data = bytearray(D.write_dng(path, raw, bits=12))
+    data[2:4] = b"+\0"
+    open(path, "wb").write(bytes(data))
+    fails("BigTIFF", path, "BigTIFF")
+
+    # ---- damaged files: an error, never a crash and never a picture of what is not there
+    for label, kw in (("uncompressed", dict(bits=12)), ("JPEG", dict(bits=14, compression=7, tile=(16, 16), jpeg=dict(restart_lines=4))),
+                      ("Deflate", dict(bits=16, compression=8, predictor=2, tile=(16, 16)))):
+        path = name()
+        whole = D.write_dng(path, D.bayer_scene(32, 40, kw["bits"], 2), **kw)
+        bad = []
+        for cut in sorted(set(list(range(0, len(whole), max(1, len(whole) // 97))) + [8, 9, 10, len(whole) - 1])):
+            open(path, "wb").write(whole[:cut])
+            r = tool("--verify", path)
+            if r.returncode != 1 or "FAILED" not in r.stdout or "Traceback" in r.stderr:
+                bad.append((cut, r.returncode, r.stdout.strip()[-120:]))
+        check(not bad, f"DNG ({label}) cut short anywhere: FAILED, nothing else: {bad[:4]}")
+        rng = np.random.default_rng(len(label))
+        crashes = []
+        for _ in range(60):
+            spoilt = bytearray(whole)
+            for at in rng.integers(8, len(whole), 3):
+                spoilt[at] = rng.integers(0, 256)
+            open(path, "wb").write(bytes(spoilt))
+            r = tool("--verify", path)
+            if r.returncode not in (0, 1) or not (": OK" in r.stdout or "FAILED" in r.stdout or "NOT FULLY CHECKED" in r.stdout):
+                crashes.append((r.returncode, r.stderr[-200:]))
+        check(not crashes, f"DNG ({label}) with bytes changed at random: a verdict, no crash: {crashes[:3]}")
+
+    z = np.zeros((8, 8), np.uint16)
+    good = D.ljpeg(z, 12)
+    at = good.index(b"\xFF\xDA") + 2 + 2 + 1 + 2   # the predictor in the scan header
+    a = D.bayer_scene(8, 8, 12, 4)
+    for label, source, change, texts in (
+            ("a lossy JPEG frame", z, lambda b: b.replace(b"\xFF\xC3", b"\xFF\xC1", 1), ("not lossless", "SOF1")),
+            ("arithmetic coding", z, lambda b: b.replace(b"\xFF\xC3", b"\xFF\xCB", 1), ("arithmetic coding",)),
+            ("predictor 0", z, lambda b: b[:at] + b"\x00" + b[at + 1:], ("predictor 0",)),
+            ("no start of image", z, lambda b: b"\0\0" + b[2:], ("no start of image",)),
+            ("a scan without its frame", z, lambda b: b.replace(b"\xFF\xC3", b"\xFF\xFE", 1), ("a scan before the frame header",)),
+            ("the stream ends in its scan", a, lambda b: b[:len(b) // 2], ("ends before the image does",)),
+            ("no end of the stream", a, lambda b: b[:-2], ()),
+            ("more lines than the tile", z, lambda b: D.ljpeg(np.zeros((16, 8), np.uint16), 12), ("room for 64",)),
+            ("fewer lines than the tile", z, lambda b: D.ljpeg(np.zeros((4, 8), np.uint16), 12), ("fewer than its part of the image",)),
+            ("data after the scan", a, lambda b: b[:-2] + b"\x12\x34\xFF\xD9", ("data beyond the end",)),
+            ("a byte after the scan", a, lambda b: b[:-2] + b"\x12\xFF\xD9", ("data beyond the end",)),
+            ("17 codes of 1 bit", z, lambda b: b.replace(b"\xFF\xC4\x00\x24\x00" + bytes(D.huffman_table()[0]),
+                                                          b"\xFF\xC4\x00\x24\x00" + bytes([17] + [0] * 15), 1),
+             ("a Huffman table that is no prefix code",)),
+            ("a restart marker out of order", a, lambda b: b.replace(b"\xFF\xD1", b"\xFF\xD3", 1), ("restart marker is missing or out of order",)),
+            ("a restart marker missing", a, lambda b: b.replace(b"\xFF\xD1", b"", 1), ("lossless JPEG",))):
+        path = name()
+        D.write_dng(path, source, bits=12, compression=7, tile=(8, 8), jpeg=dict(restart_lines=2) if source is a else None,
+                    chunk_bytes=lambda k, b: change(b))
+        if label in ("a lossy JPEG frame", "arithmetic coding"):
+            unsupported(f"lossless JPEG: {label}", path, *texts)
+        elif texts:
+            fails(f"lossless JPEG: {label}", path, *texts)
+        else:
+            got, r = to_xisf(path)
+            check(got is not None and np.array_equal(got[:, :, 0], source), f"lossless JPEG: {label}: read all the same: {r.stderr[-200:]}")
+
+    # ---- where the samples are, and what the pattern says
+    for label, edit, text in (
+            ("fewer tile offsets than tiles", lambda e: e.update({324: (D.LONG, e[324][1][:-1])}), "3 tiles where the image has 4"),
+            ("fewer byte counts than tiles", lambda e: e.update({325: (D.LONG, e[325][1][:-1])}), "(and 3 byte counts)"),
+            ("a tile beyond the end of the file", lambda e: e.update({324: (D.LONG, e[324][1][:-1] + [10 ** 9])}),
+             "tile 3 lies beyond the end of the file")):
+        path = name()
+        D.write_dng(path, D.bayer_scene(20, 20, 12, 1), bits=12, tile=(16, 16), edit_raw=edit)
+        fails(label, path, text)
+        r = tool("-I", path)
+        check(r.returncode == 0 and "Raw image at IFD 0 / SubIFD 0: 20 x 20 x 1" in r.stdout,
+              f"... --info shows the headers all the same: {r.stdout[:300]} {r.stderr[-200:]}")
+    path = name()
+    D.write_dng(path, D.bayer_scene(8, 11, 12, 1), bits=12, compression=7, tile=(8, 8),
+                chunk_bytes=lambda k, b: D.ljpeg(np.zeros((16, 3), np.uint16), 12) if k == 1 else b)
+    fails("an edge tile whose JPEG is as wide as its part of the image, and too high", path, "more samples than the tile")
+    for pattern, planes in (([0, 1, 1, 3], [0, 1, 2]), ([0, 1, 1, 7], [0, 1, 2, 7])):
+        path = name()
+        D.write_dng(path, raw, bits=12, pattern=pattern, plane_color=planes)
+        fails(f"a pattern with a colour that is not one of the planes, or none of DNG's: {pattern} {planes}", path,
+              "a colour of the filter pattern that is not one of the colours of the file")
+    path = name()
+    D.write_dng(path, raw, bits=12, tile=(64, 64))
+    fails("tiles larger than the image", path, "tiles of 64 x 64, larger than the image of 12 x 10")
+    path = name()
+    D.write_dng(path, D.bayer_scene(8, 8, 12, 1), bits=12, compression=7, tile=(16, 16),
+                edit_raw=lambda e: e.update({256: (D.LONG, 40000), 257: (D.LONG, 40000), 322: (D.LONG, 40000), 323: (D.LONG, 40000)}))
+    fails("a header that claims 40000 x 40000 pixels in a file of a few hundred bytes", path, "too few for its 1600000000 samples")
+    path = name()
+    D.write_dng(path, np.ones((1, 4000), np.uint16), bits=1, edit_raw=lambda e: e.update(
+        {257: (D.LONG, 4000), 273: (D.LONG, e[273][1] * 4000), 279: (D.LONG, e[279][1] * 4000)}))
+    fails("4000 strips that are one strip of the file", path, "the 16000000 samples of the image cannot be in the 500 bytes its strips take")
+    for label, kw in (("uncompressed", {}), ("Deflate", dict(compression=8))):
+        path = name()
+        D.write_dng(path, D.bayer_scene(8, 8, 12, 1), bits=16, **kw,
+                    edit_raw=lambda e: e.update({256: (D.LONG, 40000), 257: (D.LONG, 40000), 278: (D.LONG, 40000)}))
+        fails(f"{label}: a header that claims 40000 x 40000 pixels", path, "too few for its 1600000000 samples")
+    path = same("a reduced-resolution CFA image before the raw image", raw, bits=12, extra_ifd0={262: (D.SHORT, 32803)})
+    r = tool("-I", path)
+    check("Skipped IFD 0: a preview of 12 x 8" in r.stdout, f"... and it is a preview: {r.stdout[-300:]}")
+
+    # ---- SubIFDs in a circle, too many of them
+    path = name()
+    first = struct.unpack("<I", D.write_dng(path, raw, bits=12)[4:8])[0]
+    D.write_dng(path, raw, bits=12, extra_ifd0={330: (D.LONG, [first])})   # (one SubIFD as before: IFD 0 stays where it was)
+    fails("a SubIFD that is IFD 0", path, "the directories run in a circle")
+    path = name()
+    D.write_dng(path, raw, bits=12, extra_ifd0={330: (D.LONG, [8] * 65)})
+    fails("65 SubIFDs", path, "more than 64 SubIFDs")
+    path = name()
+    D.write_dng(path, raw, bits=12, preview=False, extra_raw={262: (D.SHORT, 2)})
+    fails("no raw image", path, "no raw image in this DNG file")
+
+    # ---- LibRaw as a second reader of the same files
+    if rawpy is None:
+        skipped.append("DNG files read by LibRaw as well (pip install rawpy)")
+        return
+    lin = [min(65535, (i * i) // 3 + 5) for i in range(1024)]
+    agreed = []
+    for label, kw in (("12-bit, MM", dict(bits=12, order=">")), ("10-bit packed", dict(bits=10, rows_per_strip=5)),
+                      ("active area", dict(bits=14, active_area=(2, 4, 62, 92))), ("linearized", dict(bits=10, linearization=lin)),
+                      ("JPEG two", dict(bits=12, pattern="BGGR", compression=7, tile=(32, 32), jpeg=dict(shape="two"))),
+                      ("JPEG tall", dict(bits=14, pattern="GBRG", compression=7, tile=(32, 16), jpeg=dict(shape="tall", predictor=4))),
+                      ("JPEG restarts", dict(bits=14, compression=7, tile=(32, 32), jpeg=dict(restart_lines=4, table="skewed"))),
+                      ("8-bit", dict(bits=8))):
+        raw = D.bayer_scene(64, 96, kw["bits"], 5)
+        path = name("libraw")
+        D.write_dng(path, raw, **kw)
+        got, r = to_xisf(path)
+        try:
+            with rawpy.imread(path) as rp:
+                theirs = rp.raw_image_visible.copy()
+                pattern = "".join(rp.color_desc.decode()[c] for c in rp.raw_pattern.ravel())
+        except Exception as e:  # noqa: BLE001
+            agreed.append((label, "LibRaw: %s" % e))
+            continue
+        hdr = xisf_header(path[:-4] + ".xisf")[1]
+        mine = re.search(r'<ColorFilterArray pattern="(\w+)"', hdr).group(1)
+        if got is None or not np.array_equal(got[:, :, 0], theirs) or mine != pattern:
+            agreed.append((label, None if got is None else got.shape, theirs.shape, mine, pattern))
+    check(not agreed, f"LibRaw reads the same raw images and patterns from the DNG files: {agreed}")
+
+
 if __name__ == "__main__":
     print("xisfconv:", EXE)
     print(subprocess.run([EXE, "--version"], capture_output=True, text=True).stdout.strip())
@@ -6543,7 +7023,7 @@ if __name__ == "__main__":
               test_xisf_fits_xisf_roundtrip, test_asdf_yaml, test_asdf_hand_written, test_asdf_output,
               test_asdf_python_files, test_asdf_roundtrips, test_export_from_fits_and_asdf, test_xisf_rewrite,
               test_verify, test_fits_tile_compressed, test_fits_tile_writing, test_property_round_trip,
-              test_downsampling_and_thumbnailer, test_distributed_units, test_directories_and_patterns,
+              test_downsampling_and_thumbnailer, test_distributed_units, test_directories_and_patterns, test_dng,
               test_documents):
         try:
             t()

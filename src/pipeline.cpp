@@ -22,6 +22,7 @@
 #include "asdf.hpp"
 #include "codecs.hpp"
 #include "convert.hpp"
+#include "dng.hpp"
 #include "fits.hpp"
 #include "fitsread.hpp"
 #include "png.hpp"
@@ -71,7 +72,8 @@ std::string flipPatternRows(const std::string& pattern, int pw, int ph, uint64_t
     if (pw <= 0 || ph <= 0 || pattern.size() != static_cast<size_t>(pw * ph)) return pattern;
     std::string out(pattern.size(), ' ');
     for (int j = 0; j < ph; ++j) {
-        const int src = static_cast<int>((imageHeight - 1 - static_cast<uint64_t>(j)) % static_cast<uint64_t>(ph));
+        const uint64_t h = static_cast<uint64_t>(ph);   // (row imageHeight - 1 - j of the pattern, also where j > imageHeight - 1)
+        const int src = static_cast<int>(((imageHeight - 1) % h + h - static_cast<uint64_t>(j)) % h);
         out.replace(static_cast<size_t>(j * pw), static_cast<size_t>(pw), pattern, static_cast<size_t>(src * pw),
                     static_cast<size_t>(pw));
     }
@@ -447,6 +449,7 @@ std::string asdfCodec(const ConvertOptions& opt) {
 InputFormat detectInputFormat(const std::string& path) {
     if (looksLikeFits(path)) return InputFormat::Fits;
     if (looksLikeAsdf(path)) return InputFormat::Asdf;
+    if (looksLikeDng(path)) return InputFormat::Dng;
     return InputFormat::Xisf;
 }
 
@@ -737,6 +740,13 @@ void flipBayerRows(std::vector<FitsKeyword>& keywords, uint64_t height) {
     }
 }
 
+void flipCfaRows(FitsImage& img) {
+    if (!img.cfaPattern.empty() && img.cfaWidth > 0 && img.cfaHeight > 0 &&
+        img.cfaPattern.size() == static_cast<size_t>(img.cfaWidth) * static_cast<size_t>(img.cfaHeight)) {
+        img.cfaPattern = flipPatternRows(img.cfaPattern, img.cfaWidth, img.cfaHeight, img.pixels.height);
+    }
+}
+
 void flipKeywordRows(std::vector<FitsKeyword>& keywords, uint64_t height) {
     flipBayerRows(keywords, height);
     flipWcsRowOrder(keywords, height);
@@ -946,11 +956,11 @@ void convertXisfFile(const std::string& input, const std::string& outPath, Forma
 
 void convertFitsOrAsdfFile(const std::string& input, InputFormat kind, const std::string& outPath, Format format,
                            const ConvertOptions& opt) {
-    if (kind == InputFormat::Xisf) throw Error("not a FITS or ASDF file", ErrorKind::Argument);
+    if (kind == InputFormat::Xisf) throw Error("not a FITS, ASDF or DNG file", ErrorKind::Argument);
     if (format == Format::Fits) fitsStorage(opt, outPath);   // an option that does not apply is reported before the file is read
     if (format == Format::Asdf) asdfCodec(opt);
-    const bool asdfInput = kind == InputFormat::Asdf;
-    const char* inputName = asdfInput ? "ASDF" : "FITS";
+    const bool asdfInput = kind == InputFormat::Asdf, dngInput = kind == InputFormat::Dng;
+    const char* inputName = asdfInput ? "ASDF" : dngInput ? "DNG" : "FITS";
     const bool exporting = format == Format::Tiff || format == Format::Png;
     if (asdfInput && format == Format::Asdf) {
         throw Error("the input is already an ASDF file; choose xisf, fits, tiff or png as output", ErrorKind::Argument);
@@ -969,10 +979,11 @@ void convertFitsOrAsdfFile(const std::string& input, InputFormat kind, const std
     }
 
     progress("reading", 0, 0);
-    FitsFile fits = asdfInput ? readAsdf(input, false, opt.verify) : readFits(input);
-    for (const auto& s : fits.skipped) warn("skipped " + s);
+    FitsFile fits = asdfInput ? readAsdf(input, false, opt.verify) : dngInput ? readDng(input) : readFits(input);
+    // (the previews of a DNG file are no news: every DNG file has them)
+    for (const auto& s : fits.skipped) (dngInput ? info : warn)("skipped " + s);
     if (fits.images.empty()) throw Error(std::string("no image data found in this ") + inputName + " file");
-    if (!asdfInput && format == Format::Fits) {
+    if (kind == InputFormat::Fits && format == Format::Fits) {
         // FITS -> FITS has two uses: writing tile-compressed images as plain ones, and plain
         // images as tile-compressed ones (what funpack and fpack do).
         bool tiled = false;
@@ -987,6 +998,17 @@ void convertFitsOrAsdfFile(const std::string& input, InputFormat kind, const std
     origin.format = inputName;
     origin.input = input;
     origin.defaultName = fromPath(toPath(input).stem());
+    if (dngInput) {
+        // The rows of a DNG file are top-down. As from XISF: FITS and ASDF output has them
+        // bottom-up, the FITS convention, unless --top-down keeps them as they are.
+        ConvertOptions dngOptions = opt;
+        dngOptions.rowOrderGiven = false;
+        if ((format == Format::Fits || format == Format::Asdf) && !(opt.rowOrderGiven && !opt.bottomUp)) {
+            for (FitsImage& img : fits.images) flipImageRows(img);
+        }
+        writeImageSet(fits, origin, outPath, format, dngOptions);
+        return;
+    }
     writeImageSet(fits, origin, outPath, format, opt);
 }
 
@@ -998,6 +1020,7 @@ std::pair<double, double> automaticBounds(const FitsImage& image) {
 void flipImageRows(FitsImage& img) {
     flipVertical(img.pixels);
     flipKeywordRows(img.keywords, img.pixels.height);
+    flipCfaRows(img);
     img.topDown = !img.topDown;
     img.hasRowOrder = true;
 }
@@ -1029,7 +1052,7 @@ void writeImageSet(FitsFile& fits, const ImageSetOrigin& source, const std::stri
     checkOutput(outPath, input, opt.force);
 
     auto origin = [&](const FitsImage& img) {
-        return asdfInput ? " (" + img.source + ")" : " (HDU " + std::to_string(img.hduIndex) + ")";
+        return asdfInput || !img.source.empty() ? " (" + img.source + ")" : " (HDU " + std::to_string(img.hduIndex) + ")";
     };
     // Images that come from a file say so in their header; images handed over in memory do not.
     const std::string history = source.format.empty() ? std::string() : "Converted from " + source.format + " by xisfconv " + kVersion;
@@ -1242,6 +1265,7 @@ void writeImageSet(FitsFile& fits, const ImageSetOrigin& source, const std::stri
         if (!topDown) {
             flipVertical(px);
             flipBayerRows(img.keywords, px.height);
+            flipCfaRows(img);
         }
         // PixInsight interprets WCS keywords in the FITS bottom-up convention even though XISF
         // rows are top-down, so keywords describing top-down rows are converted. (Those of an
@@ -1267,7 +1291,12 @@ void writeImageSet(FitsFile& fits, const ImageSetOrigin& source, const std::stri
                 o.upperBound = 1;
             }
         }
-        if (px.channels == 1) {
+        if (px.channels == 1 && !img.cfaPattern.empty()) {
+            // the colour filter array of a DNG file, of any size (an X-Trans sensor's is 6 x 6)
+            o.cfaPattern = img.cfaPattern;
+            o.cfaWidth = img.cfaWidth;
+            o.cfaHeight = img.cfaHeight;
+        } else if (px.channels == 1) {
             const FitsKeyword* bp = findKeyword(img.keywords, "BAYERPAT");
             const std::string pattern = bp ? toUpper(fitsUnquote(bp->value)) : std::string();
             auto offsetIsZero = [&](const char* key) {

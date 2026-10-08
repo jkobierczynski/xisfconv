@@ -23,6 +23,7 @@
 #include "codecs.hpp"
 #include "common.hpp"
 #include "convert.hpp"
+#include "dng.hpp"
 #include "fits.hpp"
 #include "fitsread.hpp"
 #include "pipeline.hpp"
@@ -362,8 +363,12 @@ Format outputFormat(xisfconv_format format, const std::string& path) {
         case XISFCONV_FORMAT_ASDF: return Format::Asdf;
         case XISFCONV_FORMAT_TIFF: return Format::Tiff;
         case XISFCONV_FORMAT_PNG: return Format::Png;
+        case XISFCONV_FORMAT_DNG: fail(XISFCONV_ERR_ARGUMENT, "DNG is read, not written; choose xisf, fits, asdf, tiff or png as output");
         case XISFCONV_FORMAT_AUTO:
             if (auto f = formatFromExtension(path)) return *f;
+            if (toLower(fromPath(toPath(path).extension())) == ".dng") {
+                fail(XISFCONV_ERR_ARGUMENT, path + ": DNG is read, not written; add --to fits|asdf|tiff|png|xisf");
+            }
             fail(XISFCONV_ERR_ARGUMENT, "cannot infer output format from '" + path + "'; add --to fits|asdf|tiff|png|xisf");
         default: fail(XISFCONV_ERR_ARGUMENT, "unknown output format " + std::to_string(format));
     }
@@ -445,7 +450,8 @@ void loadPixels(xisfconv_file* f, size_t image, bool verify) {
     f->loaded.reset();
     f->loadedImage = FitsImage();
     FitsFile all = f->format == XISFCONV_FORMAT_ASDF ? readAsdf(f->readPath, false, verify, image)
-                                                     : readFits(f->readPath, false, image);
+                   : f->format == XISFCONV_FORMAT_DNG ? readDng(f->readPath)
+                                                      : readFits(f->readPath, false, image);
     if (image >= all.images.size() || !all.images[image].hasData) {
         fail(XISFCONV_ERR_FORMAT, "image " + std::to_string(image) + " cannot be read (has the file changed since it was opened?)");
     }
@@ -864,6 +870,8 @@ xisfconv_status xisfconv_detect_format(xisfconv_context* ctx, const char* path, 
             *out = XISFCONV_FORMAT_FITS;
         } else if (looksLikeAsdf(path)) {
             *out = XISFCONV_FORMAT_ASDF;
+        } else if (looksLikeDng(path)) {
+            *out = XISFCONV_FORMAT_DNG;
         } else {
             std::ifstream again(toPath(path), std::ios::binary);
             char signature[8] = {};
@@ -871,7 +879,7 @@ xisfconv_status xisfconv_detect_format(xisfconv_context* ctx, const char* path, 
             if ((again.gcount() != 8 || std::memcmp(signature, "XISF0100", 8) != 0) && !looksLikeXisfHeaderFile(path)) {
                 throw Error(again.gcount() == 8 && std::memcmp(signature, "XISB0100", 8) == 0
                                 ? "an XISF data blocks file (.xisb): it is read through the header file of its unit (.xish)"
-                                : "not an XISF, FITS or ASDF file");
+                                : "not an XISF, FITS, ASDF or DNG file");
             }
             *out = XISFCONV_FORMAT_XISF;
         }
@@ -896,12 +904,23 @@ xisfconv_status xisfconv_open(xisfconv_context* ctx, const char* path, xisfconv_
         } else if (kind == InputFormat::Asdf) {
             f->format = XISFCONV_FORMAT_ASDF;
             f->fits = readAsdf(path, true, true);
+        } else if (kind == InputFormat::Dng) {
+            f->format = XISFCONV_FORMAT_DNG;
+            f->fits = readDng(path, true);
         } else {
             f->format = XISFCONV_FORMAT_XISF;
             f->xisf = std::make_unique<XisfFile>(path);
         }
         const size_t n = imageCount(f.get());
         f->known.resize(n);
+        if (f->format == XISFCONV_FORMAT_DNG) {
+            // The samples of a DNG image are what its header says, unsigned integers: known before they are read.
+            for (size_t i = 0; i < n; ++i) {
+                f->known[i].known = true;
+                f->known[i].format = f->fits.images[i].pixels.format;
+                f->known[i].mapping = f->fits.images[i].note;
+            }
+        }
         for (size_t i = 0; i < n; ++i) {
             auto kw = std::make_unique<xisfconv_keywords>();
             kw->state = ctx->state;
@@ -951,7 +970,9 @@ const char* xisfconv_file_detail(const xisfconv_file* file, const char* name) {
     if (!file || !name) return "";
     if (isXisf(file) && !std::strcmp(name, "version")) return file->xisf->version().c_str();
     if (isXisf(file) && !std::strcmp(name, "unit")) return file->xisf->headerFile() ? "distributed" : "monolithic";
-    if (file->format == XISFCONV_FORMAT_ASDF && !std::strcmp(name, "format")) return file->fits.formatNote.c_str();
+    if ((file->format == XISFCONV_FORMAT_ASDF || file->format == XISFCONV_FORMAT_DNG) && !std::strcmp(name, "format")) {
+        return file->fits.formatNote.c_str();
+    }
     return "";
 }
 
@@ -974,7 +995,7 @@ xisfconv_status xisfconv_header_text(xisfconv_file* file, const char** text, siz
             } else {
                 std::string all;
                 for (const auto& img : file->fits.images) {
-                    all += "HDU " + std::to_string(img.hduIndex) + "\n";
+                    all += (img.source.empty() ? "HDU " + std::to_string(img.hduIndex) : img.source) + "\n";
                     for (const auto& k : img.keywords) all += cardLine(k) + "\n";
                 }
                 file->headerText = std::move(all);
@@ -1089,6 +1110,12 @@ xisfconv_status xisfconv_image_info_get(const xisfconv_file* file, size_t image,
             out.bscale = img.bscale;
             out.bzero = img.bzero;
             out.source_index = img.hduIndex;
+            if (!img.cfaPattern.empty()) {
+                out.has_cfa = 1;
+                out.cfa_width = img.cfaWidth;
+                out.cfa_height = img.cfaHeight;
+                copyText(out.cfa_pattern, sizeof out.cfa_pattern, img.cfaPattern);
+            }
         }
         out.wcs_row_order = isXisf(file) ? XISFCONV_ROWS_BOTTOM_UP : out.row_order;
         const size_t size = std::min(info->struct_size, sizeof out);
@@ -1144,6 +1171,7 @@ const char* xisfconv_image_detail(const xisfconv_file* file, size_t image, const
     } else {
         if (is("source")) return img.source.c_str();
         if (is("storage")) return img.storage.c_str();
+        if (is("cfaPattern")) return img.cfaPattern.c_str();
     }
     return "";
 }
@@ -1958,6 +1986,9 @@ xisfconv_status xisfconv_verify(xisfconv_context* ctx, const char* path, xisfcon
             } else if (looksLikeAsdf(path)) {
                 report->format = XISFCONV_FORMAT_ASDF;
                 report->report = verifyAsdf(path);
+            } else if (looksLikeDng(path)) {
+                report->format = XISFCONV_FORMAT_DNG;
+                report->report = verifyDng(path);
             } else {
                 report->report = verifyXisf(path);
             }

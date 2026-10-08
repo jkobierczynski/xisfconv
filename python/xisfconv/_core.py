@@ -681,7 +681,7 @@ class _Context:
 _FORMATS = {"xisf": _lib.FORMAT_XISF, "fits": _lib.FORMAT_FITS, "fit": _lib.FORMAT_FITS, "fts": _lib.FORMAT_FITS,
             "asdf": _lib.FORMAT_ASDF, "tiff": _lib.FORMAT_TIFF, "tif": _lib.FORMAT_TIFF, "png": _lib.FORMAT_PNG}
 _FORMAT_NAMES = {_lib.FORMAT_XISF: "xisf", _lib.FORMAT_FITS: "fits", _lib.FORMAT_ASDF: "asdf",
-                 _lib.FORMAT_TIFF: "tiff", _lib.FORMAT_PNG: "png"}
+                 _lib.FORMAT_TIFF: "tiff", _lib.FORMAT_PNG: "png", _lib.FORMAT_DNG: "dng"}
 _CODECS = {"none": _lib.CODEC_NONE, "zlib": _lib.CODEC_ZLIB, "lz4": _lib.CODEC_LZ4, "lz4hc": _lib.CODEC_LZ4HC,
            "zstd": _lib.CODEC_ZSTD, "default": _lib.CODEC_DEFAULT}
 _CHECKSUMS = {"none": _lib.CHECKSUM_NONE, "sha1": _lib.CHECKSUM_SHA1, "sha-1": _lib.CHECKSUM_SHA1,
@@ -2219,7 +2219,7 @@ class FileImage:
 
     @property
     def cfa(self):
-        """Colour filter array of an XISF image: ``(pattern, width, height)`` such as
+        """Colour filter array of an XISF or DNG image: ``(pattern, width, height)`` such as
         ``("RGGB", 2, 2)``, for the rows as stored; None if there is none."""
         info = self._info()
         if not info.has_cfa:
@@ -2237,7 +2237,7 @@ class FileImage:
 
     @property
     def bitpix(self):
-        """FITS and ASDF: BITPIX of the stored data; 0 for XISF."""
+        """FITS and ASDF: BITPIX of the stored data; DNG: 16 or 32; 0 for XISF."""
         return int(self._info().bitpix)
 
     @property
@@ -2250,7 +2250,7 @@ class FileImage:
 
     @property
     def source_index(self):
-        """FITS: the number of the HDU; ASDF: the running number of the array."""
+        """FITS: the number of the HDU; ASDF: the running number of the array; DNG: 0."""
         return int(self._info().source_index)
 
     @property
@@ -2262,7 +2262,8 @@ class FileImage:
         """A detail of the image as text, "" if it has none. XISF: "sampleFormat", "colorSpace",
         "pixelStorage", "byteOrder", "location", "compression", "subblocks", "checksum",
         "imageType", "orientation", "cfaPattern", "cfaName", "resolutionUnit". FITS:
-        "tileCompression", "mapping". ASDF: "source", "storage", "mapping"."""
+        "tileCompression", "mapping". ASDF: "source", "storage", "mapping". DNG: "source" (the
+        directory of the raw image), "storage", "mapping", "cfaPattern"."""
         return self._string(_library.xisfconv_image_detail, _bytes(name))
 
     @property
@@ -2571,7 +2572,7 @@ class File:
 
     @property
     def format(self):
-        """"xisf", "fits" or "asdf"."""
+        """"xisf", "fits", "asdf" or "dng"."""
         with self._context.lock:
             return _FORMAT_NAMES.get(_library.xisfconv_file_format(self._pointer()), "")
 
@@ -2675,8 +2676,8 @@ def open(path, *, external_files=None):   # noqa: A001 - the name is the point, 
 
 
 def detect_format(path):
-    """"xisf", "fits" or "asdf", from the first bytes of the file. :class:`FormatError` if it
-    is none of them."""
+    """"xisf", "fits", "asdf" or "dng", from the first bytes of the file. :class:`FormatError`
+    if it is none of them."""
     context = _Context.borrow()
     with context.lock:
         context.about(path)
@@ -3139,7 +3140,7 @@ class Report:
     failed
         True if the verdict is "failed".
     format
-        "xisf", "fits" or "asdf".
+        "xisf", "fits", "asdf" or "dng".
     summary
         One line: "3 data blocks".
     verified

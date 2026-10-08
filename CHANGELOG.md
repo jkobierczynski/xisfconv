@@ -9,6 +9,33 @@ in [`DEVELOPMENT.md`](DEVELOPMENT.md).
 Under "changed" stands what makes the same command, or the same call, do something else than
 before.
 
+## 0.18.0 (8 October 2026)
+
+**DNG input.** The raw image of a DNG file, the format some cameras write themselves and Adobe
+DNG Converter makes of the raw files of every other camera.
+
+Added
+- DNG files are read, by the tool, the library and the Python package: the raw image as the
+  sensor recorded it, cut to its active area, with the linearization table applied and nothing
+  else done (not demosaiced). `xisfconv IMG_0001.dng` writes XISF; FITS, ASDF, TIFF and PNG as
+  for any other input.
+- The colour filter pattern goes along: to XISF as the `ColorFilterArray` element of any size
+  (Bayer 2 x 2, X-Trans 6 x 6), and as `BAYERPAT` for a 2 x 2 RGB pattern. A `LinearRaw` file
+  (Apple ProRAW) becomes an RGB image.
+- Keywords from the file and its EXIF directory: `INSTRUME`, `DATE-OBS` (in UTC when the camera
+  recorded its offset from UTC, else `DATE-LOC`), `EXPTIME`, `ISOSPEED`, `FOCALLEN`, `BLKLEVEL`,
+  `WHTLEVEL`.
+- Uncompressed, lossless JPEG and Deflate compressed raw data. Lossy DNG, JPEG XL and floating
+  point data are not read.
+- Directories and patterns take `.dng` files; `--info`, `--dump-header` and `--verify` read them.
+- Library: `XISFCONV_FORMAT_DNG` (input only); the colour filter array of a DNG image in
+  `xisfconv_image_info` and as the detail `cfaPattern`. Python: `format` and `detect_format`
+  give `"dng"`.
+
+Changed
+- A TIFF file given as input is said to be one ("a TIFF file that is not a DNG file") instead of
+  "not an XISF 1.0 file (bad signature)".
+
 ## 0.17.0 (8 October 2026)
 
 **Whole folders, and patterns on Windows.**

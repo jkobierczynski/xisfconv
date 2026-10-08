@@ -6,13 +6,14 @@ type: software
 title: "xisfconv: a converter between PixInsight XISF, FITS and ASDF images, and its library libxisfconv"
 abstract: >-
   xisfconv converts astronomical images between PixInsight XISF, FITS and ASDF in every direction,
-  with their keywords, astrometric solutions and XISF properties, exports TIFF and PNG, rewrites
+  with their keywords, astrometric solutions and XISF properties, reads the raw images of DNG
+  files, exports TIFF and PNG, rewrites
   the storage of XISF files and verifies files. The same code is a library with a C API,
   libxisfconv, and a Python package that reads and writes the images as NumPy arrays.
 authors:
   - family-names: Kobierczynski
     given-names: Jurgen
-version: 0.17.0
+version: 0.18.0
 date-released: "2026-10-08"
 repository-code: "https://github.com/jkobierczynski/xisfconv"
 url: "https://github.com/jkobierczynski/xisfconv"
@@ -26,4 +27,5 @@ keywords:
   - PixInsight
   - FITS
   - ASDF
+  - DNG
   - WCS

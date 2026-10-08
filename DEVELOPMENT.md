@@ -27,6 +27,7 @@ The decisions:
 - [XISF properties in FITS and ASDF](#xisf-properties-in-fits-and-asdf)
 - [Distributed XISF units (0.16.0)](#distributed-xisf-units-0160)
 - [Directories and patterns (0.17.0)](#directories-and-patterns-0170)
+- [DNG input (0.18.0)](#dng-input-0180)
 - [Care with files](#care-with-files)
 - [Structure of the code](#structure-of-the-code)
 - [The library (libxisfconv)](#the-library-libxisfconv)
@@ -67,7 +68,7 @@ Warnings are on (`-Wall -Wextra -Wpedantic`, `/W4`) and kept at zero, with GCC a
 ## Running the tests
 
 ```
-pip install numpy astropy tifffile imagecodecs xisf lz4 zstandard pillow asdf asdf-astropy asdf-compression
+pip install numpy astropy tifffile imagecodecs xisf lz4 zstandard pillow asdf asdf-astropy asdf-compression rawpy
 python3 tests/run_tests.py build/xisfconv
 
 # the library: C test programs, and its API called from Python
@@ -85,8 +86,8 @@ XISFCONV_LIBRARY=build-shared/libxisfconv.so PYTHONPATH=python XISFCONV_TOOL=bui
 ```
 
 `tests/run_tests.py` uses `tiffcp`, `fitsverify`, `pngcheck`, `fpack` and `funpack` where they are
-installed, and the `asdf` packages likewise; it says at its start and its end what it had to leave
-out. With `OPENXISF_BIN` set to the directory of OpenXISF's sample programs, each side also reads
+installed, and the `asdf` packages likewise, and `rawpy` (LibRaw) and `imagecodecs` (libjpeg)
+for the DNG files it writes; it says at its start and its end what it had to leave out. With `OPENXISF_BIN` set to the directory of OpenXISF's sample programs, each side also reads
 the distributed units of the other. Every script ends with the number of checks passed and
 failed, and with exit status 1 if one failed. CI (`.github/workflows/ci.yml`) runs all of this on
 Linux, macOS and Windows for every push.
@@ -398,6 +399,7 @@ brought are in the sections below.
 | | | The documents around the program: the changelog, how to report and to contribute, the citation file, the man page, and the layout of the properties in FITS and ASDF for other programs |
 | | | A logo at the top of the README (`docs/logo.svg`) |
 | 8 October | 0.17.0 | Whole folders: a directory as input, `--skip-existing`, and patterns expanded by the program |
+| | 0.18.0 | DNG input: the raw image of a DNG file, with its colour filter pattern and the exposure |
 
 ## Purpose and scope
 
@@ -406,7 +408,8 @@ brought are in the sections below.
 - The centre is XISF and the conversions. FITS and ASDF are supported as far as images need them:
   no tables, no general header editing, no ASDF data models. For those, CFITSIO, astropy and the
   Python `asdf` package are the tools to use.
-- TIFF and PNG are output only.
+- TIFF and PNG are output only. DNG (since 0.18) is input only, and of it the raw image: what a
+  calibration and stacking program works on.
 - A feature is only called done when its output has been compared with an independent
   implementation (see "Testing").
 
@@ -940,6 +943,77 @@ them. The choices:
 - **Left out, and written into `TODO.md`**: a run that only says what it would do, converting
   again what changed, several files at a time.
 
+## DNG input (0.18.0)
+
+- **Why DNG, and why first.** Asked whether xisfconv should read the raw files of every camera
+  through LibRaw: a reader of DNG comes first. DNG is documented (Adobe's specification, 1.7),
+  some cameras write it themselves (Leica, Pentax, Ricoh, phones), and Adobe's free DNG Converter
+  makes it of the raw files of every other camera, so a DNG reader of its own reaches every
+  camera without a dependency. LibRaw (LGPL-2.1 or CDDL) stays the way to read CR3, NEF and ARW
+  directly; it would be an optional dependency, and is in `TODO.md`.
+- **Input only, and the raw image only.** The image of the file whose `NewSubFileType` is 0 and
+  whose samples are those of the sensor (`PhotometricInterpretation` CFA or LinearRaw), the
+  first one where a file has two; previews and masks are listed as skipped, and are notes
+  (`info`), not warnings, since every DNG file has them.
+- **Nothing is done to the samples but reading them.** The image is cut to `ActiveArea`, and the
+  `LinearizationTable` is applied (it is how the file stores its values; a sample beyond the
+  table takes its last entry, as the DNG SDK does). No demosaicing, no black level, no white
+  balance or colour matrix, no orientation: PixInsight's and Siril's calibration needs the mosaic
+  as it was recorded, and darks, flats and lights must stay comparable. The black and white
+  levels go along as keywords (`BLKLEVEL`, `WHTLEVEL`), the names other astronomy programs use.
+- **The colour filter pattern is relative to the corner of the active area**, as the DNG SDK takes
+  `CFAPattern` (LibRaw shifts it by the margins, and rounds odd margins up to even ones; for an
+  active area at odd coordinates the two differ, and the test leaves LibRaw out there). It goes to
+  `FitsImage::cfaPattern` of any size, and so to XISF's `ColorFilterArray`; `BAYERPAT` only for
+  2 x 2 patterns of R, G and B, the only ones it is defined for.
+- **Rows.** DNG rows are top-down; the image is marked so (`topDown`, as a FITS file with
+  `ROWORDER = 'TOP-DOWN'`). For FITS and ASDF output it is turned bottom-up before it is written,
+  with `BAYERPAT` and the pattern, unless `--top-down` is given: the same as from XISF, the other
+  top-down input. `--bottom-up` (a statement about the rows of a FITS file) has no effect on DNG.
+- **Samples are UInt16**, or UInt32 above 16 bits without a linearization table (a table gives
+  16-bit values). The values are not scaled to the 16-bit range: a 14-bit camera gives 0..16383,
+  as every raw converter and calibration program expects.
+- **Time.** EXIF's `DateTimeOriginal` is local time. With `OffsetTimeOriginal` (EXIF 2.31) it is
+  turned into UTC and written as `DATE-OBS`; without it the time zone is not known, and writing
+  it as `DATE-OBS` (which FITS defines as UTC) would be wrong by hours: it is `DATE-LOC`, the
+  keyword N.I.N.A. writes for local time. `SubSecTimeOriginal` gives the fraction.
+- **Compression.** Uncompressed (1 to 16, 24 and 32 bits), lossless JPEG (compression 7), Deflate
+  (8, with the predictors 2, 34892 and 34893). The lossless JPEG decoder is written from ITU-T
+  T.81: Huffman tables, the seven predictors, point transforms, restart intervals that begin at
+  a line, up to four components. The samples of a JPEG fill its tile line after line, so that the
+  shapes Adobe's encoder uses (a tile as half as wide with two components) and those of other
+  writers (twice as wide and half as high; an edge tile as wide as its part of the image) all
+  read. Lossy DNG (34892) and JPEG XL (52546, DNG 1.7) are refused as unsupported: lossy data is
+  no longer what the sensor recorded, and JPEG XL would be a decoder larger than the reader.
+- **What is checked before memory is allocated**: the size of the image (at most 2^20 a side),
+  tiles no larger than the image, the number of tiles or strips against the size, every tile
+  inside the file, and whether its bytes can hold its samples at all (uncompressed data has all
+  its bytes, lossless JPEG at least a bit a sample, Deflate at most 1032 bytes of each), so that
+  a header of a few hundred bytes cannot claim gigabytes; the samples of a JPEG against the room of
+  its tile; a Huffman table before its codes are entered. The directories are read with a guard
+  against loops (an offset read twice) and limits (256 directories, 64 SubIFDs each, 65536
+  entries together, since directories may overlap in the file). Where the samples are is checked
+  when they are read, so that `--info` shows the headers of a file whose data is cut off.
+- **Two readings of the specification that the first version had wrong**, found by the review:
+  the cells of `CFAPattern` are colours (TIFF/EP's codes, 0 red to 6 white), and `CFAPlaneColor`
+  says which colours the planes are, so a cell is not an index into it (the DNG SDK and dcraw take
+  it so; for the usual R, G, B planes the two readings agree). And samples of 24 bits are packed
+  with the highest bit first like every size but 8, 16 and 32, also in a little-endian file. The
+  test writer had the same mistakes, so the round trips passed: a writer of one's own is no
+  oracle for a reading of the specification, and LibRaw had no file of either kind to read.
+- **`--verify`** decodes the whole raw image. `NewRawImageDigest` is not computed (it is an MD5 of
+  the samples in a layout of the DNG SDK's own): such a file is NOT FULLY CHECKED, saying so, and
+  so is a raw image stored in a way the reader does not decode (`Unsupported`, as elsewhere).
+- **The tests write their DNG files themselves** (`tests/dng_files.py`), with a lossless JPEG
+  encoder written from T.81 as well; that encoder is held against libjpeg (imagecodecs) in every
+  predictor, point transform, restart interval and number of components, and the raw images and
+  patterns of the files against LibRaw (rawpy) where it is installed. Neither is needed to run the
+  suite. LibRaw does not read JPEG data in several strips (only tiles) and, in some builds,
+  Deflate: those cases are checked against the numbers the files were written from. Files of
+  real cameras were looked at as far as they could be had here (ExifTool's and Exiv2's test
+  files, whose image data is cut off): the headers and keywords are read, and the missing data
+  is reported.
+
 ## Care with files
 
 - Output is written to `<name>.part` and renamed when complete. An existing `.part` file is not
@@ -958,7 +1032,8 @@ them. The choices:
 
 - One module per format or concern in `src/`: `xisf`, `xisfwrite`, `xisfrewrite`, `fits`,
   `fitsread`, `fitstile`, `asdf`, `yaml`, `xml`, `tiff`, `png`, `wcs`, `property` (XISF
-  properties as they go from one format to another), `convert` (sample formats, stretch),
+  properties as they go from one format to another), `dng` (the DNG reader, and its decoder of
+  lossless JPEG), `convert` (sample formats, stretch),
   `codecs` (compression, digests), `common`.
 - `pipeline` holds the conversion of whole files. It takes an options struct and prints nothing.
   Its second half, `writeImageSet`, writes images that are in memory to any format: FITS and ASDF
@@ -979,7 +1054,7 @@ them. The choices:
   crosses the C API.
 - File names are UTF-8 inside the library and the tool; every file is opened through `toPath`, so
   that Windows gets wide-character names. The tool takes its arguments as UTF-16 there (`wmain`).
-- FITS and ASDF input share one in-memory form (`FitsFile`), so every conversion from them is
+- FITS, ASDF and DNG input share one in-memory form (`FitsFile`), so every conversion from them is
   written once.
 - The version is stated in one place, `include/xisfconv.h`; CMake reads it from there.
 - Numbers are formatted and parsed independently of the locale of the program the library lives
@@ -1516,13 +1591,15 @@ library with one line changed.
   Python. What they print is held against what they must print for those files (most lines word
   for word, numbers that depend on the arithmetic of the machine by their form and range), and
   what they write is read back.
-- `tests/run_tests.py` drives the built program (6289 checks at 0.17.0 when run as root, 6302 with OpenXISF beside it). The Python packages it
+- `tests/run_tests.py` drives the built program (6492 checks at 0.18.0 when run as root with rawpy and imagecodecs installed, 13 more with OpenXISF beside it). The Python packages it
   needs are listed at its top; the `asdf` packages and the external tools (`tiffcp`, `fitsverify`,
   `pngcheck`, `fpack`/`funpack`) are used when installed and their checks skipped when not.
 - Every format is checked against an implementation that shares no code with xisfconv: astropy
   (FITS, WCS, tile compression), the `xisf` package and a separate decoder in the test script
   (XISF), Python's `asdf` with `asdf-astropy` and PyYAML (ASDF), tifffile, libtiff's tools, Pillow
-  and `pngcheck` (TIFF, PNG), `fitsverify`, `fpack`/`funpack`, `hashlib`.
+  and `pngcheck` (TIFF, PNG), `fitsverify`, `fpack`/`funpack`, `hashlib`; for DNG, the files are
+  written by `tests/dng_files.py` and read again by LibRaw (`rawpy`), and its lossless JPEG
+  encoder is held against libjpeg (`imagecodecs`).
 - Round trips must return identical pixels, keywords and WCS.
 - Damaged and truncated files are part of the suite: each must be refused with a message, and an
   original must be left byte for byte as it was.

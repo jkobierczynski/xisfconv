@@ -20,11 +20,11 @@ namespace xisfconv {
 
 enum class Format { Fits, Tiff, Png, Xisf, Asdf };   // what can be written
 
-enum class InputFormat { Xisf, Fits, Asdf };
+enum class InputFormat { Xisf, Fits, Asdf, Dng };   // (DNG is read, never written)
 
 enum class Stretch { None, Auto, Linked, Unlinked, Stored };
 
-// FITS and ASDF are recognized by their signature; everything else is taken for XISF, whose
+// FITS, ASDF and DNG are recognized by their signature; everything else is taken for XISF, whose
 // reader says what is wrong with a file that is not.
 InputFormat detectInputFormat(const std::string& path);
 
@@ -74,6 +74,8 @@ void writeImageSet(FitsFile& images, const ImageSetOrigin& origin, const std::st
 void flipImageRows(FitsImage& image);
 // The same for the keywords alone.
 void flipKeywordRows(std::vector<FitsKeyword>& keywords, uint64_t height);
+// And for the colour filter array of a DNG file (FitsImage::cfaPattern), to the image's height.
+void flipCfaRows(FitsImage& image);
 // And for BAYERPAT alone: the keyword that goes with the pixels whatever the WCS keywords describe.
 void flipBayerRows(std::vector<FitsKeyword>& keywords, uint64_t height);
 

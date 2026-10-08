@@ -86,6 +86,8 @@ jobs:
         shell: bash
         run: |
           pip install numpy astropy tifffile imagecodecs xisf lz4 zstandard pillow asdf asdf-astropy asdf-compression
+          # LibRaw, as a second reader of the DNG files of the tests (where it has a wheel; else those checks are skipped)
+          pip install rawpy || echo "rawpy is not available here: LibRaw does not read the DNG files of the tests"
           python tests/run_tests.py "${{ steps.bin.outputs.path }}"
 
       # The library seen from C: the header compiled by a C compiler, error paths, callbacks.

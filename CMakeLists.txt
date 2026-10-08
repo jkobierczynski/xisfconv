@@ -65,6 +65,7 @@ add_library(xisfconv_core
   src/xisfrewrite.cpp
   src/xisfwrite.cpp
   src/convert.cpp
+  src/dng.cpp
   src/fits.cpp
   src/fitsread.cpp
   src/fitstile.cpp

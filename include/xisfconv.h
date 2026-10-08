@@ -2,7 +2,8 @@
  * xisfconv.h - C API of libxisfconv
  *
  * Reads and writes PixInsight XISF images and converts between XISF, FITS and ASDF, with TIFF
- * and PNG export; rewrites the block storage of XISF files and verifies files.
+ * and PNG export; reads the raw image of DNG files; rewrites the block storage of XISF files and
+ * verifies files.
  *
  * FITS and ASDF are supported as far as images need them. For tables and everything else in
  * those formats, use CFITSIO, astropy or the Python asdf package.
@@ -52,7 +53,7 @@
 #include <stdint.h>
 
 #define XISFCONV_VERSION_MAJOR 0
-#define XISFCONV_VERSION_MINOR 17
+#define XISFCONV_VERSION_MINOR 18
 #define XISFCONV_VERSION_PATCH 0
 
 #if defined(XISFCONV_STATIC)
@@ -277,7 +278,8 @@ enum {
     XISFCONV_FORMAT_FITS = 2,
     XISFCONV_FORMAT_ASDF = 3,
     XISFCONV_FORMAT_TIFF = 4, /* output only */
-    XISFCONV_FORMAT_PNG  = 5  /* output only */
+    XISFCONV_FORMAT_PNG  = 5, /* output only */
+    XISFCONV_FORMAT_DNG  = 6  /* input only (since 0.18) */
 };
 
 typedef int32_t xisfconv_sample_format;
@@ -384,23 +386,29 @@ XISFCONV_API xisfconv_status xisfconv_keywords_fits_text(const xisfconv_keywords
 /* ------------------------------------------------------------------------------------------
  * Reading files
  *
- * One model for the three input formats. A file holds a list of images:
+ * One model for the four input formats. A file holds a list of images:
  *   XISF  the Image elements
  *   FITS  the primary HDU and the IMAGE extensions that hold pixels, including tile-compressed ones
  *   ASDF  the HDUs of FITS-tagged nodes, then every other 2-D or 3-D numeric array
+ *   DNG   one image (since 0.18): the raw image, the samples of the sensor as the camera recorded
+ *         them, cut to the active area and linearized, not demosaiced; its rows are top-down.
+ *         Its metadata are FITS keywords (INSTRUME, EXPTIME, ISOSPEED, DATE-OBS or DATE-LOC,
+ *         FOCALLEN, BAYERPAT, BLKLEVEL, WHTLEVEL); the previews are listed as skipped.
  * Opening reads the headers only. Pixels are read by xisfconv_read_pixels.
  * ---------------------------------------------------------------------------------------- */
 
 typedef struct xisfconv_file xisfconv_file;
 
-/* Looks at the first bytes of the file: FITS and ASDF are recognized by their signature, XISF
+/* Looks at the first bytes of the file: FITS, ASDF and DNG are recognized by their signature
+ * (DNG: a TIFF file whose first directory has the tag DNGVersion; a TIFF file without it is not
+ * one, and gives XISFCONV_ERR_FORMAT), XISF
  * by its (a monolithic file) or by being an XML document whose root element is xisf (the header
  * file of a distributed unit). XISFCONV_ERR_FORMAT if it is none of them (an XISF data blocks
  * file, .xisb, is none: it is read through its header file), XISFCONV_ERR_IO if it cannot be
  * read. */
 XISFCONV_API xisfconv_status xisfconv_detect_format(xisfconv_context *ctx, const char *path, xisfconv_format *out);
 
-/* A file that is neither FITS nor ASDF is taken for XISF, so that the XISF reader says what is
+/* A file that is neither FITS, ASDF nor DNG is taken for XISF, so that the XISF reader says what is
  * wrong with it. */
 XISFCONV_API xisfconv_status xisfconv_open(xisfconv_context *ctx, const char *path, xisfconv_file **out);
 XISFCONV_API void xisfconv_close(xisfconv_file *file); /* NULL is allowed */
@@ -428,16 +436,17 @@ XISFCONV_API uint64_t xisfconv_unit_size(const xisfconv_file *file);
 /* Details of a file as text, by name; "" if the file has no such detail.
  *   XISF  "version" (of the format, "1.0"); since 0.16 "unit": "monolithic" (a .xisf file) or
  *         "distributed" (the header file of a distributed unit, .xish)
- *   ASDF  "format" (versions of the format and standard, number of blocks) */
+ *   ASDF  "format" (versions of the format and standard, number of blocks)
+ *   DNG   "format" (version of DNG, camera, and the program that wrote the file) */
 XISFCONV_API const char *xisfconv_file_detail(const xisfconv_file *file, const char *name);
 
 /* Number of parts of the file that are not convertible images (FITS tables, ASDF arrays of an
- * unsupported kind), and a one-line description of each. */
+ * unsupported kind, the previews of a DNG file), and a one-line description of each. */
 XISFCONV_API size_t xisfconv_skipped_count(const xisfconv_file *file);
 XISFCONV_API const char *xisfconv_skipped_text(const xisfconv_file *file, size_t index);
 
 /* The header as text: the XML header (XISF), the non-structural cards of the image HDUs, one per
- * line (FITS) or the YAML tree, byte for byte (ASDF). *length excludes the terminating NUL and
+ * line (FITS and DNG) or the YAML tree, byte for byte (ASDF). *length excludes the terminating NUL and
  * may be NULL. The text stays valid until the file is closed. */
 XISFCONV_API xisfconv_status xisfconv_header_text(xisfconv_file *file, const char **text, size_t *length);
 
@@ -453,7 +462,8 @@ typedef struct xisfconv_image_info {
      * ASDF: both depend on the data (signed integers without negative values become unsigned,
      * with negative values floating point; the range is 0:1 when the data fits, else 0:65535
      * when it fits, else minimum and maximum), so they are known once the pixels have been
-     * loaded: data_known is 0 before that. xisfconv_load_pixels loads them. */
+     * loaded: data_known is 0 before that. xisfconv_load_pixels loads them. DNG: unsigned
+     * integers, known from the header (16-bit, or 32-bit for samples of more than 16 bits). */
     xisfconv_sample_format sample_format;
     int32_t data_known;
     double lower_bound;
@@ -469,7 +479,7 @@ typedef struct xisfconv_image_info {
     int32_t has_stored_stretch;        /* ... and it is not the identity */
     int32_t has_astrometric_solution;  /* PixInsight solution properties or WCS keywords */
 
-    /* Colour filter array (XISF ColorFilterArray element). */
+    /* Colour filter array (XISF ColorFilterArray element; DNG: CFAPattern, of any size). */
     int32_t has_cfa;
     int32_t cfa_width;
     int32_t cfa_height;
@@ -481,12 +491,12 @@ typedef struct xisfconv_image_info {
     double resolution_x;
     double resolution_y;
 
-    /* FITS and ASDF input (0, 1.0, 0.0 for XISF). */
+    /* FITS, ASDF and DNG input (0, 1.0, 0.0 for XISF). */
     int32_t bitpix;
     int32_t plain_array;               /* ASDF: an array that is not an HDU of a FITS-tagged node */
     double bscale;
     double bzero;
-    uint64_t source_index;             /* FITS: number of the HDU; ASDF: running number of the array */
+    uint64_t source_index;             /* FITS: number of the HDU; ASDF: running number of the array; DNG: 0 */
 
     /* The row order that the WCS keywords of the image describe. FITS and ASDF: the order the
      * rows are stored in. XISF: always bottom-up, although the rows are stored top-down, because
@@ -512,6 +522,8 @@ XISFCONV_API const char *xisfconv_image_unsupported_reason(const xisfconv_file *
  *         once the pixels are loaded)
  *   ASDF  "source" (place in the tree: fits[0].data), "storage" (datatype, byte order, block,
  *         compression), "mapping"
+ *   DNG   "source" (the directory of the raw image: "IFD 0 / SubIFD 0"), "storage" (compression,
+ *         strips or tiles), "mapping", "cfaPattern"
  *   FITS and ASDF, since 0.15: "carriedSolution": "current" if the image carries the astrometric
  *         solution of an XISF file and still has the WCS keywords it was written with, "stale"
  *         if the keywords, the size or the row order changed since (a conversion to XISF then
@@ -637,7 +649,7 @@ typedef struct xisfconv_read_options {
 
 XISFCONV_API void xisfconv_read_options_init(xisfconv_read_options *options, size_t struct_size);
 
-/* FITS and ASDF: reads the pixels of an image and keeps them in the file handle, so that
+/* FITS, ASDF and DNG: reads the pixels of an image and keeps them in the file handle, so that
  * xisfconv_image_info_get reports the final sample format and bounds. The next
  * xisfconv_read_pixels of that image takes them from there and releases them; loading another
  * image, or xisfconv_close, releases them too. XISF: does nothing. */
@@ -731,7 +743,7 @@ XISFCONV_API xisfconv_status xisfconv_wcs_keywords(xisfconv_file *file, size_t i
  *     and WCS keywords for `row_order`; and, if wcs is not 0 and the image has no WCS keywords,
  *     those built from a PixInsight solution as by xisfconv_wcs_keywords (sip_order: 2..7,
  *     0 = linear only).
- *   FITS and ASDF: the cards of the image, with BAYERPAT and WCS keywords converted if `row_order`
+ *   FITS, ASDF and DNG: the cards of the image, with BAYERPAT and WCS keywords converted if `row_order`
  *     is not the order the rows are stored in.
  * fit_summary as for xisfconv_wcs_keywords; it may be NULL. Caller frees *out. */
 XISFCONV_API xisfconv_status xisfconv_fits_keywords(xisfconv_file *file, size_t image, xisfconv_row_order row_order,
@@ -821,7 +833,8 @@ XISFCONV_API xisfconv_status xisfconv_properties_set_array(xisfconv_properties *
  *
  * The whole of the command line tool's conversion in one call: XISF to FITS, ASDF, TIFF or PNG;
  * FITS and ASDF to XISF, to each other, or to TIFF or PNG; FITS to FITS to write tile-compressed
- * images as plain ones, or plain images tile-compressed. XISF to XISF is xisfconv_rewrite.
+ * images as plain ones, or plain images tile-compressed; DNG (since 0.18) to XISF, FITS, ASDF,
+ * TIFF or PNG. XISF to XISF is xisfconv_rewrite.
  * ---------------------------------------------------------------------------------------- */
 
 typedef struct xisfconv_convert_options {
@@ -848,7 +861,7 @@ typedef struct xisfconv_convert_options {
     xisfconv_checksum checksum;           /* XISF output; default XISFCONV_CHECKSUM_NONE */
     uint64_t subblock_size;               /* XISF output; default 1 GiB */
 
-    /* XISF input: row order written to FITS or ASDF (DEFAULT = bottom-up).
+    /* XISF and DNG input: row order written to FITS or ASDF (DEFAULT = bottom-up).
      * FITS or ASDF input: row order the file is stored in (DEFAULT = what ROWORDER says,
      * else bottom-up). */
     xisfconv_row_order row_order;

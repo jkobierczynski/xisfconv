@@ -158,6 +158,13 @@ XisfFile::XisfFile(const std::string& path, const XisfBlocksRedirect* redirect, 
         }
         if (fileSize_ < 16) throw Error("file too short to be XISF");
         if (std::memcmp(preamble, "SIMPLE", 6) == 0) throw Error("this looks like a FITS file, not XISF");
+        if (std::memcmp(preamble, "II*\0", 4) == 0 || std::memcmp(preamble, "MM\0*", 4) == 0) {
+            throw Error("a TIFF file that is not a DNG file (its first directory has no DNGVersion tag, or the file ends "
+                        "before it does): there is no raw image in it to read; TIFF is written, not read");
+        }
+        if (std::memcmp(preamble, "II+\0", 4) == 0 || std::memcmp(preamble, "MM\0+", 4) == 0) {
+            throw Error("a BigTIFF file: not read (a DNG file is a classic TIFF file)");
+        }
         throw Error("not an XISF 1.0 file (bad signature)");
     }
     while (!headerXml_.empty() && headerXml_.back() == '\0') headerXml_.pop_back();

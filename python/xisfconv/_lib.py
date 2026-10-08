@@ -15,7 +15,7 @@ from ctypes import (CFUNCTYPE, POINTER, Structure, c_char, c_char_p, c_double, c
 
 # The library version this module was written for. In 0.x every release may change the layout
 # of the structures, so another library is refused.
-API_VERSION = (0, 17)
+API_VERSION = (0, 18)
 
 # ------------------------------------------------------------------------------------------
 # Constants of xisfconv.h
@@ -53,6 +53,7 @@ FORMAT_FITS = 2
 FORMAT_ASDF = 3
 FORMAT_TIFF = 4
 FORMAT_PNG = 5
+FORMAT_DNG = 6   # input only (since 0.18)
 
 SAMPLE_AS_STORED = 0
 SAMPLE_UINT8 = 1

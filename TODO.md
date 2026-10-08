@@ -38,12 +38,17 @@ in `DEVELOPMENT.md`.
       already are what is asked for passed over, the tree kept below `-d`, `--skip-existing`;
       and patterns (`*.xisf`) expanded by the program, so that they work in cmd and PowerShell
       (0.17.0)
+- [x] DNG input: the raw image of a DNG file (uncompressed, lossless JPEG, Deflate), with its
+      colour filter pattern and the exposure as keywords, in the tool, the library and the Python
+      package (0.18.0)
 - [ ] More platforms and packaging: Linux arm64 and Intel macOS release builds; Homebrew formula,
       AUR package, winget manifest
 
 Smaller items, each closing a limitation listed in `MANUAL.md`:
 
 - [ ] BigTIFF for output over 4 GiB
+- [ ] DNG: compute the `NewRawImageDigest` in `--verify`; read JPEG XL compressed raw data (DNG
+      1.7); the raw files of cameras directly (through LibRaw, as an optional dependency)
 - [ ] Distributed units: several data blocks files for one unit when writing (one per image),
       and a preview of `.xish` files in GNOME Files (its sandbox holds the header file alone)
 - [ ] JPEG output

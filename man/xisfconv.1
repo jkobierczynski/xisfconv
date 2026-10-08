@@ -2,9 +2,9 @@
 .\" Copyright (C) 2026 Jurgen Kobierczynski
 .\" The manual page of the command line tool. Its options are those of "xisfconv --help", and its
 .\" version that of include/xisfconv.h: tests/run_tests.py holds both against the program.
-.TH XISFCONV 1 "2026-10-08" "xisfconv 0.17.0" "User Commands"
+.TH XISFCONV 1 "2026-10-08" "xisfconv 0.18.0" "User Commands"
 .SH NAME
-xisfconv \- convert between PixInsight XISF, FITS and ASDF images; export TIFF and PNG
+xisfconv \- convert between PixInsight XISF, FITS and ASDF images; read DNG; export TIFF and PNG
 .SH SYNOPSIS
 .B xisfconv
 .RI [ options ]
@@ -19,13 +19,14 @@ xisfconv \- convert between PixInsight XISF, FITS and ASDF images; export TIFF a
 .B xisfconv
 converts astronomical images between the XISF format of PixInsight, FITS and ASDF, in every
 direction, and writes TIFF and PNG pictures from all three. Keywords, the order of the rows,
-astrometric solutions and XISF properties are carried from one format to the other.
+astrometric solutions and XISF properties are carried from one format to the other. It also reads
+the raw image of a DNG file (camera raw), to any of these formats.
 .PP
 The format of the input is recognized by its first bytes. The format of the output is given with
 .BR \-t ,
 or follows the name given with
 .BR \-o .
-Without either, an XISF file becomes a FITS file, and a FITS or an ASDF file becomes an XISF file.
+Without either, an XISF file becomes a FITS file, and a FITS, ASDF or DNG file becomes an XISF file.
 The output is named after the input, with the extension of its format, and is written next to it
 unless
 .B \-d
@@ -58,6 +59,15 @@ writes it as a plain FITS file, and
 .B "\-t fits \-c"
 writes a FITS file tile-compressed.
 .PP
+Of a DNG file the raw image is read: the samples of the sensor as the camera recorded them, cut to
+the area that saw light and with the file's linearization table applied, and nothing else done to
+them (not demosaiced, no black level taken off, no white balance). The colour filter pattern goes
+to XISF as its ColorFilterArray element and, for a 2 x 2 RGB pattern, to the keyword
+.BR BAYERPAT ;
+the camera, the time and length of the exposure, the ISO speed and the focal length become
+keywords. Uncompressed, lossless JPEG and Deflate compressed raw data are read; lossy DNG is not.
+Nothing is written as DNG.
+.PP
 With several inputs, each is converted on its own; a file that fails is reported and the others
 are still converted. No file is written twice in a run, and none over a file the run reads: of two
 inputs with one output name the second is refused.
@@ -68,9 +78,10 @@ A directory stands for the image files in it and below it, by their names
 .IR .fits ,
 .IR .fit ,
 .IR .fts ,
-.I .fits.fz
+.IR .fits.fz ,
+.I .asdf
 and
-.IR .asdf ),
+.IR .dng ),
 in the order of the names. Of a directory, the files that are not yet what is written are
 converted: with
 .B "\-t fits"
@@ -83,7 +94,7 @@ to
 Without
 .BR \-t ,
 a directory of one format is converted as a file of it is, and one that holds both XISF files and
-FITS or ASDF files is refused, so that the direction is said and not guessed. Names that begin
+FITS, ASDF or DNG files is refused, so that the direction is said and not guessed. Names that begin
 with a dot are passed over, and links to directories are not followed.
 .PP
 An argument with
@@ -113,7 +124,7 @@ The default is
 .B fits
 for XISF input and
 .B xisf
-for FITS and ASDF input, or what the extension of the name given with
+for FITS, ASDF and DNG input, or what the extension of the name given with
 .B \-o
 says.
 .B xish
@@ -215,7 +226,7 @@ is
 before a stretch is applied.
 .TP
 .B \-\-top\-down
-XISF input: keep the top-down row order of XISF in FITS and ASDF output
+XISF and DNG input: keep the top-down row order in FITS and ASDF output
 .RB ( ROWORDER='TOP\-DOWN' )
 in place of the FITS convention, bottom-up. FITS and ASDF input: the rows are stored top-down.
 .TP
@@ -312,7 +323,7 @@ checksums only. ASDF blocks always carry an MD5 checksum.
 .SS Inspection
 .TP
 .B \-\-verify
-Check the files given, and the XISF, FITS and ASDF files in the directories given, without
+Check the files given, and the XISF, FITS, ASDF and DNG files in the directories given, without
 converting anything: checksums are verified, compressed data is decompressed, sizes are compared.
 The exit status is 1 if a file is damaged.
 .TP
@@ -321,7 +332,7 @@ Print the geometry, the keywords and the properties of the images. Nothing is co
 .TP
 .B \-\-dump\-header
 Print the header: the XML header of an XISF file and the YAML tree of an ASDF file as they are, and
-of a FITS file what
+of a FITS or DNG file what
 .B \-\-info
 prints. Nothing is converted.
 .SS Other
@@ -385,6 +396,15 @@ Convert an XISF file to FITS, and a FITS file to a compressed XISF file:
 .nf
 xisfconv M31_integration.xisf
 xisfconv \-c light_0001.fits
+.fi
+.RE
+.PP
+The raw image of a camera's DNG file as XISF, with its colour filter pattern, and as FITS:
+.PP
+.RS
+.nf
+xisfconv IMG_0001.dng
+xisfconv \-t fits IMG_0001.dng
 .fi
 .RE
 .PP

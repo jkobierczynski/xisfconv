@@ -1,7 +1,7 @@
 # xisfconv for Python
 
 PixInsight **XISF** images as NumPy arrays, and conversion between **XISF**, **FITS** and
-**ASDF**, with TIFF and PNG export. This is the Python package of
+**ASDF**, with TIFF and PNG export; the raw images of **DNG** files (camera raw) are read too. This is the Python package of
 [xisfconv](https://github.com/jkobierczynski/xisfconv): the same library as the command line
 tool, with nothing else to install.
 
@@ -27,7 +27,7 @@ image.data, image.name, image.bounds
 image.keywords["EXPTIME"]                   # FITS keywords
 image.properties["Instrument:Telescope:FocalLength"]   # XISF properties
 
-with xisfconv.open("m31.xisf") as f:        # XISF, FITS (also tile-compressed .fits.fz) or ASDF
+with xisfconv.open("m31.xisf") as f:        # XISF, FITS (also tile-compressed .fits.fz), ASDF or DNG
     print(f.format, len(f))
     for entry in f:
         print(entry.name, entry.shape, entry.dtype, entry.color_space)
@@ -39,6 +39,10 @@ Arrays have **row 0 at the top** of the image and the **channels last**, like th
 Pillow, matplotlib and tifffile. `row_order="bottom-up"` and `channels="first"` give the FITS
 conventions instead. A colour image with the channels last is a view of planar memory;
 `numpy.ascontiguousarray` makes it contiguous where that is needed.
+
+A DNG file holds one image to read: the raw image as the sensor recorded it, not demosaiced
+(`xisfconv.read("IMG_0001.dng")` gives the mosaic as 16-bit integers, `f[0].cfa` its colour filter
+pattern, such as `("RGGB", 2, 2)`, and the keywords hold the camera, exposure and time).
 
 `sample_format` converts the samples while reading: `xisfconv.read(path, sample_format="uint16")`.
 This rescales, it does not cast: integers to integers over the full ranges, integers to floating
