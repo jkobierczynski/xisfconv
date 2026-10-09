@@ -7208,6 +7208,125 @@ def test_debayer():
     check(r.returncode == 1 and "--debayer makes a colour picture" in r.stderr, f"--debayer, XISF -> XISF: refused: {r.stderr.strip()}")
 
 
+def test_compression_level_and_shuffling():
+    """--level and --no-shuffle: XISF output from FITS, ASDF and DNG input, and XISF -> XISF, monolithic and
+    distributed. The blocks are read back with Python's zlib, zstandard and lz4 (xisf_blocks); zlib states the class
+    of its level in its header."""
+    d = os.path.join(TMP, "level")
+    os.makedirs(d)
+    y, x = np.mgrid[0:300, 0:400]
+    smooth = ((x * 3 + y * 5) % 4000 + np.random.default_rng(3).integers(0, 8, (300, 400))).astype(np.uint16)
+    src = os.path.join(d, "smooth.xisf")
+    write_xisf(src, [image_entry(smooth[:, :, None])])
+    fsrc = os.path.join(d, "smooth.fits")
+    fits.PrimaryHDU(smooth[::-1]).writeto(fsrc)
+
+    def pixels(path):
+        blocks = [b for b in xisf_blocks(path) if b["tag"] == "Image"]
+        return blocks[0], np.frombuffer(blocks[0]["data"], "<u2").reshape(smooth.shape)
+
+    def codecs_property(path):
+        import re
+        m = re.search(r'id="XISF:CompressionCodecs" type="String"(?: value="([^"]*)"/>|>([^<]*)<)', xisf_header(path)[1])
+        return m and (m.group(1) or m.group(2))
+
+    sizes = {}
+    zlib_class = {}   # FLEVEL of the zlib header: 0 for level 1, 1 for 2 to 5, 2 for 6, 3 for 7 to 9
+    for source in (src, fsrc):
+        kind = "XISF -> XISF" if source == src else "FITS -> XISF"
+        for codec, levels in (("zlib", (None, 1, 4, 6, 9)), ("zstd", (None, 1, 19)), ("lz4hc", (None, 1, 12))):
+            if codec == "zstd" and not (zstandard and ZSTD_BUILD):
+                continue
+            for level in levels:
+                out = os.path.join(d, f"out-{codec}-{level}.xisf")
+                flags = ["--codec", codec] + (["--level", str(level)] if level else [])
+                r = tool(source, "-t", "xisf", *flags, "-o", out, "-f")
+                if r.returncode:
+                    check(False, f"{kind} {flags}: {r.stderr.strip()[-200:]}")
+                    continue
+                block, got = pixels(out)
+                sizes[(kind, codec, level)] = len(block["stored"])
+                if codec == "zlib":
+                    zlib_class[(kind, level)] = block["stored"][1] >> 6
+                check(np.array_equal(got, smooth) and block["attr"]["compression"].startswith(codec + "+sh:") and
+                      codecs_property(out) == codec + "+sh",
+                      f"{kind} {flags}: the pixels come back, shuffled, the codec named in the metadata: "
+                      f"{block['attr']['compression']} {codecs_property(out)}")
+        check([zlib_class.get((kind, level)) for level in (1, 4, 6, 9, None)] == [0, 1, 2, 3, 2],
+              f"{kind}: zlib's header states the class of the level asked for (None: 6): {zlib_class}")
+        check(sizes.get((kind, "zstd", 19), 0) < sizes.get((kind, "zstd", 1), 0) or not (zstandard and ZSTD_BUILD),
+              f"{kind}: zstd at level 19 is smaller than at level 1: {sizes}")
+        check(sizes.get((kind, "lz4hc", 12), 0) <= sizes.get((kind, "lz4hc", 1), 0),
+              f"{kind}: lz4hc at level 12 is no larger than at level 1: {sizes}")
+        out = os.path.join(d, "unshuffled.xisf")
+        r = tool(source, "-t", "xisf", "--codec", "zlib", "--no-shuffle", "-o", out, "-f")
+        block, got = pixels(out) if r.returncode == 0 else ({"attr": {"compression": ""}, "stored": b""}, None)
+        check(r.returncode == 0 and np.array_equal(got, smooth) and block["attr"]["compression"].startswith("zlib:") and
+              codecs_property(out) == "zlib" and len(block["stored"]) > sizes[(kind, "zlib", None)],
+              f"{kind} --no-shuffle: the bytes are not shuffled, and named so; larger than shuffled here: "
+              f"{block['attr']['compression']} {codecs_property(out)} {len(block['stored'])}")
+        out = os.path.join(d, "implied.xisf")
+        r = tool(source, "-t", "xisf", "--level", "5", "-o", out, "-f")
+        check(r.returncode == 0 and pixels(out)[0]["attr"]["compression"].split(":")[0] in ("zstd+sh", "zlib+sh"),
+              f"{kind} --level alone implies --compress: {r.stderr.strip()[-200:]}")
+
+    # ASDF and DNG input, a distributed unit written and rewritten
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import dng_files as D
+    raw = D.bayer_scene(64, 80, 14, 5)
+    dng = os.path.join(d, "raw.dng")
+    D.write_dng(dng, raw, bits=14)
+    sources = [(dng, raw)]
+    if HAVE_ASDF:
+        a = os.path.join(d, "smooth.asdf")
+        tool(fsrc, "-t", "asdf", "-o", a, "-f", "-q")
+        sources.append((a, smooth))
+    else:
+        skipped.append("--level from ASDF input (pip install asdf asdf-astropy)")
+    for source, want in sources:
+        for level, flevel in ((1, 0), (9, 3)):
+            out = os.path.join(d, f"from-{os.path.basename(source)}-{level}.xish")
+            r = tool(source, "-t", "xish", "--codec", "zlib", "--level", str(level), "--no-shuffle", "-o", out, "-f")
+            blocks = [b for b in xisf_blocks(out) if b["tag"] == "Image"] if r.returncode == 0 else []
+            check(blocks and blocks[0]["kind"] == "path" and blocks[0]["attr"]["compression"].startswith("zlib:") and
+                  blocks[0]["stored"][1] >> 6 == flevel and np.array_equal(np.frombuffer(blocks[0]["data"], "<u2").reshape(want.shape), want),
+                  f"{os.path.basename(source)} to a distributed unit, zlib level {level}, not shuffled: {r.stderr.strip()[-200:]}")
+    unit = os.path.join(d, "from-raw.dng-9.xish")
+    r = tool(unit, "-t", "xish", "--codec", "zlib", "--level", "1", "-o", os.path.join(d, "again.xish"), "-f")
+    blocks = [b for b in xisf_blocks(os.path.join(d, "again.xish")) if b["tag"] == "Image"] if r.returncode == 0 else []
+    check(blocks and blocks[0]["attr"]["compression"].startswith("zlib+sh:") and blocks[0]["stored"][1] >> 6 == 0 and
+          np.array_equal(np.frombuffer(blocks[0]["data"], "<u2").reshape(raw.shape), raw),
+          f"a distributed unit rewritten with level 1 and shuffling: {r.stdout.strip()[-200:]} {r.stderr.strip()[-200:]}")
+
+    # refused: what has no level, and where the options do not apply
+    for args, text in ((["--codec", "zlib", "--level", "10"], "zlib has the levels 1 to 9"),
+                       (["--codec", "lz4", "--level", "2"], "the codec lz4 has no compression levels"),
+                       (["--codec", "lz4hc", "--level", "13"], "lz4hc has the levels 1 to 12"),
+                       (["--codec", "none", "--level", "5"], "compress"),
+                       (["--codec", "none", "--no-shuffle"], "compress")):
+        for source in (src, fsrc):
+            r = tool(source, "-t", "xisf", *args, "-o", os.path.join(d, "refused.xisf"), "-f")
+            check(r.returncode == 1 and text in r.stderr and not os.path.exists(os.path.join(d, "refused.xisf")),
+                  f"{os.path.basename(source)} {args}: refused: {r.stderr.strip()[-200:]}")
+    for target in ("fits", "tiff", "asdf"):
+        for flag in (["--level", "5"], ["--no-shuffle"]):
+            r = tool(fsrc if target != "fits" else src, "-t", target, *flag, "-o", os.path.join(d, "x." + target), "-f")
+            check(r.returncode == 1 and "is for XISF output" in r.stderr, f"{flag} to {target}: refused: {r.stderr.strip()[-200:]}")
+    r = tool("--level", "0", src)
+    check(r.returncode == 2 and "--level expects" in r.stderr, f"--level 0: an argument error: {r.stderr.strip()}")
+
+    # in place: a level is not in the file, so a file is compressed again each time a level is asked for
+    target = os.path.join(d, "inplace.xisf")
+    shutil.copy(src, target)
+    runs = [tool(target, "--in-place", "--codec", "zstd" if zstandard and ZSTD_BUILD else "zlib", *extra) for extra in
+            (["--level", "3"], ["--level", "3"], [], ["--no-shuffle"], ["--no-shuffle"], [])]
+    said = [r.stdout.strip() for r in runs]
+    check(all(r.returncode == 0 for r in runs) and "compressed with" in said[0] and "(level 3)" in said[0] and
+          "compressed with" in said[1] and "already stored as requested" in said[2] and "not shuffled" in said[3] and
+          "already stored as requested" in said[4] and "1 block compressed" in said[5] and np.array_equal(pixels(target)[1], smooth),
+          f"--in-place with a level compresses again, without one leaves the file, and --no-shuffle is a form of its own: {said}")
+
+
 if __name__ == "__main__":
     print("xisfconv:", EXE)
     print(subprocess.run([EXE, "--version"], capture_output=True, text=True).stdout.strip())
@@ -7227,6 +7346,7 @@ if __name__ == "__main__":
               test_asdf_python_files, test_asdf_roundtrips, test_export_from_fits_and_asdf, test_xisf_rewrite,
               test_verify, test_fits_tile_compressed, test_fits_tile_writing, test_property_round_trip,
               test_downsampling_and_thumbnailer, test_distributed_units, test_directories_and_patterns, test_dng, test_debayer,
+              test_compression_level_and_shuffling,
               test_documents):
         try:
             t()

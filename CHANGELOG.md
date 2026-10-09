@@ -9,7 +9,25 @@ in [`DEVELOPMENT.md`](DEVELOPMENT.md).
 Under "changed" stands what makes the same command, or the same call, do something else than
 before.
 
-## 0.18.1 (8 October 2026)
+## 0.19.0 (9 October 2026)
+
+**The compression level and byte shuffling, for conversions and rewrites.**
+
+Added
+- `--level n`: the compression level of the codec for XISF output, from FITS, ASDF and DNG and
+  XISF -> XISF (zlib 1 to 9, LZ4HC 1 to 12, Zstandard 1 to 22). It implies `-c`. In a rewrite
+  every block is compressed again, since a file does not say with which level its blocks were.
+- `--no-shuffle`: XISF blocks compressed without byte shuffling. It implies `-c`.
+- Library: `compression_level` and `shuffle` in `xisfconv_convert_options` and
+  `xisfconv_rewrite_options` (the latter after a `reserved` field where its old layout had
+  padding). Python: `level` and `shuffle` for `convert`, `rewrite`, `rewrite_in_place` and
+  `stored_as_requested`, as `write` has them.
+
+Fixed
+- Python: `write(level=...)` took a level above 2**31 - 1 cut to 32 bits, as another level; it
+  is refused. `shuffle=None` turned shuffling off; it is the default (on).
+
+## 0.18.1 (8 October 2026), released
 
 **Colour pictures of a mosaic.**
 

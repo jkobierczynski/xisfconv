@@ -118,8 +118,8 @@ Later, each when it is needed:
 - [ ] Library and Python: read and write an image in pieces instead of as a whole (which would
       also let Ctrl-C stop the reading or writing of one large image: it is one step now); wheels
       for musllinux and Intel macOS; type stubs.
-- [ ] A compression level and byte shuffling off for conversions and rewrites, and for the tool
-      (`--level`): the writer of images from memory has both since 0.15.0.
+- [x] A compression level and byte shuffling off for conversions and rewrites, and for the tool
+      (`--level`, `--no-shuffle`) (0.19.0)
 - [ ] `xisfconv.xisf`: the resolution, the ICC profile and the thumbnail of an image, which the
       `xisf` package leaves out as well; table properties.
 - [ ] Write LZ4 blocks to ASDF (its own layout of chunks, which is read).

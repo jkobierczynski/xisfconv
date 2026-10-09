@@ -20,6 +20,9 @@ struct XisfRewriteOptions {
     bool verifyInput = true;   // check the input's checksums and that every compressed block decodes
     bool readBack = true;      // read the written file back and compare every block with the input
     uint64_t subblockSize = 1u << 30;  // blocks larger than this are compressed in subblocks
+    int level = 0;          // compression level of the codec; 0: its usual one. With a level, every block is
+                            //   compressed again (the file does not say with which level a block was)
+    bool shuffle = true;    // byte shuffling before compression (of samples wider than one byte)
     // The output is a distributed unit: `output` gets the header alone and this file the data
     // blocks, which the header names as blocksName in its own directory (see XisfWriteOptions).
     // Empty: a monolithic file. (What the input is does not matter.)

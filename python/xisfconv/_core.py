@@ -169,6 +169,7 @@ def _path(path):
 # The messages of the library are those of the command line tool and name its options. Here they
 # name the arguments of this package instead. (python/tests checks that no option is missing.)
 _OPTION_WORDS = [
+    ("a codec that compresses (--codec or --compress)", "a codec that compresses (codec)"),
     ("--to fits|asdf|tiff|png|xisf", 'format="fits", "asdf", "tiff", "png" or "xisf"'),
     ("--stretch=unlinked", 'stretch="unlinked"'),
     ("--stretch=linked", 'stretch="linked"'),
@@ -190,6 +191,8 @@ _OPTION_WORDS = [
     ("--top-down", 'row_order="top-down"'),
     ("--no-properties", "properties=False"),
     ("--debayer", "debayer=True"),
+    ("a compression level (--level)", "a compression level (level)"),
+    ("byte shuffling off (--no-shuffle)", "byte shuffling off (shuffle=False)"),
     ("--bin and --resize", "bin, resize and scale"),
     ("--bin", "bin"),
     ("--resize", "resize"),
@@ -2829,13 +2832,8 @@ def write(path, images, *, format=None, codec=None, checksum=None, stored_row_or
     options.subblock_size = _subblock(subblock_size, options.subblock_size)
     options.wcs = int(bool(wcs))
     options.overwrite = int(bool(overwrite))
-    options.shuffle = int(bool(shuffle))
-    if level is not None:
-        if isinstance(level, bool):
-            raise TypeError("the compression level is a number, not %r" % level)
-        options.compression_level = operator.index(level)
-        if options.compression_level <= 0:
-            raise ValueError("the compression level is 1 or more (None: the usual one of the codec)")
+    options.shuffle = _shuffle(shuffle)
+    options.compression_level = _level(level)
     if creator is not None:
         if not isinstance(creator, str):
             raise TypeError("creator is the name of a program, a string")
@@ -2945,7 +2943,7 @@ def _smaller(bin, resize, scale):   # noqa: A002
 def convert(input, output, *, format=None, sample_format=None, image=None, stretch=None, codec=None, checksum=None,
             subblock_size=None, row_order=None, property_keywords=True, wcs=True, sip_order=3, verify=True, bounds=None,
             overwrite=False, progress=None, properties=True, bin=1, resize=None, scale=None,
-            external_files=None, debayer=False):   # noqa: A002 - the names of the command line
+            external_files=None, debayer=False, level=None, shuffle=True):   # noqa: A002 - the names of the command line
     """Converts a file, as the command line tool does: XISF to FITS, ASDF, TIFF or PNG; FITS
     and ASDF to XISF, to each other, or to TIFF or PNG; FITS to FITS to pack a file
     (``codec=True``: tile-compressed) or to unpack one. (XISF to XISF is :func:`rewrite`.)
@@ -3006,6 +3004,10 @@ def convert(input, output, *, format=None, sample_format=None, image=None, stret
         PNG output (bilinear, by the image's 2 x 2 pattern of R, G and B, or BAYERPAT; before
         ``bin``, ``resize`` and a stretch; no white balance). An image without such a pattern is
         written as it is, with a warning. (Since 0.18.1.)
+    level, shuffle
+        XISF output with a codec (``--level``, ``--no-shuffle``), as for :func:`write`: the
+        compression level of the codec (None: its usual one; zlib 1-9, lz4hc 1-12, zstd 1-22),
+        and byte shuffling before compression. (Since 0.19.)
     """
     options = _lib.struct(_lib.ConvertOptions, _library.xisfconv_convert_options_init)
     options.output_format = _output_format(format)
@@ -3026,6 +3028,8 @@ def convert(input, output, *, format=None, sample_format=None, image=None, stret
     options.properties = int(bool(properties))
     options.bin, options.fit_width, options.fit_height, options.scale = _smaller(bin, resize, scale)
     options.debayer = int(bool(debayer))
+    options.compression_level = _level(level)
+    options.shuffle = _shuffle(shuffle)
     context = _Context.borrow()
     with context.lock:
         context.about(input, other=output, external_files=external_files)
@@ -3041,8 +3045,29 @@ with the requested codec, now stored uncompressed, and copied as they were; chec
 as requested."""
 
 
-def _rewrite_options(codec, checksum, image, verify, read_back, subblock_size, overwrite):
+def _level(level):
+    """A compression level as the library takes it: None is 0, the usual one of the codec."""
+    if level is None:
+        return 0
+    if isinstance(level, bool):
+        raise TypeError("the compression level is a number, not %r" % level)
+    level = operator.index(level)
+    if level <= 0:
+        raise ValueError("the compression level is 1 or more (None: the usual one of the codec)")
+    if level > 2 ** 31 - 1:   # (a larger one would arrive cut to 32 bits, as another level)
+        raise ValueError("compression level %d: no codec has it" % level)
+    return level
+
+
+def _shuffle(shuffle):
+    """Byte shuffling on or off; None is the default, on."""
+    return 1 if shuffle is None else int(bool(shuffle))
+
+
+def _rewrite_options(codec, checksum, image, verify, read_back, subblock_size, overwrite, level=None, shuffle=True):
     options = _lib.struct(_lib.RewriteOptions, _library.xisfconv_rewrite_options_init)
+    options.compression_level = _level(level)
+    options.shuffle = _shuffle(shuffle)
     if codec is True:
         options.codec = _lib.CODEC_DEFAULT
     elif codec is not None:
@@ -3064,7 +3089,7 @@ def _rewrite_result(result):
 
 
 def rewrite(input, output, *, codec=None, checksum=None, image=None, verify=True, read_back=True, subblock_size=None,
-            overwrite=False, progress=None, external_files=None):   # noqa: A002
+            overwrite=False, progress=None, external_files=None, level=None, shuffle=True):   # noqa: A002
     """Writes an XISF file again with its data blocks stored another way: another compression,
     checksums added or removed, one image of several. Returns a :class:`RewriteResult`.
 
@@ -3086,10 +3111,15 @@ def rewrite(input, output, *, codec=None, checksum=None, image=None, verify=True
         Verify the checksums of the input.
     read_back
         Read the output back and compare every block with the input.
+    level, shuffle
+        With a codec that compresses: its compression level (None: the usual one; zlib 1-9,
+        lz4hc 1-12, zstd 1-22), and byte shuffling before compression. The file does not say
+        with which level a block was compressed, so with a level every block is compressed
+        again. (Since 0.19.)
     external_files
         How far the header of the input is followed: see :func:`open`.
     """
-    options = _rewrite_options(codec, checksum, image, verify, read_back, subblock_size, overwrite)
+    options = _rewrite_options(codec, checksum, image, verify, read_back, subblock_size, overwrite, level, shuffle)
     result = _lib.struct(_lib.RewriteResult, _library.xisfconv_rewrite_result_init)
     context = _Context.borrow()
     with context.lock:
@@ -3100,7 +3130,7 @@ def rewrite(input, output, *, codec=None, checksum=None, image=None, verify=True
 
 
 def rewrite_in_place(path, *, codec=None, checksum=None, image=None, verify=True, subblock_size=None, overwrite=False,
-                     progress=None, external_files=None):
+                     progress=None, external_files=None, level=None, shuffle=True):
     """Replaces an XISF file by its rewritten self. The new file is written next to it, read
     back and compared, flushed to the disk, and only then renamed over the original. A file
     that is already stored as requested is left alone (``changed`` is False). The options are
@@ -3114,7 +3144,7 @@ def rewrite_in_place(path, *, codec=None, checksum=None, image=None, verify=True
     of them cannot, it is put back and the unit is as it was. A data blocks file that also
     holds blocks this header does not name (those of another header) is replaced only with
     ``overwrite=True``: without it :class:`OutputExistsError`."""
-    options = _rewrite_options(codec, checksum, image, verify, True, subblock_size, overwrite)
+    options = _rewrite_options(codec, checksum, image, verify, True, subblock_size, overwrite, level, shuffle)
     result = _lib.struct(_lib.RewriteResult, _library.xisfconv_rewrite_result_init)
     context = _Context.borrow()
     with context.lock:
@@ -3124,10 +3154,10 @@ def rewrite_in_place(path, *, codec=None, checksum=None, image=None, verify=True
         return _rewrite_result(result)
 
 
-def stored_as_requested(path, *, codec=None, checksum=None, image=None, external_files=None):
+def stored_as_requested(path, *, codec=None, checksum=None, image=None, external_files=None, level=None, shuffle=True):
     """True if every data block of the XISF file is already stored the way the options of
     :func:`rewrite` ask, judged by the header alone."""
-    options = _rewrite_options(codec, checksum, image, True, True, None, False)
+    options = _rewrite_options(codec, checksum, image, True, True, None, False, level, shuffle)
     out = c_int32()
     context = _Context.borrow()
     with context.lock:

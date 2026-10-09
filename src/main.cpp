@@ -151,6 +151,8 @@ struct Options {
     bool properties = true;      // take XISF properties along to FITS and ASDF, and use those such a file carries
     uint64_t bin = 1;            // TIFF and PNG output: n x n pixels become one
     bool debayer = false;        // TIFF and PNG output: a colour picture of a mosaic
+    int level = 0;               // XISF output: compression level of the codec; 0: its usual one
+    bool shuffle = true;         // XISF output: byte shuffling before compression
     uint64_t fitWidth = 0, fitHeight = 0;   // ... the picture fits that many pixels
     double scale = 0;            // ... the picture is that fraction of the image
     bool verify = true;
@@ -253,11 +255,17 @@ void usage(std::ostream& os) {
           "XISF, ASDF and FITS output:\n"
           "      --codec <zlib|zstd|lz4|lz4hc|none>\n"
           "                              compression codec (a codec implies --compress). XISF blocks are\n"
-          "                              also byte shuffled; lz4 and lz4hc are for XISF only. zstd in ASDF\n"
-          "                              needs the asdf-compression package in Python. none: no compression;\n"
+          "                              also byte shuffled (but with --no-shuffle); lz4 and lz4hc are for\n"
+          "                              XISF only. zstd in ASDF needs the asdf-compression package in\n"
+          "                              Python. none: no compression;\n"
           "                              XISF -> XISF: decompress the blocks\n"
           "                              FITS: zlib compresses the tiles of every sample type with gzip\n"
           "                              (GZIP_2; GZIP_1 for 8-bit data); there is no zstd or lz4 for FITS\n"
+          "      --level <n>             XISF: the compression level of the codec (implies --compress): zlib 1-9\n"
+          "                              (default 6), lz4hc 1-12 (9), zstd 1-22 (3); lz4 has none. Higher is\n"
+          "                              smaller and slower to write, as fast to read. XISF -> XISF: every\n"
+          "                              block is compressed again (a file does not say its level)\n"
+          "      --no-shuffle            XISF: no byte shuffling before compression (implies --compress)\n"
           "      --checksum <sha1|sha256|sha512|sha3-256|sha3-512|none>\n"
           "                              XISF: store a checksum of the pixel data block; XISF -> XISF: of every\n"
           "                              attached block (none removes them). ASDF blocks always carry MD5.\n"
@@ -398,6 +406,8 @@ xisfconv_convert_options conversionOptions(const Options& opt, xisfconv_format f
     c.properties = opt.properties;
     c.bin = static_cast<int32_t>(opt.bin);
     c.debayer = opt.debayer;
+    c.compression_level = opt.level;
+    c.shuffle = opt.shuffle;
     c.fit_width = opt.fitWidth;
     c.fit_height = opt.fitHeight;
     c.scale = opt.scale;
@@ -641,6 +651,10 @@ void rewriteXisfInput(const Library& lib, const std::string& input, const Option
     r.read_back = opt.verify;
     r.subblock_size = opt.subblockSize;
     r.overwrite = opt.force;
+    r.compression_level = opt.level;
+    r.shuffle = opt.shuffle;
+    if (opt.level && !codec.empty() && codec != "none") codec += " (level " + std::to_string(opt.level) + ")";
+    if (!opt.shuffle && !codec.empty() && codec != "none") codec += ", not shuffled";
 
     xisfconv_rewrite_result done;
     xisfconv_rewrite_result_init(&done, sizeof done);
@@ -835,6 +849,15 @@ bool parseArgs(int argc, char** argv, Options& opt, int& exitCode) {
             opt.codecNone = v == "none";
             opt.codec = opt.codecNone ? std::string() : v;
             if (!opt.codecNone) opt.compress = true;
+        } else if (a == "--level") {
+            uint64_t n;
+            const std::string v = need(i, a);
+            if (!parseUInt64(v, n) || n == 0 || n > 100) throw Error("--level expects the compression level of the codec: zlib 1-9, lz4hc 1-12, zstd 1-22");
+            opt.level = static_cast<int>(n);
+            opt.compress = true;
+        } else if (a == "--no-shuffle") {
+            opt.shuffle = false;
+            opt.compress = true;
         } else if (a == "--checksum") {
             std::string v = toLower(need(i, a));
             v.erase(std::remove(v.begin(), v.end(), '-'), v.end());

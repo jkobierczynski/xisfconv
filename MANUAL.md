@@ -88,7 +88,8 @@ xisfconv [options] <file or directory>...   # any of XISF, FITS, ASDF -> any oth
   -b, --bits <fmt>            output sample format: u8, u16, u32, f32, f64 (default: as stored)
   -i, --image <n>             convert only image n (0-based); default: all images
   -c, --compress              FITS: tile compression, lossless (image.fits.fz): RICE_1, GZIP_2 for floats
-                              TIFF: Deflate with predictor; XISF: zstd + byte shuffling; ASDF: zlib
+                              TIFF: Deflate with predictor; XISF: zstd + byte shuffling (unless
+                              --no-shuffle); ASDF: zlib
                               XISF -> XISF: every attached data block
   -s, --stretch[=mode]        screen stretch for viewing: auto (default), linked, unlinked, stf
       --bin <n>               TIFF and PNG: a smaller picture, n x n pixels averaged into one
@@ -114,6 +115,9 @@ xisfconv [options] <file or directory>...   # any of XISF, FITS, ASDF -> any oth
                               XISF and ASDF output: compression codec (a codec implies -c; lz4 and
                               lz4hc are for XISF only); none = uncompressed (XISF -> XISF: decompress)
                               FITS output: zlib = gzip tiles for every sample type; no zstd or lz4
+      --level <n>             XISF output: the codec's compression level (implies -c): zlib 1-9,
+                              lz4hc 1-12, zstd 1-22; XISF -> XISF: every block compressed again
+      --no-shuffle            XISF output: no byte shuffling before compression (implies -c)
       --checksum <sha1|sha256|sha512|sha3-256|sha3-512|none>
                               XISF output: checksum of the pixel data;
                               XISF -> XISF: of every attached block (none removes them)
@@ -305,7 +309,7 @@ A FITS input is converted to XISF automatically.
   zenithal projection (TAN, STG, ZEA, SIN, ARC) given as a CD matrix, PC + CDELT or CDELT + CROTA2.
   `--no-wcs` leaves the properties out.
 - Output is a monolithic XISF 1.0 file, or under a name that ends in `.xish` (`-t xish`) a
-  distributed unit: see "Distributed XISF units" below. `-c` compresses with Zstandard + byte shuffling (the same
+  distributed unit: see "Distributed XISF units" below. `-c` compresses with Zstandard + byte shuffling (`--no-shuffle` turns it off; the same
   settings PixInsight uses; `--codec zlib` for zlib), blocks over 1 GiB are written as subblocks, and
   `--checksum sha1|sha256|sha512` adds an integrity checksum (`sha3-256` and `sha3-512` are also
   written, but PixInsight does not open such files: see below).
@@ -484,6 +488,20 @@ Another compression, checksums, one image of several, the other kind of unit: `-
   of uncompressed files: `-c` compresses every such block with Zstandard and byte shuffling
   (`--codec zlib` for zlib, `--codec none` to store everything uncompressed). On the uncompressed
   71 MiB test frame from PixInsight that gives 52 MiB, the size PixInsight's own zstd files have.
+- `--level n` sets the compression level of the codec (since 0.19): zlib 1 to 9 (6 if not given),
+  LZ4HC 1 to 12 (9), Zstandard 1 to 22 (3); LZ4 has none. A higher level makes a smaller file and
+  takes longer to write; reading is as fast. How much smaller depends on the data: on
+  PixInsight's 71 MiB test frame Zstandard at level 19 gained 1 to 4% over its usual level 3,
+  on smooth synthetic frames about a fifth, and it is many times slower to write: for an
+  archive, not for every day. A file does not say with which level its blocks were compressed,
+  so with `--level` every block is compressed again (`--in-place` with a level always rewrites;
+  without one, a file already in the requested codec is left alone). It also applies to FITS,
+  ASDF and DNG converted to XISF, and implies `-c`.
+- `--no-shuffle` stores the blocks without byte shuffling (since 0.19). Shuffling puts the first
+  bytes of all samples together, then the second bytes, and so on: the high bytes of image data
+  change slowly and compress well, apart from the noisy low ones. It almost always makes a file
+  smaller (on PixInsight's test frame, by 16% with zlib); turning it off is for comparing files with
+  those of another program, or for data it does not help. 8-bit samples are never shuffled.
 - `--checksum sha1|sha256|sha512|sha3-256|sha3-512` adds a checksum to every attached block
   (replacing others); `--checksum none` removes them. Without the option, checksums the file has are
   kept, and computed again with the same algorithm for blocks whose stored bytes change.
@@ -1148,9 +1166,9 @@ Good to know:
   the `NewRawImageDigest` (not computed by `--verify`). The maker notes are not read.
 - ASDF output always uses the FITS HDU list layout described above; it does not write generalized WCS
   (gwcs) objects or instrument-specific data models.
-- A compression level and byte shuffling can be chosen when an image is written from memory (the
-  library's writer, `xisfconv.write`), not for a conversion or a rewrite: the tool has no option
-  for them. LZ4 is written to XISF only (ASDF's own LZ4 layout is read, not written).
+- A compression level and byte shuffling are for XISF output only: the gzip tiles of FITS and the
+  blocks of ASDF are written with the usual level of their codec, and ASDF without shuffling
+  (its readers do not know it). LZ4 is written to XISF only (ASDF's own LZ4 layout is read, not written).
 - XISF files with SHA3-256 or SHA3-512 checksums are valid but cannot be opened by PixInsight 1.9.3.
 - XISF → XISF does not move blocks between the header (inline, embedded) and attachments. Replacing a
   file in place gives it a new inode: other hard links to the old file keep the old content.

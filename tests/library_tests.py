@@ -71,6 +71,7 @@ FORMAT_AUTO, FORMAT_XISF, FORMAT_FITS, FORMAT_ASDF, FORMAT_TIFF, FORMAT_PNG, FOR
 AS_STORED, UINT8, UINT16, UINT32, UINT64, FLOAT32, FLOAT64 = range(7)
 ROWS_DEFAULT, ROWS_TOP_DOWN, ROWS_BOTTOM_UP = range(3)
 CODEC_NONE, CODEC_ZLIB, CODEC_LZ4, CODEC_LZ4HC, CODEC_ZSTD, CODEC_DEFAULT = range(6)
+CODEC_KEEP = -1   # (rewrites only)
 CHECKSUM_NONE, SHA1, SHA256, SHA512, SHA3_256, SHA3_512 = range(6)
 ALL_IMAGES = C.c_size_t(-1).value
 FILE_PROPERTIES = ALL_IMAGES
@@ -103,7 +104,14 @@ class ConvertOptions(C.Structure):
                 ("codec", i32), ("checksum", i32), ("subblock_size", u64), ("row_order", i32), ("property_keywords", i32),
                 ("wcs", i32), ("sip_order", i32), ("verify_checksums", i32), ("use_bounds", i32), ("overwrite", i32),
                 ("lower_bound", f64), ("upper_bound", f64), ("properties", i32), ("reserved", i32), ("fit_width", u64),
-                ("fit_height", u64), ("scale", f64), ("bin", i32), ("debayer", i32)]
+                ("fit_height", u64), ("scale", f64), ("bin", i32), ("debayer", i32),
+                ("compression_level", i32), ("shuffle", i32)]
+
+
+class RewriteOptions(C.Structure):
+    _fields_ = [("struct_size", size_t), ("codec", i32), ("checksum", i32), ("image", size_t), ("verify_input", i32),
+                ("read_back", i32), ("subblock_size", u64), ("overwrite", i32), ("reserved", i32), ("compression_level", i32),
+                ("shuffle", i32)]
 
 
 class WriteOptions(C.Structure):
@@ -1317,6 +1325,44 @@ def test_threads():
           "each context hears only about its own files")
 
 
+def test_rewrite_level_and_shuffle():
+    """compression_level and shuffle of xisfconv_rewrite_options (0.19), and a caller of the layout of 0.18."""
+    init = declare("rewrite_options_init", None, C.POINTER(RewriteOptions), size_t)
+    y, x = np.mgrid[0:120, 0:160]
+    a = ((x * 3 + y * 5) % 4000).astype(np.uint16)
+    src = os.path.join(TMP, "lvl.xisf")
+    check(write_images(src, [a]) == OK, "lvl: written")
+
+    def stored(path):
+        raw = open(path, "rb").read()
+        header = raw[16:16 + int.from_bytes(raw[8:12], "little")].decode()
+        tag = re.search(r"<Image [^>]*>", header).group(0)
+        _, at, n = re.search(r'location="([^"]*)"', tag).group(1).split(":")
+        return re.search(r'compression="([^"]*)"', tag).group(1), raw[int(at):int(at) + int(n)]
+
+    ro = RewriteOptions()
+    init(C.byref(ro), C.sizeof(ro))
+    check(ro.shuffle == 1 and ro.compression_level == 0 and ro.reserved == 0, "rewrite options: shuffle 1, level 0 by default")
+    ro.codec, ro.compression_level, ro.shuffle = CODEC_ZLIB, 9, 0
+    out = os.path.join(TMP, "lvl9.xisf")
+    st = rewrite(ctx, enc(src), enc(out), C.byref(ro), None)
+    compression, data = stored(out) if st == OK else ("", b"\0\0")
+    check(st == OK and compression.startswith("zlib:") and data[1] >> 6 == 3, f"rewrite with level 9, not shuffled: {st} {compression}")
+    # a program of 0.18 hands over 48 bytes (on 64-bit systems), its padding holding whatever it holds
+    old = RewriteOptions()
+    init(C.byref(old), C.sizeof(old))
+    old.codec, old.reserved, old.compression_level, old.shuffle = CODEC_ZLIB, -1, 77, 0
+    old.struct_size = RewriteOptions.compression_level.offset   # (with its padding, where reserved is now)
+    out = os.path.join(TMP, "lvl-old.xisf")
+    st = rewrite(ctx, enc(src), enc(out), C.byref(old), None)
+    compression, data = stored(out) if st == OK else ("", b"\0\0")
+    check(st == OK and compression.startswith("zlib+sh:") and data[1] >> 6 == 2,
+          f"a struct of the old size: what lies beyond it is not read (the usual level, shuffled): {st} {err()} {compression}")
+    ro.codec, ro.compression_level, ro.shuffle = CODEC_KEEP, 5, 1
+    st = rewrite(ctx, enc(src), enc(os.path.join(TMP, "lvl-keep.xisf")), C.byref(ro), None)
+    check(st == ERR_ARGUMENT and "without a codec" in err(), f"a level and no codec: an argument error: {st} {err()}")
+
+
 def test_distributed_units():
     """Distributed XISF units: the two files as the specification has them, and which files a
     header is followed to, context by context."""
@@ -1655,7 +1701,8 @@ if __name__ == "__main__":
     print("asdf + asdf-astropy:", "yes" if HAVE_ASDF else "no")
     for t in (test_write_fits, test_write_fits_tile_compressed, test_write_xisf, test_lz4_and_levels, test_write_asdf, test_write_tiff_png, test_writer_arguments, test_read_fits,
               test_read_dng, test_read_xisf, test_smaller_pictures, test_carried_properties, test_wcs, test_wcs_forms, test_stretch, test_odd_files, test_locale, test_progress_and_cancel,
-              test_kept_messages_and_cancel_from_another_thread, test_threads, test_distributed_units, test_silence):
+              test_kept_messages_and_cancel_from_another_thread, test_threads, test_distributed_units, test_silence,
+              test_rewrite_level_and_shuffle):
         try:
             t()
         except Exception as e:  # noqa: BLE001

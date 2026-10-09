@@ -139,6 +139,18 @@ void downsampleIsForPictures(const ConvertOptions& opt, Format format) {
     }
 }
 
+// --level and --no-shuffle are of XISF's compression: for XISF output, and with a codec.
+void xisfStorageIsForXisf(const ConvertOptions& opt, Format format) {
+    if (opt.level == 0 && opt.shuffle) return;
+    const std::string what = opt.level != 0 ? "a compression level (--level)" : "byte shuffling off (--no-shuffle)";
+    if (format != Format::Xisf) {
+        throw Error(what + " is for XISF output (and XISF -> XISF)", ErrorKind::Argument);
+    }
+    if (!opt.compress) throw Error(what + " needs a codec that compresses (--codec or --compress)", ErrorKind::Argument);
+    // (a level the codec does not have is said before anything is read)
+    if (opt.level != 0) xisfCompress(!opt.codec.empty() ? opt.codec : (zstdAvailable() ? "zstd" : "zlib"), nullptr, 0, opt.level);
+}
+
 // --debayer makes a colour picture of the mosaic of a one-shot colour camera; data keeps its mosaic.
 void debayerIsForPictures(const ConvertOptions& opt, Format format) {
     if (opt.debayer && format != Format::Tiff && format != Format::Png) {
@@ -827,6 +839,7 @@ void convertXisfFile(const std::string& input, const std::string& outPath, Forma
     if (format == Format::Xisf) throw Error("XISF to XISF is a rewrite, not a conversion", ErrorKind::Argument);
     downsampleIsForPictures(opt, format);
     debayerIsForPictures(opt, format);
+    xisfStorageIsForXisf(opt, format);
     const FitsWriteOptions fitsOptions = format == Format::Fits ? fitsStorage(opt, outPath) : FitsWriteOptions();
     if (format == Format::Asdf) asdfCodec(opt);   // (said before anything is read)
     XisfFile file(input);
@@ -1060,6 +1073,7 @@ void convertFitsOrAsdfFile(const std::string& input, InputFormat kind, const std
     }
     downsampleIsForPictures(opt, format);
     debayerIsForPictures(opt, format);
+    xisfStorageIsForXisf(opt, format);
     if (opt.stretch == Stretch::Stored) {
         throw Error(std::string(inputName) + " files carry no saved STF; use --stretch, --stretch=linked or --stretch=unlinked",
                     ErrorKind::NotFound);

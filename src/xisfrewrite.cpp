@@ -211,7 +211,25 @@ std::string checksumAlgorithm(const std::string& attribute) {
 bool storedAsRequested(const XisfRewriteOptions& opt, bool compressed, const XisfCompression& comp, size_t itemSize) {
     if (opt.codec.empty()) return true;
     if (opt.codec == "none") return !compressed;
-    return compressed && comp.codec == opt.codec && (comp.shuffled || itemSize <= 1);
+    if (opt.level != 0) return false;   // (no file says the level a block was compressed with)
+    return compressed && comp.codec == opt.codec && (itemSize <= 1 || comp.shuffled == opt.shuffle);
+}
+
+// A level and byte shuffling are of a codec that compresses: they need one, and the level must
+// be one of its own.
+void checkStorageOptions(const XisfRewriteOptions& opt) {
+    const bool compresses = isXisfWriteCodec(opt.codec);
+    if (opt.level != 0) {
+        if (!compresses) {
+            throw Error(opt.codec == "none" ? "a compression level, and no compression" : "a compression level without a codec",
+                        ErrorKind::Argument);
+        }
+        xisfCompress(opt.codec, nullptr, 0, opt.level);   // (says what is wrong with the level)
+    }
+    if (!opt.shuffle && !compresses) {
+        throw Error(opt.codec == "none" ? "byte shuffling off, and no compression" : "byte shuffling off without a codec",
+                    ErrorKind::Argument);
+    }
 }
 
 void checkImageSize(const BlockRef& b, uint64_t size) {
@@ -230,7 +248,7 @@ struct Packed {
 Packed compressBlock(const std::vector<uint8_t>& raw, size_t itemSize, const XisfRewriteOptions& opt) {
     Packed p;
     if (raw.empty()) return p;
-    const bool shuffle = itemSize > 1;
+    const bool shuffle = opt.shuffle && itemSize > 1;
     std::vector<uint8_t> shuffledData;
     const uint8_t* src = raw.data();
     if (shuffle) {
@@ -242,7 +260,7 @@ Packed compressBlock(const std::vector<uint8_t>& raw, size_t itemSize, const Xis
     size_t chunks = 0;
     for (uint64_t off = 0; off < raw.size(); off += chunk, ++chunks) {
         const size_t n = static_cast<size_t>(std::min<uint64_t>(chunk, raw.size() - off));
-        const std::vector<uint8_t> c = xisfCompress(opt.codec, src + off, n);
+        const std::vector<uint8_t> c = xisfCompress(opt.codec, src + off, n, opt.level);
         p.bytes.insert(p.bytes.end(), c.begin(), c.end());
         if (!subblocks.empty()) subblocks += ':';
         subblocks += std::to_string(c.size()) + "," + std::to_string(n);
@@ -313,6 +331,7 @@ XisfRewriteResult rewriteXisf(const std::string& input, const std::string& outpu
         throw Error("unsupported XISF compression codec '" + opt.codec + "' (use zlib, lz4, lz4hc, zstd or none)", ErrorKind::Argument);
     }
     if (opt.codec == "zstd" && !zstdAvailable()) throw Unsupported("this build has no Zstandard support; use --codec zlib");
+    checkStorageOptions(opt);
     const bool recompress = isXisfWriteCodec(opt.codec);
     warnIfChecksumUnknownToPixInsight(opt.checksum);
 
@@ -508,7 +527,8 @@ XisfRewriteResult rewriteXisf(const std::string& input, const std::string& outpu
         }
         if (!hasCodecs && result.compressed > 0) {
             // PixInsight records the codec it used here; do the same for a file that had none.
-            editor.appendChild(*metadata, "<Property id=\"XISF:CompressionCodecs\" type=\"String\">" + opt.codec + "+sh</Property>");
+            editor.appendChild(*metadata, "<Property id=\"XISF:CompressionCodecs\" type=\"String\">" + opt.codec +
+                                              (opt.shuffle ? "+sh" : "") + "</Property>");
         }
         for (const xml::Node* p : metadata->childrenNamed("Property")) {
             const std::string* id = p->attr("id");
@@ -522,8 +542,8 @@ XisfRewriteResult rewriteXisf(const std::string& input, const std::string& outpu
                 editor.removeElement(*p);  // the level of the original compressor no longer applies
             } else if (result.compressed + result.decompressed > 0 && *id == "XISF:CompressionCodecs") {
                 if (!recompress) editor.removeElement(*p);
-                else if (p->attr("value")) editor.update(*p, "value", opt.codec + "+sh");
-                else if (!p->selfClosing && !p->attr("location")) editor.replaceContent(*p, opt.codec + "+sh");
+                else if (p->attr("value")) editor.update(*p, "value", opt.codec + (opt.shuffle ? "+sh" : ""));
+                else if (!p->selfClosing && !p->attr("location")) editor.replaceContent(*p, opt.codec + (opt.shuffle ? "+sh" : ""));
             }
         }
     }
@@ -577,6 +597,7 @@ XisfRewriteResult rewriteXisf(const std::string& input, const std::string& outpu
 }
 
 bool xisfStoredAsRequested(const std::string& path, const XisfRewriteOptions& opt) {
+    checkStorageOptions(opt);
     XisfFile file(path);
     if (opt.imageIndex && (file.images().size() > 1 || *opt.imageIndex >= file.images().size())) return false;
     for (const BlockRef& b : collectBlocks(file, {})) {

@@ -2,7 +2,7 @@
 .\" Copyright (C) 2026 Jurgen Kobierczynski
 .\" The manual page of the command line tool. Its options are those of "xisfconv --help", and its
 .\" version that of include/xisfconv.h: tests/run_tests.py holds both against the program.
-.TH XISFCONV 1 "2026-10-08" "xisfconv 0.18.1" "User Commands"
+.TH XISFCONV 1 "2026-10-09" "xisfconv 0.19.0" "User Commands"
 .SH NAME
 xisfconv \- convert between PixInsight XISF, FITS and ASDF images; read DNG; export TIFF and PNG
 .SH SYNOPSIS
@@ -301,7 +301,8 @@ or
 .BR none .
 A codec implies
 .BR \-\-compress .
-XISF blocks are also byte shuffled;
+XISF blocks are also byte shuffled (but with
+.BR \-\-no\-shuffle );
 .B lz4
 and
 .B lz4hc
@@ -316,6 +317,24 @@ compresses the tiles of every sample type with gzip; there is no
 or
 .B lz4
 for FITS.
+.TP
+.BI \-\-level " n"
+XISF output: the compression level of the codec (implies
+.BR \-\-compress ):
+.B zlib
+1 to 9 (6 if not given),
+.B lz4hc
+1 to 12 (9),
+.B zstd
+1 to 22 (3);
+.B lz4
+has none. A higher level makes a smaller file and takes longer to write. XISF to XISF: every
+block is compressed again, since a file does not say with which level its blocks were.
+.TP
+.B \-\-no\-shuffle
+XISF output: store the compressed blocks without byte shuffling (implies
+.BR \-\-compress ).
+Shuffling almost always makes them smaller.
 .TP
 .BI \-\-checksum " algorithm"
 XISF: store a checksum of the pixel data block; XISF to XISF: of every attached block.

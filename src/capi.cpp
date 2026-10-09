@@ -397,6 +397,8 @@ XisfRewriteOptions rewriteOptionsFrom(const xisfconv_rewrite_options& o) {
     r.readBack = o.read_back != 0;
     if (o.subblock_size == 0) fail(XISFCONV_ERR_ARGUMENT, "invalid subblock size");
     r.subblockSize = o.subblock_size;
+    r.level = o.compression_level;
+    r.shuffle = o.shuffle != 0;
     return r;
 }
 
@@ -1850,7 +1852,8 @@ xisfconv_status xisfconv_wcs_flip_rows(xisfconv_keywords* kw, uint64_t image_hei
 // built against it hands over its whole struct, and what its padding holds is nobody's business.
 static_assert(sizeof(void*) != 8 || (offsetof(xisfconv_convert_options, reserved) == 100 &&
                                      offsetof(xisfconv_convert_options, fit_width) == 104 &&
-                                     offsetof(xisfconv_convert_options, debayer) + 4 == sizeof(xisfconv_convert_options)),
+                                     offsetof(xisfconv_convert_options, debayer) + 4 == offsetof(xisfconv_convert_options, compression_level) &&
+                                     offsetof(xisfconv_convert_options, shuffle) + 4 == sizeof(xisfconv_convert_options)),
               "xisfconv_convert_options: a field where an older layout had padding, or padding at the end");
 
 void xisfconv_convert_options_init(xisfconv_convert_options* options, size_t struct_size) {
@@ -1871,6 +1874,7 @@ void xisfconv_convert_options_init(xisfconv_convert_options* options, size_t str
     defaults.upper_bound = 1;
     defaults.properties = 1;
     defaults.bin = 1;
+    defaults.shuffle = 1;
     initStruct(options, struct_size, defaults);
 }
 
@@ -1909,6 +1913,8 @@ xisfconv_status xisfconv_convert(xisfconv_context* ctx, const char* input, const
         c.downsample.fitHeight = o.fit_height;
         c.downsample.scale = o.scale;
         c.debayer = o.debayer != 0;
+        c.level = o.compression_level;
+        c.shuffle = o.shuffle != 0;
         const Format format = outputFormat(o.output_format, output);
         mustBeReadable(input);
         const InputFormat kind = detectInputFormat(input);
@@ -1930,8 +1936,16 @@ void xisfconv_rewrite_options_init(xisfconv_rewrite_options* options, size_t str
     defaults.verify_input = 1;
     defaults.read_back = 1;
     defaults.subblock_size = 1u << 30;
+    defaults.shuffle = 1;
     initStruct(options, struct_size, defaults);
 }
+
+// The fields of 0.19 begin after the padding of the layout of 0.18: a program built against it
+// hands over its padding, whatever it holds.
+static_assert(sizeof(void*) != 8 || (offsetof(xisfconv_rewrite_options, reserved) == 44 &&
+                                     offsetof(xisfconv_rewrite_options, compression_level) == 48 &&
+                                     offsetof(xisfconv_rewrite_options, shuffle) + 4 == sizeof(xisfconv_rewrite_options)),
+              "xisfconv_rewrite_options: a field where an older layout had padding, or padding at the end");
 
 void xisfconv_rewrite_result_init(xisfconv_rewrite_result* result, size_t struct_size) {
     xisfconv_rewrite_result defaults;

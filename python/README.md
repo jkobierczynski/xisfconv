@@ -114,7 +114,8 @@ A `datetime` without a zone and a `numpy.datetime64` are written without one; a 
 `tzinfo` is written with its offset from UTC.
 
 `codec` is "zlib", "zstd", "lz4" or "lz4hc" for XISF; `level` sets the compression level
-(zlib 1 to 9, lz4hc 1 to 12, zstd 1 to 22) and `shuffle=False` turns byte shuffling off.
+(zlib 1 to 9, lz4hc 1 to 12, zstd 1 to 22) and `shuffle=False` turns byte shuffling off; `convert`
+and `rewrite` take both as well, for XISF output (since 0.19).
 `codec=True` compresses with the usual codec of the format. For FITS that is tile compression
 without loss (RICE_1 for integers, GZIP_2 for floating point; the format of fpack, which astropy
 and CFITSIO read), and a name that ends in `.fz` is written that way whatever `codec` says. (Up

@@ -401,6 +401,7 @@ brought are in the sections below.
 | 8 October | 0.17.0 | Whole folders: a directory as input, `--skip-existing`, and patterns expanded by the program |
 | | 0.18.0 | DNG input: the raw image of a DNG file, with its colour filter pattern and the exposure |
 | | 0.18.1 | `--debayer`: colour pictures of a mosaic, for TIFF and PNG |
+| 9 October | 0.19.0 | `--level` and `--no-shuffle`: the compression level and byte shuffling for conversions to XISF and rewrites |
 
 ## Purpose and scope
 
@@ -1548,9 +1549,19 @@ library with one line changed.
   looked at. The reference adds a byte per 64 failed looks, which grows with the square root of
   the distance. Found by comparing sizes with the lz4 library on a real frame, not by any test
   of correctness.
-- **A compression level and byte shuffling off** are options of the writer (`xisfconv_write`,
-  `xisfconv.write`) because the interface of the `xisf` package has them. A conversion and a
-  rewrite keep the usual level and always shuffle; the tool has no option for either.
+- **A compression level and byte shuffling off** came to the writer (`xisfconv_write`,
+  `xisfconv.write`) because the interface of the `xisf` package has them, and since 0.19 they are
+  options of conversions to XISF and of rewrites as well (`--level`, `--no-shuffle`;
+  `compression_level` and `shuffle` of `xisfconv_convert_options` and
+  `xisfconv_rewrite_options`; `level` and `shuffle` in Python, the names of `write`). Either one
+  implies `-c` in the tool, as `--codec` does, and is refused for other output and without a
+  codec rather than ignored. A file does not record the level of a block (PixInsight's
+  `XISF:CompressionLevel` is a number of its own scale), so a rewrite with a level cannot know
+  whether a block is stored as asked: it compresses every block again. Shuffled or not is in the
+  `compression` attribute, so that is judged like the codec. The new fields of
+  `xisfconv_rewrite_options` begin after a `reserved` one where the layout of 0.18 had padding
+  (on 64-bit systems):
+  a program built against it hands that padding over, whatever it holds.
 - LZ4 is written to XISF only. ASDF has its own LZ4 layout, which is read; nothing asks for it
   to be written.
 
@@ -1623,7 +1634,7 @@ library with one line changed.
   Python. What they print is held against what they must print for those files (most lines word
   for word, numbers that depend on the arithmetic of the machine by their form and range), and
   what they write is read back.
-- `tests/run_tests.py` drives the built program (6579 checks at 0.18.1 when run as root with rawpy and imagecodecs installed, 13 more with OpenXISF beside it). The Python packages it
+- `tests/run_tests.py` drives the built program (6634 checks at 0.19.0 when run as root with rawpy and imagecodecs installed, 13 more with OpenXISF beside it). The Python packages it
   needs are listed at its top; the `asdf` packages and the external tools (`tiffcp`, `fitsverify`,
   `pngcheck`, `fpack`/`funpack`) are used when installed and their checks skipped when not.
 - Every format is checked against an implementation that shares no code with xisfconv: astropy

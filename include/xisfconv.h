@@ -53,8 +53,8 @@
 #include <stdint.h>
 
 #define XISFCONV_VERSION_MAJOR 0
-#define XISFCONV_VERSION_MINOR 18
-#define XISFCONV_VERSION_PATCH 1
+#define XISFCONV_VERSION_MINOR 19
+#define XISFCONV_VERSION_PATCH 0
 
 #if defined(XISFCONV_STATIC)
 #  define XISFCONV_API
@@ -917,6 +917,14 @@ typedef struct xisfconv_convert_options {
      * balance. An image without such a pattern, or of more than one channel, is written as it is,
      * with a warning. Default 0. */
     int32_t debayer;
+
+    /* XISF output (since 0.19), as for xisfconv_write: the compression level of the codec, 0
+     * (default) for its usual one (ZLIB 6, LZ4HC 9, ZSTD 3), else ZLIB 1..9, LZ4HC 1..12, ZSTD
+     * 1..22 (LZ4 has none); and byte shuffling before compression, default 1. Either one set
+     * otherwise needs XISF output and a codec, else XISFCONV_ERR_ARGUMENT, as is a level the
+     * codec does not have. */
+    int32_t compression_level;
+    int32_t shuffle;
 } xisfconv_convert_options;
 
 XISFCONV_API void xisfconv_convert_options_init(xisfconv_convert_options *options, size_t struct_size);
@@ -946,6 +954,14 @@ typedef struct xisfconv_rewrite_options {
     uint64_t subblock_size;     /* default 1 GiB */
     int32_t overwrite;          /* default 0. In place it only decides whether a leftover
                                    "<path>.part" file from an interrupted run may be overwritten */
+    int32_t reserved;           /* not used (where the layout of 0.18 had padding on 64-bit systems) */
+    /* (Since 0.19.) The compression level of the codec, 0 (default) for its usual one, and byte
+     * shuffling before compression, default 1: as in xisfconv_convert_options. Either one set
+     * otherwise needs a codec that compresses (not KEEP or NONE), else XISFCONV_ERR_ARGUMENT.
+     * The file does not say with which level a block was compressed: with a level, every block
+     * is compressed again, also one stored in the requested codec already. */
+    int32_t compression_level;
+    int32_t shuffle;
 } xisfconv_rewrite_options;
 
 typedef struct xisfconv_rewrite_result {
