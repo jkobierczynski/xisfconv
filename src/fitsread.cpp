@@ -4,11 +4,14 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <fstream>
 #include <limits>
 
+#include "bytes.hpp"
 #include "fits.hpp"
 #include "fitstile.hpp"
+#include "imagesource.hpp"
 
 namespace xisfconv {
 
@@ -164,45 +167,174 @@ bool readHeader(std::ifstream& in, uint64_t fileSize, uint64_t& pos, Header& hdr
     return true;
 }
 
-template <class T>
-T* as(std::vector<uint8_t>& v) {
-    return reinterpret_cast<T*>(v.data());
+// How the stored samples of an image become those it is read as (BITPIX, BSCALE, BZERO).
+struct FitsMapping {
+    enum class Op { Same, FlipSign, ToFloat };
+    Op op = Op::Same;
+    SampleFormat raw = SampleFormat::UInt8;      // the stored samples in host order, as unsigned integers or floats
+    SampleFormat format = SampleFormat::UInt8;   // what they become
+    int bitpix = 0;
+    double bscale = 1, bzero = 0;
+    std::string note;
+};
+
+SampleFormat rawFormatOf(int bitpix) {
+    switch (bitpix) {
+        case 8: return SampleFormat::UInt8;
+        case 16: return SampleFormat::UInt16;
+        case 32: return SampleFormat::UInt32;
+        case 64: return SampleFormat::UInt64;
+        case -32: return SampleFormat::Float32;
+        case -64: return SampleFormat::Float64;
+        default: throw Error("unsupported BITPIX " + std::to_string(bitpix));
+    }
 }
 
-// Converts samples (already in host byte order) to a floating point buffer, applying BSCALE/BZERO.
+// True if the mapping depends on whether a sample is negative: signed integers without
+// scaling become unsigned ones if none is.
+bool mappingAsksForSign(const FitsImage& img) {
+    if (img.bscale != 1 || img.bzero != 0) return false;
+    return img.bitpix == 16 || img.bitpix == 32 || img.bitpix == 64;
+}
+
+FitsMapping fitsMapping(const FitsImage& img, bool anyNegative) {
+    FitsMapping m;
+    m.bitpix = img.bitpix;
+    m.bscale = img.bscale;
+    m.bzero = img.bzero;
+    m.raw = rawFormatOf(img.bitpix);
+    const bool plain = img.bscale == 1 && img.bzero == 0;
+    auto offsetIs = [&](double z) { return img.bscale == 1 && img.bzero == z; };
+    using Op = FitsMapping::Op;
+    switch (img.bitpix) {
+        case 8:
+            if (plain) {
+                m.format = SampleFormat::UInt8;
+                m.note = "8-bit unsigned";
+            } else {
+                m.op = Op::ToFloat;
+                m.format = SampleFormat::Float32;
+                m.note = "8-bit with BSCALE/BZERO -> Float32";
+            }
+            break;
+        case 16:
+            if (offsetIs(32768)) {
+                m.op = Op::FlipSign;
+                m.format = SampleFormat::UInt16;
+                m.note = "16-bit unsigned (BZERO=32768)";
+            } else if (plain && !anyNegative) {
+                m.format = SampleFormat::UInt16;
+                m.note = "16-bit signed, no negative values -> UInt16";
+            } else {
+                m.op = Op::ToFloat;
+                m.format = SampleFormat::Float32;
+                m.note = plain ? "16-bit signed with negative values -> Float32" : "16-bit with BSCALE/BZERO -> Float32";
+            }
+            break;
+        case 32:
+            if (offsetIs(2147483648.0)) {
+                m.op = Op::FlipSign;
+                m.format = SampleFormat::UInt32;
+                m.note = "32-bit unsigned (BZERO=2^31)";
+            } else if (plain && !anyNegative) {
+                m.format = SampleFormat::UInt32;
+                m.note = "32-bit signed, no negative values -> UInt32";
+            } else {
+                m.op = Op::ToFloat;
+                m.format = SampleFormat::Float64;
+                m.note = plain ? "32-bit signed with negative values -> Float64" : "32-bit with BSCALE/BZERO -> Float64";
+            }
+            break;
+        case 64:
+            if (offsetIs(9223372036854775808.0)) {
+                m.op = Op::FlipSign;
+                m.format = SampleFormat::UInt64;
+                m.note = "64-bit unsigned (BZERO=2^63)";
+            } else if (plain && !anyNegative) {
+                m.format = SampleFormat::UInt64;
+                m.note = "64-bit signed, no negative values -> UInt64";
+            } else {
+                m.op = Op::ToFloat;
+                m.format = SampleFormat::Float64;
+                m.note = "64-bit signed -> Float64 (values beyond 2^53 lose precision)";
+            }
+            break;
+        case -32:
+            if (!plain) m.op = Op::ToFloat;
+            m.format = SampleFormat::Float32;
+            m.note = "32-bit float";
+            break;
+        case -64:
+            if (!plain) m.op = Op::ToFloat;
+            m.format = SampleFormat::Float64;
+            m.note = "64-bit float";
+            break;
+        default:
+            throw Error("unsupported BITPIX " + std::to_string(img.bitpix));
+    }
+    return m;
+}
+
+// Samples in host order (as integers of their size, or floats), with BSCALE/BZERO applied.
 template <class S, class D>
-void toFloat(std::vector<uint8_t>& data, size_t n, double bscale, double bzero) {
-    std::vector<uint8_t> out(n * sizeof(D));
-    const S* src = reinterpret_cast<const S*>(data.data());
-    D* dst = reinterpret_cast<D*>(out.data());
-    for (size_t i = 0; i < n; ++i) dst[i] = static_cast<D>(bzero + bscale * static_cast<double>(src[i]));
-    data.swap(out);
+void toFloat(const uint8_t* in, uint8_t* out, size_t n, double bscale, double bzero) {
+    for (size_t i = 0; i < n; ++i) {
+        S v;
+        std::memcpy(&v, in + i * sizeof(S), sizeof(S));
+        const D d = static_cast<D>(bzero + bscale * static_cast<double>(v));
+        std::memcpy(out + i * sizeof(D), &d, sizeof(D));
+    }
 }
 
 template <class T>
-bool anyNegative(const std::vector<uint8_t>& data, size_t n) {
-    const T* p = reinterpret_cast<const T*>(data.data());
-    for (size_t i = 0; i < n; ++i)
-        if (p[i] < 0) return true;
+void flipSign(const uint8_t* in, uint8_t* out, size_t n) {
+    constexpr T sign = static_cast<T>(T(1) << (8 * sizeof(T) - 1));
+    for (size_t i = 0; i < n; ++i) {
+        T v;
+        std::memcpy(&v, in + i * sizeof(T), sizeof(T));
+        v ^= sign;
+        std::memcpy(out + i * sizeof(T), &v, sizeof(T));
+    }
+}
+
+// `in` and `out` may be one buffer where the samples keep their size.
+void mapFitsSamples(const FitsMapping& m, const uint8_t* in, uint8_t* out, size_t n) {
+    using Op = FitsMapping::Op;
+    switch (m.op) {
+        case Op::Same:
+            if (in != out) std::memcpy(out, in, n * sampleBytes(m.raw));
+            return;
+        case Op::FlipSign:
+            if (m.bitpix == 16) flipSign<uint16_t>(in, out, n);
+            else if (m.bitpix == 32) flipSign<uint32_t>(in, out, n);
+            else flipSign<uint64_t>(in, out, n);
+            return;
+        case Op::ToFloat:
+            switch (m.bitpix) {
+                case 8: toFloat<uint8_t, float>(in, out, n, m.bscale, m.bzero); return;
+                case 16: toFloat<int16_t, float>(in, out, n, m.bscale, m.bzero); return;
+                case 32: toFloat<int32_t, double>(in, out, n, m.bscale, m.bzero); return;
+                case 64: toFloat<int64_t, double>(in, out, n, m.bscale, m.bzero); return;
+                case -32: toFloat<float, float>(in, out, n, m.bscale, m.bzero); return;
+                default: toFloat<double, double>(in, out, n, m.bscale, m.bzero); return;
+            }
+    }
+}
+
+template <class T>
+bool anyNegative(const uint8_t* data, size_t n) {
+    for (size_t i = 0; i < n; ++i) {
+        T v;
+        std::memcpy(&v, data + i * sizeof(T), sizeof(T));
+        if (v < 0) return true;
+    }
     return false;
 }
 
-template <class T>
-void floatRange(FitsImage& img, size_t n) {
-    const T* p = reinterpret_cast<const T*>(img.pixels.data.data());
-    double lo = std::numeric_limits<double>::infinity(), hi = -lo;
-    for (size_t i = 0; i < n; ++i) {
-        const double v = static_cast<double>(p[i]);
-        if (std::isfinite(v)) {
-            if (v < lo) lo = v;
-            if (v > hi) hi = v;
-        } else {
-            img.hasNaN = true;
-        }
-    }
-    if (lo > hi) lo = hi = 0;
-    img.dataMin = lo;
-    img.dataMax = hi;
+bool anyNegativeSample(int bitpix, const uint8_t* data, size_t n) {
+    if (bitpix == 16) return anyNegative<int16_t>(data, n);
+    if (bitpix == 32) return anyNegative<int32_t>(data, n);
+    return anyNegative<int64_t>(data, n);
 }
 
 void decodeSamples(FitsImage& img, std::vector<uint8_t>& raw) {
@@ -211,80 +343,55 @@ void decodeSamples(FitsImage& img, std::vector<uint8_t>& raw) {
     const size_t sb = static_cast<size_t>(std::abs(img.bitpix)) / 8;
     if (raw.size() != n * sb) throw Error("the image data does not have the size the header gives it");
     if (hostIsLittleEndian()) byteSwapInPlace(raw.data(), n, sb);
-    px.data.swap(raw);
-
-    const bool plain = img.bscale == 1 && img.bzero == 0;
-    auto offsetIs = [&](double z) { return img.bscale == 1 && img.bzero == z; };
-    switch (img.bitpix) {
-        case 8:
-            if (plain) {
-                px.format = SampleFormat::UInt8;
-                img.note = "8-bit unsigned";
-            } else {
-                toFloat<uint8_t, float>(px.data, n, img.bscale, img.bzero);
-                px.format = SampleFormat::Float32;
-                img.note = "8-bit with BSCALE/BZERO -> Float32";
-            }
-            break;
-        case 16:
-            if (offsetIs(32768)) {
-                uint16_t* p = as<uint16_t>(px.data);
-                for (size_t i = 0; i < n; ++i) p[i] ^= 0x8000u;
-                px.format = SampleFormat::UInt16;
-                img.note = "16-bit unsigned (BZERO=32768)";
-            } else if (plain && !anyNegative<int16_t>(px.data, n)) {
-                px.format = SampleFormat::UInt16;
-                img.note = "16-bit signed, no negative values -> UInt16";
-            } else {
-                toFloat<int16_t, float>(px.data, n, img.bscale, img.bzero);
-                px.format = SampleFormat::Float32;
-                img.note = plain ? "16-bit signed with negative values -> Float32" : "16-bit with BSCALE/BZERO -> Float32";
-            }
-            break;
-        case 32:
-            if (offsetIs(2147483648.0)) {
-                uint32_t* p = as<uint32_t>(px.data);
-                for (size_t i = 0; i < n; ++i) p[i] ^= 0x80000000u;
-                px.format = SampleFormat::UInt32;
-                img.note = "32-bit unsigned (BZERO=2^31)";
-            } else if (plain && !anyNegative<int32_t>(px.data, n)) {
-                px.format = SampleFormat::UInt32;
-                img.note = "32-bit signed, no negative values -> UInt32";
-            } else {
-                toFloat<int32_t, double>(px.data, n, img.bscale, img.bzero);
-                px.format = SampleFormat::Float64;
-                img.note = plain ? "32-bit signed with negative values -> Float64" : "32-bit with BSCALE/BZERO -> Float64";
-            }
-            break;
-        case 64:
-            if (offsetIs(9223372036854775808.0)) {
-                uint64_t* p = as<uint64_t>(px.data);
-                for (size_t i = 0; i < n; ++i) p[i] ^= 0x8000000000000000ull;
-                px.format = SampleFormat::UInt64;
-                img.note = "64-bit unsigned (BZERO=2^63)";
-            } else if (plain && !anyNegative<int64_t>(px.data, n)) {
-                px.format = SampleFormat::UInt64;
-                img.note = "64-bit signed, no negative values -> UInt64";
-            } else {
-                toFloat<int64_t, double>(px.data, n, img.bscale, img.bzero);
-                px.format = SampleFormat::Float64;
-                img.note = "64-bit signed -> Float64 (values beyond 2^53 lose precision)";
-            }
-            break;
-        case -32:
-            if (!plain) toFloat<float, float>(px.data, n, img.bscale, img.bzero);
-            px.format = SampleFormat::Float32;
-            img.note = "32-bit float";
-            break;
-        case -64:
-            if (!plain) toFloat<double, double>(px.data, n, img.bscale, img.bzero);
-            px.format = SampleFormat::Float64;
-            img.note = "64-bit float";
-            break;
-        default:
-            throw Error("unsupported BITPIX " + std::to_string(img.bitpix));
+    const FitsMapping m = fitsMapping(img, mappingAsksForSign(img) && anyNegativeSample(img.bitpix, raw.data(), n));
+    if (sampleBytes(m.format) == sb) {
+        mapFitsSamples(m, raw.data(), raw.data(), n);
+        px.data.swap(raw);
+    } else {
+        std::vector<uint8_t> out(n * sampleBytes(m.format));
+        mapFitsSamples(m, raw.data(), out.data(), n);
+        px.data.swap(out);
     }
+    px.format = m.format;
+    img.note = m.note;
     updateFloatRange(img);
+}
+
+// The same for an image that is read a piece at a time: `bytes` holds its stored samples
+// (big-endian). Whether a sample is negative and the range of floating point samples are
+// found by reading them once each.
+void decodeSamples(FitsImage& img, std::shared_ptr<RandomBytes> bytes) {
+    PixelBuffer& px = img.pixels;
+    const SampleFormat raw = rawFormatOf(img.bitpix);
+    StoredLayout layout;
+    layout.swap = hostIsLittleEndian() && sampleBytes(raw) > 1;
+    if (bytes->size() != checkedMul(px.samples(), sampleBytes(raw), "image size")) {
+        throw Error("the image data does not have the size the header gives it");
+    }
+    Source stored = storedSource(std::move(bytes), px.width, px.height, px.channels, raw, layout);
+    bool negative = false;
+    if (mappingAsksForSign(img)) {
+        const uint64_t rows = rowsPerPiece(stored->rowBytes());
+        std::vector<uint8_t> band(static_cast<size_t>(std::min(rows, px.height) * stored->rowBytes()));
+        for (uint64_t c = 0; c < px.channels && !negative; ++c) {
+            for (uint64_t y = 0; y < px.height && !negative; y += rows) {
+                const uint64_t count = std::min(rows, px.height - y);
+                stored->readRows(c, y, count, band.data());
+                negative = anyNegativeSample(img.bitpix, band.data(), static_cast<size_t>(count * px.width));
+                progressTick(count * stored->rowBytes());
+            }
+        }
+    }
+    const FitsMapping m = fitsMapping(img, negative);
+    px.format = m.format;
+    img.note = m.note;
+    img.pieces = m.op == FitsMapping::Op::Same
+                     ? stored
+                     : mappedSource(stored, m.format, [m](uint64_t, const uint8_t* in, uint8_t* out, size_t n) { mapFitsSamples(m, in, out, n); });
+    const FloatRange range = floatRange(*img.pieces);
+    img.dataMin = range.min;
+    img.dataMax = range.max;
+    img.hasNaN = img.hasNaN || range.hasNaN;
 }
 
 uint64_t padded(uint64_t bytes) { return (bytes + kBlock - 1) / kBlock * kBlock; }
@@ -292,9 +399,11 @@ uint64_t padded(uint64_t bytes) { return (bytes + kBlock - 1) / kBlock * kBlock;
 }  // namespace
 
 void updateFloatRange(FitsImage& img) {
-    const size_t n = static_cast<size_t>(img.pixels.samples());
-    if (img.pixels.format == SampleFormat::Float32) floatRange<float>(img, n);
-    else if (img.pixels.format == SampleFormat::Float64) floatRange<double>(img, n);
+    if (!isFloat(img.pixels.format)) return;
+    const FloatRange r = img.pieces ? floatRange(*img.pieces) : floatRange(*borrowedSource(img.pixels));
+    img.dataMin = r.min;
+    img.dataMax = r.max;
+    if (r.hasNaN) img.hasNaN = true;
 }
 
 std::string fitsUnquote(const std::string& value) {
@@ -543,6 +652,7 @@ uint32_t onesComplementSum(std::ifstream& in, uint64_t pos, uint64_t size) {
         }
         sum = (sum & 0xFFFFFFFFull) + (sum >> 32);  // fold per chunk, so the accumulator cannot overflow
         size -= n;
+        progressTick(n);
     }
     while (sum >> 32) sum = (sum & 0xFFFFFFFFull) + (sum >> 32);
     return static_cast<uint32_t>(sum);
@@ -560,6 +670,7 @@ VerifyReport verifyFits(const std::string& path) {
     VerifyReport report;
     std::ifstream in(toPath(path), std::ios::binary);
     if (!in) failToOpen(path);
+    std::shared_ptr<RawFile> rawFile;   // the file again, for tiles read one at a time
     in.seekg(0, std::ios::end);
     const uint64_t fileSize = static_cast<uint64_t>(in.tellg());
 
@@ -633,10 +744,16 @@ VerifyReport verifyFits(const std::string& path) {
                 bool empty = tile.naxis.empty();
                 for (uint64_t d : tile.naxis)
                     if (d == 0) empty = true;
-                if (!empty) decodeTiledImage(tile, readBytes(in, dataPos, dataBytes, label));
+                if (!empty) {
+                    // (decompressed a tile at a time, and forgotten)
+                    if (!rawFile) rawFile = RawFile::openForReading(path);
+                    FileBytes unit(rawFile, dataPos, dataBytes, label + ": read error in image data");
+                    decodeTiledImage(tile, unit, [](uint64_t, const uint8_t*, size_t) {});
+                }
             } catch (const Unsupported& e) {
                 report.notChecked.push_back(label + ": " + e.what());
             } catch (const Error& e) {
+                if (e.kind == ErrorKind::Cancelled) throw;   // (stopped within the image: no finding)
                 const std::string message = e.what();
                 report.problems.push_back(message.find(label) == std::string::npos ? label + ": " + message : message);
             }
@@ -672,7 +789,7 @@ VerifyReport verifyFits(const std::string& path) {
     return report;
 }
 
-FitsFile readFits(const std::string& path, bool headersOnly, std::optional<size_t> onlyImage) {
+FitsFile readFits(const std::string& path, bool headersOnly, std::optional<size_t> onlyImage, bool inPieces) {
     FitsFile file;
     file.path = path;
     std::ifstream in(toPath(path), std::ios::binary);
@@ -681,6 +798,7 @@ FitsFile readFits(const std::string& path, bool headersOnly, std::optional<size_
     file.fileSize = static_cast<uint64_t>(in.tellg());
 
     uint64_t pos = 0;
+    std::shared_ptr<RawFile> rawFile;   // the file again, for the images that are read in pieces
     // The image the HDU before the current one became, if it became one: a table of XISF
     // properties belongs to it.
     std::optional<size_t> imageBefore;
@@ -822,7 +940,36 @@ FitsFile readFits(const std::string& path, bool headersOnly, std::optional<size_
             img.keywords.push_back({c.name, c.value, c.comment});
         }
 
-        if (!headersOnly && (!onlyImage || *onlyImage == file.images.size())) {
+        if (!headersOnly && (!onlyImage || *onlyImage == file.images.size()) && inPieces) {
+            // The samples are read from the file where they are, as they are asked for; those of a
+            // tile-compressed image are decompressed first (into memory, or a temporary file).
+            if (!rawFile) rawFile = RawFile::openForReading(path);
+            std::shared_ptr<RandomBytes> unit = std::make_shared<FileBytes>(rawFile, dataPos, dataBytes, label + ": read error in image data");
+            if (tiled) {
+                try {
+                    uint64_t total = elements;
+                    total = checkedMul(total, static_cast<uint64_t>(std::abs(tile.bitpix)) / 8, "image size");
+                    std::shared_ptr<Store> decoded;
+                    decodeTiledImage(tile, *unit, [&](uint64_t at, const uint8_t* data, size_t n) {
+                        if (!decoded) decoded = std::make_shared<Store>(total);   // (once the header has passed the checks)
+                        decoded->write(at, data, n);
+                    });
+                    if (!decoded) decoded = std::make_shared<Store>(total);
+                    unit = decoded;
+                } catch (const Unsupported& e) {
+                    if (onlyImage) throw Unsupported(label + ": tile-compressed image: " + e.what());
+                    file.skipped.push_back(label + ": tile-compressed image: " + e.what());
+                    continue;
+                } catch (const Error& e) {
+                    // (reading the file, a temporary file, and a request to stop are not about the image)
+                    if (e.kind == ErrorKind::Io || e.kind == ErrorKind::Cancelled) throw;
+                    throw Error(label + ": tile-compressed image: " + e.what(), e.kind);
+                }
+            }
+            decodeSamples(img, unit);
+            if (tiled) img.note += ", " + tile.algorithm + " tile compression";
+            img.hasData = true;
+        } else if (!headersOnly && (!onlyImage || *onlyImage == file.images.size())) {
             std::vector<uint8_t> raw = readBytes(in, dataPos, dataBytes, label);
             if (tiled) {
                 try {

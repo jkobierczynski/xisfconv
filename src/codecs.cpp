@@ -239,65 +239,20 @@ bool zstdFrameContentSize(const uint8_t* src, size_t srcSize, uint64_t& size) {
 
 // ---------------------------------------------------------------- compression
 
-std::vector<uint8_t> zlibCompress(const uint8_t* src, size_t srcSize, int level) {
-    // Streaming deflate, so blocks larger than 4 GiB work on every platform.
-    z_stream zs{};
-    if (deflateInit(&zs, level) != Z_OK) throw Error("zlib: deflateInit failed");
-    std::vector<uint8_t> out;
-    std::vector<uint8_t> buf(1 << 20);
-    size_t inPos = 0;
-    int ret = Z_OK;
-    while (ret != Z_STREAM_END) {
-        if (zs.avail_in == 0 && inPos < srcSize) {
-            const size_t n = std::min<size_t>(srcSize - inPos, 1u << 30);
-            zs.next_in = const_cast<Bytef*>(src + inPos);
-            zs.avail_in = static_cast<uInt>(n);
-            inPos += n;
-        }
-        zs.next_out = buf.data();
-        zs.avail_out = static_cast<uInt>(buf.size());
-        ret = deflate(&zs, inPos >= srcSize ? Z_FINISH : Z_NO_FLUSH);
-        if (ret == Z_STREAM_ERROR) {
-            deflateEnd(&zs);
-            throw Error("zlib: compression failed");
-        }
-        out.insert(out.end(), buf.data(), buf.data() + (buf.size() - zs.avail_out));
-    }
-    deflateEnd(&zs);
-    return out;
-}
-
-std::vector<uint8_t> zstdCompress(const uint8_t* src, size_t srcSize, int level) {
-#ifdef XISFCONV_HAVE_ZSTD
-    std::vector<uint8_t> out(ZSTD_compressBound(srcSize));
-    const size_t r = ZSTD_compress(out.data(), out.size(), src, srcSize, level);
-    if (ZSTD_isError(r)) throw Error(std::string("zstd: ") + ZSTD_getErrorName(r));
-    out.resize(r);
-    return out;
-#else
-    (void)src;
-    (void)srcSize;
-    (void)level;
-    throw Unsupported("this build has no Zstandard support (use --codec zlib, or rebuild with libzstd)");
-#endif
-}
-
 // ---------------------------------------------------------------- LZ4 compression
 // A block is a row of sequences: a token (the length of the literals, the length of the match
 // less 4), the literals, the distance back to the match (1 to 65535, two bytes) and what of the
 // lengths did not fit the token. The last sequence is literals only. Three rules of the format
 // keep a decoder from reading past the end: the last 5 bytes are literals, the last match
 // starts at least 12 bytes before the end, and so a block of less than 13 bytes has no match.
+//
+// A block is compressed a piece at a time: what is looked at is a window of it that moves along
+// (the block itself when it is in memory), and what is made goes to a sink. The bytes are the
+// same however the block is held: the window only says where they are read from.
 
 namespace {
 
 constexpr size_t kLz4MinMatch = 4, kLz4LastLiterals = 5, kLz4MatchStartLimit = 12, kLz4Window = 65535;
-
-inline uint32_t lz4Read32(const uint8_t* p) {
-    uint32_t v;
-    std::memcpy(&v, p, 4);
-    return v;   // (in the order of the host: it is compared and hashed, never written)
-}
 
 // How many bytes are the same at `a` and at `b`, up to `limit`.
 inline size_t lz4Same(const uint8_t* a, const uint8_t* b, size_t limit) {
@@ -313,28 +268,134 @@ inline size_t lz4Same(const uint8_t* a, const uint8_t* b, size_t limit) {
     return n;
 }
 
-void lz4Length(std::vector<uint8_t>& out, size_t rest) {
-    while (rest >= 255) {
-        out.push_back(255);
-        rest -= 255;
+// The block being compressed, by its positions: [position, position + size) of the input.
+class Lz4Input {
+public:
+    Lz4Input(RandomBytes& in, uint64_t position, size_t size, size_t span) : in_(in), base_(position), n_(size), span_(span) {
+        if (const uint8_t* all = in.contiguous()) {
+            direct_ = all + position;
+            hi_ = size;
+        }
     }
-    out.push_back(static_cast<uint8_t>(rest));
-}
+    size_t size() const { return n_; }
+    // The bytes [p, p + length), until the next call.
+    const uint8_t* at(size_t p, size_t length) {
+        if (direct_) return direct_ + p;
+        if (p < lo_ || p + length > hi_) load(p, p + length);
+        return window_.data() + (p - lo_);
+    }
+    uint8_t byte(size_t p) { return *at(p, 1); }
+    uint32_t read32(size_t p) {
+        uint32_t v;
+        std::memcpy(&v, at(p, 4), 4);
+        return v;   // (in the order of the host: it is compared and hashed, never written)
+    }
+    // How many bytes are the same from `a` and from `b` (a < b), up to `limit`.
+    size_t same(size_t a, size_t b, size_t limit) {
+        if (direct_) return lz4Same(direct_ + a, direct_ + b, limit);
+        size_t n = 0;
+        while (n < limit) {
+            const size_t step = std::min<size_t>(limit - n, size_t(1) << 16);
+            const uint8_t* pa = at(a + n, b - a + step);
+            const size_t k = lz4Same(pa, pa + (b - a), step);
+            n += k;
+            if (k < step) break;
+        }
+        return n;
+    }
+    // Copies [p, p + length) to `out`.
+    void copy(size_t p, size_t length, uint8_t* out) {
+        if (direct_) std::memcpy(out, direct_ + p, length);
+        else if (p >= lo_ && p + length <= hi_) std::memcpy(out, window_.data() + (p - lo_), length);
+        else in_.read(base_ + p, length, out);
+    }
+    // A sign of life every MiB or so of the block.
+    void reached(size_t p) {
+        if (p - ticked_ >= (size_t(1) << 20)) {
+            progressTick(p - ticked_);
+            ticked_ = p;
+        }
+    }
 
-// matchLength 0: the last sequence, literals only.
-void lz4Sequence(std::vector<uint8_t>& out, const uint8_t* literals, size_t literalCount, size_t distance, size_t matchLength) {
-    const size_t extra = matchLength ? matchLength - kLz4MinMatch : 0;
-    out.push_back(static_cast<uint8_t>((std::min<size_t>(literalCount, 15) << 4) | std::min<size_t>(extra, 15)));
-    if (literalCount >= 15) lz4Length(out, literalCount - 15);
-    out.insert(out.end(), literals, literals + literalCount);
-    if (!matchLength) return;
-    out.push_back(static_cast<uint8_t>(distance));
-    out.push_back(static_cast<uint8_t>(distance >> 8));
-    if (extra >= 15) lz4Length(out, extra - 15);
-}
+private:
+    static constexpr size_t kBack = kLz4Window + 1 + 64;   // what is kept before the first byte asked for
+    RandomBytes& in_;
+    uint64_t base_;
+    size_t n_, span_;
+    const uint8_t* direct_ = nullptr;
+    std::vector<uint8_t> window_, spare_;
+    size_t lo_ = 0, hi_ = 0;   // the window holds [lo_, hi_)
+    size_t ticked_ = 0;
+
+    void load(size_t from, size_t to) {
+        const size_t lo = from > kBack ? from - kBack : 0;
+        const size_t hi = std::min(n_, std::max(to, from + span_));
+        spare_.resize(hi - lo);
+        const size_t a = std::max(lo, lo_), b = std::min(hi, hi_);
+        if (a < b) {
+            // what the old window has of the new one is copied, the rest is read
+            std::memcpy(spare_.data() + (a - lo), window_.data() + (a - lo_), b - a);
+            if (lo < a) in_.read(base_ + lo, a - lo, spare_.data());
+            if (b < hi) in_.read(base_ + b, hi - b, spare_.data() + (b - lo));
+        } else {
+            in_.read(base_ + lo, hi - lo, spare_.data());
+        }
+        window_.swap(spare_);
+        lo_ = lo;
+        hi_ = hi;
+    }
+};
+
+class Lz4Output {
+public:
+    Lz4Output(Lz4Input& input, ByteSink& sink) : input_(input), sink_(sink) { buffer_.reserve(kFlush + 64); }
+    // matchLength 0: the last sequence, literals only.
+    void sequence(size_t literals, size_t literalCount, size_t distance, size_t matchLength) {
+        const size_t extra = matchLength ? matchLength - kLz4MinMatch : 0;
+        put(static_cast<uint8_t>((std::min<size_t>(literalCount, 15) << 4) | std::min<size_t>(extra, 15)));
+        if (literalCount >= 15) length(literalCount - 15);
+        while (literalCount > 0) {
+            const size_t n = std::min(literalCount, kFlush);
+            const size_t at = buffer_.size();
+            buffer_.resize(at + n);
+            input_.copy(literals, n, buffer_.data() + at);
+            literals += n;
+            literalCount -= n;
+            if (buffer_.size() >= kFlush) flush();
+        }
+        if (!matchLength) return;
+        put(static_cast<uint8_t>(distance));
+        put(static_cast<uint8_t>(distance >> 8));
+        if (extra >= 15) length(extra - 15);
+    }
+    void finish() { flush(); }
+
+private:
+    static constexpr size_t kFlush = size_t(1) << 20;
+    Lz4Input& input_;
+    ByteSink& sink_;
+    std::vector<uint8_t> buffer_;
+
+    void put(uint8_t b) {
+        buffer_.push_back(b);
+        if (buffer_.size() >= kFlush) flush();
+    }
+    void length(size_t rest) {
+        while (rest >= 255) {
+            put(255);
+            rest -= 255;
+        }
+        put(static_cast<uint8_t>(rest));
+    }
+    void flush() {
+        if (!buffer_.empty()) sink_.write(buffer_.data(), buffer_.size());
+        buffer_.clear();
+    }
+};
 
 // One table of the last place each hash was seen at, one look per position.
-void lz4Fast(const uint8_t* src, size_t n, std::vector<uint8_t>& out) {
+void lz4Fast(Lz4Input& src, Lz4Output& out) {
+    const size_t n = src.size();
     size_t anchor = 0;   // the first byte that is not written yet
     if (n > kLz4MatchStartLimit) {
         std::vector<uint32_t> table(size_t(1) << 16, 0);   // a position + 1; 0: none
@@ -342,19 +403,20 @@ void lz4Fast(const uint8_t* src, size_t n, std::vector<uint8_t>& out) {
         size_t ip = 0;
         size_t misses = 0;   // looks since the last match
         while (ip <= lastStart) {
-            const uint32_t word = lz4Read32(src + ip);
+            src.reached(ip);
+            const uint32_t word = src.read32(ip);
             const uint32_t hash = (word * 2654435761u) >> 16;
             const size_t seen = table[hash];
             table[hash] = static_cast<uint32_t>(ip + 1);
-            if (seen && ip - (seen - 1) <= kLz4Window && lz4Read32(src + seen - 1) == word) {
+            if (seen && ip - (seen - 1) <= kLz4Window && src.read32(seen - 1) == word) {
                 size_t match = seen - 1, start = ip;
-                size_t length = kLz4MinMatch + lz4Same(src + match + kLz4MinMatch, src + ip + kLz4MinMatch, matchEnd - ip - kLz4MinMatch);
-                while (start > anchor && match > 0 && src[start - 1] == src[match - 1]) {
+                size_t length = kLz4MinMatch + src.same(match + kLz4MinMatch, ip + kLz4MinMatch, matchEnd - ip - kLz4MinMatch);
+                while (start > anchor && match > 0 && src.byte(start - 1) == src.byte(match - 1)) {
                     --start;
                     --match;
                     ++length;
                 }
-                lz4Sequence(out, src + anchor, start - anchor, start - match, length);
+                out.sequence(anchor, start - anchor, start - match, length);
                 ip = anchor = start + length;
                 misses = 0;
                 continue;
@@ -365,13 +427,14 @@ void lz4Fast(const uint8_t* src, size_t n, std::vector<uint8_t>& out) {
             ip += 1 + (misses++ >> 6);
         }
     }
-    lz4Sequence(out, src + anchor, n - anchor, 0, 0);
+    out.sequence(anchor, n - anchor, 0, 0);
 }
 
 // Every position is kept in a chain of the positions with the same hash, and the chain is
 // followed for the longest match; a match is put off by a byte if the next position has a
 // longer one.
-void lz4Chains(const uint8_t* src, size_t n, int effort, std::vector<uint8_t>& out) {
+void lz4Chains(Lz4Input& src, int effort, Lz4Output& out) {
+    const size_t n = src.size();
     size_t anchor = 0;
     if (n > kLz4MatchStartLimit) {
         const int tries = effort >= 12 ? 4096 : effort >= 3 ? 1 << (effort - 1) : effort + 1;
@@ -379,7 +442,7 @@ void lz4Chains(const uint8_t* src, size_t n, int effort, std::vector<uint8_t>& o
         std::vector<uint16_t> back(size_t(1) << 16, 0);    // from a position to the one before it in its chain; 0: none
         const size_t matchEnd = n - kLz4LastLiterals, lastStart = n - kLz4MatchStartLimit;
         size_t next = 0;   // the first position that is not in the chains yet
-        auto hashAt = [&](size_t p) { return (lz4Read32(src + p) * 2654435761u) >> 16; };
+        auto hashAt = [&](size_t p) { return (src.read32(p) * 2654435761u) >> 16; };
         auto insertUpTo = [&](size_t end) {
             for (; next < end; ++next) {
                 const uint32_t hash = hashAt(next);
@@ -392,14 +455,14 @@ void lz4Chains(const uint8_t* src, size_t n, int effort, std::vector<uint8_t>& o
         auto longest = [&](size_t p, size_t& match) {
             insertUpTo(p);
             const size_t limit = matchEnd - p;
-            const uint32_t word = lz4Read32(src + p);
+            const uint32_t word = src.read32(p);
             size_t best = 0;
             size_t candidate = head[hashAt(p)];
             for (int left = tries; candidate && left > 0; --left) {
                 const size_t at = candidate - 1;
                 if (p - at > kLz4Window) break;
-                if (lz4Read32(src + at) == word && (best < kLz4MinMatch || src[at + best] == src[p + best])) {
-                    const size_t length = kLz4MinMatch + lz4Same(src + at + kLz4MinMatch, src + p + kLz4MinMatch, limit - kLz4MinMatch);
+                if (src.read32(at) == word && (best < kLz4MinMatch || src.byte(at + best) == src.byte(p + best))) {
+                    const size_t length = kLz4MinMatch + src.same(at + kLz4MinMatch, p + kLz4MinMatch, limit - kLz4MinMatch);
                     if (length > best) {
                         best = length;
                         match = at;
@@ -414,6 +477,7 @@ void lz4Chains(const uint8_t* src, size_t n, int effort, std::vector<uint8_t>& o
         };
         size_t ip = 0;
         while (ip <= lastStart) {
+            src.reached(ip);
             size_t match = 0;
             size_t length = longest(ip, match);
             if (!length) {
@@ -429,27 +493,418 @@ void lz4Chains(const uint8_t* src, size_t n, int effort, std::vector<uint8_t>& o
                 match = later;
             }
             size_t start = ip;
-            while (start > anchor && match > 0 && src[start - 1] == src[match - 1]) {
+            while (start > anchor && match > 0 && src.byte(start - 1) == src.byte(match - 1)) {
                 --start;
                 --match;
                 ++length;
             }
-            lz4Sequence(out, src + anchor, start - anchor, start - match, length);
+            out.sequence(anchor, start - anchor, start - match, length);
             ip = anchor = start + length;
         }
     }
-    lz4Sequence(out, src + anchor, n - anchor, 0, 0);
+    out.sequence(anchor, n - anchor, 0, 0);
+}
+
+// How much of a block that is not in memory is held at once: a piece, within bounds.
+size_t lz4Span() {
+    // (at least what is kept behind it, which every load copies)
+    return static_cast<size_t>(std::min<uint64_t>(std::max<uint64_t>(pieceSettings().pieceBytes, 128 << 10), uint64_t(4) << 20));
+}
+
+void lz4Compress(RandomBytes& in, uint64_t position, uint64_t size, int effort, ByteSink& sink) {
+    if (size > kLz4MaxInput) throw Error("lz4: a block of more than " + std::to_string(kLz4MaxInput) + " bytes");
+    Lz4Input src(in, position, static_cast<size_t>(size), lz4Span());
+    Lz4Output out(src, sink);
+    if (effort <= 0) lz4Fast(src, out);
+    else lz4Chains(src, std::min(effort, 12), out);
+    out.finish();
 }
 
 }  // namespace
 
 std::vector<uint8_t> lz4BlockCompress(const uint8_t* src, size_t srcSize, int effort) {
-    if (srcSize > kLz4MaxInput) throw Error("lz4: a block of more than " + std::to_string(kLz4MaxInput) + " bytes");
     std::vector<uint8_t> out;
     out.reserve(srcSize / 2 + 64);
-    if (effort <= 0) lz4Fast(src, srcSize, out);
-    else lz4Chains(src, srcSize, std::min(effort, 12), out);
+    MemoryBytes in(src, srcSize);
+    VectorSink sink(out);
+    lz4Compress(in, 0, srcSize, effort, sink);
     return out;
+}
+
+// ---------------------------------------------------------------- compression in pieces
+
+namespace {
+
+class ZlibCompressor : public StreamCompressor {
+public:
+    ZlibCompressor(int level, ByteSink& out) : out_(out), buffer_(size_t(1) << 20) {
+        if (deflateInit(&zs_, level) != Z_OK) throw Error("zlib: deflateInit failed");
+    }
+    ~ZlibCompressor() override { deflateEnd(&zs_); }
+    void write(const uint8_t* data, size_t n) override {
+        while (n > 0) {
+            const size_t piece = std::min<size_t>(n, size_t(1) << 30);
+            zs_.next_in = const_cast<Bytef*>(data);
+            zs_.avail_in = static_cast<uInt>(piece);
+            pump(Z_NO_FLUSH);
+            data += piece;
+            n -= piece;
+        }
+    }
+    void finish() override {
+        zs_.next_in = nullptr;
+        zs_.avail_in = 0;
+        pump(Z_FINISH);
+    }
+
+private:
+    z_stream zs_{};
+    ByteSink& out_;
+    std::vector<uint8_t> buffer_;
+    void pump(int flush) {
+        for (;;) {
+            zs_.next_out = buffer_.data();
+            zs_.avail_out = static_cast<uInt>(buffer_.size());
+            const int ret = deflate(&zs_, flush);
+            if (ret == Z_STREAM_ERROR) throw Error("zlib: compression failed");
+            const size_t made = buffer_.size() - zs_.avail_out;
+            if (made) out_.write(buffer_.data(), made);
+            if (flush == Z_FINISH ? ret == Z_STREAM_END : (zs_.avail_in == 0 && zs_.avail_out != 0)) break;
+        }
+    }
+};
+
+#ifdef XISFCONV_HAVE_ZSTD
+// Zstandard is given its input in pieces of one size, whatever the caller writes at once: so
+// the bytes it makes do not depend on that.
+class ZstdCompressor : public StreamCompressor {
+public:
+    ZstdCompressor(int level, uint64_t total, ByteSink& out) : out_(out), output_(ZSTD_CStreamOutSize()) {
+        cctx_ = ZSTD_createCCtx();
+        if (!cctx_) throw Error("zstd: out of memory");
+        check(ZSTD_CCtx_setParameter(cctx_, ZSTD_c_compressionLevel, level));
+        check(ZSTD_CCtx_setPledgedSrcSize(cctx_, total));
+        input_.reserve(kPiece);
+    }
+    ~ZstdCompressor() override { ZSTD_freeCCtx(cctx_); }
+    void write(const uint8_t* data, size_t n) override {
+        while (n > 0) {
+            const size_t take = std::min(n, kPiece - input_.size());
+            input_.insert(input_.end(), data, data + take);
+            data += take;
+            n -= take;
+            if (input_.size() == kPiece) {
+                run(ZSTD_e_continue);
+                input_.clear();
+            }
+        }
+    }
+    void finish() override {
+        run(ZSTD_e_end);
+        input_.clear();
+    }
+
+private:
+    static constexpr size_t kPiece = size_t(1) << 20;
+    ZSTD_CCtx* cctx_ = nullptr;
+    ByteSink& out_;
+    std::vector<uint8_t> input_, output_;
+    static void check(size_t r) {
+        if (ZSTD_isError(r)) throw Error(std::string("zstd: ") + ZSTD_getErrorName(r));
+    }
+    void run(ZSTD_EndDirective how) {
+        ZSTD_inBuffer in{input_.data(), input_.size(), 0};
+        for (;;) {
+            ZSTD_outBuffer out{output_.data(), output_.size(), 0};
+            const size_t left = ZSTD_compressStream2(cctx_, &out, &in, how);
+            check(left);
+            if (out.pos) out_.write(output_.data(), out.pos);
+            if (how == ZSTD_e_end ? left == 0 : in.pos == in.size) break;
+        }
+    }
+};
+#endif
+
+}  // namespace
+
+std::unique_ptr<StreamCompressor> StreamCompressor::create(const std::string& codec, int level, uint64_t totalSize, ByteSink& out) {
+    if (codec == "zlib") return std::make_unique<ZlibCompressor>(level ? level : 6, out);
+    if (codec == "zstd") {
+#ifdef XISFCONV_HAVE_ZSTD
+        return std::make_unique<ZstdCompressor>(level ? level : 3, totalSize, out);
+#else
+        (void)totalSize;
+        throw Unsupported("this build has no Zstandard support (use --codec zlib, or rebuild with libzstd)");
+#endif
+    }
+    throw Error("no stream compression with " + codec + " (internal error)");
+}
+
+namespace {
+
+void checkLevel(const std::string& codec, int level) {
+    if (level == 0) return;
+    int lowest = 0, highest = 0;
+    if (!xisfCodecLevels(codec, lowest, highest)) {
+        throw Error("the codec " + codec + " has no compression levels", ErrorKind::Argument);
+    }
+    if (level < lowest || level > highest) {
+        throw Error("compression level " + std::to_string(level) + ": " + codec + " has the levels " + std::to_string(lowest) +
+                    " to " + std::to_string(highest), ErrorKind::Argument);
+    }
+}
+
+}  // namespace
+
+void compressBytes(const std::string& codec, int level, RandomBytes& in, uint64_t position, uint64_t size, ByteSink& out) {
+    checkLevel(codec, level);
+    if (!isXisfWriteCodec(codec)) {
+        throw Error("unsupported XISF compression codec '" + codec + "' (use zlib, lz4, lz4hc or zstd)", ErrorKind::Argument);
+    }
+    if (codec == "lz4" || codec == "lz4hc") {
+        lz4Compress(in, position, size, codec == "lz4" ? 0 : (level ? level : 9), out);
+        return;
+    }
+    const std::unique_ptr<StreamCompressor> compressor = StreamCompressor::create(codec, level, size, out);
+    const size_t piece = size_t(1) << 20;
+    const uint8_t* all = in.contiguous();
+    std::vector<uint8_t> buffer(all ? 0 : static_cast<size_t>(std::min<uint64_t>(size, piece)));
+    for (uint64_t done = 0; done < size;) {
+        const size_t n = static_cast<size_t>(std::min<uint64_t>(piece, size - done));
+        if (all) {
+            compressor->write(all + position + done, n);
+        } else {
+            in.read(position + done, n, buffer.data());
+            compressor->write(buffer.data(), n);
+        }
+        done += n;
+        progressTick(n);
+    }
+    compressor->finish();
+}
+
+std::vector<uint8_t> zlibCompress(const uint8_t* src, size_t srcSize, int level) {
+    std::vector<uint8_t> out;
+    VectorSink sink(out);
+    ZlibCompressor compressor(level, sink);
+    compressor.write(src, srcSize);
+    compressor.finish();
+    return out;
+}
+
+std::vector<uint8_t> zstdCompress(const uint8_t* src, size_t srcSize, int level) {
+    std::vector<uint8_t> out;
+    VectorSink sink(out);
+    const std::unique_ptr<StreamCompressor> compressor = StreamCompressor::create("zstd", level, srcSize, sink);
+    compressor->write(src, srcSize);
+    compressor->finish();
+    return out;
+}
+
+// ---------------------------------------------------------------- decompression in pieces
+
+namespace {
+
+// Reads the compressed bytes a piece at a time.
+class PieceReader {
+public:
+    PieceReader(RandomBytes& in, uint64_t position, uint64_t size)
+        : in_(in), position_(position), end_(position + size), all_(in.contiguous()) {}
+    // The next piece (empty at the end).
+    std::pair<const uint8_t*, size_t> next() {
+        const size_t n = static_cast<size_t>(std::min<uint64_t>(end_ - position_, size_t(1) << 20));
+        if (n == 0) return {nullptr, 0};
+        const uint8_t* p;
+        if (all_) {
+            p = all_ + position_;
+        } else {
+            buffer_.resize(n);
+            in_.read(position_, n, buffer_.data());
+            p = buffer_.data();
+        }
+        position_ += n;
+        progressTick(n);
+        return {p, n};
+    }
+
+private:
+    RandomBytes& in_;
+    uint64_t position_, end_;
+    const uint8_t* all_;
+    std::vector<uint8_t> buffer_;
+};
+
+void inflateBytes(RandomBytes& in, uint64_t position, uint64_t size, uint64_t expected, ByteSink& out) {
+    z_stream zs{};
+    if (inflateInit(&zs) != Z_OK) throw Error("zlib: inflateInit failed");
+    struct End {
+        z_stream& zs;
+        ~End() { inflateEnd(&zs); }
+    } end{zs};
+    PieceReader reader(in, position, size);
+    std::vector<uint8_t> buffer(size_t(1) << 20);
+    uint64_t produced = 0;
+    bool more = true;   // input that is not handed over yet
+    int ret = Z_OK;
+    while (ret != Z_STREAM_END) {
+        if (zs.avail_in == 0 && more) {
+            const auto piece = reader.next();
+            more = piece.second != 0;
+            zs.next_in = const_cast<Bytef*>(piece.first);
+            zs.avail_in = static_cast<uInt>(piece.second);
+        }
+        // (room for what is declared and one byte more, which tells data that goes beyond it)
+        const size_t room = static_cast<size_t>(std::min<uint64_t>(buffer.size(), expected - produced + 1));
+        zs.next_out = buffer.data();
+        zs.avail_out = static_cast<uInt>(room);
+        ret = inflate(&zs, Z_NO_FLUSH);
+        const size_t made = room - zs.avail_out;
+        if (ret != Z_OK && ret != Z_STREAM_END && ret != Z_BUF_ERROR) throw Error("zlib: " + std::string(zs.msg ? zs.msg : "error " + std::to_string(ret)));
+        if (made > expected - produced) throw Error("zlib: decompressed data larger than declared size");
+        if (made) out.write(buffer.data(), made);
+        produced += made;
+        if (ret == Z_BUF_ERROR && zs.avail_in == 0 && !more) throw Error("zlib: truncated compressed data");
+    }
+    if (produced != expected) {
+        throw Error("zlib: decompressed " + std::to_string(produced) + " bytes, expected " + std::to_string(expected));
+    }
+}
+
+void zstdBytes(RandomBytes& in, uint64_t position, uint64_t size, uint64_t expected, ByteSink& out) {
+#ifdef XISFCONV_HAVE_ZSTD
+    ZSTD_DCtx* dctx = ZSTD_createDCtx();
+    if (!dctx) throw Error("zstd: out of memory");
+    struct End {
+        ZSTD_DCtx* d;
+        ~End() { ZSTD_freeDCtx(d); }
+    } end{dctx};
+    PieceReader reader(in, position, size);
+    std::vector<uint8_t> buffer(ZSTD_DStreamOutSize());
+    uint64_t produced = 0;
+    size_t left = 1;   // ZSTD_decompressStream: 0 where a frame is complete
+    bool any = false;
+    for (auto piece = reader.next(); piece.second != 0; piece = reader.next()) {
+        any = true;
+        ZSTD_inBuffer zin{piece.first, piece.second, 0};
+        while (zin.pos < zin.size || left > 0) {
+            ZSTD_outBuffer zout{buffer.data(), buffer.size(), 0};
+            left = ZSTD_decompressStream(dctx, &zout, &zin);
+            if (ZSTD_isError(left)) throw Error(std::string("zstd: ") + ZSTD_getErrorName(left));
+            if (zout.pos > expected - produced) throw Error("zstd: decompressed data larger than declared size");
+            if (zout.pos) out.write(buffer.data(), zout.pos);
+            produced += zout.pos;
+            // (all input taken and the output not full: there is no more to be had from this piece)
+            if (zin.pos == zin.size && zout.pos < zout.size) break;
+        }
+    }
+    if (!any || left != 0) throw Error("zstd: truncated compressed data");
+    if (produced != expected) {
+        throw Error("zstd: decompressed " + std::to_string(produced) + " bytes, expected " + std::to_string(expected));
+    }
+#else
+    (void)in;
+    (void)position;
+    (void)size;
+    (void)expected;
+    (void)out;
+    throw Unsupported("this build has no Zstandard support (rebuild with libzstd)");
+#endif
+}
+
+// The LZ4 block format, with the last 64 KiB of what was decoded at hand for the matches.
+void lz4Bytes(RandomBytes& in, uint64_t position, uint64_t size, uint64_t expected, ByteSink& out) {
+    auto corrupt = [] { throw Error("lz4: corrupt compressed data"); };
+    PieceReader reader(in, position, size);
+    std::pair<const uint8_t*, size_t> piece{nullptr, 0};
+    size_t at = 0;              // in the piece
+    uint64_t consumed = 0;      // of the input
+    auto available = [&]() {
+        if (at < piece.second) return true;
+        piece = reader.next();
+        at = 0;
+        return piece.second != 0;
+    };
+    auto get = [&]() -> unsigned {
+        if (!available()) corrupt();
+        ++consumed;
+        return piece.first[at++];
+    };
+    constexpr size_t kKeep = 65536, kFlush = size_t(1) << 20;
+    std::vector<uint8_t> window;   // the end of what was decoded
+    window.reserve(kKeep + kFlush + 1024);
+    uint64_t produced = 0;
+    auto flush = [&](bool all) {
+        const size_t keep = all ? 0 : std::min(window.size(), kKeep);
+        const size_t n = window.size() - keep;
+        if (n == 0) return;
+        out.write(window.data(), n);
+        window.erase(window.begin(), window.begin() + static_cast<std::ptrdiff_t>(n));
+    };
+    while (consumed < size) {
+        const unsigned token = get();
+        uint64_t litLen = token >> 4;
+        if (litLen == 15) {
+            unsigned b;
+            do {
+                b = get();
+                litLen += b;
+            } while (b == 255);
+        }
+        if (litLen > size - consumed || litLen > expected - produced) corrupt();
+        for (uint64_t left = litLen; left > 0;) {
+            if (!available()) corrupt();
+            const size_t n = static_cast<size_t>(std::min<uint64_t>(left, piece.second - at));
+            window.insert(window.end(), piece.first + at, piece.first + at + n);
+            at += n;
+            consumed += n;
+            left -= n;
+            if (window.size() >= kKeep + kFlush) flush(false);
+        }
+        produced += litLen;
+        if (consumed >= size) break;  // the last sequence carries literals only
+
+        if (size - consumed < 2) corrupt();
+        const unsigned lo = get(), hi = get();
+        const size_t offset = lo | (hi << 8);
+        if (offset == 0 || offset > produced) corrupt();
+        uint64_t matchLen = token & 15;
+        if (matchLen == 15) {
+            unsigned b;
+            do {
+                b = get();
+                matchLen += b;
+            } while (b == 255);
+        }
+        matchLen += 4;
+        if (matchLen > expected - produced) corrupt();
+        for (uint64_t left = matchLen; left > 0;) {
+            // (offset <= 65535 < kKeep: the match is in the window)
+            const size_t n = static_cast<size_t>(std::min<uint64_t>(left, kFlush));
+            const size_t start = window.size() - offset;
+            window.resize(window.size() + n);
+            uint8_t* d = window.data() + window.size() - n;
+            const uint8_t* s = window.data() + start;
+            if (offset >= n) std::memcpy(d, s, n);
+            else for (size_t i = 0; i < n; ++i) d[i] = s[i];   // overlapping copy
+            left -= n;
+            if (window.size() >= kKeep + kFlush) flush(false);
+        }
+        produced += matchLen;
+    }
+    flush(true);
+    if (produced != expected) {
+        throw Error("lz4: decompressed " + std::to_string(produced) + " bytes, expected " + std::to_string(expected));
+    }
+}
+
+}  // namespace
+
+void decompressBytes(const std::string& codec, RandomBytes& in, uint64_t position, uint64_t size, uint64_t expected,
+                     ByteSink& out) {
+    if (codec == "zlib") inflateBytes(in, position, size, expected, out);
+    else if (codec == "lz4" || codec == "lz4hc") lz4Bytes(in, position, size, expected, out);
+    else if (codec == "zstd") zstdBytes(in, position, size, expected, out);
+    else throw Error("unsupported compression codec '" + codec + "'");
 }
 
 bool isXisfWriteCodec(const std::string& codec) {
@@ -471,21 +926,11 @@ bool xisfCodecLevels(const std::string& codec, int& lowest, int& highest) {
 }
 
 std::vector<uint8_t> xisfCompress(const std::string& codec, const uint8_t* src, size_t srcSize, int level) {
-    if (level != 0) {
-        int lowest = 0, highest = 0;
-        if (!xisfCodecLevels(codec, lowest, highest)) {
-            throw Error("the codec " + codec + " has no compression levels", ErrorKind::Argument);
-        }
-        if (level < lowest || level > highest) {
-            throw Error("compression level " + std::to_string(level) + ": " + codec + " has the levels " + std::to_string(lowest) +
-                        " to " + std::to_string(highest), ErrorKind::Argument);
-        }
-    }
-    if (codec == "zlib") return zlibCompress(src, srcSize, level ? level : 6);
-    if (codec == "zstd") return zstdCompress(src, srcSize, level ? level : 3);
-    if (codec == "lz4") return lz4BlockCompress(src, srcSize, 0);
-    if (codec == "lz4hc") return lz4BlockCompress(src, srcSize, level ? level : 9);
-    throw Error("unsupported XISF compression codec '" + codec + "' (use zlib, lz4, lz4hc or zstd)", ErrorKind::Argument);
+    std::vector<uint8_t> out;
+    VectorSink sink(out);
+    MemoryBytes in(src, srcSize);
+    compressBytes(codec, level, in, 0, srcSize, sink);
+    return out;
 }
 
 uint64_t xisfSubblockSize(const std::string& codec, uint64_t wanted) {
@@ -527,7 +972,9 @@ void unshuffle(std::vector<uint8_t>& data, size_t itemSize) {
     data.swap(out);
 }
 
-// ---------------------------------------------------------------- SHA family
+// ---------------------------------------------------------------- digests
+// SHA-1, SHA-256 and SHA-512 (FIPS 180-4), SHA3-256 and SHA3-512 (FIPS 202), MD5 (RFC 1321), each
+// fed a piece at a time.
 
 namespace {
 
@@ -546,52 +993,27 @@ inline uint32_t rotl32(uint32_t x, int n) { return (x << n) | (x >> (32 - n)); }
 inline uint32_t rotr32(uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
 inline uint64_t rotr64(uint64_t x, int n) { return (x >> n) | (x << (64 - n)); }
 
-// Generic Merkle-Damgard padding driver. BlockSize is 64 or 128; LenBytes is 8 or 16.
-template <size_t BlockSize, size_t LenBytes, class Compress>
-void mdHash(const uint8_t* data, size_t size, Compress compress) {
-    size_t full = size / BlockSize;
-    for (size_t i = 0; i < full; ++i) compress(data + i * BlockSize);
-    uint8_t buf[BlockSize * 2] = {};
-    const size_t rem = size - full * BlockSize;
-    if (rem) std::memcpy(buf, data + full * BlockSize, rem);
-    buf[rem] = 0x80;
-    const size_t total = (rem + 1 + LenBytes <= BlockSize) ? BlockSize : 2 * BlockSize;
-    const uint64_t bits = static_cast<uint64_t>(size) * 8;  // < 2^64 bits always for in-memory data
-    for (int i = 0; i < 8; ++i) buf[total - 1 - i] = static_cast<uint8_t>(bits >> (8 * i));
-    compress(buf);
-    if (total == 2 * BlockSize) compress(buf + BlockSize);
+void sha1Block(uint32_t h[5], const uint8_t* blk) {
+    uint32_t w[80];
+    for (int i = 0; i < 16; ++i) {
+        w[i] = static_cast<uint32_t>(blk[4 * i]) << 24 | static_cast<uint32_t>(blk[4 * i + 1]) << 16 |
+               static_cast<uint32_t>(blk[4 * i + 2]) << 8 | blk[4 * i + 3];
+    }
+    for (int i = 16; i < 80; ++i) w[i] = rotl32(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+    uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4];
+    for (int i = 0; i < 80; ++i) {
+        uint32_t f, k;
+        if (i < 20) { f = (b & c) | (~b & d); k = 0x5A827999; }
+        else if (i < 40) { f = b ^ c ^ d; k = 0x6ED9EBA1; }
+        else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC; }
+        else { f = b ^ c ^ d; k = 0xCA62C1D6; }
+        const uint32_t t = rotl32(a, 5) + f + e + k + w[i];
+        e = d; d = c; c = rotl32(b, 30); b = a; a = t;
+    }
+    h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e;
 }
 
-}  // namespace
-
-std::string sha1Hex(const uint8_t* data, size_t size) {
-    uint32_t h[5] = {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0};
-    mdHash<64, 8>(data, size, [&h](const uint8_t* blk) {
-        uint32_t w[80];
-        for (int i = 0; i < 16; ++i) {
-            w[i] = static_cast<uint32_t>(blk[4 * i]) << 24 | static_cast<uint32_t>(blk[4 * i + 1]) << 16 |
-                   static_cast<uint32_t>(blk[4 * i + 2]) << 8 | blk[4 * i + 3];
-        }
-        for (int i = 16; i < 80; ++i) w[i] = rotl32(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
-        uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4];
-        for (int i = 0; i < 80; ++i) {
-            uint32_t f, k;
-            if (i < 20) { f = (b & c) | (~b & d); k = 0x5A827999; }
-            else if (i < 40) { f = b ^ c ^ d; k = 0x6ED9EBA1; }
-            else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC; }
-            else { f = b ^ c ^ d; k = 0xCA62C1D6; }
-            const uint32_t t = rotl32(a, 5) + f + e + k + w[i];
-            e = d; d = c; c = rotl32(b, 30); b = a; a = t;
-        }
-        h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e;
-    });
-    uint8_t out[20];
-    for (int i = 0; i < 5; ++i)
-        for (int j = 0; j < 4; ++j) out[4 * i + j] = static_cast<uint8_t>(h[i] >> (24 - 8 * j));
-    return toHex(out, 20);
-}
-
-std::string sha256Hex(const uint8_t* data, size_t size) {
+void sha256Block(uint32_t h[8], const uint8_t* blk) {
     static const uint32_t K[64] = {
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
         0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
@@ -601,38 +1023,30 @@ std::string sha256Hex(const uint8_t* data, size_t size) {
         0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
         0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
         0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
-    uint32_t h[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-                     0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
-    mdHash<64, 8>(data, size, [&h](const uint8_t* blk) {
-        uint32_t w[64];
-        for (int i = 0; i < 16; ++i) {
-            w[i] = static_cast<uint32_t>(blk[4 * i]) << 24 | static_cast<uint32_t>(blk[4 * i + 1]) << 16 |
-                   static_cast<uint32_t>(blk[4 * i + 2]) << 8 | blk[4 * i + 3];
-        }
-        for (int i = 16; i < 64; ++i) {
-            const uint32_t s0 = rotr32(w[i - 15], 7) ^ rotr32(w[i - 15], 18) ^ (w[i - 15] >> 3);
-            const uint32_t s1 = rotr32(w[i - 2], 17) ^ rotr32(w[i - 2], 19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16] + s0 + w[i - 7] + s1;
-        }
-        uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
-        for (int i = 0; i < 64; ++i) {
-            const uint32_t S1 = rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25);
-            const uint32_t ch = (e & f) ^ (~e & g);
-            const uint32_t t1 = hh + S1 + ch + K[i] + w[i];
-            const uint32_t S0 = rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22);
-            const uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
-            const uint32_t t2 = S0 + maj;
-            hh = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
-        }
-        h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
-    });
-    uint8_t out[32];
-    for (int i = 0; i < 8; ++i)
-        for (int j = 0; j < 4; ++j) out[4 * i + j] = static_cast<uint8_t>(h[i] >> (24 - 8 * j));
-    return toHex(out, 32);
+    uint32_t w[64];
+    for (int i = 0; i < 16; ++i) {
+        w[i] = static_cast<uint32_t>(blk[4 * i]) << 24 | static_cast<uint32_t>(blk[4 * i + 1]) << 16 |
+               static_cast<uint32_t>(blk[4 * i + 2]) << 8 | blk[4 * i + 3];
+    }
+    for (int i = 16; i < 64; ++i) {
+        const uint32_t s0 = rotr32(w[i - 15], 7) ^ rotr32(w[i - 15], 18) ^ (w[i - 15] >> 3);
+        const uint32_t s1 = rotr32(w[i - 2], 17) ^ rotr32(w[i - 2], 19) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+    }
+    uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
+    for (int i = 0; i < 64; ++i) {
+        const uint32_t S1 = rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25);
+        const uint32_t ch = (e & f) ^ (~e & g);
+        const uint32_t t1 = hh + S1 + ch + K[i] + w[i];
+        const uint32_t S0 = rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22);
+        const uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+        const uint32_t t2 = S0 + maj;
+        hh = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
+    }
+    h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
 }
 
-std::string sha512Hex(const uint8_t* data, size_t size) {
+void sha512Block(uint64_t h[8], const uint8_t* blk) {
     static const uint64_t K[80] = {
         0x428a2f98d728ae22ULL, 0x7137449123ef65cdULL, 0xb5c0fbcfec4d3b2fULL, 0xe9b5dba58189dbbcULL,
         0x3956c25bf348b538ULL, 0x59f111f1b605d019ULL, 0x923f82a4af194f9bULL, 0xab1c5ed5da6d8118ULL,
@@ -654,42 +1068,64 @@ std::string sha512Hex(const uint8_t* data, size_t size) {
         0x06f067aa72176fbaULL, 0x0a637dc5a2c898a6ULL, 0x113f9804bef90daeULL, 0x1b710b35131c471bULL,
         0x28db77f523047d84ULL, 0x32caab7b40c72493ULL, 0x3c9ebe0a15c9bebcULL, 0x431d67c49c100d4cULL,
         0x4cc5d4becb3e42b6ULL, 0x597f299cfc657e2aULL, 0x5fcb6fab3ad6faecULL, 0x6c44198c4a475817ULL};
-    uint64_t h[8] = {0x6a09e667f3bcc908ULL, 0xbb67ae8584caa73bULL, 0x3c6ef372fe94f82bULL,
-                     0xa54ff53a5f1d36f1ULL, 0x510e527fade682d1ULL, 0x9b05688c2b3e6c1fULL,
-                     0x1f83d9abfb41bd6bULL, 0x5be0cd19137e2179ULL};
-    mdHash<128, 16>(data, size, [&h](const uint8_t* blk) {
-        uint64_t w[80];
-        for (int i = 0; i < 16; ++i) {
-            uint64_t v = 0;
-            for (int j = 0; j < 8; ++j) v = (v << 8) | blk[8 * i + j];
-            w[i] = v;
-        }
-        for (int i = 16; i < 80; ++i) {
-            const uint64_t s0 = rotr64(w[i - 15], 1) ^ rotr64(w[i - 15], 8) ^ (w[i - 15] >> 7);
-            const uint64_t s1 = rotr64(w[i - 2], 19) ^ rotr64(w[i - 2], 61) ^ (w[i - 2] >> 6);
-            w[i] = w[i - 16] + s0 + w[i - 7] + s1;
-        }
-        uint64_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
-        for (int i = 0; i < 80; ++i) {
-            const uint64_t S1 = rotr64(e, 14) ^ rotr64(e, 18) ^ rotr64(e, 41);
-            const uint64_t ch = (e & f) ^ (~e & g);
-            const uint64_t t1 = hh + S1 + ch + K[i] + w[i];
-            const uint64_t S0 = rotr64(a, 28) ^ rotr64(a, 34) ^ rotr64(a, 39);
-            const uint64_t maj = (a & b) ^ (a & c) ^ (b & c);
-            const uint64_t t2 = S0 + maj;
-            hh = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
-        }
-        h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
-    });
-    uint8_t out[64];
-    for (int i = 0; i < 8; ++i)
-        for (int j = 0; j < 8; ++j) out[8 * i + j] = static_cast<uint8_t>(h[i] >> (56 - 8 * j));
-    return toHex(out, 64);
+    uint64_t w[80];
+    for (int i = 0; i < 16; ++i) {
+        uint64_t v = 0;
+        for (int j = 0; j < 8; ++j) v = (v << 8) | blk[8 * i + j];
+        w[i] = v;
+    }
+    for (int i = 16; i < 80; ++i) {
+        const uint64_t s0 = rotr64(w[i - 15], 1) ^ rotr64(w[i - 15], 8) ^ (w[i - 15] >> 7);
+        const uint64_t s1 = rotr64(w[i - 2], 19) ^ rotr64(w[i - 2], 61) ^ (w[i - 2] >> 6);
+        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+    }
+    uint64_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
+    for (int i = 0; i < 80; ++i) {
+        const uint64_t S1 = rotr64(e, 14) ^ rotr64(e, 18) ^ rotr64(e, 41);
+        const uint64_t ch = (e & f) ^ (~e & g);
+        const uint64_t t1 = hh + S1 + ch + K[i] + w[i];
+        const uint64_t S0 = rotr64(a, 28) ^ rotr64(a, 34) ^ rotr64(a, 39);
+        const uint64_t maj = (a & b) ^ (a & c) ^ (b & c);
+        const uint64_t t2 = S0 + maj;
+        hh = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
+    }
+    h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
 }
 
-// ---------------------------------------------------------------- SHA-3 (FIPS 202)
-
-namespace {
+void md5Block(uint32_t h[4], const uint8_t* blk) {
+    static const uint32_t K[64] = {
+        0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+        0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+        0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+        0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+        0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+        0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+        0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+        0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391};
+    static const int S[64] = {7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9,  14, 20, 5, 9,
+                              14, 20, 5, 9,  14, 20, 5, 9,  14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+                              4, 11, 16, 23, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21};
+    uint32_t m[16];
+    for (int i = 0; i < 16; ++i) {
+        m[i] = static_cast<uint32_t>(blk[4 * i]) | static_cast<uint32_t>(blk[4 * i + 1]) << 8 |
+               static_cast<uint32_t>(blk[4 * i + 2]) << 16 | static_cast<uint32_t>(blk[4 * i + 3]) << 24;
+    }
+    uint32_t a = h[0], b = h[1], c = h[2], d = h[3];
+    for (int i = 0; i < 64; ++i) {
+        uint32_t f;
+        int g;
+        if (i < 16) { f = (b & c) | (~b & d); g = i; }
+        else if (i < 32) { f = (d & b) | (~d & c); g = (5 * i + 1) % 16; }
+        else if (i < 48) { f = b ^ c ^ d; g = (3 * i + 5) % 16; }
+        else { f = c ^ (b | ~d); g = (7 * i) % 16; }
+        const uint32_t t = a + f + K[i] + m[g];
+        a = d;
+        d = c;
+        c = b;
+        b = b + rotl32(t, S[i]);
+    }
+    h[0] += a; h[1] += b; h[2] += c; h[3] += d;
+}
 
 void keccakF1600(uint64_t s[25]) {
     static const uint64_t roundConstants[24] = {
@@ -723,84 +1159,185 @@ void keccakF1600(uint64_t s[25]) {
     }
 }
 
+enum class HashKind { Sha1, Sha256, Sha512, Sha3_256, Sha3_512, Md5 };
+
+bool hashKindOf(const std::string& algorithm, HashKind& kind) {
+    const std::string a = toLower(trim(algorithm));
+    if (a == "sha1" || a == "sha-1") kind = HashKind::Sha1;
+    else if (a == "sha256" || a == "sha-256") kind = HashKind::Sha256;
+    else if (a == "sha512" || a == "sha-512") kind = HashKind::Sha512;
+    else if (a == "sha3-256") kind = HashKind::Sha3_256;
+    else if (a == "sha3-512") kind = HashKind::Sha3_512;
+    else if (a == "md5") kind = HashKind::Md5;
+    else return false;
+    return true;
+}
+
 }  // namespace
+
+struct Hasher::State {
+    HashKind kind;
+    size_t block = 64;          // the bytes one step takes: 64, 128, or the rate of SHA-3
+    uint32_t h32[8] = {};
+    uint64_t h64[8] = {};
+    uint64_t keccak[25] = {};
+    uint8_t buffer[200] = {};   // what does not fill a block yet
+    size_t used = 0;
+    uint64_t total = 0;         // bytes so far
+
+    void step(const uint8_t* blk) {
+        switch (kind) {
+            case HashKind::Sha1: sha1Block(h32, blk); break;
+            case HashKind::Sha256: sha256Block(h32, blk); break;
+            case HashKind::Sha512: sha512Block(h64, blk); break;
+            case HashKind::Md5: md5Block(h32, blk); break;
+            default:
+                for (size_t i = 0; i < block / 8; ++i) {
+                    uint64_t w = 0;
+                    for (int k = 7; k >= 0; --k) w = (w << 8) | blk[i * 8 + static_cast<size_t>(k)];   // little-endian lanes
+                    keccak[i] ^= w;
+                }
+                keccakF1600(keccak);
+        }
+    }
+};
+
+bool Hasher::known(const std::string& algorithm) {
+    HashKind kind;
+    return hashKindOf(algorithm, kind);
+}
+
+Hasher::Hasher(const std::string& algorithm) : s_(new State()) {
+    if (!hashKindOf(algorithm, s_->kind)) throw Error("unknown digest algorithm '" + algorithm + "'", ErrorKind::Argument);
+    static const uint32_t sha1Init[5] = {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0};
+    static const uint32_t sha256Init[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+                                           0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
+    static const uint64_t sha512Init[8] = {0x6a09e667f3bcc908ULL, 0xbb67ae8584caa73bULL, 0x3c6ef372fe94f82bULL,
+                                           0xa54ff53a5f1d36f1ULL, 0x510e527fade682d1ULL, 0x9b05688c2b3e6c1fULL,
+                                           0x1f83d9abfb41bd6bULL, 0x5be0cd19137e2179ULL};
+    static const uint32_t md5Init[4] = {0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476};
+    switch (s_->kind) {
+        case HashKind::Sha1: std::memcpy(s_->h32, sha1Init, sizeof sha1Init); break;
+        case HashKind::Sha256: std::memcpy(s_->h32, sha256Init, sizeof sha256Init); break;
+        case HashKind::Sha512: std::memcpy(s_->h64, sha512Init, sizeof sha512Init); s_->block = 128; break;
+        case HashKind::Md5: std::memcpy(s_->h32, md5Init, sizeof md5Init); break;
+        case HashKind::Sha3_256: s_->block = 200 - 2 * 32; break;
+        case HashKind::Sha3_512: s_->block = 200 - 2 * 64; break;
+    }
+}
+
+Hasher::~Hasher() = default;
+Hasher::Hasher(Hasher&&) noexcept = default;
+Hasher& Hasher::operator=(Hasher&&) noexcept = default;
+
+void Hasher::update(const uint8_t* data, size_t n) {
+    State& s = *s_;
+    s.total += n;
+    if (s.used) {
+        const size_t take = std::min(n, s.block - s.used);
+        std::memcpy(s.buffer + s.used, data, take);
+        s.used += take;
+        data += take;
+        n -= take;
+        if (s.used < s.block) return;
+        s.step(s.buffer);
+        s.used = 0;
+    }
+    for (; n >= s.block; data += s.block, n -= s.block) s.step(data);
+    if (n) std::memcpy(s.buffer, data, n);
+    s.used = n;
+}
+
+std::vector<uint8_t> Hasher::finish() {
+    State& s = *s_;
+    std::vector<uint8_t> out;
+    if (s.kind == HashKind::Sha3_256 || s.kind == HashKind::Sha3_512) {
+        uint8_t last[200] = {};
+        std::memcpy(last, s.buffer, s.used);
+        last[s.used] ^= 0x06;
+        last[s.block - 1] ^= 0x80;
+        s.step(last);
+        const size_t digestBytes = s.kind == HashKind::Sha3_256 ? 32 : 64;
+        for (size_t i = 0; i < digestBytes; ++i) out.push_back(static_cast<uint8_t>(s.keccak[i / 8] >> (8 * (i % 8))));
+        return out;
+    }
+    // Merkle-Damgard padding: 0x80, zeros, the length in bits (big-endian; little-endian for MD5)
+    const size_t lengthBytes = s.kind == HashKind::Sha512 ? 16 : 8;
+    uint8_t last[256] = {};
+    std::memcpy(last, s.buffer, s.used);
+    last[s.used] = 0x80;
+    const size_t total = s.used + 1 + lengthBytes <= s.block ? s.block : 2 * s.block;
+    const uint64_t bits = s.total * 8;
+    for (int i = 0; i < 8; ++i) {
+        if (s.kind == HashKind::Md5) last[total - 8 + static_cast<size_t>(i)] = static_cast<uint8_t>(bits >> (8 * i));
+        else last[total - 1 - static_cast<size_t>(i)] = static_cast<uint8_t>(bits >> (8 * i));
+    }
+    s.step(last);
+    if (total == 2 * s.block) s.step(last + s.block);
+    switch (s.kind) {
+        case HashKind::Sha1:
+        case HashKind::Sha256:
+            for (int i = 0; i < (s.kind == HashKind::Sha1 ? 5 : 8); ++i)
+                for (int j = 0; j < 4; ++j) out.push_back(static_cast<uint8_t>(s.h32[i] >> (24 - 8 * j)));
+            break;
+        case HashKind::Sha512:
+            for (int i = 0; i < 8; ++i)
+                for (int j = 0; j < 8; ++j) out.push_back(static_cast<uint8_t>(s.h64[i] >> (56 - 8 * j)));
+            break;
+        default:   // MD5
+            for (int i = 0; i < 4; ++i)
+                for (int j = 0; j < 4; ++j) out.push_back(static_cast<uint8_t>(s.h32[i] >> (8 * j)));
+    }
+    return out;
+}
+
+std::string Hasher::finishHex() {
+    const std::vector<uint8_t> digest = finish();
+    return toHex(digest.data(), digest.size());
+}
+
+namespace {
+std::string digestHex(const char* algorithm, const uint8_t* data, size_t size) {
+    Hasher h(algorithm);
+    h.update(data, size);
+    return h.finishHex();
+}
+}  // namespace
+
+std::string digestHex(const std::string& algorithm, RandomBytes& bytes, uint64_t position, uint64_t size) {
+    Hasher hasher(algorithm);
+    const uint8_t* all = bytes.contiguous();
+    std::vector<uint8_t> piece;
+    const size_t step = static_cast<size_t>(std::min<uint64_t>(size, std::max<uint64_t>(pieceSettings().pieceBytes, 4096)));
+    for (uint64_t done = 0; done < size;) {
+        const size_t n = static_cast<size_t>(std::min<uint64_t>(step, size - done));
+        if (all) {
+            hasher.update(all + position + done, n);
+        } else {
+            piece.resize(n);
+            bytes.read(position + done, n, piece.data());
+            hasher.update(piece.data(), n);
+        }
+        done += n;
+        progressTick(n);
+    }
+    return hasher.finishHex();
+}
+
+std::string sha1Hex(const uint8_t* data, size_t size) { return digestHex("sha1", data, size); }
+std::string sha256Hex(const uint8_t* data, size_t size) { return digestHex("sha256", data, size); }
+std::string sha512Hex(const uint8_t* data, size_t size) { return digestHex("sha512", data, size); }
 
 std::string sha3Hex(const uint8_t* data, size_t size, int bits) {
     if (bits != 256 && bits != 512) throw Error("unsupported SHA-3 digest size");
-    const size_t digestBytes = static_cast<size_t>(bits) / 8;
-    const size_t rate = 200 - 2 * digestBytes;  // bytes absorbed per permutation
-    uint64_t s[25] = {};
-    auto absorb = [&](const uint8_t* block) {
-        for (size_t i = 0; i < rate / 8; ++i) {
-            uint64_t w = 0;
-            for (int k = 7; k >= 0; --k) w = (w << 8) | block[i * 8 + static_cast<size_t>(k)];  // little-endian lanes
-            s[i] ^= w;
-        }
-        keccakF1600(s);
-    };
-    size_t offset = 0;
-    for (; size - offset >= rate; offset += rate) absorb(data + offset);
-    uint8_t last[144] = {};  // the largest rate (SHA3-256: 136)
-    if (size > offset) std::memcpy(last, data + offset, size - offset);
-    last[size - offset] ^= 0x06;
-    last[rate - 1] ^= 0x80;
-    absorb(last);
-    uint8_t digest[64];
-    for (size_t i = 0; i < digestBytes; ++i) digest[i] = static_cast<uint8_t>(s[i / 8] >> (8 * (i % 8)));
-    return toHex(digest, digestBytes);
+    return digestHex(bits == 256 ? "sha3-256" : "sha3-512", data, size);
 }
 
-// ---------------------------------------------------------------- MD5
-
 void md5(const uint8_t* data, size_t size, uint8_t digest[16]) {
-    static const uint32_t K[64] = {
-        0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
-        0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
-        0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
-        0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
-        0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
-        0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
-        0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
-        0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391};
-    static const int S[64] = {7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9,  14, 20, 5, 9,
-                              14, 20, 5, 9,  14, 20, 5, 9,  14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
-                              4, 11, 16, 23, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21};
-    uint32_t h[4] = {0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476};
-    auto compress = [&h](const uint8_t* blk) {
-        uint32_t m[16];
-        for (int i = 0; i < 16; ++i) {
-            m[i] = static_cast<uint32_t>(blk[4 * i]) | static_cast<uint32_t>(blk[4 * i + 1]) << 8 |
-                   static_cast<uint32_t>(blk[4 * i + 2]) << 16 | static_cast<uint32_t>(blk[4 * i + 3]) << 24;
-        }
-        uint32_t a = h[0], b = h[1], c = h[2], d = h[3];
-        for (int i = 0; i < 64; ++i) {
-            uint32_t f;
-            int g;
-            if (i < 16) { f = (b & c) | (~b & d); g = i; }
-            else if (i < 32) { f = (d & b) | (~d & c); g = (5 * i + 1) % 16; }
-            else if (i < 48) { f = b ^ c ^ d; g = (3 * i + 5) % 16; }
-            else { f = c ^ (b | ~d); g = (7 * i) % 16; }
-            const uint32_t t = a + f + K[i] + m[g];
-            a = d;
-            d = c;
-            c = b;
-            b = b + rotl32(t, S[i]);
-        }
-        h[0] += a; h[1] += b; h[2] += c; h[3] += d;
-    };
-    const size_t full = size / 64;
-    for (size_t i = 0; i < full; ++i) compress(data + i * 64);
-    uint8_t buf[128] = {};
-    const size_t rem = size - full * 64;
-    if (rem) std::memcpy(buf, data + full * 64, rem);
-    buf[rem] = 0x80;
-    const size_t total = rem + 1 + 8 <= 64 ? 64 : 128;
-    const uint64_t bits = static_cast<uint64_t>(size) * 8;
-    for (int i = 0; i < 8; ++i) buf[total - 8 + i] = static_cast<uint8_t>(bits >> (8 * i));  // little-endian length
-    compress(buf);
-    if (total == 128) compress(buf + 64);
-    for (int i = 0; i < 4; ++i)
-        for (int j = 0; j < 4; ++j) digest[4 * i + j] = static_cast<uint8_t>(h[i] >> (8 * j));
+    Hasher h("md5");
+    h.update(data, size);
+    const std::vector<uint8_t> d = h.finish();
+    std::memcpy(digest, d.data(), 16);
 }
 
 }  // namespace xisfconv

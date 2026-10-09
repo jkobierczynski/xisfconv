@@ -60,6 +60,8 @@ add_library(xisfconv_core
   src/common.cpp
   src/xml.cpp
   src/codecs.cpp
+  src/bytes.cpp
+  src/imagesource.cpp
   src/xisf.cpp
   src/xisfblocks.cpp
   src/xisfrewrite.cpp
@@ -80,6 +82,10 @@ target_include_directories(xisfconv_core
   PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>
   PRIVATE src)
 target_compile_definitions(xisfconv_core PRIVATE XISFCONV_BUILDING)
+# Files of 2 GiB and more are read and written at any place (pread, pwrite) on 32-bit systems too.
+if(NOT WIN32)
+  target_compile_definitions(xisfconv_core PRIVATE _FILE_OFFSET_BITS=64)
+endif()
 if(NOT BUILD_SHARED_LIBS)
   target_compile_definitions(xisfconv_core PUBLIC XISFCONV_STATIC)
 endif()

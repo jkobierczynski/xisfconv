@@ -229,13 +229,11 @@ void storeBE(uint8_t* p, T v) {
     for (size_t i = 0; i < sizeof(T); ++i) p[i] = static_cast<uint8_t>(v >> (8 * (sizeof(T) - 1 - i)));
 }
 
-// The samples [first, first + count) of the buffer as a FITS data unit holds them: big-endian,
-// unsigned integers of 16 bits and more as signed ones (the header says BZERO).
-void storedSamples(const PixelBuffer& px, size_t first, size_t count, uint8_t* d) {
-    const size_t sb = sampleBytes(px.format);
-    const uint8_t* s = px.data.data() + first * sb;
+// `count` samples as a FITS data unit holds them: big-endian, unsigned integers of 16 bits and
+// more as signed ones (the header says BZERO).
+void storedSamples(SampleFormat format, const uint8_t* s, size_t count, uint8_t* d) {
     const size_t m = count;
-    switch (px.format) {
+    switch (format) {
         case SampleFormat::UInt8:
             std::memcpy(d, s, m);
             break;
@@ -284,17 +282,16 @@ void writeZeros(std::ofstream& out, uint64_t count) {
 // Fills the last block of a data unit of `bytes` bytes.
 void padBlock(std::ofstream& out, uint64_t bytes) { writeZeros(out, (kBlock - bytes % kBlock) % kBlock); }
 
-void writeData(std::ofstream& out, const PixelBuffer& px) {
+void writeData(std::ofstream& out, ImageSource& px) {
     const size_t sb = sampleBytes(px.format);
-    const size_t n = static_cast<size_t>(px.samples());
-    const size_t chunk = size_t(1) << 20;
-    std::vector<uint8_t> buf(std::min(n, chunk) * sb);
-    for (size_t off = 0; off < n; off += chunk) {
-        const size_t m = std::min(chunk, n - off);
-        storedSamples(px, off, m, buf.data());
+    std::vector<uint8_t> buf;
+    forEachBand(px, [&](uint64_t, uint64_t, uint64_t rows, const uint8_t* data) {
+        const size_t m = static_cast<size_t>(rows * px.width);
+        buf.resize(m * sb);
+        storedSamples(px.format, data, m, buf.data());
         out.write(reinterpret_cast<const char*>(buf.data()), static_cast<std::streamsize>(m * sb));
-    }
-    padBlock(out, static_cast<uint64_t>(n) * sb);
+    });
+    padBlock(out, px.samples() * sb);
 }
 
 }  // namespace
@@ -443,7 +440,7 @@ std::string headerBlocks(std::vector<std::string> cards) {
 }
 
 void writePlainImage(std::ofstream& out, const FitsHdu& hdu, bool primary, bool first) {
-    const PixelBuffer& px = *hdu.pixels;
+    ImageSource& px = *hdu.pixels;
     std::vector<std::string> cards;
     if (primary) cards.push_back(logicalCard("SIMPLE", true, "file conforms to FITS standard"));
     else cards.push_back(valueCard("XTENSION", fitsString("IMAGE"), "image extension"));
@@ -472,7 +469,7 @@ void writePlainImage(std::ofstream& out, const FitsHdu& hdu, bool primary, bool 
 // sizes in the header are known only when the tiles are compressed: both are written last, into
 // the room left for them.
 void writeTiledImage(std::ofstream& out, const std::string& path, const FitsHdu& hdu, bool first, FitsTiles tiles) {
-    const PixelBuffer& px = *hdu.pixels;
+    ImageSource& px = *hdu.pixels;
     const size_t sb = sampleBytes(px.format);
     const bool rice = tiles == FitsTiles::Default && !isFloat(px.format);
     const char* algorithm = rice ? "RICE_1" : sb == 1 ? "GZIP_1" : "GZIP_2";
@@ -561,26 +558,29 @@ void writeTiledImage(std::ofstream& out, const std::string& path, const FitsHdu&
     const size_t count = static_cast<size_t>(tileSamples);
     // a sign of life (and a chance to stop) every 8 MiB of pixels or so
     const uint64_t reportEvery = std::max<uint64_t>(1, (uint64_t(8) << 20) / (tileSamples * sb));
-    // The rows of the buffer one after the other, channel by channel: the order of the tiles.
-    for (uint64_t row = 0; row < ntiles; ++row) {
-        if (row % reportEvery == 0) progress("compressing", row, ntiles);
-        storedSamples(px, static_cast<size_t>(row) * count, count, tile.data());
-        const std::vector<uint8_t> packed = rice ? riceEncode(tile.data(), count, static_cast<int>(sb))
-                                                 : gzip.compress(tile.data(), count, sb, true);
-        if (!wide && heap + packed.size() > narrowLimit) throw Error("the compressed tiles do not fit the table (internal error)");
-        uint8_t* descriptor = table.data() + static_cast<size_t>(row) * rowBytes;
-        if (wide) {
-            storeBE<uint64_t>(descriptor, packed.size());
-            storeBE<uint64_t>(descriptor + 8, heap);
-        } else {
-            storeBE<uint32_t>(descriptor, static_cast<uint32_t>(packed.size()));
-            storeBE<uint32_t>(descriptor + 4, static_cast<uint32_t>(heap));
+    // The rows of the image one after the other, channel by channel: the order of the tiles.
+    uint64_t row = 0;
+    forEachBand(px, [&](uint64_t, uint64_t, uint64_t rows, const uint8_t* data) {
+        for (uint64_t r = 0; r < rows; ++r, ++row) {
+            if (row % reportEvery == 0) progress("compressing", row, ntiles);
+            storedSamples(px.format, data + r * count * sb, count, tile.data());
+            const std::vector<uint8_t> packed = rice ? riceEncode(tile.data(), count, static_cast<int>(sb))
+                                                     : gzip.compress(tile.data(), count, sb, true);
+            if (!wide && heap + packed.size() > narrowLimit) throw Error("the compressed tiles do not fit the table (internal error)");
+            uint8_t* descriptor = table.data() + static_cast<size_t>(row) * rowBytes;
+            if (wide) {
+                storeBE<uint64_t>(descriptor, packed.size());
+                storeBE<uint64_t>(descriptor + 8, heap);
+            } else {
+                storeBE<uint32_t>(descriptor, static_cast<uint32_t>(packed.size()));
+                storeBE<uint32_t>(descriptor + 4, static_cast<uint32_t>(heap));
+            }
+            out.write(reinterpret_cast<const char*>(packed.data()), static_cast<std::streamsize>(packed.size()));
+            if (!out) throw Error("write error on " + path, ErrorKind::Io);
+            heap += packed.size();
+            longest = std::max<uint64_t>(longest, packed.size());
         }
-        out.write(reinterpret_cast<const char*>(packed.data()), static_cast<std::streamsize>(packed.size()));
-        if (!out) throw Error("write error on " + path, ErrorKind::Io);
-        heap += packed.size();
-        longest = std::max<uint64_t>(longest, packed.size());
-    }
+    });
     padBlock(out, tableBytes + heap);
     const std::ofstream::pos_type endAt = out.tellp();
 

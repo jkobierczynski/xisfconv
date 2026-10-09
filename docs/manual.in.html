@@ -416,7 +416,9 @@ constants, and flags are 0 or 1.</p>
 <code>sample_format="float32"</code>, <code>codec="zstd"</code>, <code>row_order="bottom-up"</code>.</p>
 
 <h3 id="pixel-layout">Pixels</h3>
-<p>An image is read and written as a whole, in memory. The table says how it lies there.</p>
+<p>An image that a program reads or writes is a whole, in memory. The table says how it lies there. (A conversion and a
+rewrite read and write an image a piece at a time, and hold none whole: since 0.20 they take little memory whatever the
+size of the image.)</p>
 <table class="grid">
   <thead><tr><th></th><th>C and C++</th><th>Python</th></tr></thead>
   <tbody>
@@ -572,7 +574,8 @@ converts the frame to FITS and that file back to XISF, and prints what the libra
 <p>In C and C++ the progress handler returns something other than 0 to stop the call, which then returns
 <code>XISFCONV_ERR_CANCELLED</code>. Another thread can ask for the same with <code>xisfconv_context_cancel</code>, the one
 function that may be called while a call runs in the context. In Python the handler stops the work by raising, and the
-exception comes out of the call; Ctrl-C does the same.</p>
+exception comes out of the call; Ctrl-C does the same. A step that goes on is reported again every 8&nbsp;MiB or so of
+data (since 0.20), so that a call is stopped in the middle of a large image too.</p>
 
 <!-- ============================================================================================ -->
 <h2 id="python-more">More for Python</h2>

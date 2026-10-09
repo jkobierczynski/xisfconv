@@ -9,7 +9,7 @@
 <title>xisfconv library manual: C, C++ and Python</title>
 <meta name="description" content="How to read and write PixInsight XISF images with libxisfconv from C, C++ and Python, with example programs run on a real frame and the complete API reference.">
 <meta name="generator" content="docs/make_manual.py">
-<meta name="xisfconv-manual-sources" content="bcca5811564ed176e8f2d3b720f0e335bbc209e14a5e1aa2c0b66c175a53c409">
+<meta name="xisfconv-manual-sources" content="99ee73206efd044fb3749f54b0a24e88e0bbb252654e4b40605dd0e1254b968e">
 <script>
 (function () {
   var root = document.documentElement;
@@ -250,7 +250,7 @@ pre.decl { padding: 0.8rem 1rem; overflow-x: auto; background: var(--panel); bor
 <nav class="side" aria-label="Manual">
   <div>
     <a class="brand" href="#top">xisfconv</a>
-    <p class="brand-version">Library manual, 0.19.0</p>
+    <p class="brand-version">Library manual, 0.20.0</p>
   </div>
   <p class="side-label" id="language-label">Show the examples in</p>
   <div class="switch" role="group" aria-labelledby="language-label">
@@ -266,7 +266,7 @@ pre.decl { padding: 0.8rem 1rem; overflow-x: auto; background: var(--panel); bor
 <main id="top">
 
 <header class="hero">
-  <p class="hero-version">libxisfconv 0.19.0, the library manual</p>
+  <p class="hero-version">libxisfconv 0.20.0, the library manual</p>
   <h1>Reading and writing XISF images from C, C++ and Python</h1>
   <p class="lede">libxisfconv reads PixInsight XISF, FITS and ASDF images into arrays and writes arrays as XISF, FITS, ASDF, TIFF or
   PNG. This manual shows how to use it from each of the three languages, with programs that ran on one real frame.
@@ -344,7 +344,7 @@ be used with <code>pkg-config --static</code>; the CMake package is installed wi
 <div class="code plain"><pre><code>pip<span class="t-w"> </span>install<span class="t-w"> </span>.<span class="t-w">                    </span><span class="t-c1"># from a checkout: builds the library and installs the package</span>
 pip<span class="t-w"> </span>install<span class="t-w"> </span><span class="t-s2">&quot;.[astropy]&quot;</span><span class="t-w">         </span><span class="t-c1"># the same, with astropy</span></code></pre></div>
 <p>The package needs Python 3.10 or later and NumPy. It brings its own copy of the library, so nothing else has to be
-installed. At the time of version 0.19.0 the package is not on PyPI yet; once it is, <code>pip install xisfconv</code>
+installed. At the time of version 0.20.0 the package is not on PyPI yet; once it is, <code>pip install xisfconv</code>
 does the same without a checkout.</p>
 
 <h3 id="first">A first program</h3>
@@ -567,7 +567,9 @@ constants, and flags are 0 or 1.</p>
 <code>sample_format="float32"</code>, <code>codec="zstd"</code>, <code>row_order="bottom-up"</code>.</p>
 
 <h3 id="pixel-layout">Pixels</h3>
-<p>An image is read and written as a whole, in memory. The table says how it lies there.</p>
+<p>An image that a program reads or writes is a whole, in memory. The table says how it lies there. (A conversion and a
+rewrite read and write an image a piece at a time, and hold none whole: since 0.20 they take little memory whatever the
+size of the image.)</p>
 <table class="grid">
   <thead><tr><th></th><th>C and C++</th><th>Python</th></tr></thead>
   <tbody>
@@ -2100,7 +2102,8 @@ stopped: by the handler; a file is left: no</samp></pre></div></section></div>
 <p>In C and C++ the progress handler returns something other than 0 to stop the call, which then returns
 <code>XISFCONV_ERR_CANCELLED</code>. Another thread can ask for the same with <code>xisfconv_context_cancel</code>, the one
 function that may be called while a call runs in the context. In Python the handler stops the work by raising, and the
-exception comes out of the call; Ctrl-C does the same.</p>
+exception comes out of the call; Ctrl-C does the same. A step that goes on is reported again every 8&nbsp;MiB or so of
+data (since 0.20), so that a call is stopped in the middle of a large image too.</p>
 
 <!-- ============================================================================================ -->
 <h2 id="python-more">More for Python</h2>
@@ -2183,7 +2186,7 @@ wrote compat.xisf</samp></pre></div>
 
 <!-- ============================================================================================ -->
 <h2 id="c-reference">C API reference</h2>
-<p class="part-lede">The declarations of <code>xisfconv.h</code>, version 0.19.0, in the order of the header. C++ programs use the same ones.</p>
+<p class="part-lede">The declarations of <code>xisfconv.h</code>, version 0.20.0, in the order of the header. C++ programs use the same ones.</p>
 <p>Two things of the header are not listed below. The macros <code>XISFCONV_VERSION_MAJOR</code>,
 <code>XISFCONV_VERSION_MINOR</code> and <code>XISFCONV_VERSION_PATCH</code> are the version a program was compiled with;
 <code>xisfconv_version</code> gives the one it runs with. And a program that links the static library defines
@@ -2238,7 +2241,7 @@ library does that for it.</p>
 <span class="t-cm">                                     for floating point data, WCS fit quality, stretch parameters */</span>
 <span class="t-p">};</span></code></pre></div>
 <div class="entry"><pre class="decl"><code><span class="t-k">typedef</span><span class="t-w"> </span><span class="t-kt">void</span><span class="t-w"> </span><span class="t-p">(</span><span class="t-o">*</span><span class="t-n def" id="c-xisfconv_message_fn">xisfconv_message_fn</span><span class="t-p">)(</span><span class="t-kt">void</span><span class="t-w"> </span><span class="t-o">*</span><span class="t-n">user</span><span class="t-p">,</span><span class="t-w"> </span><a href="#c-xisfconv_message_level"><span class="t-n">xisfconv_message_level</span></a><span class="t-w"> </span><span class="t-n">level</span><span class="t-p">,</span><span class="t-w"> </span><span class="t-k">const</span><span class="t-w"> </span><span class="t-kt">char</span><span class="t-w"> </span><span class="t-o">*</span><span class="t-n">path</span><span class="t-p">,</span><span class="t-w"> </span><span class="t-k">const</span><span class="t-w"> </span><span class="t-kt">char</span><span class="t-w"> </span><span class="t-o">*</span><span class="t-n">message</span><span class="t-p">);</span></code></pre><div class="doc"><p><code>path</code> is the file being processed, or NULL. <code>message</code> has no trailing newline. Both are valid only during the call. The handler must not call back into the same context.</p></div></div>
-<div class="entry"><pre class="decl"><code><span class="t-k">typedef</span><span class="t-w"> </span><span class="t-kt">int32_t</span><span class="t-w"> </span><span class="t-p">(</span><span class="t-o">*</span><span class="t-n def" id="c-xisfconv_progress_fn">xisfconv_progress_fn</span><span class="t-p">)(</span><span class="t-kt">void</span><span class="t-w"> </span><span class="t-o">*</span><span class="t-n">user</span><span class="t-p">,</span><span class="t-w"> </span><span class="t-k">const</span><span class="t-w"> </span><span class="t-kt">char</span><span class="t-w"> </span><span class="t-o">*</span><span class="t-n">stage</span><span class="t-p">,</span><span class="t-w"> </span><span class="t-kt">uint64_t</span><span class="t-w"> </span><span class="t-n">done</span><span class="t-p">,</span><span class="t-w"> </span><span class="t-kt">uint64_t</span><span class="t-w"> </span><span class="t-n">total</span><span class="t-p">);</span></code></pre><div class="doc"><p>Called from time to time during reading, writing, rewriting and verifying. <code>stage</code> is a short word ("reading", "writing", "compressing", "rewriting", "comparing", "verifying"); <code>total</code> is 0 when the amount of work is not known. ("compressing", for tile-compressed FITS, counts the rows of the image being written: it starts again with every image, every 8 MiB or so of pixels, and is not called once more when an image is complete.) Return 0 to go on, anything else to stop: the call in progress then returns <a href="#c-XISFCONV_ERR_CANCELLED"><code>XISFCONV_ERR_CANCELLED</code></a> and leaves no partly written file behind.</p></div></div>
+<div class="entry"><pre class="decl"><code><span class="t-k">typedef</span><span class="t-w"> </span><span class="t-kt">int32_t</span><span class="t-w"> </span><span class="t-p">(</span><span class="t-o">*</span><span class="t-n def" id="c-xisfconv_progress_fn">xisfconv_progress_fn</span><span class="t-p">)(</span><span class="t-kt">void</span><span class="t-w"> </span><span class="t-o">*</span><span class="t-n">user</span><span class="t-p">,</span><span class="t-w"> </span><span class="t-k">const</span><span class="t-w"> </span><span class="t-kt">char</span><span class="t-w"> </span><span class="t-o">*</span><span class="t-n">stage</span><span class="t-p">,</span><span class="t-w"> </span><span class="t-kt">uint64_t</span><span class="t-w"> </span><span class="t-n">done</span><span class="t-p">,</span><span class="t-w"> </span><span class="t-kt">uint64_t</span><span class="t-w"> </span><span class="t-n">total</span><span class="t-p">);</span></code></pre><div class="doc"><p>Called from time to time during reading, writing, rewriting and verifying. <code>stage</code> is a short word ("reading", "writing", "compressing", "rewriting", "comparing", "verifying"); <code>total</code> is 0 when the amount of work is not known. ("compressing", for tile-compressed FITS, counts the rows of the image being written: it starts again with every image, every 8 MiB or so of pixels, and is not called once more when an image is complete.) Since 0.20 a step that goes on is reported again every 8 MiB or so of data, with the stage and the numbers of the last report: a call is stopped there too, in the middle of one image. Return 0 to go on, anything else to stop: the call in progress then returns <a href="#c-XISFCONV_ERR_CANCELLED"><code>XISFCONV_ERR_CANCELLED</code></a> and leaves no partly written file behind.</p></div></div>
 <div class="entry"><pre class="decl"><code><a href="#c-xisfconv_context"><span class="t-n">xisfconv_context</span></a><span class="t-w"> </span><span class="t-o">*</span><a href="#c-xisfconv_context_new"><span class="t-nf"><span class="def" id="c-xisfconv_context_new">xisfconv_context_new</span></span></a><span class="t-p">(</span><span class="t-kt">void</span><span class="t-p">);</span></code></pre><div class="doc"><p>Returns NULL only if memory is exhausted.</p></div></div>
 <div class="entry"><pre class="decl"><code><span class="t-kt">void</span><span class="t-w"> </span><a href="#c-xisfconv_context_free"><span class="t-nf"><span class="def" id="c-xisfconv_context_free">xisfconv_context_free</span></span></a><span class="t-p">(</span><a href="#c-xisfconv_context"><span class="t-n">xisfconv_context</span></a><span class="t-w"> </span><span class="t-o">*</span><span class="t-n">ctx</span><span class="t-p">);</span></code></pre><div class="doc"><p>NULL is allowed. Handles made from the context may live on; the handlers are no longer called.</p></div></div>
 <div class="entry"><pre class="decl"><code><span class="t-kt">void</span><span class="t-w"> </span><a href="#c-xisfconv_context_set_message_handler"><span class="t-nf"><span class="def" id="c-xisfconv_context_set_message_handler">xisfconv_context_set_message_handler</span></span></a><span class="t-p">(</span><a href="#c-xisfconv_context"><span class="t-n">xisfconv_context</span></a><span class="t-w"> </span><span class="t-o">*</span><span class="t-n">ctx</span><span class="t-p">,</span><span class="t-w"> </span><a href="#c-xisfconv_message_fn"><span class="t-n">xisfconv_message_fn</span></a><span class="t-w"> </span><span class="t-n">handler</span><span class="t-p">,</span><span class="t-w"> </span><span class="t-kt">void</span><span class="t-w"> </span><span class="t-o">*</span><span class="t-n">user</span><span class="t-p">);</span></code></pre><div class="doc"><p>handler NULL = drop messages (the default).</p></div></div>
@@ -2839,7 +2842,7 @@ TimePoint                        a date, or a date and a time, of ISO 8601:
 
 <!-- ============================================================================================ -->
 <h2 id="python-reference">Python API reference</h2>
-<p class="part-lede">The package <code>xisfconv</code>, version 0.19.0: its functions and classes with their own documentation.</p>
+<p class="part-lede">The package <code>xisfconv</code>, version 0.20.0: its functions and classes with their own documentation.</p>
 <div class="doc"><p>xisfconv: PixInsight XISF images as NumPy arrays, and conversion between XISF, FITS and ASDF.</p><p>Reading:</p><div class="code small"><pre><code><span class="t-kn">import</span><span class="t-w"> </span><span class="t-nn">xisfconv</span>
 
 <span class="t-n">data</span> <span class="t-o">=</span> <span class="t-n">xisfconv</span><span class="t-o">.</span><a href="#py-read"><span class="t-n">read</span></a><span class="t-p">(</span><span class="t-s2">&quot;m31.xisf&quot;</span><span class="t-p">)</span>              <span class="t-c1"># [height, width] or [height, width, channels]</span>

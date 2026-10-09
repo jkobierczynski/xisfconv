@@ -203,15 +203,15 @@ std::string bayerPatternOf(const std::vector<FitsKeyword>& keywords, const std::
 
 // --debayer on one image: the mosaic becomes RGB, or a warning says why it stays as it is.
 // `pattern` is that of the pixels as they are now. Returns true if the image is RGB now.
-bool debayerForPicture(PixelBuffer& px, const std::string& pattern, const std::string& why, const std::string& label) {
+bool debayerForPicture(Source& px, const std::string& pattern, const std::string& why, const std::string& label) {
     std::string reason = why;
-    if (px.channels != 1) reason = "it has " + std::to_string(px.channels) + " channels, a mosaic has one";
-    else if (!pattern.empty() && (px.width < 2 || px.height < 2)) reason = "it is smaller than 2 x 2 pixels";
-    if (px.channels != 1 || pattern.empty() || px.width < 2 || px.height < 2) {
+    if (px->channels != 1) reason = "it has " + std::to_string(px->channels) + " channels, a mosaic has one";
+    else if (!pattern.empty() && (px->width < 2 || px->height < 2)) reason = "it is smaller than 2 x 2 pixels";
+    if (px->channels != 1 || pattern.empty() || px->width < 2 || px->height < 2) {
         warn(label + ": not debayered: " + reason);
         return false;
     }
-    debayerBilinear(px, pattern);
+    px = debayeredSource(px, pattern);
     info(label + ": debayered (" + pattern + ", bilinear)");
     return true;
 }
@@ -219,17 +219,17 @@ bool debayerForPicture(PixelBuffer& px, const std::string& pattern, const std::s
 // Makes the image the picture that was asked for, if one was. Returns what happened, for the
 // notes, and how many pixels of the picture there are for one of the image in width and in
 // height (what a resolution in pixels per inch is to be multiplied by).
-std::string makeSmaller(PixelBuffer& px, const Downsample& how, double& perPixelX, double& perPixelY) {
-    const uint64_t fullWidth = px.width, fullHeight = px.height;
+std::string makeSmaller(Source& px, const Downsample& how, double& perPixelX, double& perPixelY) {
+    const uint64_t fullWidth = px->width, fullHeight = px->height;
     perPixelX = perPixelY = 1;
     if (!how.any()) return {};
-    const DownsampledSize size = downsampledSize(how, px.width, px.height);
+    const DownsampledSize size = downsampledSize(how, px->width, px->height);
     if (!size.changes) return {};
-    downsample(px, size);
+    px = downsampledSource(px, size);
     perPixelX = static_cast<double>(size.width) / static_cast<double>(size.useWidth);
     perPixelY = static_cast<double>(size.height) / static_cast<double>(size.useHeight);
     std::string note = std::to_string(fullWidth) + " x " + std::to_string(fullHeight) + " pixels averaged to " +
-                       std::to_string(px.width) + " x " + std::to_string(px.height);
+                       std::to_string(px->width) + " x " + std::to_string(px->height);
     if (size.useWidth != fullWidth || size.useHeight != fullHeight) {
         note += " (" + std::to_string(fullWidth - size.useWidth) + " column(s) and " + std::to_string(fullHeight - size.useHeight) +
                 " row(s) at the right and the bottom do not fill a block of " + std::to_string(how.bin) + " and are left out)";
@@ -527,6 +527,19 @@ std::string asdfCodec(const ConvertOptions& opt) {
     return opt.codec.empty() ? "zlib" : opt.codec;
 }
 
+// The directory a file is written to: where the temporary files of its conversion go.
+std::string directoryOf(const std::string& path) {
+    const fs::path parent = toPath(path).parent_path();
+    return parent.empty() ? std::string(".") : fromPath(parent);
+}
+
+// The pixels of an image, read a piece at a time: from where the reader left them, or from
+// memory (an image handed over by a caller), which the image keeps.
+Source sourceOf(const FitsImage& img) {
+    if (img.pieces) return img.pieces;
+    return borrowedSource(img.pixels);
+}
+
 }  // namespace
 
 InputFormat detectInputFormat(const std::string& path) {
@@ -693,6 +706,7 @@ XisfFileRewrite rewriteXisfFile(const std::string& input, const std::string& out
     }
 
     const std::string tmpPath = partPathFor(outPath, input, force, &inputFiles);
+    const TempDirectoryScope temporaries(directoryOf(outPath));   // (what a block is made into on the way, where it is large)
     if (!blocksPath.empty()) {
         // (in place, the temporary file of the data blocks file is no file the unit reads either)
         blocksTmp = partPathFor(blocksPath, input, force, &inputFiles);
@@ -874,7 +888,9 @@ void convertXisfFile(const std::string& input, const std::string& outPath, Forma
     const InputFiles others = inputFilesOf(file);
     checkOutput(outPath, input, opt.force, &others);
 
-    std::vector<PixelBuffer> buffers;
+    // Temporary files go beside the output.
+    const TempDirectoryScope temporaries(directoryOf(outPath));
+    std::vector<Source> buffers;
     std::vector<std::string> stretchNotes;  // HISTORY text per converted image
     std::vector<std::pair<double, double>> shrunk;   // pixels of each picture per pixel of its image, in width and height
     std::vector<bool> colour;                        // an RGB picture (an RGB image, or a mosaic debayered)
@@ -883,7 +899,7 @@ void convertXisfFile(const std::string& input, const std::string& outPath, Forma
     for (size_t idx : indices) {
         progress("reading", buffers.size(), indices.size());
         const XisfImage& img = file.images()[idx];
-        PixelBuffer px = file.readPixels(idx, opt.verify);
+        Source px = file.pixelSource(idx, opt.verify);
         bool rgb = img.colorSpace != "Gray", madeRgb = false;
         if (opt.debayer) {
             // (XISF rows are top-down, as the picture's: the pattern is that of the pixels as they are)
@@ -908,7 +924,7 @@ void convertXisfFile(const std::string& input, const std::string& outPath, Forma
             const bool useStored = df.present && !df.isIdentity() &&
                                    (opt.stretch == Stretch::Auto || opt.stretch == Stretch::Stored);
             if (useStored) {
-                for (size_t c = 0; c < std::min<size_t>(colorChannels, px.channels); ++c) {
+                for (size_t c = 0; c < std::min<size_t>(colorChannels, px->channels); ++c) {
                     const size_t k = madeRgb ? 0 : c;   // (the STF of a mosaic is that of its one channel: for each colour)
                     params.push_back({df.s[k], df.m[k], df.h[k], df.l[k], df.r[k]});
                 }
@@ -919,44 +935,43 @@ void convertXisfFile(const std::string& input, const std::string& outPath, Forma
                                 "use --stretch=linked or --stretch=unlinked", ErrorKind::NotFound);
                 }
                 const bool linked = opt.stretch != Stretch::Unlinked;
-                params = autoStretch(px, img.lowerBound, img.upperBound, colorChannels, linked);
+                params = autoStretch(*px, img.lowerBound, img.upperBound, colorChannels, linked);
                 how = linked ? "linked auto-STF" : "unlinked auto-STF";
             }
-            applyStretch(px, params, img.lowerBound, img.upperBound);
+            px = stretchedSource(px, params, img.lowerBound, img.upperBound);
             SampleFormat target = isFloat(img.format) ? (fitsLike ? SampleFormat::Float32
                                                                                 : SampleFormat::UInt16)
                                                       : img.format;
             if (opt.bits) target = *opt.bits;
-            convertSampleFormat(px, target, 0, 1);
+            px = convertedSource(px, target, 0, 1);
             const std::string desc = stretchDescription(how, params);
             stretchNotes.push_back("Stretched with " + desc);
             info("image " + std::to_string(idx) + ": " + desc);
         } else if (opt.bits) {
-            convertSampleFormat(px, *opt.bits, img.lowerBound, img.upperBound);
+            px = convertedSource(px, *opt.bits, img.lowerBound, img.upperBound);
         }
         if (format == Format::Png) {
-            if (px.format != SampleFormat::UInt8 && px.format != SampleFormat::UInt16) {
-                convertSampleFormat(px, SampleFormat::UInt16, opt.stretch == Stretch::None ? img.lowerBound : 0,
-                                    opt.stretch == Stretch::None ? img.upperBound : 1);
+            if (px->format != SampleFormat::UInt8 && px->format != SampleFormat::UInt16) {
+                px = convertedSource(px, SampleFormat::UInt16, opt.stretch == Stretch::None ? img.lowerBound : 0,
+                                     opt.stretch == Stretch::None ? img.upperBound : 1);
             }
-            const uint64_t colorCh = (rgb && px.channels >= 3) ? 3 : 1;
-            if (px.channels > colorCh + 1) {
-                warn("PNG: keeping " + std::to_string(colorCh + 1) + " of " + std::to_string(px.channels) +
+            const uint64_t colorCh = (rgb && px->channels >= 3) ? 3 : 1;
+            if (px->channels > colorCh + 1) {
+                warn("PNG: keeping " + std::to_string(colorCh + 1) + " of " + std::to_string(px->channels) +
                      " channels (color + alpha)");
-                px.channels = colorCh + 1;
-                px.data.resize(static_cast<size_t>(px.samples()) * sampleBytes(px.format));
+                px = channelSource(px, 0, colorCh + 1);
             }
             if (isFloat(img.format) && opt.stretch == Stretch::None) {
                 info("linear data may look dark in PNG; add --stretch for a viewable image");
             }
         }
-        if (fitsLike && opt.bottomUp) flipVertical(px);
-        if (format == Format::Tiff && (px.format == SampleFormat::UInt32 || px.format == SampleFormat::UInt64 ||
-                                       px.format == SampleFormat::Float64)) {
-            warn(std::string("image ") + std::to_string(idx) + ": " + sampleFormatName(px.format) +
+        if (fitsLike && opt.bottomUp) px = flippedSource(px);
+        if (format == Format::Tiff && (px->format == SampleFormat::UInt32 || px->format == SampleFormat::UInt64 ||
+                                       px->format == SampleFormat::Float64)) {
+            warn(std::string("image ") + std::to_string(idx) + ": " + sampleFormatName(px->format) +
                  " TIFF is not supported by many programs; consider --bits u16 or --bits f32");
         }
-        if (opt.stretch == Stretch::None && isFloat(img.format) && !isFloat(px.format) && !img.boundsDeclared) {
+        if (opt.stretch == Stretch::None && isFloat(img.format) && !isFloat(px->format) && !img.boundsDeclared) {
             warn("image " + std::to_string(idx) + " has no bounds attribute; assuming [0,1]");
         }
         buffers.push_back(std::move(px));
@@ -971,7 +986,7 @@ void convertXisfFile(const std::string& input, const std::string& outPath, Forma
                 const size_t idx = indices[n];
                 const XisfImage& img = file.images()[idx];
                 FitsHdu hdu;
-                hdu.pixels = &buffers[n];
+                hdu.pixels = buffers[n];
                 hdu.extname = img.id;
                 hdu.bottomUp = opt.bottomUp;
                 std::string wcsSummary;
@@ -983,7 +998,7 @@ void convertXisfFile(const std::string& input, const std::string& outPath, Forma
                 if (opt.properties) {
                     hdu.properties = carriedProperties(file, idx, opt.verify);
                     if (!hdu.properties.empty()) {
-                        hdu.wcsDigest = wcsDigest(hdu.keywords, buffers[n].width, buffers[n].height, opt.bottomUp);
+                        hdu.wcsDigest = wcsDigest(hdu.keywords, buffers[n]->width, buffers[n]->height, opt.bottomUp);
                         info("image " + std::to_string(idx) + ": " + countOf(hdu.properties.size(), "XISF property", "XISF properties") +
                              " taken along");
                     }
@@ -1008,7 +1023,7 @@ void convertXisfFile(const std::string& input, const std::string& outPath, Forma
                 const size_t idx = indices[n];
                 const XisfImage& img = file.images()[idx];
                 TiffPage page;
-                page.pixels = &buffers[n];
+                page.pixels = buffers[n];
                 page.rgb = colour[n];
                 if (img.colorSpace == "CIELab") warn("CIELab image written as RGB samples without color conversion");
                 if (img.hasIccProfile && debayered[n]) {
@@ -1033,8 +1048,8 @@ void convertXisfFile(const std::string& input, const std::string& outPath, Forma
         } else {
             const XisfImage& img = file.images()[indices[0]];
             PngImage png;
-            png.pixels = &buffers[0];
-            png.rgb = colour[0] && buffers[0].channels >= 3;
+            png.pixels = buffers[0];
+            png.rgb = colour[0] && buffers[0]->channels >= 3;
             if (img.hasIccProfile && debayered[0]) {
                 warn("image " + std::to_string(indices[0]) + ": its ICC profile, of the one-channel mosaic, is not given to the colour picture");
             } else if (img.hasIccProfile) {
@@ -1083,7 +1098,12 @@ void convertFitsOrAsdfFile(const std::string& input, InputFormat kind, const std
     }
 
     progress("reading", 0, 0);
-    FitsFile fits = asdfInput ? readAsdf(input, false, opt.verify) : dngInput ? readDng(input) : readFits(input);
+    // (images are read a piece at a time; a compressed one is decompressed into a temporary file
+    // beside the output where it does not fit the memory a conversion takes)
+    const TempDirectoryScope temporaries(directoryOf(outPath));
+    FitsFile fits = asdfInput ? readAsdf(input, false, opt.verify, std::nullopt, true)
+                    : dngInput ? readDng(input, false, true)
+                               : readFits(input, false, std::nullopt, true);
     // (the previews of a DNG file are no news: every DNG file has them)
     for (const auto& s : fits.skipped) (dngInput ? info : warn)("skipped " + s);
     if (fits.images.empty()) throw Error(std::string("no image data found in this ") + inputName + " file");
@@ -1122,7 +1142,8 @@ std::pair<double, double> automaticBounds(const FitsImage& image) {
 }
 
 void flipImageRows(FitsImage& img) {
-    flipVertical(img.pixels);
+    if (img.pieces) img.pieces = flippedSource(img.pieces);
+    else flipVertical(img.pixels);
     flipKeywordRows(img.keywords, img.pixels.height);
     flipCfaRows(img);
     img.topDown = !img.topDown;
@@ -1161,6 +1182,7 @@ void writeImageSet(FitsFile& fits, const ImageSetOrigin& source, const std::stri
     // Images that come from a file say so in their header; images handed over in memory do not.
     const std::string history = source.format.empty() ? std::string() : "Converted from " + source.format + " by xisfconv " + kVersion;
     const std::string tmpPath = partPathFor(outPath, input, opt.force);
+    const TempDirectoryScope temporaries(directoryOf(outPath));
     // An XISF unit under the name of a header file (.xish) is written distributed: the header
     // there, the data blocks in a file of the same name that ends in .xisb.
     const BlocksOutput blocksFile = blocksOutputFor(format == Format::Xisf ? outPath : std::string(), input, opt.force);
@@ -1168,20 +1190,20 @@ void writeImageSet(FitsFile& fits, const ImageSetOrigin& source, const std::stri
 
     if (exporting) {
         // TIFF and PNG: rows top-down, floating point data scaled so that its range is 0..1.
-        std::vector<PixelBuffer> buffers;   // one per page; planes of a cube that is not RGB become pages
+        std::vector<Source> buffers;   // one per page; planes of a cube that is not RGB become pages
         std::vector<std::string> names;
         std::vector<std::vector<uint8_t>> profiles;   // ICC profiles, only for images handed over in memory
         for (size_t idx : indices) {
             FitsImage& img = fits.images[idx];
-            PixelBuffer& px = img.pixels;
+            Source px = sourceOf(img);
             const std::string label = "image " + std::to_string(idx);
             const bool topDown = opt.rowOrderGiven ? !opt.bottomUp : img.topDown;
-            if (!topDown) flipVertical(px);
+            if (!topDown) px = flippedSource(px);
             if (opt.debayer) {
                 // the pattern is that of the rows as stored: turned with them
                 std::string why;
                 std::string pattern = bayerPatternOf(img.keywords, img.cfaPattern, img.cfaWidth, img.cfaHeight, why);
-                if (!topDown && !pattern.empty()) pattern = flipPatternRows(pattern, 2, 2, px.height);
+                if (!topDown && !pattern.empty()) pattern = flipPatternRows(pattern, 2, 2, px->height);
                 if (debayerForPicture(px, pattern, why, label) && !img.iccProfile.empty()) {
                     warn(label + ": its ICC profile, of the one-channel mosaic, is not given to the colour picture");
                     img.iccProfile.clear();
@@ -1191,13 +1213,10 @@ void writeImageSet(FitsFile& fits, const ImageSetOrigin& source, const std::stri
             const std::string smaller = makeSmaller(px, opt.downsample, perPixelX, perPixelY);   // before a stretch, as from XISF
             if (!smaller.empty() && img.hasNaN) {
                 // what was no number is left out of the means: is there still a pixel that is none?
-                const double low = img.dataMin, high = img.dataMax;   // (the range stays that of the image)
-                img.hasNaN = false;
-                updateFloatRange(img);
-                img.dataMin = low;
-                img.dataMax = high;
+                // (the range stays that of the image)
+                img.hasNaN = floatRange(*px).hasNaN;
             }
-            const SampleFormat stored = px.format;
+            const SampleFormat stored = px->format;
             const bool wasFloat = isFloat(stored);
             std::string rangeNote;
             std::pair<double, double> range{0.0, 1.0};   // of floating point samples; integers use their full range
@@ -1209,26 +1228,26 @@ void writeImageSet(FitsFile& fits, const ImageSetOrigin& source, const std::stri
             if (opt.stretch != Stretch::None) {
                 // Every plane is image data here (FITS has no alpha channel): all are stretched.
                 const bool linked = opt.stretch != Stretch::Unlinked;
-                const auto params = autoStretch(px, range.first, range.second, static_cast<size_t>(px.channels), linked);
-                applyStretch(px, params, range.first, range.second);   // leaves Float32 in [0,1]
+                const auto params = autoStretch(*px, range.first, range.second, static_cast<size_t>(px->channels), linked);
+                px = stretchedSource(px, params, range.first, range.second);   // Float32 in [0,1]
                 range = {0.0, 1.0};
                 // As for XISF input: 16-bit for floating point data, the stored type for integers.
-                convertSampleFormat(px, opt.bits ? *opt.bits : wasFloat ? SampleFormat::UInt16 : stored, 0, 1);
+                px = convertedSource(px, opt.bits ? *opt.bits : wasFloat ? SampleFormat::UInt16 : stored, 0, 1);
                 stretchNote = stretchDescription(linked ? "linked auto-STF" : "unlinked auto-STF", params);
             } else if (opt.bits) {
-                convertSampleFormat(px, *opt.bits, range.first, range.second);
+                px = convertedSource(px, *opt.bits, range.first, range.second);
             }
-            if (format == Format::Png && px.format != SampleFormat::UInt8 && px.format != SampleFormat::UInt16) {
-                convertSampleFormat(px, SampleFormat::UInt16, range.first, range.second);
+            if (format == Format::Png && px->format != SampleFormat::UInt8 && px->format != SampleFormat::UInt16) {
+                px = convertedSource(px, SampleFormat::UInt16, range.first, range.second);
             }
             bool scaled = false;
-            if (isFloat(px.format) && wasFloat && (range.first != 0 || range.second != 1)) {
-                normalizeFloat(px, range.first, range.second);
+            if (isFloat(px->format) && wasFloat && (range.first != 0 || range.second != 1)) {
+                px = normalizedSource(px, range.first, range.second);
                 scaled = true;
             }
-            if (format == Format::Tiff && (px.format == SampleFormat::UInt32 || px.format == SampleFormat::UInt64 ||
-                                           px.format == SampleFormat::Float64)) {
-                warn(label + ": " + sampleFormatName(px.format) +
+            if (format == Format::Tiff && (px->format == SampleFormat::UInt32 || px->format == SampleFormat::UInt64 ||
+                                           px->format == SampleFormat::Float64)) {
+                warn(label + ": " + sampleFormatName(px->format) +
                      " TIFF is not supported by many programs; consider --bits u16 or --bits f32");
             }
             if (source.notes) {
@@ -1247,40 +1266,30 @@ void writeImageSet(FitsFile& fits, const ImageSetOrigin& source, const std::stri
                 }
             }
             const std::string name = img.name.empty() ? source.defaultName : img.name;
-            if (px.channels == 1 || px.channels == 3) {
+            if (px->channels == 1 || px->channels == 3) {
                 buffers.push_back(std::move(px));
                 names.push_back(name);
                 profiles.push_back(img.iccProfile);
                 continue;
             }
             // A cube that is not an RGB image: one grayscale page per plane.
-            const uint64_t planes = format == Format::Png ? 1 : px.channels;
+            const uint64_t planes = format == Format::Png ? 1 : px->channels;
             if (format == Format::Png) {
-                warn(label + ": PNG holds one image; writing the first of " + std::to_string(px.channels) + " planes");
+                warn(label + ": PNG holds one image; writing the first of " + std::to_string(px->channels) + " planes");
             }
-            const size_t planeBytes = static_cast<size_t>(px.planeSamples()) * sampleBytes(px.format);
             for (uint64_t c = 0; c < planes; ++c) {
-                PixelBuffer plane;
-                plane.width = px.width;
-                plane.height = px.height;
-                plane.channels = 1;
-                plane.format = px.format;
-                plane.data.assign(px.data.begin() + static_cast<std::ptrdiff_t>(c * planeBytes),
-                                  px.data.begin() + static_cast<std::ptrdiff_t>((c + 1) * planeBytes));
-                buffers.push_back(std::move(plane));
+                buffers.push_back(channelSource(px, c, 1));
                 names.push_back(name + " plane " + std::to_string(c));
                 profiles.push_back(img.iccProfile);
             }
-            px.data.clear();
-            px.data.shrink_to_fit();
         }
         try {
             if (format == Format::Tiff) {
                 std::vector<TiffPage> pages;
                 for (size_t n = 0; n < buffers.size(); ++n) {
                     TiffPage page;
-                    page.pixels = &buffers[n];
-                    page.rgb = buffers[n].channels == 3;
+                    page.pixels = buffers[n];
+                    page.rgb = buffers[n]->channels == 3;
                     page.iccProfile = profiles[n];
                     page.description = names[n];
                     pages.push_back(std::move(page));
@@ -1288,8 +1297,8 @@ void writeImageSet(FitsFile& fits, const ImageSetOrigin& source, const std::stri
                 writeTiff(tmpPath, pages, opt.compress);
             } else {
                 PngImage png;
-                png.pixels = &buffers[0];
-                png.rgb = buffers[0].channels == 3;
+                png.pixels = buffers[0];
+                png.rgb = buffers[0]->channels == 3;
                 png.iccProfile = profiles[0];
                 writePng(tmpPath, png);
             }
@@ -1306,18 +1315,18 @@ void writeImageSet(FitsFile& fits, const ImageSetOrigin& source, const std::stri
         std::vector<FitsHdu> hdus;
         for (size_t idx : indices) {
             FitsImage& img = fits.images[idx];
-            PixelBuffer& px = img.pixels;
+            Source px = sourceOf(img);
             const std::string label = "image " + std::to_string(idx);
             const bool topDown = opt.rowOrderGiven ? !opt.bottomUp : img.topDown;
             std::string boundsNote;
-            if (opt.bits && *opt.bits != px.format) {
+            if (opt.bits && *opt.bits != px->format) {
                 std::pair<double, double> bounds{0.0, 1.0};
-                if (isFloat(px.format)) bounds = floatBounds(img, opt, boundsNote);
-                convertSampleFormat(px, *opt.bits, bounds.first, bounds.second);
+                if (isFloat(px->format)) bounds = floatBounds(img, opt, boundsNote);
+                px = convertedSource(px, *opt.bits, bounds.first, bounds.second);
             }
-            if (img.hasNaN && isFloat(px.format)) warn(label + ": the data contains NaN/Inf values, which are copied as they are");
+            if (img.hasNaN && isFloat(px->format)) warn(label + ": the data contains NaN/Inf values, which are copied as they are");
             FitsHdu hdu;
-            hdu.pixels = &px;
+            hdu.pixels = px;
             hdu.keywords = img.keywords;
             hdu.extname = img.name;
             hdu.bottomUp = !topDown;
@@ -1358,7 +1367,7 @@ void writeImageSet(FitsFile& fits, const ImageSetOrigin& source, const std::stri
     std::vector<XisfOutImage> out;
     for (size_t idx : indices) {
         FitsImage& img = fits.images[idx];
-        PixelBuffer& px = img.pixels;
+        Source px = sourceOf(img);
         const std::string label = "image " + std::to_string(idx);
 
         // XISF stores rows top-down. FITS rows are bottom-up unless ROWORDER (or the user) says otherwise.
@@ -1368,7 +1377,7 @@ void writeImageSet(FitsFile& fits, const ImageSetOrigin& source, const std::stri
         // (which were written from it, or with it) are the same and the rows are where they were.
         const bool carried = opt.properties && !img.properties.empty();
         bool sameWcs = carried && topDown == img.topDown &&
-                       wcsDigest(img.keywords, px.width, px.height, !img.topDown) == img.wcsDigest;
+                       wcsDigest(img.keywords, px->width, px->height, !img.topDown) == img.wcsDigest;
         if (carried && img.propertiesGiven) {
             // The caller's own properties: a solution among them stands as it is given. Without
             // one, a solution is made from the WCS keywords as for an image without properties.
@@ -1377,40 +1386,40 @@ void writeImageSet(FitsFile& fits, const ImageSetOrigin& source, const std::stri
             sameWcs = solution || !opt.wcs;
         }
         if (!topDown) {
-            flipVertical(px);
-            flipBayerRows(img.keywords, px.height);
+            px = flippedSource(px);
+            flipBayerRows(img.keywords, px->height);
             flipCfaRows(img);
         }
         // PixInsight interprets WCS keywords in the FITS bottom-up convention even though XISF
         // rows are top-down, so keywords describing top-down rows are converted. (Those of an
         // image handed over in memory may describe the other order than its pixels have.)
-        if (img.wcsTopDown ? *img.wcsTopDown : topDown) flipWcsRowOrder(img.keywords, px.height);
+        if (img.wcsTopDown ? *img.wcsTopDown : topDown) flipWcsRowOrder(img.keywords, px->height);
 
         XisfOutImage o;
-        o.pixels = &px;
         o.id = img.name.empty() ? source.defaultName : img.name;
-        o.rgb = px.channels == 3;
+        o.rgb = px->channels == 3;
         std::string boundsNote;
-        if (isFloat(px.format)) {
+        if (isFloat(px->format)) {
             const auto b = floatBounds(img, opt, boundsNote);
             o.lowerBound = b.first;
             o.upperBound = b.second;
             if (img.hasNaN) warn(label + ": the data contains NaN/Inf values, which are copied as they are");
         }
-        if (opt.bits && *opt.bits != px.format) {
-            const bool wasFloat = isFloat(px.format);
-            convertSampleFormat(px, *opt.bits, o.lowerBound, o.upperBound);
-            if (isFloat(px.format) && !wasFloat) {  // integers are normalized to [0,1]
+        if (opt.bits && *opt.bits != px->format) {
+            const bool wasFloat = isFloat(px->format);
+            px = convertedSource(px, *opt.bits, o.lowerBound, o.upperBound);
+            if (isFloat(px->format) && !wasFloat) {  // integers are normalized to [0,1]
                 o.lowerBound = 0;
                 o.upperBound = 1;
             }
         }
-        if (px.channels == 1 && !img.cfaPattern.empty()) {
+        o.pixels = px;
+        if (px->channels == 1 && !img.cfaPattern.empty()) {
             // the colour filter array of a DNG file, of any size (an X-Trans sensor's is 6 x 6)
             o.cfaPattern = img.cfaPattern;
             o.cfaWidth = img.cfaWidth;
             o.cfaHeight = img.cfaHeight;
-        } else if (px.channels == 1) {
+        } else if (px->channels == 1) {
             const FitsKeyword* bp = findKeyword(img.keywords, "BAYERPAT");
             const std::string pattern = bp ? toUpper(fitsUnquote(bp->value)) : std::string();
             auto offsetIsZero = [&](const char* key) {
@@ -1436,7 +1445,7 @@ void writeImageSet(FitsFile& fits, const ImageSetOrigin& source, const std::stri
         } else if (opt.wcs) {
             // The keywords are now in the bottom-up convention PixInsight uses. PixInsight reads only
             // their linear part, so the solution is also written as its native properties.
-            if (!wcsToAstrometricSolution(o.keywords, px.width, px.height, o.properties, solutionNote) &&
+            if (!wcsToAstrometricSolution(o.keywords, px->width, px->height, o.properties, solutionNote) &&
                 !solutionNote.empty()) {
                 warn(label + ": no PixInsight solution properties written: " + solutionNote);
                 solutionNote.clear();

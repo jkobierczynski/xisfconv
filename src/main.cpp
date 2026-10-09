@@ -3,7 +3,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Jurgen Kobierczynski
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <csignal>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -38,6 +40,11 @@ namespace {
 
 struct Error : std::runtime_error {
     using std::runtime_error::runtime_error;
+};
+
+// A call that was stopped (Ctrl-C).
+struct Cancelled : Error {
+    using Error::Error;
 };
 
 // ---------------------------------------------------------------- small helpers
@@ -328,6 +335,39 @@ std::string megabytes(uint64_t bytes) {
 
 // ---------------------------------------------------------------- the library
 
+// Ctrl-C (and a request to terminate): the call that is running stops at its next step, within an
+// image too, and leaves no partly written file; then the run ends. A second Ctrl-C ends the program
+// at once.
+std::atomic<xisfconv_context*> g_context{nullptr};
+volatile std::sig_atomic_t g_interrupted = 0;
+
+extern "C" void onInterrupt(int signal) {
+    g_interrupted = 1;
+    if (xisfconv_context* ctx = g_context.load()) xisfconv_context_cancel(ctx);
+    std::signal(signal, SIG_DFL);
+}
+
+void catchInterrupts(xisfconv_context* ctx) {
+    g_context.store(ctx);
+#ifdef _WIN32
+    std::signal(SIGINT, onInterrupt);
+    std::signal(SIGTERM, onInterrupt);
+#else
+    struct sigaction action {};
+    action.sa_handler = onInterrupt;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = SA_RESTART | SA_RESETHAND;   // (reading and writing go on until the next step; a second one ends the program)
+    sigaction(SIGINT, &action, nullptr);
+    sigaction(SIGTERM, &action, nullptr);
+#endif
+}
+
+// What the run says and returns when it was interrupted.
+int interrupted(const std::string& input) {
+    std::cerr << "xisfconv: interrupted" << (input.empty() ? std::string() : "; " + input + " is not converted") << "\n";
+    return 130;
+}
+
 // One context for the whole run. Its message handler prints the library's warnings and notes
 // the way this program always has.
 struct Library {
@@ -358,6 +398,7 @@ struct Library {
     void check(xisfconv_status status) const {
         if (status == XISFCONV_OK) return;
         if (status == XISFCONV_ERR_MEMORY) throw std::bad_alloc();
+        if (status == XISFCONV_ERR_CANCELLED) throw Cancelled(xisfconv_error_message(ctx));
         throw Error(xisfconv_error_message(ctx));
     }
 };
@@ -1442,6 +1483,11 @@ int verifyFiles(const Library& lib, const Options& opt, const std::vector<Name>&
         xisfconv_report* report = nullptr;
         std::vector<std::string> problems;
         const xisfconv_status status = xisfconv_verify(lib.ctx, f.c_str(), &report);
+        if (g_interrupted) {
+            xisfconv_report_free(report);
+            std::cerr << "xisfconv: interrupted\n";
+            return 130;
+        }
         if (status != XISFCONV_OK) {
             problems.push_back(status == XISFCONV_ERR_MEMORY ? "out of memory" : xisfconv_error_message(lib.ctx));
         } else {
@@ -1599,10 +1645,13 @@ int convertFiles(const Library& lib, Options& opt) {
             ++failures;
             removeEmpty(made);
         } catch (const std::exception& e) {
+            removeEmpty(made);
+            // (a file that failed for another reason before the interrupt came says so)
+            if (g_interrupted && dynamic_cast<const Cancelled*>(&e)) return interrupted(input);
             std::cerr << "error: " << input << ": " << e.what() << "\n";
             ++failures;
-            removeEmpty(made);
         }
+        if (g_interrupted) return interrupted(std::string());
     }
     if ((plan.many || expanded) && !opt.quiet && !(opt.info || opt.dumpHeader || opt.treeJson)) {
         std::cout << "\n" << done << (done == 1 ? " file " : " files ") << (opt.inPlace ? "done" : "converted") << ", " << passedOver
@@ -1628,6 +1677,10 @@ int run(int argc, char** argv) {
         Library lib;
         lib.quiet = opt.quiet;
         xisfconv_context_set_external_files(lib.ctx, opt.externalFiles);
+        catchInterrupts(lib.ctx);
+        struct Release {
+            ~Release() { g_context.store(nullptr); }   // (before the context is freed)
+        } release;
         return convertFiles(lib, opt);
     } catch (const std::bad_alloc&) {
         std::cerr << "xisfconv: out of memory\n";

@@ -13,7 +13,7 @@ abstract: >-
 authors:
   - family-names: Kobierczynski
     given-names: Jurgen
-version: 0.19.0
+version: 0.20.0
 date-released: "2026-10-09"
 repository-code: "https://github.com/jkobierczynski/xisfconv"
 url: "https://github.com/jkobierczynski/xisfconv"

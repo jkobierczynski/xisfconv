@@ -151,10 +151,10 @@ stretch.
 `progress=` takes a function `progress(stage, done, total)`. It is called between the steps of
 the work, in the thread that made the call. A rewrite and a verification have a step per data
 block. A conversion has a step per image while it reads an XISF file; it reads a FITS or ASDF
-file in one step and writes its output in one, as `write` does; only a tile-compressed FITS
-file is written with a report every few megabytes of pixels. So there are many reports for a
-file with many images and few for one large image. An exception that the function raises
-stops the work there and leaves no partly written file.
+file in one step and writes its output in one, as `write` does. Since 0.20 a step that goes on
+is reported again every 8 MiB or so of data, with the stage and numbers of the last report: a
+large image gives many reports too. An exception that the function raises stops the work there
+and leaves no partly written file.
 
 Ctrl-C stops the work at the same places, and so does any other signal whose handler raises
 (a SIGTERM handler that ends the program, an alarm that sets a time limit): the exception is
@@ -326,10 +326,11 @@ that a signal handler raises there (an alarm's time limit) can be lost. `Keyboar
 - FITS and ASDF are supported as far as images need them: signed integers are read as unsigned
   if none is negative and as floating point otherwise, and tables are left alone. For
   everything else in those formats use astropy or the asdf package.
-- An image is read and written as a whole, in memory. Reading takes about twice the size of the
-  image for a moment (three times for a compressed file). Writing takes once the size of the
-  image on top of the array, twice for a colour image with the channels last, and about four
-  times when the file is compressed.
+- An array is read and written as a whole, in memory. Reading takes about twice the size of the
+  image for a moment. Writing takes once the size of the image on top of the array, twice for a
+  colour image with the channels last, and for a compressed XISF file at most 256 MiB more
+  (beyond that, temporary files beside it; see "Large images" in the manual of the tool).
+  `convert` and `rewrite` hold no image whole: they read and write it a piece at a time.
 - Not everything of an XISF file is carried by `read_image` and `write`: the saved screen
   stretch, the resolution and the thumbnail are not. The XISF properties are (since 0.15; up to
   0.14 they were read and not written), with the astrometric solution of PixInsight among them,

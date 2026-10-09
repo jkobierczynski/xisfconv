@@ -4,6 +4,7 @@
 #pragma once
 
 #include "common.hpp"
+#include "imagesource.hpp"
 
 namespace xisfconv {
 
@@ -13,6 +14,8 @@ namespace xisfconv {
 //  float-> int   : [lower,upper] mapped to the full integer range, clipped
 //  float-> float : values copied unchanged
 void convertSampleFormat(PixelBuffer& px, SampleFormat target, double lower, double upper);
+// The same for `n` samples, from `src` to `dst`.
+void convertSamples(const uint8_t* src, SampleFormat from, uint8_t* dst, SampleFormat to, size_t n, double lower, double upper);
 
 // Histogram transformation in PixInsight's STF form, on values normalized to [0,1]:
 //   x1 = clip((x - shadows) / (highlights - shadows))
@@ -27,13 +30,18 @@ struct StretchParams {
 // all of them share the averaged statistics, which preserves the color balance.
 std::vector<StretchParams> autoStretch(const PixelBuffer& px, double lower, double upper, size_t colorChannels,
                                        bool linked);
+std::vector<StretchParams> autoStretch(ImageSource& source, double lower, double upper, size_t colorChannels, bool linked);
 
 // Applies the stretch to the first params.size() channels; remaining (alpha) channels are only
 // normalized. The result is Float32 in [0,1].
 void applyStretch(PixelBuffer& px, const std::vector<StretchParams>& params, double lower, double upper);
+// The same for `n` samples of one channel (params nullptr: normalized only).
+void stretchSamples(const uint8_t* src, SampleFormat format, size_t n, const StretchParams* params, double lower, double upper,
+                    float* dst);
 
 // Maps floating point samples from [lower,upper] to [0,1] without clipping (no-op for integers).
 void normalizeFloat(PixelBuffer& px, double lower, double upper);
+void normalizeSamples(uint8_t* data, SampleFormat format, size_t n, double lower, double upper);
 
 // Reverses the row order of every channel plane.
 void flipVertical(PixelBuffer& px);
@@ -75,5 +83,14 @@ void downsample(PixelBuffer& px, const DownsampledSize& size);
 // up), exactly; floating point samples are averaged as doubles, those that are not finite (NaN,
 // Inf) left out (NaN where no neighbour of a colour is finite). The sample format stays.
 void debayerBilinear(PixelBuffer& px, const std::string& pattern);
+
+// The same done to an image read a piece at a time, as it is read: what the functions above make
+// of the whole image, the source gives a piece of. (A source that would come out as it is, is
+// given back as it is.)
+Source convertedSource(Source source, SampleFormat target, double lower, double upper);
+Source stretchedSource(Source source, const std::vector<StretchParams>& params, double lower, double upper);
+Source normalizedSource(Source source, double lower, double upper);
+Source debayeredSource(Source source, const std::string& pattern);     // throws as debayerBilinear does
+Source downsampledSource(Source source, const DownsampledSize& size);
 
 }  // namespace xisfconv

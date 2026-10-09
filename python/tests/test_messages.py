@@ -153,6 +153,43 @@ def test_an_exception_in_progress_stops_the_work(tmp_path, many_blocks):
     assert xisfconv.rewrite(many_blocks, tmp_path / "out.xisf", codec="zlib").compressed == 24
 
 
+def test_progress_and_stopping_within_one_image(tmp_path):
+    """Since 0.20 an image is read and written a piece at a time: a long step reports every 8 MiB or
+    so (the last report again), and is stopped there, within one image."""
+    rng = np.random.default_rng(5)
+    data = rng.normal(1000, 50, (2000, 3000)).astype(np.float32)     # 24 MB
+    src = tmp_path / "large.xisf"
+    xisfconv.write(src, data, codec="zlib")
+    calls = []
+    xisfconv.convert(src, tmp_path / "out.tif", stretch=True, progress=lambda *a: calls.append(a))
+    assert {stage for stage, _, _ in calls} == {"reading", "writing"}
+    assert len(calls) > 4                                               # (one image: two reports before 0.20)
+
+    for stop_at in (2, 3, 4):
+        seen = []
+
+        def progress(stage, done, total):
+            seen.append(stage)
+            if len(seen) == stop_at:
+                raise KeyboardInterrupt
+
+        with pytest.raises(KeyboardInterrupt):
+            xisfconv.convert(src, tmp_path / "stopped.fits", progress=progress)
+        assert len(seen) == stop_at
+        assert sorted(os.listdir(tmp_path)) == ["large.xisf", "out.tif"]   # no output, no .part, no temporary file
+    stages = []
+
+    def stop_rewrite(stage, done, total):
+        stages.append((stage, done, total))
+        if len(stages) == 3:
+            raise xisfconv.Cancelled("enough")
+
+    with pytest.raises(xisfconv.Cancelled, match="enough"):
+        xisfconv.rewrite(src, tmp_path / "stopped.xisf", codec="lz4hc", progress=stop_rewrite)
+    assert stages == [("rewriting", 0, 1)] * 3                          # the one block, three times
+    assert sorted(os.listdir(tmp_path)) == ["large.xisf", "out.tif"]
+
+
 def test_progress_is_called_where_the_call_was_made(tmp_path, many_blocks):
     """The progress function is called in the thread of the caller, between two steps of the
     work, and may use the package itself."""

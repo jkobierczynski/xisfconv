@@ -4,6 +4,7 @@
 #include "dng.hpp"
 
 #include <algorithm>
+#include <functional>
 #include <cmath>
 #include <cstdio>
 #include <fstream>
@@ -729,6 +730,7 @@ std::vector<T> decodeChunk(Tiff& tiff, const RawLayout& r, size_t k, uint64_t ro
     for (uint64_t row = 0; row < rows; ++row) {
         T* line = out.data() + row * rowSamples;
         unpackRow(bytes.data() + row * rowBytes, rowSamples, r.bits, tiff.little(), line);
+        progressTick(rowBytes);
         if (r.predictor != 1) {
             // horizontal differences: of the sample one pixel (two, four) to the left
             const uint64_t back = r.spp * (r.predictor == 2 ? 1 : r.predictor == 34892 ? 2 : 4);
@@ -741,11 +743,15 @@ std::vector<T> decodeChunk(Tiff& tiff, const RawLayout& r, size_t k, uint64_t ro
 
 // The samples of the file go to the image (T) as they are, or through the linearization table;
 // they are decoded as C, which holds as many bits as the file's samples have.
+// Each run of samples of a row of a plane goes to `put`, with its place in the image (in bytes,
+// planar).
+using SamplePut = std::function<void(uint64_t at, const uint8_t* data, size_t n)>;
+
 template <typename T, typename C>
-void readSamples(Tiff& tiff, const RawLayout& r, PixelBuffer& px) {
+void readSamples(Tiff& tiff, const RawLayout& r, const SamplePut& put) {
     const uint64_t outWidth = r.right - r.left, outHeight = r.bottom - r.top;
-    T* planes = reinterpret_cast<T*>(px.data.data());
     const uint64_t planeSize = outWidth * outHeight;
+    std::vector<T> run;
     const uint64_t across = r.tiled ? (r.width + r.chunkWidth - 1) / r.chunkWidth : 1;
     for (size_t k = 0; k < r.offsets.size(); ++k) {
         const uint64_t x0 = r.tiled ? (k % across) * r.chunkWidth : 0;
@@ -754,18 +760,21 @@ void readSamples(Tiff& tiff, const RawLayout& r, PixelBuffer& px) {
         const uint64_t validWidth = std::min(r.chunkWidth, r.width - x0), validRows = std::min(rows, r.height - y0);
         const std::string name = (r.tiled ? "tile " : "strip ") + std::to_string(k);
         const std::vector<C> chunk = decodeChunk<C>(tiff, r, k, rows, validWidth, validRows, name);
-        for (uint64_t row = 0; row < validRows; ++row) {
+        // the columns of the chunk that are in the active area
+        const uint64_t from = std::max(x0, r.left), to = std::min(x0 + validWidth, r.right);
+        for (uint64_t row = 0; row < validRows && from < to; ++row) {
             const uint64_t y = y0 + row;
             if (y < r.top || y >= r.bottom) continue;
             const C* line = chunk.data() + row * r.chunkWidth * r.spp;
-            for (uint64_t col = 0; col < validWidth; ++col) {
-                const uint64_t x = x0 + col;
-                if (x < r.left || x >= r.right) continue;
-                for (unsigned s = 0; s < r.spp; ++s) {
-                    uint64_t v = line[col * r.spp + s];
+            for (unsigned s = 0; s < r.spp; ++s) {
+                run.resize(static_cast<size_t>(to - from));
+                for (uint64_t x = from; x < to; ++x) {
+                    uint64_t v = line[(x - x0) * r.spp + s];
                     if (!r.linearization.empty()) v = r.linearization[static_cast<size_t>(std::min<uint64_t>(v, r.linearization.size() - 1))];
-                    planes[s * planeSize + (y - r.top) * outWidth + (x - r.left)] = static_cast<T>(v);
+                    run[static_cast<size_t>(x - from)] = static_cast<T>(v);
                 }
+                put((s * planeSize + (y - r.top) * outWidth + (from - r.left)) * sizeof(T), reinterpret_cast<const uint8_t*>(run.data()),
+                    run.size() * sizeof(T));
             }
         }
         progress("reading", k + 1, r.offsets.size());
@@ -807,7 +816,7 @@ bool looksLikeDng(const std::string& path) {
 }
 
 // readDng; `digest`, if given, names the digest of the raw data the file carries ("" if none).
-static FitsFile readDngFile(const std::string& path, bool headersOnly, std::string* digest) {
+static FitsFile readDngFile(const std::string& path, bool headersOnly, std::string* digest, bool inPieces = false) {
     Tiff tiff(path);
     Directories dirs = readDirectories(tiff);
     if (digest) {
@@ -1078,24 +1087,35 @@ static FitsFile readDngFile(const std::string& path, bool headersOnly, std::stri
 
     if (!headersOnly) {
         checkChunks();
-        px.data.resize(static_cast<size_t>(checkedMul(px.samples(), sampleBytes(px.format), "the size of the image")));
-        if (px.format == SampleFormat::UInt32) readSamples<uint32_t, uint32_t>(tiff, r, px);
-        else if (r.bits > 16) readSamples<uint16_t, uint32_t>(tiff, r, px);
-        else readSamples<uint16_t, uint16_t>(tiff, r, px);
+        const uint64_t bytes = checkedMul(px.samples(), sampleBytes(px.format), "the size of the image");
+        SamplePut put;
+        std::shared_ptr<Store> store;
+        if (inPieces) {
+            // (into memory, or a temporary file where the image is large)
+            store = std::make_shared<Store>(bytes);
+            put = [&](uint64_t at, const uint8_t* data, size_t n) { store->write(at, data, n); };
+        } else {
+            px.data.resize(static_cast<size_t>(bytes));
+            put = [&](uint64_t at, const uint8_t* data, size_t n) { std::memcpy(px.data.data() + at, data, n); };
+        }
+        if (px.format == SampleFormat::UInt32) readSamples<uint32_t, uint32_t>(tiff, r, put);
+        else if (r.bits > 16) readSamples<uint16_t, uint32_t>(tiff, r, put);
+        else readSamples<uint16_t, uint16_t>(tiff, r, put);
+        if (store) img.pieces = storedSource(store, px.width, px.height, px.channels, px.format, StoredLayout());
         img.hasData = true;
     }
     file.images.push_back(std::move(img));
     return file;
 }
 
-FitsFile readDng(const std::string& path, bool headersOnly) { return readDngFile(path, headersOnly, nullptr); }
+FitsFile readDng(const std::string& path, bool headersOnly, bool inPieces) { return readDngFile(path, headersOnly, nullptr, inPieces); }
 
 VerifyReport verifyDng(const std::string& path) {
     VerifyReport report;
     FitsFile file;
     std::string digest;
     try {
-        file = readDngFile(path, false, &digest);
+        file = readDngFile(path, false, &digest, true);   // (the raw image decoded into a store, not into memory)
     } catch (const Unsupported& e) {
         // (a raw image this reader does not decode, in a file that may well be intact)
         report.summary = "the raw image is not read";

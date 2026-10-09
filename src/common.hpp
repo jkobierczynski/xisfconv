@@ -91,11 +91,18 @@ public:
 private:
     ProgressHandler handler_;
     const ProgressHandler* previous_;
+    const char* stage_;   // the last report of the call it is made from (progressTick)
+    uint64_t done_, total_, since_;
 };
 
 // Reports to the handler of the calling thread, if there is one. Throws Error (Cancelled) when
 // the handler asks to stop; files being written are removed on the way out.
 void progress(const char* stage, uint64_t done, uint64_t total);
+// A sign of life in the middle of a long step, and the chance to stop it: `bytes` more were read
+// or written. Every 8 MiB or so the handler gets the last report of the call again (as if the
+// step had begun once more), and may stop the work there as it may at any report. A call that has
+// reported nothing is not reported on.
+void progressTick(uint64_t bytes);
 
 enum class SampleFormat { UInt8, UInt16, UInt32, UInt64, Float32, Float64 };
 

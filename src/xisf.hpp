@@ -13,7 +13,9 @@
 #include <string>
 #include <vector>
 
+#include "bytes.hpp"
 #include "common.hpp"
+#include "imagesource.hpp"
 #include "property.hpp"
 #include "xisfblocks.hpp"
 #include "xml.hpp"
@@ -119,6 +121,19 @@ struct XisfStoredBlock {
 
 enum class XisfChecksumState { None, Verified, Unsupported };
 
+// A data block where it is stored, before it is read: its bytes are read from there a piece at
+// a time (the attachment in the file, the block in another file; the text of an inline or
+// embedded block is decoded into memory).
+struct XisfBlockView {
+    std::shared_ptr<RandomBytes> bytes;
+    std::string compression, subblocks, checksum;   // attribute text (empty if absent)
+    bool attachment = false;
+    uint64_t position = 0;
+    bool external = false;
+    bool indexed = false;
+    uint64_t indexUncompressedLength = 0;
+};
+
 class XisfFile {
 public:
     // `redirect`: see XisfBlocksRedirect.
@@ -165,6 +180,10 @@ public:
 
     // Decodes the pixel data of image `index` into host byte order, planar layout.
     PixelBuffer readPixels(size_t index, bool verifyChecksum);
+    // The same a piece at a time. The checksum is verified and a compressed block decompressed
+    // (into memory, or a temporary file where it is large) before it returns; an uncompressed
+    // block is read from the file as the pieces are asked for. The source may outlive this object.
+    Source pixelSource(size_t index, bool verifyChecksum);
 
     // Reads an image's embedded ICC profile (empty if none).
     std::vector<uint8_t> readIccProfile(size_t index, bool verifyChecksum);
@@ -173,6 +192,14 @@ public:
     // element with a location attribute; `what` names it in error messages.
     const xml::Node& root() const { return *root_; }
     XisfStoredBlock readStoredBlock(const xml::Node& element, const std::string& what);
+    XisfBlockView openStoredBlock(const xml::Node& element, const std::string& what);
+    // verifyBlockChecksum and decodeBlock for a block that is read a piece at a time. The block
+    // that decodedBlock gives is the stored one where it is not compressed, else a Store.
+    static XisfChecksumState verifyBlockChecksum(RandomBytes& bytes, const std::string& checksum, const std::string& what);
+    static std::shared_ptr<RandomBytes> decodedBlock(const XisfBlockView& block, const std::string& what, uint64_t expectedSize = 0);
+    // Decompresses a compressed block to `out` (still byte-shuffled, if it was), with the checks
+    // of decodeBlock.
+    static void decodeBlockTo(const XisfBlockView& block, const std::string& what, uint64_t expectedSize, ByteSink& out);
     // The size the block of an element is stored with, as far as the header (or the index of
     // its data blocks file) tells without reading it; 0 if it does not.
     uint64_t storedBlockSize(const xml::Node& element) const;
@@ -211,7 +238,6 @@ public:
 
 private:
     std::string path_;
-    std::ifstream file_;
     uint64_t fileSize_ = 0;
     bool headerFile_ = false;
     std::unique_ptr<XisfExternalFiles> external_;
@@ -240,7 +266,8 @@ private:
 
     void parseImage(const xml::Node& node);
     XisfProperty parseProperty(const xml::Node& node);
-    std::vector<uint8_t> readAttachment(uint64_t position, uint64_t size);
+    std::shared_ptr<RawFile> raw_;   // the file, open while the object lives (and while a source of its pixels does)
+    std::map<std::string, std::weak_ptr<RawFile>> opened_;   // the other files of the unit that blocks read from now, by resolved path
 };
 
 // True for the types of vector and matrix properties whose values XisfFile::readNumericProperty

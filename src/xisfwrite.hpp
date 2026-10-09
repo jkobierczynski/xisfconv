@@ -9,12 +9,13 @@
 #include <vector>
 
 #include "common.hpp"
+#include "imagesource.hpp"
 #include "property.hpp"
 
 namespace xisfconv {
 
 struct XisfOutImage {
-    const PixelBuffer* pixels = nullptr;  // host byte order, planar, rows top-down
+    Source pixels;                        // rows top-down; read a piece at a time as the image is written
     std::string id;                       // image identifier (made a valid, unique identifier on write)
     bool rgb = false;                     // colorSpace RGB (else Gray)
     double lowerBound = 0, upperBound = 1;  // representable range of floating point samples

@@ -53,7 +53,7 @@
 #include <stdint.h>
 
 #define XISFCONV_VERSION_MAJOR 0
-#define XISFCONV_VERSION_MINOR 19
+#define XISFCONV_VERSION_MINOR 20
 #define XISFCONV_VERSION_PATCH 0
 
 #if defined(XISFCONV_STATIC)
@@ -147,7 +147,9 @@ typedef void (*xisfconv_message_fn)(void *user, xisfconv_message_level level, co
  * word ("reading", "writing", "compressing", "rewriting", "comparing", "verifying"); `total` is 0
  * when the amount of work is not known. ("compressing", for tile-compressed FITS, counts the
  * rows of the image being written: it starts again with every image, every 8 MiB or so of
- * pixels, and is not called once more when an image is complete.) Return 0 to go on, anything else to stop: the call in progress
+ * pixels, and is not called once more when an image is complete.) Since 0.20 a step that goes on
+ * is reported again every 8 MiB or so of data, with the stage and the numbers of the last report:
+ * a call is stopped there too, in the middle of one image. Return 0 to go on, anything else to stop: the call in progress
  * then returns XISFCONV_ERR_CANCELLED and leaves no partly written file behind. */
 typedef int32_t (*xisfconv_progress_fn)(void *user, const char *stage, uint64_t done, uint64_t total);
 

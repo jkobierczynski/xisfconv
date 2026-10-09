@@ -975,6 +975,59 @@ static void test_kept_messages_and_cancel(xisfconv_context *ctx) {
     xisfconv_report_free(report);
 }
 
+/* Since 0.20 an image is read and written a piece at a time: a long step reports more than once
+ * (every 8 MiB or so the last report again) and is stopped there, within one image. */
+static void test_pieces(xisfconv_context *ctx) {
+    enum { LW = 4000, LH = 3000 };
+    xisfconv_writer *w = NULL;
+    xisfconv_image img;
+    xisfconv_write_options wo;
+    progress steps;
+    canceller stop;
+    uint16_t *pixels = (uint16_t *)malloc(sizeof(uint16_t) * LW * LH);
+    size_t i;
+    if (!pixels) {
+        CHECK(0, "memory for a large image");
+        return;
+    }
+    for (i = 0; i < (size_t)LW * LH; ++i) pixels[i] = (uint16_t)((i * 2654435761u) >> 16);   /* (does not compress) */
+    xisfconv_write_options_init(&wo, sizeof wo);
+    wo.codec = XISFCONV_CODEC_ZLIB;
+    wo.overwrite = 1;
+    xisfconv_image_init(&img, sizeof img);
+    img.pixels = pixels;
+    img.width = LW;
+    img.height = LH;
+    img.channels = 1;
+    img.sample_format = XISFCONV_SAMPLE_UINT16;
+    img.row_order = XISFCONV_ROWS_TOP_DOWN;
+    memset(&steps, 0, sizeof steps);
+    xisfconv_context_set_progress_handler(ctx, on_progress, &steps);
+    CHECK(xisfconv_writer_new(ctx, path_of("large.xisf"), &wo, &w) == XISFCONV_OK && xisfconv_writer_add_image(w, &img) == XISFCONV_OK &&
+              xisfconv_writer_finish(w) == XISFCONV_OK,
+          "a large image written");
+    CHECK(steps.calls >= 2, "writing one large image reports progress more than once");
+    steps.calls = 0;
+    CHECK(xisfconv_convert(ctx, path_of("large.xisf"), path_of("large.fits"), NULL) == XISFCONV_OK && steps.calls >= 4,
+          "so does converting it");
+    memset(&stop, 0, sizeof stop);
+    stop.ctx = ctx;
+    stop.cancel_at = 3;
+    xisfconv_context_set_progress_handler(ctx, on_progress_cancel, &stop);
+    CHECK(xisfconv_convert(ctx, path_of("large.xisf"), path_of("large-stopped.tif"), NULL) == XISFCONV_ERR_CANCELLED &&
+              !file_exists(path_of("large-stopped.tif")) && !file_exists(path_of("large-stopped.tif.part")),
+          "a conversion of one image is stopped within it, and nothing is left behind");
+    stop.calls = 0;
+    stop.cancel_at = 2;   /* (the block is copied in three reports: the step, and two every 8 MiB) */
+    CHECK(xisfconv_rewrite(ctx, path_of("large.xisf"), path_of("large-stopped.xisf"), NULL, NULL) == XISFCONV_ERR_CANCELLED &&
+              !file_exists(path_of("large-stopped.xisf")) && !file_exists(path_of("large-stopped.xisf.part")),
+          "so is a rewrite of one block");
+    xisfconv_context_set_progress_handler(ctx, NULL, NULL);
+    remove(path_of("large.xisf"));
+    remove(path_of("large.fits"));
+    free(pixels);
+}
+
 /* A host's progress handler, as an interpreter would give it. */
 typedef struct {
     int reports, answer_at;
@@ -2661,6 +2714,7 @@ int main(int argc, char **argv) {
     test_tile_compression(ctx);
     test_callbacks(ctx);
     test_kept_messages_and_cancel(ctx);
+    test_pieces(ctx);
     test_host_progress(ctx);
     test_stretch_and_wcs(ctx);
     test_fits_header(ctx);

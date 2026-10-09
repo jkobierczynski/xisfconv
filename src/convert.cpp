@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <memory>
 #include <type_traits>
 
 namespace xisfconv {
@@ -68,14 +69,13 @@ void dispatchTarget(const uint8_t* src, uint8_t* dst, size_t n, SampleFormat tar
 
 }  // namespace
 
-void convertSampleFormat(PixelBuffer& px, SampleFormat target, double lower, double upper) {
-    if (px.format == target) return;
+void convertSamples(const uint8_t* src, SampleFormat from, uint8_t* dst, SampleFormat target, size_t n, double lower, double upper) {
     if (!(upper > lower)) { lower = 0; upper = 1; }
-    const size_t n = static_cast<size_t>(px.samples());
-    std::vector<uint8_t> out(n * sampleBytes(target));
-    const uint8_t* src = px.data.data();
-    uint8_t* dst = out.data();
-    switch (px.format) {
+    if (from == target) {
+        std::memcpy(dst, src, n * sampleBytes(from));
+        return;
+    }
+    switch (from) {
         case SampleFormat::UInt8: dispatchTarget<uint8_t>(src, dst, n, target, lower, upper); break;
         case SampleFormat::UInt16: dispatchTarget<uint16_t>(src, dst, n, target, lower, upper); break;
         case SampleFormat::UInt32: dispatchTarget<uint32_t>(src, dst, n, target, lower, upper); break;
@@ -83,19 +83,25 @@ void convertSampleFormat(PixelBuffer& px, SampleFormat target, double lower, dou
         case SampleFormat::Float32: dispatchTarget<float>(src, dst, n, target, lower, upper); break;
         case SampleFormat::Float64: dispatchTarget<double>(src, dst, n, target, lower, upper); break;
     }
+}
+
+void convertSampleFormat(PixelBuffer& px, SampleFormat target, double lower, double upper) {
+    if (px.format == target) return;
+    const size_t n = static_cast<size_t>(px.samples());
+    std::vector<uint8_t> out(n * sampleBytes(target));
+    convertSamples(px.data.data(), px.format, out.data(), target, n, lower, upper);
     px.data.swap(out);
     px.format = target;
 }
 
 namespace {
 
-// Reads channel `c`, normalized to [0,1] (integers by their full range, floats by [lower,upper]).
-// With step > 1 only every step-th sample is read (for statistics).
+// Appends samples first, first + step, ... (below count) of `data`, normalized to [0,1]
+// (integers by their full range, floats by [lower,upper]).
 template <class T>
-void readNormalized(const PixelBuffer& px, uint64_t c, double lower, double upper, size_t step,
-                    std::vector<float>& out) {
-    const size_t n = static_cast<size_t>(px.planeSamples());
-    const T* src = reinterpret_cast<const T*>(px.data.data()) + c * n;
+void appendNormalized(const uint8_t* data, size_t count, size_t first, size_t step, double lower, double upper,
+                      std::vector<float>& out) {
+    const T* src = reinterpret_cast<const T*>(data);
     double offset = 0, scale = 1;
     if (std::is_floating_point<T>::value) {
         offset = lower;
@@ -103,9 +109,7 @@ void readNormalized(const PixelBuffer& px, uint64_t c, double lower, double uppe
     } else {
         scale = 1.0 / maxValue<T>();
     }
-    out.clear();
-    out.reserve(n / step + 1);
-    for (size_t i = 0; i < n; i += step) {
+    for (size_t i = first; i < count; i += step) {
         double v = (static_cast<double>(src[i]) - offset) * scale;
         if (!(v > 0)) v = 0;  // also NaN
         if (v > 1) v = 1;
@@ -113,16 +117,16 @@ void readNormalized(const PixelBuffer& px, uint64_t c, double lower, double uppe
     }
 }
 
-void channelNormalized(const PixelBuffer& px, uint64_t c, double lower, double upper, size_t step,
-                       std::vector<float>& out) {
+void normalizedSamples(const uint8_t* data, SampleFormat format, size_t count, size_t first, size_t step, double lower,
+                       double upper, std::vector<float>& out) {
     if (!(upper > lower)) { lower = 0; upper = 1; }
-    switch (px.format) {
-        case SampleFormat::UInt8: readNormalized<uint8_t>(px, c, lower, upper, step, out); break;
-        case SampleFormat::UInt16: readNormalized<uint16_t>(px, c, lower, upper, step, out); break;
-        case SampleFormat::UInt32: readNormalized<uint32_t>(px, c, lower, upper, step, out); break;
-        case SampleFormat::UInt64: readNormalized<uint64_t>(px, c, lower, upper, step, out); break;
-        case SampleFormat::Float32: readNormalized<float>(px, c, lower, upper, step, out); break;
-        case SampleFormat::Float64: readNormalized<double>(px, c, lower, upper, step, out); break;
+    switch (format) {
+        case SampleFormat::UInt8: appendNormalized<uint8_t>(data, count, first, step, lower, upper, out); break;
+        case SampleFormat::UInt16: appendNormalized<uint16_t>(data, count, first, step, lower, upper, out); break;
+        case SampleFormat::UInt32: appendNormalized<uint32_t>(data, count, first, step, lower, upper, out); break;
+        case SampleFormat::UInt64: appendNormalized<uint64_t>(data, count, first, step, lower, upper, out); break;
+        case SampleFormat::Float32: appendNormalized<float>(data, count, first, step, lower, upper, out); break;
+        case SampleFormat::Float64: appendNormalized<double>(data, count, first, step, lower, upper, out); break;
     }
 }
 
@@ -146,19 +150,32 @@ inline double mtf(double m, double x) {
 
 }  // namespace
 
-std::vector<StretchParams> autoStretch(const PixelBuffer& px, double lower, double upper, size_t colorChannels,
-                                       bool linked) {
+std::vector<StretchParams> autoStretch(ImageSource& source, double lower, double upper, size_t colorChannels, bool linked) {
     constexpr double kShadowsClip = -2.8;     // in units of normalized MAD
     constexpr double kTargetBackground = 0.25;
-    constexpr size_t kMaxSamples = 4u << 20;  // statistics on at most ~4M samples per channel
+    constexpr uint64_t kMaxSamples = 4u << 20;  // statistics on at most ~4M samples per channel
 
-    const size_t channels = std::min<size_t>(colorChannels, static_cast<size_t>(px.channels));
-    const size_t n = static_cast<size_t>(px.planeSamples());
-    const size_t step = std::max<size_t>(1, n / kMaxSamples);
+    const size_t channels = std::min<size_t>(colorChannels, static_cast<size_t>(source.channels));
+    const uint64_t n = source.width * source.height;
+    const uint64_t step = std::max<uint64_t>(1, n / kMaxSamples);
     std::vector<double> med(channels), madn(channels);
     std::vector<float> buf;
     for (size_t c = 0; c < channels; ++c) {
-        channelNormalized(px, c, lower, upper, step, buf);
+        // every step-th sample of the channel, counted from its first one
+        buf.clear();
+        buf.reserve(static_cast<size_t>(n / step + 1));
+        const uint64_t rows = rowsPerPiece(source.rowBytes());
+        std::vector<uint8_t> band(static_cast<size_t>(std::min(rows, source.height) * source.rowBytes()));
+        for (uint64_t y = 0; y < source.height; y += rows) {
+            const uint64_t count = std::min(rows, source.height - y);
+            const uint64_t begin = y * source.width, end = (y + count) * source.width;
+            const uint64_t first = (begin + step - 1) / step * step;   // the first sample of the band that is taken
+            if (first >= end) continue;
+            source.readRows(c, y, count, band.data());
+            normalizedSamples(band.data(), source.format, static_cast<size_t>(end - begin), static_cast<size_t>(first - begin),
+                              static_cast<size_t>(step), lower, upper, buf);
+            progressTick(count * source.rowBytes());
+        }
         med[c] = median(buf);
         for (auto& v : buf) v = static_cast<float>(std::fabs(v - med[c]));
         madn[c] = 1.4826 * median(buf);
@@ -192,43 +209,56 @@ std::vector<StretchParams> autoStretch(const PixelBuffer& px, double lower, doub
     return out;
 }
 
+std::vector<StretchParams> autoStretch(const PixelBuffer& px, double lower, double upper, size_t colorChannels, bool linked) {
+    return autoStretch(*borrowedSource(px), lower, upper, colorChannels, linked);
+}
+
+void stretchSamples(const uint8_t* src, SampleFormat format, size_t n, const StretchParams* params, double lower, double upper,
+                    float* dst) {
+    std::vector<float> buf;
+    buf.reserve(n);
+    normalizedSamples(src, format, n, 0, 1, lower, upper, buf);
+    if (!params) {
+        std::copy(buf.begin(), buf.end(), dst);
+        return;
+    }
+    const StretchParams& p = *params;
+    const double range = p.highlights - p.shadows;
+    const double erange = p.high - p.low;
+    for (size_t i = 0; i < n; ++i) {
+        double x = range > 0 ? (buf[i] - p.shadows) / range : (buf[i] >= p.highlights ? 1.0 : 0.0);
+        x = mtf(p.midtones, std::min(1.0, std::max(0.0, x)));
+        if (erange > 0 && (p.low != 0 || p.high != 1)) x = (x - p.low) / erange;
+        dst[i] = static_cast<float>(std::min(1.0, std::max(0.0, x)));
+    }
+}
+
 void applyStretch(PixelBuffer& px, const std::vector<StretchParams>& params, double lower, double upper) {
     const size_t n = static_cast<size_t>(px.planeSamples());
+    const size_t sb = sampleBytes(px.format);
     std::vector<uint8_t> outBytes(static_cast<size_t>(px.samples()) * sizeof(float));
     float* out = reinterpret_cast<float*>(outBytes.data());
-    std::vector<float> buf;
     for (uint64_t c = 0; c < px.channels; ++c) {
-        channelNormalized(px, c, lower, upper, 1, buf);
-        float* dst = out + c * n;
-        if (c >= params.size()) {
-            std::copy(buf.begin(), buf.end(), dst);
-            continue;
-        }
-        const StretchParams& p = params[c];
-        const double range = p.highlights - p.shadows;
-        const double erange = p.high - p.low;
-        for (size_t i = 0; i < n; ++i) {
-            double x = range > 0 ? (buf[i] - p.shadows) / range : (buf[i] >= p.highlights ? 1.0 : 0.0);
-            x = mtf(p.midtones, std::min(1.0, std::max(0.0, x)));
-            if (erange > 0 && (p.low != 0 || p.high != 1)) x = (x - p.low) / erange;
-            dst[i] = static_cast<float>(std::min(1.0, std::max(0.0, x)));
-        }
+        stretchSamples(px.data.data() + c * n * sb, px.format, n, c < params.size() ? &params[c] : nullptr, lower, upper, out + c * n);
     }
     px.data.swap(outBytes);
     px.format = SampleFormat::Float32;
 }
 
-void normalizeFloat(PixelBuffer& px, double lower, double upper) {
-    if (!isFloat(px.format) || !(upper > lower) || (lower == 0 && upper == 1)) return;
-    const size_t n = static_cast<size_t>(px.samples());
+void normalizeSamples(uint8_t* data, SampleFormat format, size_t n, double lower, double upper) {
+    if (!isFloat(format) || !(upper > lower) || (lower == 0 && upper == 1)) return;
     const double scale = 1.0 / (upper - lower);
-    if (px.format == SampleFormat::Float32) {
-        float* p = reinterpret_cast<float*>(px.data.data());
+    if (format == SampleFormat::Float32) {
+        float* p = reinterpret_cast<float*>(data);
         for (size_t i = 0; i < n; ++i) p[i] = static_cast<float>((static_cast<double>(p[i]) - lower) * scale);
     } else {
-        double* p = reinterpret_cast<double*>(px.data.data());
+        double* p = reinterpret_cast<double*>(data);
         for (size_t i = 0; i < n; ++i) p[i] = (p[i] - lower) * scale;
     }
+}
+
+void normalizeFloat(PixelBuffer& px, double lower, double upper) {
+    normalizeSamples(px.data.data(), px.format, static_cast<size_t>(px.samples()), lower, upper);
 }
 
 void flipVertical(PixelBuffer& px) {
@@ -326,8 +356,10 @@ std::vector<Span> spans(uint64_t from, uint64_t to) {
     return out;
 }
 
-template <class T>
-void downsamplePlane(const T* src, uint64_t stride, T* dst, const std::vector<Span>& columns, const std::vector<Span>& rows) {
+// Output rows [0, rowCount) of a plane, which are the rows of `rowSpans`; `rowAt(y)` gives row y
+// of the image (any row the spans cover).
+template <class T, class Rows>
+void downsamplePlane(Rows&& rowAt, T* dst, const std::vector<Span>& columns, const Span* rowSpans, size_t rowCount) {
     // (the type is asked for where it is needed: a constant of this function is not one inside the lambda
     // below for every compiler)
     const size_t outW = columns.size();
@@ -336,7 +368,7 @@ void downsamplePlane(const T* src, uint64_t stride, T* dst, const std::vector<Sp
     uint64_t reduced = std::numeric_limits<uint64_t>::max();   // the row of the image that rowSum holds
     auto reduce = [&](uint64_t y) {
         if (y == reduced) return;   // (the last row of one pixel of the picture is often the first of the next)
-        const T* line = src + y * stride;
+        const T* line = rowAt(y);
         for (size_t j = 0; j < outW; ++j) {
             const Span& c = columns[j];
             double s = 0, w = 0;
@@ -354,8 +386,8 @@ void downsamplePlane(const T* src, uint64_t stride, T* dst, const std::vector<Sp
         }
         reduced = y;
     };
-    for (size_t r = 0; r < rows.size(); ++r) {
-        const Span& rowSpan = rows[r];
+    for (size_t r = 0; r < rowCount; ++r) {
+        const Span& rowSpan = rowSpans[r];
         std::fill(sum.begin(), sum.end(), 0.0);
         std::fill(share.begin(), share.end(), 0.0);
         for (uint64_t k = 0; k < rowSpan.count; ++k) {
@@ -376,7 +408,7 @@ void downsamplePlane(const T* src, uint64_t stride, T* dst, const std::vector<Sp
                     mean = 0;
                     for (uint64_t ky = 0; ky < rowSpan.count; ++ky) {
                         const double py = ky == 0 ? rowSpan.firstShare : ky + 1 == rowSpan.count ? rowSpan.lastShare : 1.0;
-                        const T* line = src + (rowSpan.first + ky) * stride;
+                        const T* line = rowAt(rowSpan.first + ky);
                         const Span& c = columns[j];
                         for (uint64_t kx = 0; kx < c.count; ++kx) {
                             const double px = kx == 0 ? c.firstShare : kx + 1 == c.count ? c.lastShare : 1.0;
@@ -400,13 +432,17 @@ void downsamplePlane(const T* src, uint64_t stride, T* dst, const std::vector<Sp
 
 namespace {
 
-template <typename T>
-void debayerPlanes(const T* src, uint64_t width, uint64_t height, const int colour[2][2], T* out) {
-    const uint64_t plane = width * height;
-    for (uint64_t y = 0; y < height; ++y) {
+// Rows [y0, y1) of the three planes, each (y1 - y0) * width samples at `out`; `rowAt(y)` gives row
+// y of the mosaic (from y0 - 1 to y1, within the image).
+template <typename T, class Rows>
+void debayerPlanes(Rows&& rowAt, uint64_t width, uint64_t height, uint64_t y0, uint64_t y1, const int colour[2][2], T* out) {
+    const uint64_t plane = width * (y1 - y0);
+    for (uint64_t y = y0; y < y1; ++y) {
+        const T* rows[3] = {y ? rowAt(y - 1) : nullptr, rowAt(y), y + 1 < height ? rowAt(y + 1) : nullptr};
+        auto at = [&](uint64_t yy, uint64_t xx) { return rows[yy + 1 - y][xx]; };
         for (uint64_t x = 0; x < width; ++x) {
             const int own = colour[y & 1][x & 1];
-            const T v = src[y * width + x];
+            const T v = at(y, x);
             for (int c = 0; c < 3; ++c) {
                 T result;
                 if (c == own) {
@@ -420,7 +456,7 @@ void debayerPlanes(const T* src, uint64_t width, uint64_t height, const int colo
                         for (uint64_t xx = x ? x - 1 : 0; xx <= x + 1 && xx < width; ++xx) {
                             if ((yy == y && xx == x) || colour[yy & 1][xx & 1] != c) continue;
                             if constexpr (std::is_floating_point<T>::value) {
-                                if (!std::isfinite(src[yy * width + xx])) continue;
+                                if (!std::isfinite(at(yy, xx))) continue;
                             }
                             ++n;
                         }
@@ -430,7 +466,7 @@ void debayerPlanes(const T* src, uint64_t width, uint64_t height, const int colo
                     for (uint64_t yy = y ? y - 1 : 0; yy <= y + 1 && yy < height; ++yy) {
                         for (uint64_t xx = x ? x - 1 : 0; xx <= x + 1 && xx < width; ++xx) {
                             if ((yy == y && xx == x) || colour[yy & 1][xx & 1] != c) continue;
-                            const T w = src[yy * width + xx];
+                            const T w = at(yy, xx);
                             if constexpr (std::is_floating_point<T>::value) {
                                 // (each divided first: a sum of values near the largest double would overflow)
                                 if (std::isfinite(w)) sum += static_cast<double>(w) / static_cast<double>(n);
@@ -448,18 +484,14 @@ void debayerPlanes(const T* src, uint64_t width, uint64_t height, const int colo
                         result = static_cast<T>(quotients + (remainders + n / 2) / n);
                     }
                 }
-                out[static_cast<uint64_t>(c) * plane + y * width + x] = result;
+                out[static_cast<uint64_t>(c) * plane + (y - y0) * width + x] = result;
             }
         }
     }
 }
 
-}  // namespace
-
-void debayerBilinear(PixelBuffer& px, const std::string& pattern) {
-    if (px.channels != 1) throw Error("--debayer: the image has " + std::to_string(px.channels) + " channels, not one", ErrorKind::Argument);
-    if (px.width < 2 || px.height < 2) throw Error("--debayer: an image smaller than 2 x 2 pixels", ErrorKind::Argument);
-    int colour[2][2];
+// The colours of a 2 x 2 pattern of R, G and B (0, 1, 2); throws Error (Argument) for one that is not.
+void patternColours(const std::string& pattern, int colour[2][2]) {
     bool seen[3] = {false, false, false};
     if (pattern.size() != 4) throw Error("--debayer: a pattern of 2 x 2 is needed, not \"" + pattern + "\"", ErrorKind::Argument);
     for (int k = 0; k < 4; ++k) {
@@ -472,27 +504,37 @@ void debayerBilinear(PixelBuffer& px, const std::string& pattern) {
     if (!seen[0] || !seen[1] || !seen[2]) {
         throw Error("--debayer: the pattern \"" + pattern + "\" lacks a colour", ErrorKind::Argument);
     }
+}
+
+// Calls fn with a pointer of the type of the samples.
+template <class F>
+void withType(SampleFormat format, F&& fn) {
+    switch (format) {
+        case SampleFormat::UInt8: fn(static_cast<uint8_t*>(nullptr)); break;
+        case SampleFormat::UInt16: fn(static_cast<uint16_t*>(nullptr)); break;
+        case SampleFormat::UInt32: fn(static_cast<uint32_t*>(nullptr)); break;
+        case SampleFormat::UInt64: fn(static_cast<uint64_t*>(nullptr)); break;
+        case SampleFormat::Float32: fn(static_cast<float*>(nullptr)); break;
+        case SampleFormat::Float64: fn(static_cast<double*>(nullptr)); break;
+    }
+}
+
+}  // namespace
+
+void debayerBilinear(PixelBuffer& px, const std::string& pattern) {
+    if (px.channels != 1) throw Error("--debayer: the image has " + std::to_string(px.channels) + " channels, not one", ErrorKind::Argument);
+    if (px.width < 2 || px.height < 2) throw Error("--debayer: an image smaller than 2 x 2 pixels", ErrorKind::Argument);
+    int colour[2][2];
+    patternColours(pattern, colour);
     const size_t sb = sampleBytes(px.format);
     std::vector<uint8_t> out(static_cast<size_t>(checkedMul(px.planeSamples(), 3, "the size of the image")) * sb);
     const uint8_t* src = px.data.data();
-    switch (px.format) {
-        case SampleFormat::UInt8: debayerPlanes(src, px.width, px.height, colour, out.data()); break;
-        case SampleFormat::UInt16:
-            debayerPlanes(reinterpret_cast<const uint16_t*>(src), px.width, px.height, colour, reinterpret_cast<uint16_t*>(out.data()));
-            break;
-        case SampleFormat::UInt32:
-            debayerPlanes(reinterpret_cast<const uint32_t*>(src), px.width, px.height, colour, reinterpret_cast<uint32_t*>(out.data()));
-            break;
-        case SampleFormat::UInt64:
-            debayerPlanes(reinterpret_cast<const uint64_t*>(src), px.width, px.height, colour, reinterpret_cast<uint64_t*>(out.data()));
-            break;
-        case SampleFormat::Float32:
-            debayerPlanes(reinterpret_cast<const float*>(src), px.width, px.height, colour, reinterpret_cast<float*>(out.data()));
-            break;
-        case SampleFormat::Float64:
-            debayerPlanes(reinterpret_cast<const double*>(src), px.width, px.height, colour, reinterpret_cast<double*>(out.data()));
-            break;
-    }
+    withType(px.format, [&](auto* type) {
+        using T = std::remove_pointer_t<decltype(type)>;
+        const T* mosaic = reinterpret_cast<const T*>(src);
+        debayerPlanes([&](uint64_t y) { return mosaic + y * px.width; }, px.width, px.height, 0, px.height, colour,
+                      reinterpret_cast<T*>(out.data()));
+    });
     px.data = std::move(out);
     px.channels = 3;
 }
@@ -510,28 +552,211 @@ void downsample(PixelBuffer& px, const DownsampledSize& size) {
     for (uint64_t c = 0; c < px.channels; ++c) {
         const uint8_t* src = px.data.data() + static_cast<size_t>(c) * inPlane * sb;
         uint8_t* dst = out.data() + static_cast<size_t>(c) * outPlane * sb;
-        switch (px.format) {
-            case SampleFormat::UInt8: downsamplePlane(src, px.width, dst, columns, rows); break;
-            case SampleFormat::UInt16:
-                downsamplePlane(reinterpret_cast<const uint16_t*>(src), px.width, reinterpret_cast<uint16_t*>(dst), columns, rows);
-                break;
-            case SampleFormat::UInt32:
-                downsamplePlane(reinterpret_cast<const uint32_t*>(src), px.width, reinterpret_cast<uint32_t*>(dst), columns, rows);
-                break;
-            case SampleFormat::UInt64:
-                downsamplePlane(reinterpret_cast<const uint64_t*>(src), px.width, reinterpret_cast<uint64_t*>(dst), columns, rows);
-                break;
-            case SampleFormat::Float32:
-                downsamplePlane(reinterpret_cast<const float*>(src), px.width, reinterpret_cast<float*>(dst), columns, rows);
-                break;
-            case SampleFormat::Float64:
-                downsamplePlane(reinterpret_cast<const double*>(src), px.width, reinterpret_cast<double*>(dst), columns, rows);
-                break;
-        }
+        withType(px.format, [&](auto* type) {
+            using T = std::remove_pointer_t<decltype(type)>;
+            const T* plane = reinterpret_cast<const T*>(src);
+            downsamplePlane([&](uint64_t y) { return plane + y * px.width; }, reinterpret_cast<T*>(dst), columns, rows.data(),
+                            rows.size());
+        });
     }
     px.data.swap(out);
     px.width = size.width;
     px.height = size.height;
+}
+
+// ------------------------------------------------------------------------------------------
+// The same, a piece at a time
+
+namespace {
+
+class ConvertedSource : public ImageSource {
+public:
+    ConvertedSource(Source s, SampleFormat target, double lower, double upper) : s_(std::move(s)), lower_(lower), upper_(upper) {
+        width = s_->width;
+        height = s_->height;
+        channels = s_->channels;
+        format = target;
+    }
+    void readRows(uint64_t channel, uint64_t y, uint64_t rows, uint8_t* out) override {
+        const size_t n = static_cast<size_t>(rows * width);
+        in_.resize(n * sampleBytes(s_->format));
+        s_->readRows(channel, y, rows, in_.data());
+        convertSamples(in_.data(), s_->format, out, format, n, lower_, upper_);
+    }
+
+private:
+    Source s_;
+    double lower_, upper_;
+    std::vector<uint8_t> in_;
+};
+
+class StretchedSource : public ImageSource {
+public:
+    StretchedSource(Source s, std::vector<StretchParams> params, double lower, double upper)
+        : s_(std::move(s)), params_(std::move(params)), lower_(lower), upper_(upper) {
+        width = s_->width;
+        height = s_->height;
+        channels = s_->channels;
+        format = SampleFormat::Float32;
+    }
+    void readRows(uint64_t channel, uint64_t y, uint64_t rows, uint8_t* out) override {
+        const size_t n = static_cast<size_t>(rows * width);
+        in_.resize(n * sampleBytes(s_->format));
+        s_->readRows(channel, y, rows, in_.data());
+        stretchSamples(in_.data(), s_->format, n, channel < params_.size() ? &params_[channel] : nullptr, lower_, upper_,
+                       reinterpret_cast<float*>(out));
+    }
+
+private:
+    Source s_;
+    std::vector<StretchParams> params_;
+    double lower_, upper_;
+    std::vector<uint8_t> in_;
+};
+
+class NormalizedSource : public ImageSource {
+public:
+    NormalizedSource(Source s, double lower, double upper) : s_(std::move(s)), lower_(lower), upper_(upper) {
+        width = s_->width;
+        height = s_->height;
+        channels = s_->channels;
+        format = s_->format;
+    }
+    void readRows(uint64_t channel, uint64_t y, uint64_t rows, uint8_t* out) override {
+        s_->readRows(channel, y, rows, out);
+        normalizeSamples(out, format, static_cast<size_t>(rows * width), lower_, upper_);
+    }
+
+private:
+    Source s_;
+    double lower_, upper_;
+};
+
+// Rows of one channel of a source, a band of them at hand at a time.
+class RowCache {
+public:
+    RowCache(ImageSource& s, uint64_t channel) : s_(s), channel_(channel), rows_(std::max<uint64_t>(3, rowsPerPiece(s.rowBytes()))) {}
+    const uint8_t* row(uint64_t y) {
+        if (y < first_ || y >= first_ + count_) {
+            // (going on to the next band, the row before it is wanted again too: the band begins there)
+            first_ = count_ && y == first_ + count_ ? y - 1 : y;
+            count_ = std::min(rows_, s_.height - first_);
+            band_.resize(static_cast<size_t>(count_ * s_.rowBytes()));
+            s_.readRows(channel_, first_, count_, band_.data());
+        }
+        return band_.data() + (y - first_) * s_.rowBytes();
+    }
+
+private:
+    ImageSource& s_;
+    uint64_t channel_, rows_;
+    uint64_t first_ = 0, count_ = 0;
+    std::vector<uint8_t> band_;
+};
+
+class DebayeredSource : public ImageSource {
+public:
+    DebayeredSource(Source s, const std::string& pattern) : s_(std::move(s)) {
+        if (s_->channels != 1) throw Error("--debayer: the image has " + std::to_string(s_->channels) + " channels, not one", ErrorKind::Argument);
+        if (s_->width < 2 || s_->height < 2) throw Error("--debayer: an image smaller than 2 x 2 pixels", ErrorKind::Argument);
+        patternColours(pattern, colour_);
+        width = s_->width;
+        height = s_->height;
+        channels = 3;
+        format = s_->format;
+    }
+    void readRows(uint64_t channel, uint64_t y, uint64_t rows, uint8_t* out) override {
+        const size_t plane = static_cast<size_t>(rows * rowBytes());
+        if (!(y == y_ && rows == rows_)) {
+            // the three planes of the band at once (TIFF and PNG ask for the channels of a band one
+            // after the other)
+            planes_.resize(3 * plane);
+            // the rows of the band and one above and below it, which are looked at three at a time
+            const uint64_t from = y ? y - 1 : 0, to = std::min(height, y + rows + 1);
+            mosaic_.resize(static_cast<size_t>((to - from) * rowBytes()));
+            s_->readRows(0, from, to - from, mosaic_.data());
+            withType(format, [&](auto* type) {
+                using T = std::remove_pointer_t<decltype(type)>;
+                const T* first = reinterpret_cast<const T*>(mosaic_.data());
+                debayerPlanes([&](uint64_t yy) { return first + (yy - from) * width; }, width, height, y, y + rows, colour_,
+                              reinterpret_cast<T*>(planes_.data()));
+            });
+            y_ = y;
+            rows_ = rows;
+        }
+        std::memcpy(out, planes_.data() + channel * plane, plane);
+    }
+
+private:
+    Source s_;
+    int colour_[2][2];
+    std::vector<uint8_t> planes_, mosaic_;
+    uint64_t y_ = std::numeric_limits<uint64_t>::max(), rows_ = 0;
+};
+
+class DownsampledSource : public ImageSource {
+public:
+    DownsampledSource(Source s, const DownsampledSize& size) : s_(std::move(s)) {
+        if (size.useWidth > s_->width || size.useHeight > s_->height || size.width > size.useWidth || size.height > size.useHeight) {
+            throw Error("a picture cannot be larger than the image it is made of");
+        }
+        columns_ = spans(size.useWidth, size.width);
+        rows_ = spans(size.useHeight, size.height);
+        width = size.width;
+        height = size.height;
+        channels = s_->channels;
+        format = s_->format;
+    }
+    void readRows(uint64_t channel, uint64_t y, uint64_t rows, uint8_t* out) override {
+        // (a band of the channels asked for last is kept: the next piece of a channel begins where
+        // its last one ended; TIFF and PNG ask for the channels of a band one after the other)
+        auto found = std::find_if(caches_.begin(), caches_.end(), [&](const Cache& c) { return c.channel == channel; });
+        if (found == caches_.end()) {
+            if (caches_.size() >= 4) caches_.erase(caches_.begin());
+            caches_.push_back({channel, std::make_unique<RowCache>(*s_, channel)});
+            found = caches_.end() - 1;
+        }
+        RowCache& image = *found->rows;
+        withType(format, [&](auto* type) {
+            using T = std::remove_pointer_t<decltype(type)>;
+            downsamplePlane([&](uint64_t yy) { return reinterpret_cast<const T*>(image.row(yy)); }, reinterpret_cast<T*>(out), columns_,
+                            rows_.data() + y, static_cast<size_t>(rows));
+        });
+    }
+
+private:
+    Source s_;
+    std::vector<Span> columns_, rows_;
+    struct Cache {
+        uint64_t channel;
+        std::unique_ptr<RowCache> rows;
+    };
+    std::vector<Cache> caches_;   // of at most four channels, in the order they came (the first goes first)
+};
+
+}  // namespace
+
+Source convertedSource(Source source, SampleFormat target, double lower, double upper) {
+    if (source->format == target) return source;
+    return std::make_shared<ConvertedSource>(std::move(source), target, lower, upper);
+}
+
+Source stretchedSource(Source source, const std::vector<StretchParams>& params, double lower, double upper) {
+    return std::make_shared<StretchedSource>(std::move(source), params, lower, upper);
+}
+
+Source normalizedSource(Source source, double lower, double upper) {
+    if (!isFloat(source->format) || !(upper > lower) || (lower == 0 && upper == 1)) return source;
+    return std::make_shared<NormalizedSource>(std::move(source), lower, upper);
+}
+
+Source debayeredSource(Source source, const std::string& pattern) {
+    return std::make_shared<DebayeredSource>(std::move(source), pattern);
+}
+
+Source downsampledSource(Source source, const DownsampledSize& size) {
+    if (!size.changes || size.width == 0 || size.height == 0 || source->width == 0 || source->height == 0) return source;
+    return std::make_shared<DownsampledSource>(std::move(source), size);
 }
 
 }  // namespace xisfconv

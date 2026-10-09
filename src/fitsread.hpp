@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "common.hpp"
+#include "imagesource.hpp"
 #include "property.hpp"
 
 namespace xisfconv {
@@ -16,6 +17,9 @@ namespace xisfconv {
 struct FitsImage {
     size_t hduIndex = 0;
     PixelBuffer pixels;                 // host byte order, planar, rows in the order stored in the file
+    // The pixels read a piece at a time, if the reader was asked for that: `pixels` then has
+    // their geometry and format, and no data.
+    Source pieces;
     std::vector<FitsKeyword> keywords;  // every card except the structural ones (strings keep their quotes)
     std::string name;                   // EXTNAME / HDUNAME, if any
     int bitpix = 0;
@@ -66,7 +70,9 @@ struct FitsFile {
 // the pixels of that one image are read and the others are left as headers. The XISF properties
 // a file carries are read in both cases but the last.
 // Throws xisfconv::Error on malformed files.
-FitsFile readFits(const std::string& path, bool headersOnly = false, std::optional<size_t> onlyImage = std::nullopt);
+// With inPieces the pixels are not read into memory: each image gets a source of them (FitsImage::pieces).
+FitsFile readFits(const std::string& path, bool headersOnly = false, std::optional<size_t> onlyImage = std::nullopt,
+                  bool inPieces = false);
 
 // Sets dataMin, dataMax and hasNaN from floating point pixels (no-op for integer data).
 void updateFloatRange(FitsImage& img);

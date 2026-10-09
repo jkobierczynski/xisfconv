@@ -111,11 +111,15 @@ std::string makeIdentifier(const std::string& text, size_t index, std::set<std::
     return unique;
 }
 
-// The bytes stored for one image plus the attributes that describe them.
+// The bytes stored for one image plus the attributes that describe them. They are in memory
+// (the data of a property), held for the file (`stored`: what compression made of an image), or
+// the pixels of an image as they are, which are read from their source as they are written.
 struct Block {
-    const uint8_t* data = nullptr;  // points into `owned` or into the pixel buffer
+    const uint8_t* data = nullptr;  // points into `owned` or into the property
     uint64_t size = 0;
     std::vector<uint8_t> owned;
+    std::shared_ptr<RandomBytes> stored;
+    Source pixels;
     std::string attributes;         // compression / subblocks / checksum, each with a leading space
     uint64_t uncompressed = 0;      // the size before compression, if the block is stored compressed
 };
@@ -160,6 +164,96 @@ void prepareBlock(const uint8_t* raw, size_t rawSize, size_t itemSize, const Xis
         std::string digest;
         if (!xisfDigest(opt.checksum, block.data, n, digest)) throw Error("unsupported checksum algorithm '" + opt.checksum + "'", ErrorKind::Argument);
         block.attributes += " checksum=\"" + opt.checksum + ":" + digest + "\"";
+    }
+}
+
+// The block of an image's pixels. Compressed, they are held first (in memory, or a temporary
+// file beside the output), the bytes of each sample shuffled where asked for, and compressed into
+// another store; uncompressed, they go from their source to the file when it is written.
+void prepareImageBlock(const Source& source, const XisfWriteOptions& opt, Block& block) {
+    const size_t itemSize = sampleBytes(source->format);
+    const uint64_t rawSize = checkedMul(source->samples(), itemSize, "image size");
+    block.size = rawSize;
+    if (!opt.codec.empty() && rawSize > 0) {
+        auto raw = std::make_shared<Store>();
+        raw->reserve(rawSize);
+        forEachBand(*source, [&](uint64_t, uint64_t, uint64_t rows, const uint8_t* data) {
+            raw->append(data, static_cast<size_t>(rows * source->rowBytes()));
+        });
+        const bool shuffle = opt.shuffle && itemSize > 1;
+        std::shared_ptr<RandomBytes> input = raw;
+        if (shuffle) {
+            input = shuffledBytes(raw, itemSize);
+            if (Store::fitsInMemory(rawSize)) {
+                // (in memory, the shuffled bytes are made once; a codec looks at them more than once)
+                auto copy = std::make_shared<Store>();
+                copy->reserve(rawSize);
+                StoreSink sink(*copy);
+                copyBytes(*input, 0, rawSize, sink);
+                input = copy;
+            }
+        }
+        const uint64_t chunk = xisfSubblockSize(opt.codec, opt.subblockSize);
+        auto packed = std::make_shared<Store>();
+        // Compression that makes the block no smaller is given up as soon as that is known: the
+        // pixels are stored as they are then.
+        struct NoGain {};
+        struct Sink : ByteSink {
+            Store& store;
+            uint64_t limit;
+            Sink(Store& s, uint64_t l) : store(s), limit(l) {}
+            void write(const uint8_t* data, size_t n) override {
+                if (store.size() + n >= limit) throw NoGain();
+                store.append(data, n);
+            }
+        } sink(*packed, rawSize);
+        std::string subblocks;
+        size_t chunks = 0;
+        bool gain = true;
+        try {
+            for (uint64_t off = 0; off < rawSize; off += chunk, ++chunks) {
+                const uint64_t n = std::min<uint64_t>(chunk, rawSize - off);
+                const uint64_t before = packed->size();
+                compressBytes(opt.codec, opt.level, *input, off, n, sink);
+                if (!subblocks.empty()) subblocks += ':';
+                subblocks += std::to_string(packed->size() - before) + "," + std::to_string(n);
+            }
+        } catch (const NoGain&) {
+            gain = false;
+        }
+        input.reset();
+        if (gain) {
+            block.stored = packed;
+            block.size = packed->size();
+            block.uncompressed = rawSize;
+            block.attributes += " compression=\"" + opt.codec + (shuffle ? "+sh" : "") + ":" + std::to_string(rawSize) +
+                                (shuffle ? ":" + std::to_string(itemSize) : "") + "\"";
+            if (chunks > 1) block.attributes += " subblocks=\"" + subblocks + "\"";
+        } else {
+            block.stored = raw;   // compression does not pay off: the pixels as they are
+        }
+    } else {
+        block.pixels = source;
+    }
+    if (!opt.checksum.empty()) {
+        // The checksum covers the block as stored (i.e. the compressed bytes).
+        if (!Hasher::known(opt.checksum) || toLower(trim(opt.checksum)) == "md5") {
+            throw Error("unsupported checksum algorithm '" + opt.checksum + "'", ErrorKind::Argument);
+        }
+        Hasher hasher(opt.checksum);
+        if (block.stored) {
+            struct Digest : ByteSink {
+                Hasher& h;
+                explicit Digest(Hasher& hasher) : h(hasher) {}
+                void write(const uint8_t* data, size_t n) override { h.update(data, n); }
+            } digest(hasher);
+            copyBytes(*block.stored, 0, block.size, digest);
+        } else {
+            forEachBand(*source, [&](uint64_t, uint64_t, uint64_t rows, const uint8_t* data) {
+                hasher.update(data, static_cast<size_t>(rows * source->rowBytes()));
+            });
+        }
+        block.attributes += " checksum=\"" + opt.checksum + ":" + hasher.finishHex() + "\"";
     }
 }
 
@@ -259,8 +353,7 @@ void writeXisf(const std::string& path, const std::vector<XisfOutImage>& images,
     std::vector<std::string> ids;
     std::set<std::string> usedIds;
     for (size_t i = 0; i < images.size(); ++i) {
-        const PixelBuffer& px = *images[i].pixels;
-        prepareBlock(px.data.data(), px.data.size(), sampleBytes(px.format), opt, blocks[i]);
+        prepareImageBlock(images[i].pixels, opt, blocks[i]);
         ids.push_back(makeIdentifier(images[i].id, i, usedIds));
     }
 
@@ -289,7 +382,7 @@ void writeXisf(const std::string& path, const std::vector<XisfOutImage>& images,
              "xsi:schemaLocation=\"http://www.pixinsight.com/xisf http://pixinsight.com/xisf/xisf-1.0.xsd\">\n";
         for (size_t i = 0; i < images.size(); ++i) {
             const XisfOutImage& img = images[i];
-            const PixelBuffer& px = *img.pixels;
+            const ImageSource& px = *img.pixels;
             x += "<Image id=\"" + ids[i] + "\" geometry=\"" + std::to_string(px.width) + ":" +
                  std::to_string(px.height) + ":" + std::to_string(px.channels) + "\" sampleFormat=\"" +
                  sampleFormatName(px.format) + "\"";
@@ -342,12 +435,28 @@ void writeXisf(const std::string& path, const std::vector<XisfOutImage>& images,
         const std::vector<char> zeros(kAlignment, 0);
         for (size_t i = 0; i < blocks.size(); ++i) {
             if (positions[i] > pos) out.write(zeros.data(), static_cast<std::streamsize>(positions[i] - pos));
-            // Write in pieces: some platforms limit a single write to 2 GiB.
-            uint64_t done = 0;
-            while (done < blocks[i].size) {
-                const uint64_t n = std::min<uint64_t>(blocks[i].size - done, 1u << 30);
-                out.write(reinterpret_cast<const char*>(blocks[i].data + done), static_cast<std::streamsize>(n));
-                done += n;
+            if (blocks[i].pixels) {
+                ImageSource& px = *blocks[i].pixels;
+                forEachBand(px, [&](uint64_t, uint64_t, uint64_t rows, const uint8_t* data) {
+                    out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(rows * px.rowBytes()));
+                });
+            } else if (blocks[i].stored) {
+                struct File : ByteSink {
+                    std::ofstream& out;
+                    explicit File(std::ofstream& o) : out(o) {}
+                    void write(const uint8_t* data, size_t n) override {
+                        out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(n));
+                    }
+                } file(out);
+                copyBytes(*blocks[i].stored, 0, blocks[i].size, file);
+            } else {
+                // Write in pieces: some platforms limit a single write to 2 GiB.
+                uint64_t done = 0;
+                while (done < blocks[i].size) {
+                    const uint64_t n = std::min<uint64_t>(blocks[i].size - done, 1u << 30);
+                    out.write(reinterpret_cast<const char*>(blocks[i].data + done), static_cast<std::streamsize>(n));
+                    done += n;
+                }
             }
             pos = positions[i] + blocks[i].size;
             if (!out) throw Error("write error on " + name, ErrorKind::Io);

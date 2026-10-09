@@ -178,6 +178,14 @@ public:
     Block read(const XisfLocation& location, const std::string& what);
     // How many bytes that block is stored with, without reading it. Throws as read does.
     uint64_t storedSize(const XisfLocation& location, const std::string& what);
+    // Where that block is, without reading it: the file and the bytes of it. Throws as read does.
+    struct Place {
+        std::string path;                  // the file, as resolve gives it
+        uint64_t position = 0, size = 0;
+        bool indexed = false;              // found through the index of a data blocks file
+        uint64_t uncompressedLength = 0;   // what that index says
+    };
+    Place locate(const XisfLocation& location, const std::string& what);
     // How many bytes the blocks with these identifiers are stored with in the data blocks file at
     // `path` (as resolve gives it), together, and no more than the file has; 0 for a file whose
     // index cannot be read. Does not throw.

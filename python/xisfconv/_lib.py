@@ -15,7 +15,7 @@ from ctypes import (CFUNCTYPE, POINTER, Structure, c_char, c_char_p, c_double, c
 
 # The library version this module was written for. In 0.x every release may change the layout
 # of the structures, so another library is refused.
-API_VERSION = (0, 19)
+API_VERSION = (0, 20)
 
 # ------------------------------------------------------------------------------------------
 # Constants of xisfconv.h

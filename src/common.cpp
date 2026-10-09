@@ -41,15 +41,46 @@ void info(const std::string& message) { emit(MessageLevel::Info, message); }
 
 namespace {
 thread_local const ProgressHandler* t_progress = nullptr;
+// The last report of the call, which a sign of life repeats, and the bytes since then.
+thread_local const char* t_stage = nullptr;
+thread_local uint64_t t_done = 0, t_total = 0, t_since = 0;
+constexpr uint64_t kTickBytes = uint64_t(8) << 20;
 }  // namespace
 
-ProgressScope::ProgressScope(ProgressHandler handler) : handler_(std::move(handler)), previous_(t_progress) { t_progress = &handler_; }
-ProgressScope::~ProgressScope() { t_progress = previous_; }
+// A handler is installed for a call: what an earlier call (or the call this one is made from)
+// reported is not this one's, and comes back when it ends.
+ProgressScope::ProgressScope(ProgressHandler handler)
+    : handler_(std::move(handler)), previous_(t_progress), stage_(t_stage), done_(t_done), total_(t_total), since_(t_since) {
+    t_progress = &handler_;
+    t_stage = nullptr;
+    t_done = t_total = t_since = 0;
+}
+ProgressScope::~ProgressScope() {
+    t_progress = previous_;
+    t_stage = stage_;
+    t_done = done_;
+    t_total = total_;
+    t_since = since_;
+}
 
 void progress(const char* stage, uint64_t done, uint64_t total) {
+    t_stage = stage;
+    t_done = done;
+    t_total = total;
+    t_since = 0;
     const ProgressHandler* handler = t_progress;
     if (!handler || !*handler) return;
     if (!(*handler)(stage, done, total)) throw Error("cancelled", ErrorKind::Cancelled);
+}
+
+void progressTick(uint64_t bytes) {
+    if (!t_stage) return;   // (a call that reports no steps has none to repeat: reading the pixels of an open file)
+    t_since += bytes;
+    if (t_since < kTickBytes) return;
+    t_since = 0;
+    const ProgressHandler* handler = t_progress;
+    if (!handler || !*handler) return;
+    if (!(*handler)(t_stage, t_done, t_total)) throw Error("cancelled", ErrorKind::Cancelled);
 }
 
 std::filesystem::path toPath(const std::string& utf8) {

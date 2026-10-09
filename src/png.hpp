@@ -7,11 +7,12 @@
 #include <vector>
 
 #include "common.hpp"
+#include "imagesource.hpp"
 
 namespace xisfconv {
 
 struct PngImage {
-    const PixelBuffer* pixels = nullptr;  // UInt8 or UInt16, 1-4 channels
+    Source pixels;                        // UInt8 or UInt16, 1-4 channels; read a piece at a time
     bool rgb = false;                     // color image (else grayscale); 4th/2nd channel = alpha
     std::vector<uint8_t> iccProfile;
     double pixelsPerMeter = 0;            // 0 = no pHYs chunk

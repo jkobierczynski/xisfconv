@@ -30,6 +30,7 @@ The decisions:
 - [DNG input (0.18.0)](#dng-input-0180)
 - [Care with files](#care-with-files)
 - [Structure of the code](#structure-of-the-code)
+- [Images in pieces (0.20.0)](#images-in-pieces-0200)
 - [The library (libxisfconv)](#the-library-libxisfconv)
 - [The Python package](#the-python-package)
 - [The manual (`docs/manual.html`)](#the-manual-docsmanualhtml)
@@ -402,6 +403,7 @@ brought are in the sections below.
 | | 0.18.0 | DNG input: the raw image of a DNG file, with its colour filter pattern and the exposure |
 | | 0.18.1 | `--debayer`: colour pictures of a mosaic, for TIFF and PNG |
 | 9 October | 0.19.0 | `--level` and `--no-shuffle`: the compression level and byte shuffling for conversions to XISF and rewrites |
+| | 0.20.0 | Images read and written a piece at a time; BigTIFF; Ctrl-C within one image |
 
 ## Purpose and scope
 
@@ -1066,8 +1068,10 @@ them. The choices:
 - One module per format or concern in `src/`: `xisf`, `xisfwrite`, `xisfrewrite`, `fits`,
   `fitsread`, `fitstile`, `asdf`, `yaml`, `xml`, `tiff`, `png`, `wcs`, `property` (XISF
   properties as they go from one format to another), `dng` (the DNG reader, and its decoder of
-  lossless JPEG), `convert` (sample formats, stretch),
-  `codecs` (compression, digests), `common`.
+  lossless JPEG), `convert` (sample formats, stretch, and the same as sources),
+  `codecs` (compression, digests, both also a piece at a time), `bytes` (files read at any place,
+  data kept in memory or a temporary file), `imagesource` (an image read a piece at a time),
+  `common`.
 - `pipeline` holds the conversion of whole files. It takes an options struct and prints nothing.
   Its second half, `writeImageSet`, writes images that are in memory to any format: FITS and ASDF
   input and the API's writer both end there, so an array handed to the library is treated exactly
@@ -1088,12 +1092,87 @@ them. The choices:
 - File names are UTF-8 inside the library and the tool; every file is opened through `toPath`, so
   that Windows gets wide-character names. The tool takes its arguments as UTF-16 there (`wmain`).
 - FITS, ASDF and DNG input share one in-memory form (`FitsFile`), so every conversion from them is
-  written once.
+  written once. Its images carry their pixels in memory or, for a conversion, as a source that
+  reads them a piece at a time (`FitsImage::pieces`), see [Images in pieces](#images-in-pieces-0200).
 - The version is stated in one place, `include/xisfconv.h`; CMake reads it from there.
 - Numbers are formatted and parsed independently of the locale of the program the library lives
   in (`cNumber`, `strtodC`): a host that has set a decimal comma must not change a file.
 - A NUL byte in header text (which no valid file has) is read as a space, in all three readers:
   C callers' strings would end there.
+
+## Images in pieces (0.20.0)
+
+Up to 0.19 an image was held whole in memory, several times over when it was compressed: the
+stored bytes, the decompressed ones, the unshuffled ones, and each conversion of the samples
+made a new buffer. That was the ceiling for mosaics and drizzled stacks. Since 0.20 a conversion
+reads an image a piece at a time and writes it as it reads it.
+
+- **An image is a source** (`ImageSource`, `imagesource.hpp`): it gives rows `[y, y + n)` of one
+  channel, planar, in host byte order, on demand and in any order. The readers make sources
+  (`XisfFile::pixelSource`, `readFits`, `readAsdf` and `readDng` with `inPieces`), and every step
+  between reading and writing is a source made of another: flipped rows, a channel subset, another
+  sample format, the stretch, the normalisation of floating point data, `--debayer` (which reads
+  one row more above and below its band) and `--bin`/`--resize` (which reads the rows a band of
+  the picture covers). The writers take sources and read them band by band. Each step computes
+  per sample, or per pixel from its neighbours, what the whole-image functions computed, by the
+  same code (`convertSamples`, `stretchSamples`, `debayerPlanes` and `downsamplePlane` with a
+  row accessor): the files are the same bytes, which the tests check with pieces of 300 bytes
+  against the defaults, and a comparison of some 700 conversions with the 0.19 binary.
+- **What needs the whole image first is a pass of its own** over the source, before anything is
+  written: the range of floating point data, whether a signed FITS or ASDF image has a negative
+  sample (which decides its sample format), and the statistics of the automatic stretch (every
+  step-th sample in the order of the plane, as before, so the parameters are the same). A pass
+  costs a read of the data, not memory; the messages come in the order they came.
+- **What cannot be read a piece at a time from the file is kept** in a `Store`
+  (`bytes.hpp`): in memory as long as all stores together fit `XISFCONV_MEMORY_LIMIT` (256 MiB),
+  else in a temporary file beside the output (`TempDirectoryScope`). That is a compressed block
+  of the input, decompressed once (XISF, ASDF, tile-compressed FITS, and DNG, whose tiles land
+  anywhere in the image), and for compressed XISF output the pixels and what they compress to:
+  the header says where each block is and how large it is, and it is written before the blocks.
+  Uncompressed input is read where it is in the file (`FileBytes`), byte-shuffled data through a
+  view that gathers the bytes of an item (`unshuffledBytes`, `shuffledBytes`). A store grows by
+  doubling, and what it is counted for includes its old memory while that is copied to the new;
+  where that does not fit the limit it goes into its file at once, rather than growing a little
+  at a time (which copied all of it again and again: the first measurement showed 430 MB under a
+  limit of 200 MB). A store whose size is known is given it at once (`reserve`). Small writes
+  that follow each other go to its file together.
+- **Temporary files have no name** on Linux and macOS (`mkstemp`, then `unlink`): whatever ends
+  the program, nothing is left. On Windows they are opened with `_O_TEMPORARY`, which the system
+  removes when the handle closes, also when the process is killed.
+- **Compression a piece at a time gives the bytes of compression at once**, which the tests
+  compare for every codec. zlib's `deflate` with `Z_NO_FLUSH` makes the same stream however its
+  input is cut. The LZ4 compressor is the library's own (0.15): it now looks at its block through
+  a window that keeps 64 KiB behind the first byte it asks for, reads the literals of a sequence
+  again from the input when it writes them, and is otherwise the same code; held against the
+  0.19 compressor on blocks of every kind, with windows of 4 KiB, its output is the same.
+  Zstandard's streaming output depends on how the input is cut into calls, and differs from
+  `ZSTD_compress` of the whole: the compressor is given pieces of exactly 1 MiB, whatever the
+  caller has, so its output depends on nothing but the data (and differs from 0.19's by a
+  fraction of a percent). Decompression is a piece at a time too: zlib and Zstandard by their streaming
+  interfaces, LZ4 with the last 64 KiB of its output at hand. The digests (SHA-1, SHA-2, SHA-3,
+  MD5) take their data a piece at a time as well (`Hasher`).
+- **An XISF block that keeps its shuffling keeps its bytes**: a rewrite of a shuffled block into
+  another codec, shuffled the same way, compresses the decompressed stream as it is instead of
+  unshuffling and shuffling it again (half the time of the first version).
+- **BigTIFF** is chosen before the file is written, from the uncompressed size of its pages and
+  their directories with a margin for Deflate, since the offsets of a classic file have 4 bytes.
+  A file of less than 4 GiB is the same classic file as before. `XISFCONV_BIGTIFF_ABOVE` sets the
+  threshold for the tests (a BigTIFF file of a few kilobytes).
+- **A sign of life within a step**: `progressTick` counts the bytes a step has read or written and
+  every 8 MiB gives the progress handler its last report again. The C API's handler asks for
+  `xisfconv_context_cancel` there, the Python package for Ctrl-C; the tool catches SIGINT and
+  SIGTERM and cancels its context. The stages and their numbers stay what they were, so a
+  handler that counts the reports per stage sees the same first and last ones.
+- **What stays whole**: an image the library reads into memory (`xisfconv_read_pixels`, which
+  now also reads through a source and gathers it), an array it is given to write (the writer
+  reads it through a source that borrows it), the properties of a file, the table of the tiles of
+  a tile-compressed FITS image (one row per tile).
+- Measured on a 192 MB image (6000 x 8000, Float32), peak memory and time, 0.19 against 0.20:
+  FITS to XISF 188 / 10 MB (4.3 s / 1.3 s); to zlib-compressed XISF 619 / 230 MB (the image
+  fits the limit and is kept in memory; with `XISFCONV_MEMORY_LIMIT=0`, 17 MB in 6.0 s instead of
+  7.4); to a stretched TIFF 554 / 26 MB; compressed XISF to FITS 495 / 198 MB; a rewrite to LZ4HC
+  769 / 223 MB, slightly faster. A 46400 x 46400 image (4.3 GB) of a compressed XISF file became a
+  BigTIFF file in 10 MB.
 
 ## The library (libxisfconv)
 
@@ -1634,7 +1713,7 @@ library with one line changed.
   Python. What they print is held against what they must print for those files (most lines word
   for word, numbers that depend on the arithmetic of the machine by their form and range), and
   what they write is read back.
-- `tests/run_tests.py` drives the built program (6634 checks at 0.19.0 when run as root with rawpy and imagecodecs installed, 13 more with OpenXISF beside it). The Python packages it
+- `tests/run_tests.py` drives the built program (about 6830 checks at 0.20.0 when run as root with rawpy and imagecodecs installed, 13 more with OpenXISF beside it). The Python packages it
   needs are listed at its top; the `asdf` packages and the external tools (`tiffcp`, `fitsverify`,
   `pngcheck`, `fpack`/`funpack`) are used when installed and their checks skipped when not.
 - Every format is checked against an implementation that shares no code with xisfconv: astropy

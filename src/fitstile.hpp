@@ -5,9 +5,11 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
+#include "bytes.hpp"
 #include "common.hpp"
 
 namespace xisfconv {
@@ -55,6 +57,11 @@ bool tileAlgorithmSupported(const std::string& algorithm);
 // as the values CFITSIO restores (including its subtractive dithering).
 // Throws Unsupported for algorithms that are not implemented, Error for damaged data.
 std::vector<uint8_t> decodeTiledImage(const TiledImage& image, const std::vector<uint8_t>& table);
+// The same a tile at a time: `unit` is the data unit of the table, read a tile at a time but for
+// the rows of the table, and each line of samples is handed to `put` with its place in the
+// image (in bytes from its start).
+using TilePut = std::function<void(uint64_t at, const uint8_t* data, size_t n)>;
+void decodeTiledImage(const TiledImage& image, RandomBytes& unit, const TilePut& put);
 
 // The block size the writer uses for RICE_1, which is CFITSIO's.
 constexpr int kRiceBlockSize = 32;

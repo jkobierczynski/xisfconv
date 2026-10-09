@@ -4,6 +4,7 @@
 
 #include <zlib.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
@@ -93,7 +94,7 @@ void filterRow(const uint8_t* cur, const uint8_t* prev, size_t len, size_t bpp, 
 }  // namespace
 
 void writePng(const std::string& path, const PngImage& image, int level) {
-    const PixelBuffer& px = *image.pixels;
+    ImageSource& px = *image.pixels;
     if (px.format != SampleFormat::UInt8 && px.format != SampleFormat::UInt16) {
         throw Error("PNG supports only 8- and 16-bit samples");
     }
@@ -109,7 +110,6 @@ void writePng(const std::string& path, const PngImage& image, int level) {
     const size_t width = static_cast<size_t>(px.width), height = static_cast<size_t>(px.height);
     const size_t bpp = channels * sb;
     const size_t rowLen = width * bpp;
-    const size_t plane = width * height;
 
     ChunkWriter w(path);
     std::vector<uint8_t> ihdr;
@@ -172,11 +172,21 @@ void writePng(const std::string& path, const PngImage& image, int level) {
             w.chunk("IDAT", zbuf.data(), zbuf.size() - zs.avail_out);
         }
     };
+    // the rows of each channel, a band of them at a time
+    const size_t bandRows = static_cast<size_t>(std::min<uint64_t>(rowsPerPiece(width * sb * channels), height));
+    std::vector<uint8_t> band(bandRows * width * sb * channels);
+    size_t bandFirst = 0, bandCount = 0;
     try {
         for (size_t y = 0; y < height; ++y) {
+            if (y >= bandFirst + bandCount) {
+                bandFirst = y;
+                bandCount = std::min(bandRows, height - y);
+                for (size_t c = 0; c < channels; ++c) px.readRows(c, y, bandCount, band.data() + c * bandRows * width * sb);
+                progressTick(bandCount * rowLen);
+            }
             // interleave planar channels; PNG samples are big-endian
             for (size_t c = 0; c < channels; ++c) {
-                const uint8_t* src = px.data.data() + (c * plane + y * width) * sb;
+                const uint8_t* src = band.data() + (c * bandRows + (y - bandFirst)) * width * sb;
                 for (size_t x = 0; x < width; ++x) {
                     uint8_t* d = cur.data() + x * bpp + c * sb;
                     if (sb == 1) {

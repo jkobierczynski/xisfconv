@@ -294,7 +294,7 @@ bool tileAlgorithmSupported(const std::string& algorithm) {
            algorithm == "PLIO_1" || algorithm == "NOCOMPRESS";
 }
 
-std::vector<uint8_t> decodeTiledImage(const TiledImage& image, const std::vector<uint8_t>& table) {
+void decodeTiledImage(const TiledImage& image, RandomBytes& unit, const TilePut& put) {
     if (!tileAlgorithmSupported(image.algorithm)) {
         throw Unsupported("tile compression " + (image.algorithm.empty() ? std::string("(not stated)") : image.algorithm) +
                           " is not supported" + (image.algorithm == "HCOMPRESS_1" ? "; funpack can decompress the file" : ""));
@@ -319,10 +319,10 @@ std::vector<uint8_t> decodeTiledImage(const TiledImage& image, const std::vector
     if (tiles != image.rows) {
         throw Error("the table has " + std::to_string(image.rows) + " rows, the image needs " + std::to_string(tiles) + " tiles");
     }
+    const uint64_t unitSize = unit.size();
     const uint64_t rowsEnd = checkedMul(image.rowBytes, image.rows, "table size");
-    if (rowsEnd > table.size() || image.heapOffset > table.size()) throw Error("the compressed image table is truncated");
+    if (rowsEnd > unitSize || image.heapOffset > unitSize) throw Error("the compressed image table is truncated");
     const uint64_t total = checkedMul(pixels, sampleSize, "image size");
-    if (total > std::numeric_limits<size_t>::max() / 2) throw Error("image too large for this platform");
     // A header that promises far more pixels than the table can hold is not worth the memory:
     // gzip expands at most 1032 times, Rice needs a few bits for every block of pixels.
     // (PLIO has no such limit: an empty mask line is a list of 7 words, however long the line.)
@@ -330,7 +330,7 @@ std::vector<uint8_t> decodeTiledImage(const TiledImage& image, const std::vector
         long double perByte = 2;  // NOCOMPRESS; quantized pixels may become twice as wide
         if (image.algorithm == "GZIP_1" || image.algorithm == "GZIP_2") perByte = 2 * 1032;
         else if (image.algorithm != "NOCOMPRESS") perByte = 8.0L / 3 * std::max(image.riceBlockSize, 1) * static_cast<long double>(sampleSize);
-        if (static_cast<long double>(total) > perByte * static_cast<long double>(table.size()) + 2880) {
+        if (static_cast<long double>(total) > perByte * static_cast<long double>(unitSize) + 2880) {
             throw Error("the image size in the header is implausible for the stored data");
         }
     }
@@ -354,24 +354,41 @@ std::vector<uint8_t> decodeTiledImage(const TiledImage& image, const std::vector
     const int dither = image.quantize == "SUBTRACTIVE_DITHER_1" ? 1 : image.quantize == "SUBTRACTIVE_DITHER_2" ? 2 : 0;
     const std::vector<float>& randoms = ditherNumbers();
 
+    // The rows of the table (the descriptors of the tiles), in memory; the heap is read a tile at a time.
+    if (rowsEnd > std::numeric_limits<size_t>::max()) throw Error("image too large for this platform");
+    const uint8_t* all = unit.contiguous();
+    std::vector<uint8_t> rowsCopy;
+    if (!all) {
+        rowsCopy.resize(static_cast<size_t>(rowsEnd));
+        if (rowsEnd) unit.read(0, static_cast<size_t>(rowsEnd), rowsCopy.data());
+    }
+    const uint8_t* table = all ? all : rowsCopy.data();
+    std::vector<uint8_t> heapCopy;
     // Bytes of a variable-length array field of a row.
     auto heapField = [&](const TileColumn& column, uint64_t row, const uint8_t*& data, uint64_t& bytes) {
         const size_t width = column.wide ? 8 : 4;
         const uint64_t at = row * image.rowBytes + column.offset;
         if (column.offset + 2 * width > image.rowBytes) throw Error("invalid column layout in the compressed image table");
-        const uint64_t count = getBE(table.data() + at, width);
-        const uint64_t offset = getBE(table.data() + at + width, width);
+        const uint64_t count = getBE(table + at, width);
+        const uint64_t offset = getBE(table + at + width, width);
         bytes = checkedMul(count, elementBytes(column.type), "tile size");
-        if (offset > table.size() - image.heapOffset || bytes > table.size() - image.heapOffset - offset) {
+        if (offset > unitSize - image.heapOffset || bytes > unitSize - image.heapOffset - offset) {
             throw Error("tile " + std::to_string(row) + " lies beyond the end of the table (truncated file?)");
         }
-        data = table.data() + image.heapOffset + offset;
+        if (all) {
+            data = all + image.heapOffset + offset;
+        } else {
+            if (bytes > std::numeric_limits<size_t>::max()) throw Error("image too large for this platform");
+            heapCopy.resize(static_cast<size_t>(bytes));
+            if (bytes) unit.read(image.heapOffset + offset, static_cast<size_t>(bytes), heapCopy.data());
+            data = heapCopy.data();
+        }
     };
     auto fixedField = [&](const TileColumn& column, uint64_t row) -> const uint8_t* {
         if (column.variable || column.offset + elementBytes(column.type) > image.rowBytes) {
             throw Error("invalid column layout in the compressed image table");
         }
-        return table.data() + row * image.rowBytes + column.offset;
+        return table + row * image.rowBytes + column.offset;
     };
     auto fieldNumber = [&](const TileColumn& column, uint64_t row) -> double {
         const uint8_t* p = fixedField(column, row);
@@ -384,7 +401,6 @@ std::vector<uint8_t> decodeTiledImage(const TiledImage& image, const std::vector
         }
     };
 
-    std::vector<uint8_t> out(static_cast<size_t>(total));
     std::vector<uint64_t> index(ndim, 0), start(ndim), size(ndim);
     for (uint64_t row = 0; row < image.rows; ++row) {
         // Position and size of this tile; tiles at the upper edges may be smaller.
@@ -446,6 +462,7 @@ std::vector<uint8_t> decodeTiledImage(const TiledImage& image, const std::vector
         } catch (const Unsupported&) {
             throw;
         } catch (const Error& e) {
+            if (e.kind == ErrorKind::Io || e.kind == ErrorKind::Cancelled) throw;   // (not about the tile)
             throw Error(label + ": " + e.what(), e.kind);
         }
 
@@ -506,13 +523,33 @@ std::vector<uint8_t> decodeTiledImage(const TiledImage& image, const std::vector
                 dest += (start[d] + (d == 0 ? 0 : at[d])) * stride;
                 stride *= image.naxis[d];
             }
-            std::memcpy(out.data() + static_cast<size_t>(dest) * sampleSize, samples.data() + static_cast<size_t>(line) * lineBytes, lineBytes);
+            put(dest * sampleSize, samples.data() + static_cast<size_t>(line) * lineBytes, lineBytes);
             for (size_t d = 1; d < ndim; ++d) {
                 if (++at[d] < size[d]) break;
                 at[d] = 0;
             }
         }
+        progressTick(static_cast<uint64_t>(n) * sampleSize);
     }
+}
+
+std::vector<uint8_t> decodeTiledImage(const TiledImage& image, const std::vector<uint8_t>& table) {
+    uint64_t total = image.naxis.empty() ? 0 : 1;
+    for (uint64_t d : image.naxis) total = checkedMul(total, d, "image size");
+    total = checkedMul(total, static_cast<uint64_t>(std::abs(image.bitpix)) / 8, "image size");
+    // (the checks of the header, the size of the table among them, come first)
+    std::vector<uint8_t> out;
+    MemoryBytes unit(table.data(), table.size());
+    bool sized = false;
+    decodeTiledImage(image, unit, [&](uint64_t at, const uint8_t* data, size_t n) {
+        if (!sized) {
+            if (total > std::numeric_limits<size_t>::max() / 2) throw Error("image too large for this platform");
+            out.resize(static_cast<size_t>(total));
+            sized = true;
+        }
+        std::memcpy(out.data() + at, data, n);
+    });
+    if (!sized) out.resize(static_cast<size_t>(total));
     return out;
 }
 

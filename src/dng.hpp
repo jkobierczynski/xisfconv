@@ -21,7 +21,9 @@ namespace xisfconv {
 // FitsImage::cfa*. The rows are top-down. With headersOnly the samples are not read.
 // Throws Error on a malformed file and Unsupported for what is not read (lossy and JPEG XL
 // compression, floating point data).
-FitsFile readDng(const std::string& path, bool headersOnly = false);
+// With inPieces the raw image is decoded into a store (memory, or a temporary file where it is
+// large) and read from there a piece at a time (FitsImage::pieces).
+FitsFile readDng(const std::string& path, bool headersOnly = false, bool inPieces = false);
 
 // Reads the raw image as readDng does and reports what it found; the previews are not read.
 VerifyReport verifyDng(const std::string& path);

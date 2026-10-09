@@ -484,6 +484,79 @@ void decodeSamples(FitsImage& img, std::vector<uint8_t>& raw, const DType& dt, b
     updateFloatRange(img);
 }
 
+// The same for an array that is read a piece at a time: `bytes` holds its samples as they are
+// stored. Whether a signed sample is negative, and the range of floating point samples, are found
+// by reading them once each.
+void decodeSamples(FitsImage& img, std::shared_ptr<RandomBytes> bytes, const DType& dt, bool bigEndian, bool interleaved) {
+    PixelBuffer& px = img.pixels;
+    const std::string name = dt.name;
+    const SampleFormat raw = dt.size == 1 ? SampleFormat::UInt8 : dt.size == 2 ? SampleFormat::UInt16
+                           : name == "float32" ? SampleFormat::Float32 : name == "float64" ? SampleFormat::Float64
+                           : dt.size == 4 ? SampleFormat::UInt32 : SampleFormat::UInt64;
+    StoredLayout layout;
+    layout.planar = !(interleaved && px.channels > 1);
+    layout.swap = dt.size > 1 && bigEndian == hostIsLittleEndian();
+    Source stored = storedSource(std::move(bytes), px.width, px.height, px.channels, raw, layout);
+    img.note = name;
+    Source mapped = stored;
+    if (name == "uint8") px.format = SampleFormat::UInt8;
+    else if (name == "uint16") px.format = SampleFormat::UInt16;
+    else if (name == "uint32") px.format = SampleFormat::UInt32;
+    else if (name == "uint64") px.format = SampleFormat::UInt64;
+    else if (name == "float32") px.format = SampleFormat::Float32;
+    else if (name == "float64") px.format = SampleFormat::Float64;
+    else if (name == "float16") {
+        px.format = SampleFormat::Float32;
+        img.note = "float16 -> Float32";
+        mapped = mappedSource(stored, SampleFormat::Float32, [](uint64_t, const uint8_t* in, uint8_t* out, size_t n) {
+            std::vector<uint8_t> v(in, in + 2 * n);
+            halfToFloat(v, n);
+            std::memcpy(out, v.data(), v.size());
+        });
+    } else if (dt.kind == DKind::Signed) {
+        bool negative = false;
+        const uint64_t rows = rowsPerPiece(stored->rowBytes());
+        std::vector<uint8_t> band(static_cast<size_t>(std::min(rows, px.height) * stored->rowBytes()));
+        for (uint64_t c = 0; c < px.channels && !negative; ++c) {
+            for (uint64_t y = 0; y < px.height && !negative; y += rows) {
+                const uint64_t count = std::min(rows, px.height - y);
+                stored->readRows(c, y, count, band.data());
+                const std::vector<uint8_t>& b = band;
+                const size_t n = static_cast<size_t>(count * px.width);
+                negative = name == "int8" ? anyNegative<int8_t>(b, n) : name == "int16" ? anyNegative<int16_t>(b, n)
+                         : name == "int32" ? anyNegative<int32_t>(b, n) : anyNegative<int64_t>(b, n);
+                progressTick(count * stored->rowBytes());
+            }
+        }
+        const SampleFormat unsignedFormat = raw;
+        const SampleFormat floatFormat = dt.size <= 2 ? SampleFormat::Float32 : SampleFormat::Float64;
+        if (!negative) {
+            px.format = unsignedFormat;
+            img.note = name + ", no negative values -> " + sampleFormatName(unsignedFormat);
+        } else {
+            px.format = floatFormat;
+            img.note = name + " with negative values -> " + sampleFormatName(floatFormat);
+            mapped = mappedSource(stored, floatFormat, [name](uint64_t, const uint8_t* in, uint8_t* out, size_t n) {
+                const size_t size = name == "int8" ? 1 : name == "int16" ? 2 : name == "int32" ? 4 : 8;
+                std::vector<uint8_t> v(in, in + size * n);
+                if (name == "int8") toFloat<int8_t, float>(v, n);
+                else if (name == "int16") toFloat<int16_t, float>(v, n);
+                else if (name == "int32") toFloat<int32_t, double>(v, n);
+                else toFloat<int64_t, double>(v, n);
+                std::memcpy(out, v.data(), v.size());
+            });
+        }
+    } else {
+        throw Error("unsupported datatype " + name);
+    }
+    if (interleaved && px.channels > 1) img.note += ", [rows, columns, channels] layout";
+    img.pieces = mapped;
+    const FloatRange range = floatRange(*mapped);
+    img.dataMin = range.min;
+    img.dataMax = range.max;
+    img.hasNaN = img.hasNaN || range.hasNaN;
+}
+
 bool tagContains(const YamlNode& node, const char* what) { return node.tag.find(what) != std::string::npos; }
 
 std::string scalarText(const YamlNode* node) {
@@ -498,8 +571,10 @@ bool scalarUInt(const YamlNode* node, uint64_t& out) {
 
 class Reader {
 public:
-    Reader(const std::string& path, bool headersOnly, bool verify, std::optional<size_t> onlyImage = std::nullopt)
-        : in_(toPath(path), std::ios::binary), headersOnly_(headersOnly), verify_(verify), onlyImage_(onlyImage) {
+    Reader(const std::string& path, bool headersOnly, bool verify, std::optional<size_t> onlyImage = std::nullopt,
+           bool inPieces = false)
+        : in_(toPath(path), std::ios::binary), headersOnly_(headersOnly), verify_(verify), onlyImage_(onlyImage),
+          inPieces_(inPieces) {
         file_.path = path;
         if (!in_) failToOpen(path);
         in_.seekg(0, std::ios::end);
@@ -524,12 +599,14 @@ public:
             const Block& b = blocks_[i];
             progress("verifying", i, blocks_.size());
             try {
-                blockData(i, 0, b.compression.empty() ? b.used : b.dataSize, "block " + std::to_string(i));
+                // (read a piece at a time, and forgotten)
+                blockSource(i, 0, b.compression.empty() ? b.used : b.dataSize, "block " + std::to_string(i), false);
                 if (b.hasChecksum) ++report.verified;
                 else ++report.unchecked;
             } catch (const Unsupported& e) {
                 report.notChecked.push_back(e.what());
             } catch (const Error& e) {
+                if (e.kind == ErrorKind::Cancelled) throw;   // (stopped within the block: no finding)
                 report.problems.push_back(e.what());
             }
         }
@@ -584,6 +661,8 @@ private:
     FitsFile file_;
     bool headersOnly_, verify_;
     std::optional<size_t> onlyImage_;
+    bool inPieces_ = false;
+    std::shared_ptr<RawFile> raw_;   // the file again, for the arrays that are read in pieces
     uint64_t treeEnd_ = 0;
     uint64_t scanEnd_ = 0;  // where the block scan stopped
     std::vector<Block> blocks_;
@@ -795,6 +874,120 @@ private:
         if (offset == 0 && count == data.size()) return data;
         return std::vector<uint8_t>(data.begin() + static_cast<std::ptrdiff_t>(offset),
                                     data.begin() + static_cast<std::ptrdiff_t>(offset + count));
+    }
+
+    // blockData for an array that is read a piece at a time: the bytes are those of the file
+    // where the block is not compressed, else the data decompressed into memory or a temporary
+    // file. The checksum is verified on the way (with the same rules).
+    // `keep` false: the block is only checked (its checksum, and that it decompresses), and nothing is returned.
+    std::shared_ptr<RandomBytes> blockSource(size_t index, uint64_t offset, uint64_t count, const std::string& label,
+                                             bool keep = true) {
+        const Block& b = blocks_[index];
+        const std::string where = "block " + std::to_string(index);
+        const uint64_t available = b.compression.empty() ? b.used : b.dataSize;
+        if (offset > available || count > available - offset) {
+            throw Error(label + ": the array needs " + std::to_string(count) + " bytes at offset " +
+                        std::to_string(offset) + ", but " + where + " holds " + std::to_string(available));
+        }
+        if (!raw_) raw_ = RawFile::openForReading(file_.path);
+        if (b.dataPos > file_.fileSize || b.used > file_.fileSize - b.dataPos) throw Error("unexpected end of file");
+        auto stored = std::make_shared<FileBytes>(raw_, b.dataPos, b.used, "read error");
+        auto digestOf = [](RandomBytes& bytes) {
+            Hasher h("md5");
+            std::vector<uint8_t> piece;
+            const uint64_t size = bytes.size();
+            for (uint64_t done = 0; done < size;) {
+                const size_t n = static_cast<size_t>(std::min<uint64_t>(size - done, uint64_t(1) << 20));
+                piece.resize(n);
+                bytes.read(done, n, piece.data());
+                h.update(piece.data(), n);
+                done += n;
+                progressTick(n);
+            }
+            return h.finish();
+        };
+        auto matches = [&](const std::vector<uint8_t>& digest) { return std::memcmp(digest.data(), b.checksum, 16) == 0; };
+        if (b.compression.empty()) {
+            if (verify_ && b.hasChecksum && !matches(digestOf(*stored))) checksumError(index);
+            return keep ? sliceBytes(stored, offset, count) : nullptr;
+        }
+        if (b.compression == "bzp2") {
+            throw Unsupported(where + ": bzip2 compression is not supported; rewrite the file with zlib or no compression");
+        }
+        if (b.compression == "zstd" && !zstdAvailable()) {
+            throw Unsupported(where + ": zstd compression, but this build of xisfconv has no Zstandard support");
+        }
+        if (b.compression != "zlib" && b.compression != "zstd" && b.compression != "lz4") {
+            throw Unsupported(where + ": compression '" + b.compression + "' is not supported");
+        }
+        // The checksum of a compressed block covers the stored bytes (the standard, and the
+        // asdf library since 3.0) or the uncompressed data (asdf 2.x); both are accepted.
+        const bool check = verify_ && b.hasChecksum;
+        const bool storedOk = check && matches(digestOf(*stored));
+        // A header that declares more data than the stored bytes can expand to is damaged.
+        uint64_t limit = std::numeric_limits<uint64_t>::max();
+        if (b.compression == "zlib") limit = b.used * 1032 + 1024;
+        else if (b.compression == "lz4") limit = b.used * 255 + 1024;
+        else if (b.compression == "zstd") {
+            std::vector<uint8_t> frameHeader(static_cast<size_t>(std::min<uint64_t>(b.used, 64)));
+            if (!frameHeader.empty()) stored->read(0, frameHeader.size(), frameHeader.data());
+            if (!zstdFrameContentSize(frameHeader.data(), frameHeader.size(), limit)) {
+                limit = b.used * 50000 + (1u << 20);  // RLE blocks reach about 43000:1
+            }
+        }
+        if (b.dataSize > limit) {
+            throw Error(where + ": the header declares " + std::to_string(b.dataSize) + " bytes of data, more than its " +
+                        std::to_string(b.used) + " compressed bytes can hold (damaged file?)");
+        }
+        std::shared_ptr<Store> data;
+        if (keep) {
+            data = std::make_shared<Store>();
+            data->reserve(b.dataSize);
+        }
+        // (the digest of the data as it comes out, for a checksum of the uncompressed data)
+        struct Out : ByteSink {
+            Store* store;
+            Hasher* hasher;
+            void write(const uint8_t* p, size_t n) override {
+                if (store) store->append(p, n);
+                if (hasher) hasher->update(p, n);
+            }
+            Out(Store* s, Hasher* h) : store(s), hasher(h) {}
+        };
+        Hasher decoded("md5");
+        Out out(data.get(), check && !storedOk ? &decoded : nullptr);
+        try {
+            if (b.compression == "lz4") lz4Chunks(*stored, b.dataSize, out);
+            else decompressBytes(b.compression, *stored, 0, b.used, b.dataSize, out);
+        } catch (const Error& e) {
+            // (what goes wrong with the file being read, or with a temporary file, is no damage of the data)
+            if (e.kind == ErrorKind::Cancelled || e.kind == ErrorKind::Io) throw;
+            if (check && !storedOk) checksumError(index);  // damaged data rarely decompresses
+            throw Error(where + ": " + e.what(), e.kind);
+        }
+        if (check && !storedOk && !matches(decoded.finish())) checksumError(index);
+        if (!keep) return nullptr;
+        return sliceBytes(data, offset, count);
+    }
+
+    // lz4Chunks a chunk at a time, to `out`.
+    static void lz4Chunks(RandomBytes& stored, uint64_t size, ByteSink& out) {
+        uint64_t p = 0, made = 0;
+        const uint64_t end = stored.size();
+        while (p < end) {
+            if (end - p < 8) throw Error("lz4: truncated chunk header");
+            uint8_t head[8];
+            stored.read(p, 8, head);
+            const uint64_t clen = getBE(head, 4);
+            const uint64_t ulen = head[4] | (head[5] << 8) | (head[6] << 16) | (static_cast<uint64_t>(head[7]) << 24);
+            p += 4;
+            if (clen < 4 || clen > end - p) throw Error("lz4: invalid chunk size");
+            if (ulen > size - made) throw Error("lz4: more data than the block header declares");
+            decompressBytes("lz4", stored, p + 4, clen - 4, ulen, out);
+            made += ulen;
+            p += clen;
+        }
+        if (made != size) throw Error("lz4: decompressed " + std::to_string(made) + " bytes, expected " + std::to_string(size));
     }
 
     // The asdf library's LZ4 layout: chunks of [compressed size, 4 bytes big-endian]
@@ -1040,7 +1233,11 @@ private:
                       ", block " + std::to_string(blockIndex) +
                       (block.compression.empty() ? "" : ", " + block.compression + " compressed");
         img.note = dt->name;
-        if (!headersOnly_ && (!onlyImage_ || *onlyImage_ == file_.images.size())) {
+        if (!headersOnly_ && (!onlyImage_ || *onlyImage_ == file_.images.size()) && inPieces_) {
+            auto bytes = blockSource(static_cast<size_t>(blockIndex), offset, checkedMul(elements, dt->size, "array size"), path);
+            decodeSamples(img, bytes, *dt, bigEndian, interleaved);
+            img.hasData = true;
+        } else if (!headersOnly_ && (!onlyImage_ || *onlyImage_ == file_.images.size())) {
             auto raw = blockData(static_cast<size_t>(blockIndex), offset, checkedMul(elements, dt->size, "array size"), path);
             decodeSamples(img, raw, *dt, bigEndian, interleaved);
             img.hasData = true;
@@ -1295,7 +1492,7 @@ void writeAsdf(const std::string& path, const std::vector<FitsHdu>& hdus, const 
                        "fits: !<tag:astropy.org:astropy/fits/fits-1.0.0>\n";
     for (size_t h = 0; h < hdus.size(); ++h) {
         const FitsHdu& hdu = hdus[h];
-        const PixelBuffer& px = *hdu.pixels;
+        const ImageSource& px = *hdu.pixels;
         tree += "- header:\n";
         if (h == 0) {
             tree += headerEntry("PROGRAM", yamlQuote(std::string("xisfconv ") + kVersion), "software that created this HDU");
@@ -1347,35 +1544,7 @@ void writeAsdf(const std::string& path, const std::vector<FitsHdu>& hdus, const 
 
     uint64_t pos = tree.size();
     std::vector<uint64_t> offsets;
-    for (size_t b = 0; b < hdus.size() + propertyBlocks.data.size(); ++b) {
-        const uint8_t* data = nullptr;
-        size_t bytes = 0;
-        if (b < hdus.size()) {
-            const PixelBuffer& px = *hdus[b].pixels;
-            data = px.data.data();
-            bytes = static_cast<size_t>(px.samples()) * sampleBytes(px.format);
-        } else {
-            data = propertyBlocks.data[b - hdus.size()].first;
-            bytes = propertyBlocks.data[b - hdus.size()].second;
-        }
-        std::vector<uint8_t> packed;
-        const uint8_t* stored = data;
-        size_t storedSize = bytes;
-        std::string codec = options.codec;
-        if (!codec.empty()) {
-            if (codec == "zlib") packed = zlibCompress(data, bytes);
-            else if (codec == "zstd") packed = zstdCompress(data, bytes);
-            else throw Error("ASDF output: unknown codec " + codec);
-            if (b >= hdus.size() && packed.size() >= bytes) {
-                codec.clear();   // a small value that compression only makes larger
-            } else {
-                stored = packed.data();
-                storedSize = packed.size();
-            }
-        }
-        uint8_t digest[16];
-        md5(stored, storedSize, digest);
-
+    auto blockHeader = [&](const std::string& codec, uint64_t storedSize, uint64_t bytes, const uint8_t digest[16]) {
         std::string header(kBlockMagic, 4);
         putBE(header, kBlockHeaderSize, 2);
         putBE(header, 0, 4);  // flags
@@ -1386,6 +1555,72 @@ void writeAsdf(const std::string& path, const std::vector<FitsHdu>& hdus, const 
         putBE(header, storedSize, 8);  // used
         putBE(header, bytes, 8);       // size of the uncompressed data
         header.append(reinterpret_cast<const char*>(digest), 16);
+        return header;
+    };
+    // The pixels of each image, a piece at a time: the header of the block, with the sizes and
+    // the digest of what follows, is written again once they are known.
+    struct Out : ByteSink {
+        std::ofstream& out;
+        Hasher md5{"md5"};
+        uint64_t size = 0;
+        explicit Out(std::ofstream& o) : out(o) {}
+        void write(const uint8_t* data, size_t n) override {
+            out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(n));
+            md5.update(data, n);
+            size += n;
+        }
+    };
+    for (size_t h = 0; h < hdus.size(); ++h) {
+        ImageSource& px = *hdus[h].pixels;
+        const uint64_t bytes = px.samples() * sampleBytes(px.format);
+        const std::string& codec = options.codec;
+        if (!codec.empty() && codec != "zlib" && codec != "zstd") throw Error("ASDF output: unknown codec " + codec);
+        const uint8_t zero[16] = {};
+        const std::ofstream::pos_type headerAt = out.tellp();
+        const std::string placeholder = blockHeader(codec, 0, bytes, zero);
+        out.write(placeholder.data(), static_cast<std::streamsize>(placeholder.size()));
+        Out stored(out);
+        std::unique_ptr<StreamCompressor> compressor;
+        if (!codec.empty()) compressor = StreamCompressor::create(codec, 0, bytes, stored);
+        forEachBand(px, [&](uint64_t, uint64_t, uint64_t rows, const uint8_t* data) {
+            const size_t n = static_cast<size_t>(rows * px.rowBytes());
+            if (compressor) compressor->write(data, n);
+            else stored.write(data, n);
+        });
+        if (compressor) compressor->finish();
+        if (!out) throw Error("write error on " + path, ErrorKind::Io);
+        const std::vector<uint8_t> digest = stored.md5.finish();
+        const std::string header = blockHeader(codec, stored.size, bytes, digest.data());
+        const std::ofstream::pos_type endAt = out.tellp();
+        out.seekp(headerAt);
+        out.write(header.data(), static_cast<std::streamsize>(header.size()));
+        out.seekp(endAt);
+        offsets.push_back(pos);
+        if (!out) throw Error("write error on " + path, ErrorKind::Io);
+        pos += header.size() + stored.size;
+    }
+    // The values of properties that are arrays, from memory.
+    for (const auto& value : propertyBlocks.data) {
+        const uint8_t* data = value.first;
+        const size_t bytes = value.second;
+        std::vector<uint8_t> packed;
+        const uint8_t* stored = data;
+        size_t storedSize = bytes;
+        std::string codec = options.codec;
+        if (!codec.empty()) {
+            if (codec == "zlib") packed = zlibCompress(data, bytes);
+            else if (codec == "zstd") packed = zstdCompress(data, bytes);
+            else throw Error("ASDF output: unknown codec " + codec);
+            if (packed.size() >= bytes) {
+                codec.clear();   // a small value that compression only makes larger
+            } else {
+                stored = packed.data();
+                storedSize = packed.size();
+            }
+        }
+        uint8_t digest[16];
+        md5(stored, storedSize, digest);
+        const std::string header = blockHeader(codec, storedSize, bytes, digest);
         offsets.push_back(pos);
         out.write(header.data(), static_cast<std::streamsize>(header.size()));
         out.write(reinterpret_cast<const char*>(stored), static_cast<std::streamsize>(storedSize));
@@ -1401,8 +1636,8 @@ void writeAsdf(const std::string& path, const std::vector<FitsHdu>& hdus, const 
     if (!out) throw Error("write error on " + path, ErrorKind::Io);
 }
 
-FitsFile readAsdf(const std::string& path, bool headersOnly, bool verifyChecksums, std::optional<size_t> onlyImage) {
-    Reader reader(path, headersOnly, verifyChecksums, onlyImage);
+FitsFile readAsdf(const std::string& path, bool headersOnly, bool verifyChecksums, std::optional<size_t> onlyImage, bool inPieces) {
+    Reader reader(path, headersOnly, verifyChecksums, onlyImage, inPieces);
     return reader.run();
 }
 

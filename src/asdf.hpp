@@ -40,8 +40,9 @@ void writeAsdf(const std::string& path, const std::vector<FitsHdu>& hdus, const 
 // FITS file. With headersOnly the pixel data is not read (for --info).
 // Throws xisfconv::Error on malformed files.
 // With onlyImage the pixels of that one image are read and the others are left as headers.
+// With inPieces they are not read into memory: each image gets a source of them (FitsImage::pieces).
 FitsFile readAsdf(const std::string& path, bool headersOnly = false, bool verifyChecksums = true,
-                  std::optional<size_t> onlyImage = std::nullopt);
+                  std::optional<size_t> onlyImage = std::nullopt, bool inPieces = false);
 
 // Parses the tree and reads every binary block: MD5 checksums are verified, compressed blocks
 // are decompressed.

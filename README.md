@@ -62,6 +62,11 @@ xisfconv --info light_0001.xisf               # geometry, codecs, FITS keywords,
 - **TIFF and PNG** for looking at: PixInsight's screen stretch (`--stretch`), a sample format of
   choice (`--bits`), smaller pictures (`--bin`, `--resize`), colour pictures of a colour camera's
   frames (`--debayer`), and previews in Linux file managers.
+- **Images of any size**: an image is read and written a piece at a time, so a mosaic of several
+  gigabytes converts on a machine with far less memory: what has to wait between reading and
+  writing is kept in memory up to 256 MB and in temporary files beside the output beyond. TIFF
+  output beyond 4 GiB is BigTIFF, and Ctrl-C stops a conversion within one image without leaving
+  a half-written file.
 - **Careful with files**: output is written under another name and renamed when it is complete,
   nothing is overwritten unless asked, no file is written twice in a run or over a file the run
   reads, a rewrite is read back and compared before it replaces anything, and the header of a

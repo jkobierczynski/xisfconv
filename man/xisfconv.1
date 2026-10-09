@@ -2,7 +2,7 @@
 .\" Copyright (C) 2026 Jurgen Kobierczynski
 .\" The manual page of the command line tool. Its options are those of "xisfconv --help", and its
 .\" version that of include/xisfconv.h: tests/run_tests.py holds both against the program.
-.TH XISFCONV 1 "2026-10-09" "xisfconv 0.19.0" "User Commands"
+.TH XISFCONV 1 "2026-10-09" "xisfconv 0.20.0" "User Commands"
 .SH NAME
 xisfconv \- convert between PixInsight XISF, FITS and ASDF images; read DNG; export TIFF and PNG
 .SH SYNOPSIS
@@ -401,6 +401,28 @@ option does not take, options that exclude each other, no input,
 with more than one input or with a directory, an output directory that is not there, a directory
 with both XISF and FITS files without
 .BR \-t .
+.TP
+.B 130
+The run was interrupted (Ctrl-C, or a request to terminate): the file that was being converted
+is not written, and no temporary file is left; the files before it are written.
+.SH ENVIRONMENT
+.TP
+.B XISFCONV_MEMORY_LIMIT
+What the data that a conversion keeps between reading and writing may take in memory together: a
+compressed block of the input, decompressed; the pixels of an image that is written to XISF
+compressed, and what they compress to. In bytes, or with
+.BR K ,
+.B M
+or
+.B G
+(1024, 1024\(S2, 1024\(S3); 256M by default. Beyond it that data is kept in temporary files
+beside the output.
+.B 0
+keeps all of it in temporary files. An image itself is never held whole: it is read and written
+a piece at a time.
+.TP
+.B XISFCONV_PIECE_BYTES
+About how much of an image one piece holds; 4M by default. What is written does not depend on it.
 .SH FILES
 .TP
 .IB name .part
@@ -409,6 +431,12 @@ interrupted leaves no half-written file under the final name. One that already e
 overwritten without
 .BR \-\-force ,
 and never when it is the input itself.
+.TP
+.BI .xisfconv\- XXXXXX
+A temporary file beside the output, for data that does not fit
+.BR XISFCONV_MEMORY_LIMIT .
+On Linux and macOS it is removed as soon as it is made, and is not seen; on Windows it is there
+while the conversion runs, and the system removes it when it is closed.
 .TP
 .IB name .replaced
 Where a file cannot be renamed over the one that

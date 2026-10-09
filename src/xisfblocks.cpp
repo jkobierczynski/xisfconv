@@ -707,30 +707,38 @@ uint64_t XisfExternalFiles::indexedBytes(const std::string& path, const std::set
     }
 }
 
+XisfExternalFiles::Place XisfExternalFiles::locate(const XisfLocation& location, const std::string& what) {
+    Place place;
+    place.path = resolve(location, what, true);
+    if (location.hasId) {
+        const XisbElement& e = element(location, place.path, what);
+        place.position = e.position;
+        place.size = e.length;
+        place.indexed = true;
+        place.uncompressedLength = e.uncompressedLength;
+        return place;
+    }
+    // the block is the whole file
+    std::ifstream file(toPath(place.path), std::ios::binary);
+    if (!file) throw Error(what + ": cannot open " + where(location), ErrorKind::Io);
+    file.seekg(0, std::ios::end);
+    place.size = static_cast<uint64_t>(file.tellg());
+    return place;
+}
+
 XisfExternalFiles::Block XisfExternalFiles::read(const XisfLocation& location, const std::string& what) {
-    const std::string path = resolve(location, what, true);
+    const Place place = locate(location, what);
     const std::string shown = where(location);
     Block block;
-    uint64_t position = 0, size = 0;
-    if (location.hasId) {
-        const XisbElement& e = element(location, path, what);
-        position = e.position;
-        size = e.length;
-        block.indexed = true;
-        block.uncompressedLength = e.uncompressedLength;
-    }
-    std::ifstream file(toPath(path), std::ios::binary);
+    block.indexed = place.indexed;
+    block.uncompressedLength = place.uncompressedLength;
+    std::ifstream file(toPath(place.path), std::ios::binary);
     if (!file) throw Error(what + ": cannot open " + shown, ErrorKind::Io);
-    if (!location.hasId) {
-        // the block is the whole file
-        file.seekg(0, std::ios::end);
-        size = static_cast<uint64_t>(file.tellg());
-    }
-    if (size > std::numeric_limits<size_t>::max()) throw Error("data block too large for this platform");
-    block.bytes.resize(static_cast<size_t>(size));
+    if (place.size > std::numeric_limits<size_t>::max()) throw Error("data block too large for this platform");
+    block.bytes.resize(static_cast<size_t>(place.size));
     file.clear();
-    file.seekg(static_cast<std::streamoff>(position));
-    if (size > 0 && !file.read(reinterpret_cast<char*>(block.bytes.data()), static_cast<std::streamsize>(size))) {
+    file.seekg(static_cast<std::streamoff>(place.position));
+    if (place.size > 0 && !file.read(reinterpret_cast<char*>(block.bytes.data()), static_cast<std::streamsize>(place.size))) {
         throw Error(what + ": read error in " + shown, ErrorKind::Io);
     }
     return block;

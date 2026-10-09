@@ -30,21 +30,6 @@ std::vector<uint8_t> decompressOne(const Compression& c, const uint8_t* src, siz
     return zstdDecompress(src, size, expected);
 }
 
-// Converts interleaved ("Normal") samples to planar layout.
-void deinterleave(std::vector<uint8_t>& data, uint64_t pixels, uint64_t channels, size_t sb) {
-    if (channels <= 1) return;
-    std::vector<uint8_t> out(data.size());
-    for (uint64_t ch = 0; ch < channels; ++ch) {
-        uint8_t* dst = out.data() + ch * pixels * sb;
-        const uint8_t* src = data.data() + ch * sb;
-        const size_t stride = static_cast<size_t>(channels) * sb;
-        for (uint64_t i = 0; i < pixels; ++i) {
-            std::memcpy(dst + i * sb, src + i * stride, sb);
-        }
-    }
-    data.swap(out);
-}
-
 }  // namespace
 
 XisfCompression parseXisfCompression(const std::string& text) {
@@ -89,20 +74,24 @@ bool xisfDigest(const std::string& algorithm, const uint8_t* data, size_t size, 
 }
 
 XisfChecksumState XisfFile::verifyBlockChecksum(const XisfStoredBlock& block, const std::string& what) {
-    if (block.checksum.empty()) return XisfChecksumState::None;
-    const size_t colon = block.checksum.find(':');
+    MemoryBytes bytes(block.bytes.data(), block.bytes.size());
+    return verifyBlockChecksum(bytes, block.checksum, what);
+}
+
+XisfChecksumState XisfFile::verifyBlockChecksum(RandomBytes& bytes, const std::string& checksum, const std::string& what) {
+    if (checksum.empty()) return XisfChecksumState::None;
+    const size_t colon = checksum.find(':');
     if (colon == std::string::npos) {
         warn("malformed checksum attribute on " + what + "; not verified");
         return XisfChecksumState::Unsupported;
     }
-    const std::string algo = toLower(trim(block.checksum.substr(0, colon)));
-    const std::string expected = toLower(trim(block.checksum.substr(colon + 1)));
-    std::string actual;
-    if (!xisfDigest(algo, block.bytes.data(), block.bytes.size(), actual)) {
+    const std::string algo = toLower(trim(checksum.substr(0, colon)));
+    const std::string expected = toLower(trim(checksum.substr(colon + 1)));
+    if (algo == "md5" || !Hasher::known(algo)) {
         warn("checksum algorithm '" + algo + "' on " + what + " is not supported; not verified");
         return XisfChecksumState::Unsupported;
     }
-    if (actual != expected) {
+    if (digestHex(algo, bytes, 0, bytes.size()) != expected) {
         throw Error("checksum mismatch on " + what + " (" + algo + "): file is corrupt "
                     "(use --no-verify to convert anyway)", ErrorKind::Checksum);
     }
@@ -110,19 +99,24 @@ XisfChecksumState XisfFile::verifyBlockChecksum(const XisfStoredBlock& block, co
 }
 
 XisfFile::XisfFile(const std::string& path, const XisfBlocksRedirect* redirect, bool verifying) : path_(path) {
-    file_.open(toPath(path), std::ios::binary);
-    if (!file_) failToOpen(path);
+    // (the file is kept open: it is the one that was named, also when the working directory
+    // changes before its pixels are read)
+    raw_ = RawFile::openForReading(path);
     std::error_code directoryError;
     if (std::filesystem::is_directory(toPath(path), directoryError)) throw Error("is a directory, not a file", ErrorKind::Io);
-    file_.seekg(0, std::ios::end);
-    fileSize_ = static_cast<uint64_t>(file_.tellg());
-    file_.seekg(0);
+    fileSize_ = raw_->size();
+    auto readAt = [&](uint64_t position, void* out, size_t n) {
+        try {
+            if (n) raw_->read(position, out, n);
+            return true;
+        } catch (const Error&) {
+            return false;
+        }
+    };
 
     unsigned char preamble[16] = {0};
     const size_t have = static_cast<size_t>(std::min<uint64_t>(fileSize_, 16));
-    if (have > 0 && !file_.read(reinterpret_cast<char*>(preamble), static_cast<std::streamsize>(have))) {
-        throw Error("cannot read the file", ErrorKind::Io);
-    }
+    if (have > 0 && !readAt(0, preamble, have)) throw Error("cannot read the file", ErrorKind::Io);
     // An XISF header file is an XML document and nothing else (the specification has it begin
     // with the XML declaration; a byte order mark and blanks before it are let pass).
     size_t first = have >= 3 && preamble[0] == 0xEF && preamble[1] == 0xBB && preamble[2] == 0xBF ? 3 : 0;
@@ -132,14 +126,12 @@ XisfFile::XisfFile(const std::string& path, const XisfBlocksRedirect* redirect, 
         const uint32_t headerLength = readLE32(preamble + 8);
         if (headerLength == 0 || 16ull + headerLength > fileSize_) throw Error("invalid XISF header length");
         headerXml_.resize(headerLength);
-        if (!file_.read(&headerXml_[0], headerLength)) throw Error("cannot read XISF header");
+        if (!readAt(16, &headerXml_[0], headerLength)) throw Error("cannot read XISF header");
     } else if (first < have && preamble[first] == '<') {
         // An XML document. Before all of it is read, its beginning has to show the root element
         // of an XISF header: any SVG, HTML or XML file begins like this, of any size.
         std::string beginning(static_cast<size_t>(std::min<uint64_t>(fileSize_, kXmlBeginning)), '\0');
-        file_.clear();
-        file_.seekg(0);
-        if (!file_.read(&beginning[0], static_cast<std::streamsize>(beginning.size()))) throw Error("cannot read the file", ErrorKind::Io);
+        if (!readAt(0, &beginning[0], beginning.size())) throw Error("cannot read the file", ErrorKind::Io);
         const std::string rootName = xmlRootNameAtStart(beginning);
         if (rootName != "xisf" && (!rootName.empty() || beginning.size() < fileSize_)) {
             throw Error(rootName.empty() ? "this XML file is not an XISF header: it does not begin with a root element <xisf> (within its first 64 KiB)"
@@ -148,9 +140,7 @@ XisfFile::XisfFile(const std::string& path, const XisfBlocksRedirect* redirect, 
         headerFile_ = true;
         if (fileSize_ > 0xFFFFFFFFull) throw Error("the XML header is larger than an XISF header can be");
         headerXml_.resize(static_cast<size_t>(fileSize_));
-        file_.clear();
-        file_.seekg(0);
-        if (!file_.read(&headerXml_[0], static_cast<std::streamsize>(fileSize_))) throw Error("cannot read XISF header", ErrorKind::Io);
+        if (!readAt(0, &headerXml_[0], static_cast<size_t>(fileSize_))) throw Error("cannot read XISF header", ErrorKind::Io);
     } else {
         if (have >= 8 && std::memcmp(preamble, "XISB0100", 8) == 0) {
             throw Error("this is an XISF data blocks file (.xisb): it holds data of a distributed XISF unit; name the "
@@ -433,30 +423,18 @@ void XisfFile::parseImage(const xml::Node& node) {
     images_.push_back(std::move(img));
 }
 
-std::vector<uint8_t> XisfFile::readAttachment(uint64_t position, uint64_t size) {
-    if (position > fileSize_ || size > fileSize_ - position) {
-        throw Error("data block at " + std::to_string(position) + "+" + std::to_string(size) +
-                    " lies beyond the end of the file (truncated download?)");
-    }
-    if (size > std::numeric_limits<size_t>::max()) throw Error("data block too large for this platform");
-    std::vector<uint8_t> buf(static_cast<size_t>(size));
-    file_.clear();
-    file_.seekg(static_cast<std::streamoff>(position));
-    if (size > 0 && !file_.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(size))) {
-        throw Error("read error in data block", ErrorKind::Io);
-    }
-    return buf;
-}
-
-XisfStoredBlock XisfFile::readStoredBlock(const xml::Node& element, const std::string& what) {
+XisfBlockView XisfFile::openStoredBlock(const xml::Node& element, const std::string& what) {
     const std::string location = attrOr(element, "location");
     const xml::Node* attrSource = &element;
-    XisfStoredBlock block;
+    XisfBlockView block;
 
     auto decodeText = [&](const std::string& encoding, const std::string& text) {
-        if (encoding == "base64") return base64Decode(text);
-        if (encoding == "hex") return hexDecode(text);
-        throw Error("unsupported data encoding '" + encoding + "' in " + what);
+        std::vector<uint8_t> bytes;
+        if (encoding == "base64") bytes = base64Decode(text);
+        else if (encoding == "hex") bytes = hexDecode(text);
+        else throw Error("unsupported data encoding '" + encoding + "' in " + what);
+        auto kept = std::make_shared<std::vector<uint8_t>>(std::move(bytes));
+        return std::make_shared<MemoryBytes>(kept->data(), kept->size(), kept);
     };
 
     const XisfLocation loc = parseXisfLocation(location, what);
@@ -466,7 +444,11 @@ XisfStoredBlock XisfFile::readStoredBlock(const xml::Node& element, const std::s
                 throw Error(what + " is said to be attached to the file (" + location + "), but this is an XISF header "
                             "file (.xish): nothing is attached to it");
             }
-            block.bytes = readAttachment(loc.position, loc.size);
+            if (loc.position > fileSize_ || loc.size > fileSize_ - loc.position) {
+                throw Error("data block at " + std::to_string(loc.position) + "+" + std::to_string(loc.size) +
+                            " lies beyond the end of the file (truncated download?)");
+            }
+            block.bytes = std::make_shared<FileBytes>(raw_, loc.position, loc.size);
             block.attachment = true;
             block.position = loc.position;
             break;
@@ -482,8 +464,20 @@ XisfStoredBlock XisfFile::readStoredBlock(const xml::Node& element, const std::s
         }
         case XisfLocation::Kind::Path:
         case XisfLocation::Kind::Url: {
-            XisfExternalFiles::Block found = external_->read(loc, what);
-            block.bytes = std::move(found.bytes);
+            const XisfExternalFiles::Place found = external_->locate(loc, what);
+            // (a file that a block read from it keeps open is used again: the images of a header that
+            // names hundreds of blocks in one data blocks file do not open it hundreds of times; and
+            // it is closed when no block needs it any more)
+            std::shared_ptr<RawFile> file = opened_[found.path].lock();
+            if (!file) {
+                try {
+                    file = RawFile::openForReading(found.path);
+                } catch (const Error&) {
+                    throw Error(what + ": cannot open " + external_->where(loc), ErrorKind::Io);
+                }
+                opened_[found.path] = file;
+            }
+            block.bytes = std::make_shared<FileBytes>(file, found.position, found.size, what + ": read error in " + external_->where(loc));
             block.external = true;
             block.indexed = found.indexed;
             block.indexUncompressedLength = found.uncompressedLength;
@@ -504,6 +498,70 @@ XisfStoredBlock XisfFile::readStoredBlock(const xml::Node& element, const std::s
              "as the header says");
     }
     return block;
+}
+
+XisfStoredBlock XisfFile::readStoredBlock(const xml::Node& element, const std::string& what) {
+    const XisfBlockView view = openStoredBlock(element, what);
+    XisfStoredBlock block;
+    const uint64_t size = view.bytes->size();
+    if (size > std::numeric_limits<size_t>::max()) throw Error("data block too large for this platform");
+    block.bytes.resize(static_cast<size_t>(size));
+    if (size) view.bytes->read(0, static_cast<size_t>(size), block.bytes.data());
+    block.compression = view.compression;
+    block.subblocks = view.subblocks;
+    block.checksum = view.checksum;
+    block.attachment = view.attachment;
+    block.position = view.position;
+    block.external = view.external;
+    block.indexed = view.indexed;
+    block.indexUncompressedLength = view.indexUncompressedLength;
+    return block;
+}
+
+std::shared_ptr<RandomBytes> XisfFile::decodedBlock(const XisfBlockView& block, const std::string& what, uint64_t expectedSize) {
+    if (block.compression.empty()) return block.bytes;
+    const Compression c = parseXisfCompression(block.compression);
+    auto out = std::make_shared<Store>();
+    // (a declared size that the stored bytes cannot hold is refused before any room is made)
+    if (c.uncompressedSize / (1u << 20) <= block.bytes->size() + 1) out->reserve(c.uncompressedSize);
+    StoreSink sink(*out);
+    decodeBlockTo(block, what, expectedSize, sink);
+    if (c.shuffled) return unshuffledBytes(out, c.itemSize);
+    return out;
+}
+
+void XisfFile::decodeBlockTo(const XisfBlockView& block, const std::string& what, uint64_t expectedSize, ByteSink& sink) {
+    RandomBytes& stored = *block.bytes;
+    const uint64_t storedSize = stored.size();
+
+    const Compression c = parseXisfCompression(block.compression);
+    if (expectedSize != 0 && c.uncompressedSize != expectedSize) {
+        throw Error(what + ": compressed block declares " + std::to_string(c.uncompressedSize) +
+                    " bytes, geometry requires " + std::to_string(expectedSize));
+    }
+    // Guard against absurd declared sizes in damaged headers (no codec here expands beyond ~1:33000).
+    if (c.uncompressedSize / (1u << 20) > storedSize + 1) {
+        throw Error(what + ": declared uncompressed size is implausible for the stored data");
+    }
+    if (block.subblocks.empty()) {
+        decompressBytes(c.codec, stored, 0, storedSize, c.uncompressedSize, sink);
+    } else {
+        uint64_t offset = 0, made = 0;
+        for (const auto& pair : split(block.subblocks, ':')) {
+            const auto cu = split(pair, ',');
+            uint64_t cs = 0, us = 0;
+            if (cu.size() != 2 || !parseUInt64(cu[0], cs) || !parseUInt64(cu[1], us)) {
+                throw Error("malformed subblocks attribute in " + what);
+            }
+            if (cs > storedSize - offset || us > c.uncompressedSize - made) {
+                throw Error("subblock sizes exceed the data block in " + what);
+            }
+            decompressBytes(c.codec, stored, offset, cs, us, sink);
+            offset += cs;
+            made += us;
+        }
+        if (made != c.uncompressedSize) throw Error("subblocks do not add up to the declared size in " + what);
+    }
 }
 
 std::vector<uint8_t> XisfFile::decodeBlock(const XisfStoredBlock& block, const std::string& what, uint64_t expectedSize) {
@@ -560,39 +618,35 @@ bool DisplayFunction::isIdentity() const {
     return true;
 }
 
-PixelBuffer XisfFile::readPixels(size_t index, bool verify) {
+Source XisfFile::pixelSource(size_t index, bool verify) {
     const XisfImage& img = images_.at(index);
     if (!img.unsupported.empty()) throw Unsupported("image " + std::to_string(index) + ": " + img.unsupported);
 
+    const std::string what = "image " + std::to_string(index);
     const size_t sb = sampleBytes(img.format);
     const uint64_t expected = checkedMul(checkedMul(checkedMul(img.width, img.height, "image size"), img.channels,
                                                     "image size"), sb, "image size");
-    PixelBuffer px;
-    px.width = img.width;
-    px.height = img.height;
-    px.channels = img.channels;
-    px.format = img.format;
     if (isExternalXisfLocation(attrOr(*img.node, "location")) && !img.node->attr("compression")) {
         // (pixels that are a file, or a block of one: its size is known before it is read, and a
         // file of another size is not read to find that out)
-        const uint64_t stored = external_->storedSize(parseXisfLocation(attrOr(*img.node, "location"), "image " + std::to_string(index)),
-                                                      "image " + std::to_string(index));
+        const uint64_t stored = external_->storedSize(parseXisfLocation(attrOr(*img.node, "location"), what), what);
         if (stored != expected) {
-            throw Error("image " + std::to_string(index) + ": pixel data is " + std::to_string(stored) +
-                        " bytes, geometry requires " + std::to_string(expected));
+            throw Error(what + ": pixel data is " + std::to_string(stored) + " bytes, geometry requires " + std::to_string(expected));
         }
     }
-    px.data = readBlock(*img.node, verify, "image " + std::to_string(index), expected);
-    if (px.data.size() != expected) {
-        throw Error("image " + std::to_string(index) + ": pixel data is " + std::to_string(px.data.size()) +
-                    " bytes, geometry requires " + std::to_string(expected));
+    const XisfBlockView block = openStoredBlock(*img.node, what);
+    if (verify) verifyBlockChecksum(*block.bytes, block.checksum, what);
+    const std::shared_ptr<RandomBytes> data = decodedBlock(block, what, expected);
+    if (data->size() != expected) {
+        throw Error(what + ": pixel data is " + std::to_string(data->size()) + " bytes, geometry requires " + std::to_string(expected));
     }
-    if (sb > 1 && img.bigEndian == hostIsLittleEndian()) {
-        byteSwapInPlace(px.data.data(), px.data.size() / sb, sb);
-    }
-    if (!img.planar) deinterleave(px.data, img.width * img.height, img.channels, sb);
-    return px;
+    StoredLayout layout;
+    layout.planar = img.planar;
+    layout.swap = sb > 1 && img.bigEndian == hostIsLittleEndian();
+    return storedSource(data, img.width, img.height, img.channels, img.format, layout);
 }
+
+PixelBuffer XisfFile::readPixels(size_t index, bool verify) { return readAll(*pixelSource(index, verify)); }
 
 std::vector<uint8_t> XisfFile::readIccProfile(size_t index, bool verify) {
     const XisfImage& img = images_.at(index);

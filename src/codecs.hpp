@@ -4,8 +4,11 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
+
+#include "bytes.hpp"
 
 namespace xisfconv {
 
@@ -57,5 +60,48 @@ std::string sha3Hex(const uint8_t* data, size_t size, int bits);  // SHA3-256 or
 
 // MD5 digest (16 raw bytes), used for ASDF block checksums.
 void md5(const uint8_t* data, size_t size, uint8_t digest[16]);
+
+// A digest of data that comes a piece at a time: SHA-1, SHA-256, SHA-512, SHA3-256 and SHA3-512
+// by the names XISF checksums have (sha1 or sha-1, ...), and md5.
+class Hasher {
+public:
+    explicit Hasher(const std::string& algorithm);   // throws Error (Argument) for a name it does not know
+    ~Hasher();
+    Hasher(Hasher&&) noexcept;
+    Hasher& operator=(Hasher&&) noexcept;
+    static bool known(const std::string& algorithm);
+    void update(const uint8_t* data, size_t n);
+    std::vector<uint8_t> finish();   // the digest (once)
+    std::string finishHex();         // ... as lowercase hex
+
+private:
+    struct State;
+    std::unique_ptr<State> s_;
+};
+
+// The digest of [position, position + size) of `bytes`, read a piece at a time (lowercase hex).
+std::string digestHex(const std::string& algorithm, RandomBytes& bytes, uint64_t position, uint64_t size);
+
+// zlib or Zstandard compression of data that comes a piece at a time, to `out`. The bytes are
+// those zlibCompress and zstdCompress make of all of it, however it is cut into pieces.
+class StreamCompressor {
+public:
+    // codec "zlib" or "zstd"; level 0: the usual one (6, 3). `totalSize`: how much is written in all
+    // (a Zstandard frame says it).
+    static std::unique_ptr<StreamCompressor> create(const std::string& codec, int level, uint64_t totalSize, ByteSink& out);
+    virtual ~StreamCompressor() = default;
+    virtual void write(const uint8_t* data, size_t n) = 0;
+    virtual void finish() = 0;
+};
+
+// The bytes [position, position + size) of `in` compressed with an XISF codec to `out`: what
+// xisfCompress makes of them (the same level rules; one LZ4 block holds at most kLz4MaxInput).
+void compressBytes(const std::string& codec, int level, RandomBytes& in, uint64_t position, uint64_t size, ByteSink& out);
+
+// Decompresses the bytes [position, position + size) of `in` (zlib, lz4 or lz4hc, which are one
+// block format, or zstd) to `out`: exactly `expected` bytes, or throws as zlibDecompress,
+// lz4BlockDecompress and zstdDecompress do.
+void decompressBytes(const std::string& codec, RandomBytes& in, uint64_t position, uint64_t size, uint64_t expected,
+                     ByteSink& out);
 
 }  // namespace xisfconv

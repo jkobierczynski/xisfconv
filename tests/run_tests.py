@@ -7327,6 +7327,188 @@ def test_compression_level_and_shuffling():
           f"--in-place with a level compresses again, without one leaves the file, and --no-shuffle is a form of its own: {said}")
 
 
+
+def tool_env(env, *args, cwd=None):
+    """The program run with these environment variables added."""
+    e = dict(os.environ)
+    e.update(env)
+    return subprocess.run([EXE, *args], cwd=cwd, env=e, capture_output=True, text=True, encoding="utf-8", errors="replace")
+
+
+def masked_unit(data):
+    """The bytes of an XISF header or monolithic file with what differs from run to run made the same: the time it
+    was written, and the random identifiers of the blocks of a data blocks file."""
+    import re
+    if data[:8] == b"XISB0100":
+        # a data blocks file: the identifiers of the elements of its index (one node)
+        data = bytearray(data)
+        count = int.from_bytes(data[16:20], "little")
+        for k in range(count):
+            data[32 + 40 * k:40 + 40 * k] = b"\0" * 8
+        return bytes(data)
+    data = re.sub(rb'(XISF:CreationTime" type="TimePoint" value=")[^"]*', rb"\1-", data)
+    return re.sub(rb"0x[0-9a-fA-F]{16}", b"0x" + b"0" * 16, data)
+
+
+def test_pieces():
+    """Images are read and written a piece at a time (0.20): what comes out does not depend on the size of the pieces
+    or on the memory a conversion may take (XISFCONV_PIECE_BYTES, XISFCONV_MEMORY_LIMIT), large TIFF output is BigTIFF,
+    temporary files are gone afterwards, Ctrl-C stops a conversion within an image, and the memory a large image takes
+    stays near the limit."""
+    import re
+    d = os.path.join(TMP, "pieces")
+    os.makedirs(d)
+    rng = np.random.default_rng(20)
+
+    # ---- inputs of every kind, of a size that makes many pieces of a few hundred bytes
+    def entry(dtype, h, w, c, seed, **kw):
+        return image_entry(test_image(dtype, h, w, c, seed), **kw)
+    cfa = '<ColorFilterArray pattern="GRBG" width="2" height="2"/>'
+    write_xisf(os.path.join(d, "a.xisf"), [entry(np.uint16, 61, 93, 3, 1, planar=False, codec="zlib", shuffle_item=2, checksum="sha1"),
+                                          entry(np.float32, 47, 71, 1, 2, codec="lz4hc", shuffle_item=4, subblocks=3),
+                                          entry(np.uint8, 33, 40, 4, 3, codec="lz4"),
+                                          entry(np.float64, 29, 31, 3, 4, planar=False, big=True)])
+    write_xisf(os.path.join(d, "b.xisf"), [entry(np.uint16, 70, 90, 1, 5, children=cfa)])
+    nan = rng.normal(500, 100, (83, 101)).astype(np.float32)
+    nan[5, 7] = np.nan
+    fits.HDUList([fits.PrimaryHDU(rng.normal(0, 3000, (59, 77)).astype(np.int16)),
+                  fits.ImageHDU(nan),
+                  fits.ImageHDU(rng.integers(0, 65535, (3, 40, 50)).astype(np.uint16))]).writeto(os.path.join(d, "c.fits"))
+    fits.HDUList([fits.PrimaryHDU(),
+                  fits.CompImageHDU(rng.integers(0, 4000, (66, 88)).astype(np.int16), compression_type="RICE_1", tile_shape=(16, 32)),
+                  fits.CompImageHDU(nan, compression_type="GZIP_2", quantize_level=0)]).writeto(os.path.join(d, "d.fits"))
+    r = tool(os.path.join(d, "c.fits"), "-o", os.path.join(d, "e.asdf"), "--compress", "--codec", "zlib", "-q")
+    check(r.returncode == 0, f"pieces: an ASDF input: {r.stderr.strip()[-200:]}")
+    have_dng = True
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import dng_files
+        dng_files.write_dng(os.path.join(d, "f.dng"), dng_files.bayer_scene(40, 56, 14, 3), bits=14, compression=7,
+                            tile=(16, 16), active_area=(2, 2, 38, 54))
+    except ImportError:   # pragma: no cover
+        have_dng = False
+
+    small = {"XISFCONV_PIECE_BYTES": "300", "XISFCONV_MEMORY_LIMIT": "0"}
+    medium = {"XISFCONV_PIECE_BYTES": "5000", "XISFCONV_MEMORY_LIMIT": "20000"}
+    cases = []
+    for src in ("a.xisf", "b.xisf"):
+        for out, flags in (("o.fits", []), ("o.fits.fz", []), ("o.asdf", ["--compress", "--codec", "zlib"]), ("o.tif", ["--compress"]),
+                           ("o.tif", ["--stretch", "--resize", "61%"]), ("o.png", ["--stretch=unlinked"]), ("o.png", ["--bin", "3"]),
+                           ("o.tif", ["--debayer"]), ("o.fits", ["--bits", "f32", "--top-down"])):
+            cases.append((src, out, flags))
+    for src in ("c.fits", "d.fits", "e.asdf") + (("f.dng",) if have_dng else ()):
+        for out, flags in (("o.xisf", []), ("o.xisf", ["--codec", "zlib"]), ("o.xisf", ["--codec", "lz4", "--checksum", "sha256"]),
+                           ("o.xisf", ["--codec", "lz4hc", "--level", "4", "--no-shuffle"]), ("o.xish", ["--codec", "zstd" if ZSTD_BUILD else "zlib"]),
+                           ("o.asdf", ["--compress"]), ("o.fits", ["--compress"]), ("o.tif", ["--stretch"]),
+                           ("o.png", ["--bits", "u8"]), ("o.tif", ["--debayer", "--bin", "2"])):
+            if src.endswith(".asdf") and out.endswith(".asdf"):
+                continue
+            if src.endswith(".fits") and out == "o.fits" and "--compress" not in flags:
+                continue
+            cases.append((src, out, flags))
+    for src in ("a.xisf",):
+        for flags in (["--codec", "zlib"], ["--codec", "lz4hc"], ["--codec", "none"], ["--checksum", "sha512"]):
+            cases.append((src, "r.xisf", flags))
+    for n, (src, out, flags) in enumerate(cases):
+        made = []
+        for k, env in enumerate(({}, small, medium)):
+            w = os.path.join(d, f"case{n}-{k}")
+            os.makedirs(w)
+            for f in os.listdir(d):
+                if os.path.isfile(os.path.join(d, f)):
+                    shutil.copy(os.path.join(d, f), w)
+            r = tool_env(env, src, "-o", out, "-q", *flags, cwd=w)
+            outputs = sorted(f for f in os.listdir(w) if f.startswith(("o.", "r.")))
+            made.append((r.returncode, r.stderr, {f: masked_unit(open(os.path.join(w, f), "rb").read()) for f in outputs},
+                         [f for f in os.listdir(w) if f.startswith(".xisfconv-") or f.endswith(".part")]))
+        label = f"pieces: {src} -> {out} {' '.join(flags)}"
+        check(made[0][0] == 0, f"{label}: {made[0][1].strip()[-300:]}")
+        check(made[0][:3] == made[1][:3] == made[2][:3],
+              f"{label}: the same output and messages with pieces of 300 bytes, nothing in memory, and with a little memory: "
+              f"{[m[0] for m in made]} {[sorted(m[2]) for m in made]} "
+              f"{[f for f in made[0][2] if made[0][2][f] != made[1][2].get(f) or made[0][2][f] != made[2][2].get(f)]}")
+        check(not made[0][3] and not made[1][3] and not made[2][3], f"{label}: no temporary files are left: {[m[3] for m in made]}")
+        for k in range(3):
+            shutil.rmtree(os.path.join(d, f"case{n}-{k}"))
+
+    # ---- BigTIFF: a file of pages that could be larger than 4 GiB has offsets of 8 bytes (forced here at 1 byte)
+    icc = b"\0\0\0\x80" + b"x" * 124
+    write_xisf(os.path.join(d, "icc.xisf"), [entry(np.uint16, 50, 60, 3, 9, children=f'<ICCProfile location="inline:base64">'
+                                                   f'{base64.b64encode(icc).decode()}</ICCProfile>')])
+    for src, flags in (("c.fits", []), ("c.fits", ["--compress", "--stretch"]), ("a.xisf", ["--compress"]), ("icc.xisf", [])):
+        if "--compress" in flags and src == "a.xisf" and not HAVE_IMAGECODECS:
+            skipped.append("BigTIFF with compressed floating point pages (pip install imagecodecs)")
+            continue
+        classic, big = os.path.join(d, "classic.tif"), os.path.join(d, "big.tif")
+        r1 = tool(src, "-o", classic, "-f", "-q", *flags, cwd=d)
+        r2 = tool_env({"XISFCONV_BIGTIFF_ABOVE": "1"}, src, "-o", big, "-f", "-q", *flags, cwd=d)
+        label = f"BigTIFF from {src} {' '.join(flags)}"
+        if r1.returncode or r2.returncode:
+            check(False, f"{label}: {r1.stderr.strip()[-200:]} {r2.stderr.strip()[-200:]}")
+            continue
+        head = open(big, "rb").read(16)
+        check(head[:4] == b"II+\0" and head[4:8] == b"\x08\0\0\0" and open(classic, "rb").read(4) == b"II*\0",
+              f"{label}: a BigTIFF file (and a classic one without): {head[:8]!r}")
+        with tifffile.TiffFile(big) as tb, tifffile.TiffFile(classic) as tc:
+            same = tb.is_bigtiff and len(tb.pages) == len(tc.pages) and all(
+                np.array_equal(a.asarray(), b.asarray(), equal_nan=a.asarray().dtype.kind == "f") and
+                (34675 in a.tags) == (34675 in b.tags) for a, b in zip(tb.pages, tc.pages))
+            profiles = src != "icc.xisf" or 34675 in tb.pages[0].tags
+            descriptions = [p.description for p in tb.pages] == [p.description for p in tc.pages]
+        check(same and descriptions and profiles, f"{label}: tifffile reads the same pages, profiles and descriptions from both")
+        if HAVE_TIFFCP:
+            rc = subprocess.run(["tiffcp", "-c", "none", big, big + ".copy.tif"], capture_output=True, text=True)
+            check(rc.returncode == 0, f"{label}: libtiff reads it: {rc.stderr.strip()[-200:]}")
+
+    # ---- what happens to a conversion that fails or is stopped: no output, no temporary files
+    corrupt = os.path.join(d, "corrupt.xisf")
+    write_xisf(corrupt, [entry(np.uint16, 64, 64, 1, 10, codec="zlib", shuffle_item=2),
+                         entry(np.uint16, 64, 64, 1, 11, codec="zlib", checksum="sha256", corrupt_checksum=True)])
+    w = os.path.join(d, "failing")
+    os.makedirs(w)
+    r = tool_env(small, corrupt, "-o", os.path.join(w, "o.fits"))
+    check(r.returncode == 1 and "checksum mismatch on image 1" in r.stderr and os.listdir(w) == [],
+          f"pieces: a checksum that does not match, found after the first image was decompressed into a temporary file: "
+          f"nothing is left: {r.stderr.strip()[-200:]} {os.listdir(w)}")
+
+    big_src = os.path.join(d, "large.fits")
+    y, x = np.mgrid[0:2000, 0:3000]
+    fits.PrimaryHDU((np.sin(x / 37.0) * np.cos(y / 23.0) * 1000 + rng.normal(0, 30, (2000, 3000))).astype(np.float32)).writeto(big_src)
+    if os.name == "posix":
+        import signal
+        import time
+        w = os.path.join(d, "interrupted")
+        os.makedirs(w)
+        out = os.path.join(w, "o.xisf")
+        e = dict(os.environ)
+        e.update({"XISFCONV_PIECE_BYTES": "2000"})
+        p = subprocess.Popen([EXE, big_src, "-o", out, "--codec", "lz4hc", "--level", "12"], env=e, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True)
+        time.sleep(0.5)   # (the image is being compressed: the output is not there yet)
+        running = p.poll() is None
+        p.send_signal(signal.SIGINT)
+        _, err = p.communicate(timeout=120)
+        if running:
+            check(p.returncode == 130 and "interrupted" in err and os.listdir(w) == [],
+                  f"pieces: Ctrl-C stops the conversion of one image, and nothing is left: {p.returncode} {err.strip()[-200:]} "
+                  f"{os.listdir(w)}")
+        else:   # pragma: no cover
+            skipped.append("Ctrl-C within an image (the conversion was done before it could be interrupted)")
+
+        # The memory of a conversion: with no memory for held data, what is left is the pieces and the codecs.
+        probe = ("import resource, subprocess, sys, os\n"
+                 "env = dict(os.environ); env['XISFCONV_MEMORY_LIMIT'] = sys.argv[1]\n"
+                 "subprocess.run(sys.argv[2:], env=env, check=True)\n"
+                 "print(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss)\n")
+        for flags in (["-o", os.path.join(d, "m.xisf"), "--codec", "zlib"], ["-o", os.path.join(d, "m.tif"), "--stretch"]):
+            rss = subprocess.run([sys.executable, "-c", probe, "0", EXE, big_src, "-f", "-q", *flags], capture_output=True, text=True)
+            kib = int(rss.stdout.split()[-1]) if rss.returncode == 0 and rss.stdout.split() else 10 ** 9
+            if sys.platform == "darwin" and kib != 10 ** 9:
+                kib //= 1024        # (macOS gives ru_maxrss in bytes, Linux in KiB)
+            check(kib < 40 * 1024, f"pieces: a conversion of a 24 MB image ({' '.join(flags[2:])}) with no memory for held data "
+                                   f"takes {kib // 1024} MiB")
+
+
 if __name__ == "__main__":
     print("xisfconv:", EXE)
     print(subprocess.run([EXE, "--version"], capture_output=True, text=True).stdout.strip())
@@ -7346,7 +7528,7 @@ if __name__ == "__main__":
               test_asdf_python_files, test_asdf_roundtrips, test_export_from_fits_and_asdf, test_xisf_rewrite,
               test_verify, test_fits_tile_compressed, test_fits_tile_writing, test_property_round_trip,
               test_downsampling_and_thumbnailer, test_distributed_units, test_directories_and_patterns, test_dng, test_debayer,
-              test_compression_level_and_shuffling,
+              test_compression_level_and_shuffling, test_pieces,
               test_documents):
         try:
             t()

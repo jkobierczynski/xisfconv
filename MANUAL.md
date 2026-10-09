@@ -36,6 +36,7 @@ say what to know before reading those.
 - [Colour pictures of a mosaic (`--debayer`)](#colour-pictures-of-a-mosaic---debayer)
 - [Previews in the file manager](#previews-in-the-file-manager)
 - [Sample conversion](#sample-conversion)
+- [Large images](#large-images)
 - [The library (libxisfconv)](#the-library-libxisfconv)
 - [Python](#python)
 - [Limitations](#limitations)
@@ -730,6 +731,7 @@ for a calibration and stacking program to work on.
 - Optional Deflate compression (`-c`) with horizontal or floating-point predictor
 - ICC profile and resolution copied; extra channels written as ExtraSamples (first one = alpha)
 - Multiple images become multiple pages
+- BigTIFF where the pages could take more than 4 GiB (see [Large images](#large-images))
 
 ## PNG output
 
@@ -872,6 +874,60 @@ The option `-b u8|u16|u32|f32|f64`.
 - integer → float: normalized to [0,1]
 - float → integer: the XISF `bounds` range (normally [0,1]) maps to the full integer range, clipped
 - float → float: values unchanged
+
+## Large images
+
+Since 0.20 an image is read and written a piece at a time: a band of rows of one channel, then the
+next. No conversion holds an image whole, so the memory it takes does not grow with the image: a
+mosaic or a drizzled stack of several gigabytes converts on a machine with less memory than that.
+(A 4.3 GB image of 46400 x 46400 pixels became a TIFF file in 10 MB of memory; 0.19 needed two
+to three times the size of an image.)
+
+Some data has to be kept between reading and writing:
+
+- a compressed block of the input (XISF, ASDF, tile-compressed FITS, DNG) is decompressed once,
+  before anything is written. An uncompressed one is read from the file where it is, as it is
+  written, and so is an image of FITS input that is not tile-compressed;
+- an XISF image that is written compressed: its pixels (byte-shuffled, for the codecs that are),
+  and what they compress to, which has to be complete before the header that says where it is.
+  An XISF rewrite keeps the same for the block it stores anew.
+
+That data is kept in memory as long as all of it together fits 256 MiB, and in temporary files
+beside the output beyond that (or in the system's directory for temporary files, where nothing is
+written). A temporary file is gone when the conversion ends, also when it fails or is stopped:
+on Linux and macOS it has no name from the start, on Windows the system removes it when it is
+closed. Beside the output there has to be room for what does not fit: the size of a compressed
+input image, decompressed; for compressed XISF output, the image and what it compresses to (up
+to twice its size, three times from compressed input).
+
+Two environment variables change this (in bytes, or with `K`, `M` or `G`):
+
+- `XISFCONV_MEMORY_LIMIT`: what the kept data may take in memory, 256M by default. `0` keeps all
+  of it in temporary files; `XISFCONV_MEMORY_LIMIT=4G` keeps a 4 GB image in memory, as 0.19 did.
+- `XISFCONV_PIECE_BYTES`: about how much one piece holds, 4M by default.
+
+The files that come out do not depend on either: they are the same bytes with pieces of 300 bytes
+and nothing kept in memory as with the defaults (which the tests check). They are also the bytes
+0.19 wrote, but for Zstandard: its blocks are compressed in pieces of 1 MiB now, which makes other
+bytes of the same data (a fraction of a percent more or less) than compressing a whole block at
+once did.
+
+TIFF output whose pages could take more than 4 GiB is written as BigTIFF, which has offsets of 8
+bytes instead of 4 (libtiff 4, tifffile and the programs built on them read it; a program that
+knows classic TIFF only does not). Whether a file needs it is judged before it is written, from
+the uncompressed size of its pages: a smaller one is classic TIFF, byte for byte as before.
+
+Ctrl-C (and a request to terminate) stops a conversion, a rewrite or a verification at the next
+piece, also in the middle of one image: the partly written output and the temporary files are
+removed, and the tool exits with status 130. A second Ctrl-C ends the program at once, and may
+leave a `.part` file. In the library and the Python package the same goes for a progress handler
+that stops a call, and for `xisfconv_context_cancel`: during a long step the last report is
+given again every 8 MiB or so of data, where the call can be stopped.
+
+What is still held whole: an image that the library or the Python package reads into memory
+(`xisfconv_read_pixels`, `File.read`) or is given to write, which is the array the caller has;
+the properties of a file (see [Limitations](#limitations)); and a DNG file's raw image, which is
+decoded once (into memory or a temporary file, as above).
 
 ## The library (libxisfconv)
 
@@ -1055,12 +1111,12 @@ Good to know:
 - Warnings of the library are Python warnings (`xisfconv.XisfconvWarning`), its notes go to the
   logger `xisfconv`, its errors are exceptions derived from `xisfconv.Error`.
 - Ctrl-C stops a conversion, a rewrite or a verification between its steps and leaves no partly
-  written file; during the last step it takes effect when the file is complete. (A rewrite and a
-  verification have a step per data block; a conversion has one per image while it reads an XISF
-  file, and writes its output in one, or with a step every few megabytes when the output is
-  tile-compressed FITS.) The same holds for any signal whose handler raises, such as an alarm that sets a
-  time limit. A function given as `progress=` is called between the steps, in the caller's
-  thread, and stops the work by raising an exception.
+  written file. (A rewrite and a verification have a step per data block, a conversion one per
+  image while it reads and one while it writes; since 0.20 a step that goes on is reported again
+  every 8 MiB or so of data, so a large image is stopped in the middle too.) The same holds for
+  any signal whose handler raises, such as an alarm that sets a time limit. A function given as
+  `progress=` is called between the steps, in the caller's thread, and stops the work by
+  raising an exception. Reading the pixels of an open file is not stopped this way.
 - `read_image` reads the XISF properties of an image with their types, and `write` writes them
   (since 0.15; before, they were read and not written): to XISF as the properties they were, to
   FITS and ASDF the way `convert` takes them along. `properties=` and `file_properties=` of `write`
@@ -1081,10 +1137,11 @@ Good to know:
   elsewhere, and a monolithic `.xisf` file that names any other file, raises
   `xisfconv.NotAllowedError` (a `PermissionError`) unless the call says
   `external_files="anywhere"`. Each call says it for itself: there is no setting that stays.
-- An image is read and written as a whole, in memory. Reading takes about twice the size of the
-  image for a moment, three times for a compressed file. Writing takes once its size on top of
-  the array, twice for a colour image with the channels last, and about four times when the
-  file is compressed (not for tile-compressed FITS, which is compressed row by row).
+- An array is read and written as a whole: reading takes about twice the size of the image for a
+  moment (a compressed block is decompressed once, into memory up to the limit of
+  [Large images](#large-images), into a temporary file beyond). Writing takes once its size on
+  top of the array, twice for a colour image with the channels last, and for compressed XISF
+  output at most the memory limit more. `convert` and `rewrite` hold no image whole.
 - `CCDData.read` hands the image to astropy's own FITS reader as a FITS file in memory, so that
   units, mask and uncertainty behave exactly as with FITS; that takes about four times the size
   of the image in memory.
@@ -1105,7 +1162,10 @@ Good to know:
   runs them in a sandbox that holds the one file).
 - Complex sample formats and images with more than two dimensions are skipped.
 - CIELab images are written as raw 3-channel data without color conversion.
-- TIFF output is classic TIFF (4 GiB limit); BigTIFF is not implemented.
+- Large images: compressed XISF output and decompressed input are kept in temporary files beside
+  the output where they do not fit the memory limit (see [Large images](#large-images)), which
+  needs room on that disk. A BigTIFF file is read by libtiff 4 and the programs built on it, not
+  by those that know classic TIFF only.
 - WCS keywords in an XISF header are taken to follow the FITS bottom-up convention (PixInsight's);
   they are converted when writing top-down FITS. Distortion models other than SIP (TPV, TNX) are
   copied without that conversion.

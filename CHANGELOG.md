@@ -9,6 +9,36 @@ in [`DEVELOPMENT.md`](DEVELOPMENT.md).
 Under "changed" stands what makes the same command, or the same call, do something else than
 before.
 
+## 0.20.0 (9 October 2026)
+
+**Images read and written a piece at a time.**
+
+Changed
+- A conversion and a rewrite no longer hold an image whole: it is read, converted and written in
+  bands of rows of about 4 MiB. What has to be kept between reading and writing (a compressed
+  block of the input, decompressed; the pixels of compressed XISF output and what they compress
+  to) is kept in memory up to 256 MiB together, beyond that in temporary files beside the
+  output, which are gone when the conversion ends, however it ends. Converting a 192 MB image
+  took 0.2 to 0.8 GB of memory and takes 10 to 260 MB; a 4.3 GB image becomes a TIFF file in
+  10 MB. The output is the same, byte for byte, but for Zstandard (below). In the library and
+  the Python package, `xisfconv_convert` and the rewrites work this way; reading an image into
+  memory and writing one from it still take the whole array.
+- Zstandard compression (XISF and ASDF output) is given its input in pieces of 1 MiB: other bytes
+  than before for the same data, which decodes the same.
+- Ctrl-C (or a request to terminate) stops the tool at the next piece of its work, also within
+  one image: the partly written output and its temporary files are removed and the exit status
+  is 130. Before, the program was ended where it stood and left the `.part` file. A second
+  Ctrl-C ends the program at once.
+- Progress: a step that goes on is reported again every 8 MiB or so of data (the stage and
+  numbers of the last report), so that a progress handler, `xisfconv_context_cancel` and Ctrl-C in
+  Python stop a call within one image. A handler is called more often than before.
+
+Added
+- BigTIFF: TIFF output whose pages could take more than 4 GiB is written as BigTIFF (before, an
+  error). Smaller files are classic TIFF as before.
+- The environment variables `XISFCONV_MEMORY_LIMIT` (what the kept data may take in memory; `0`:
+  all of it in temporary files) and `XISFCONV_PIECE_BYTES` (the size of a piece).
+
 ## 0.19.0 (9 October 2026)
 
 **The compression level and byte shuffling, for conversions and rewrites.**

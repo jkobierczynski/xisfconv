@@ -7,12 +7,13 @@
 #include <vector>
 
 #include "common.hpp"
+#include "imagesource.hpp"
 #include "property.hpp"
 
 namespace xisfconv {
 
 struct FitsHdu {
-    const PixelBuffer* pixels = nullptr;
+    Source pixels;                      // read a piece at a time as the image is written
     std::vector<FitsKeyword> keywords;  // user keywords; structural ones are filtered out
     std::string extname;
     bool bottomUp = false;  // pixel rows already flipped to bottom-up order
