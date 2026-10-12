@@ -1466,6 +1466,10 @@ def _inferred_type(key, value):
         return "Float64"
     if isinstance(value, numbers.Complex):
         return "Complex64"
+    if isinstance(value, Table):
+        return "Table"
+    if isinstance(value, DataBlock):
+        return value.type
     if isinstance(value, (bytes, bytearray, memoryview)):
         return "ByteArray"
     if isinstance(value, (np.ndarray, list, tuple)):
@@ -1638,6 +1642,143 @@ def _still_read(value, read):
     return _same_value(value, read)
 
 
+TableField = namedtuple("TableField", "id type header format", defaults=("", ""))
+TableField.__doc__ = """A field (a column) of a :class:`Table`: its id, its XISF type, and the header (the title of
+its column) and the format of its values, "" where it has none. The type is one of a value: Boolean, Int8 to Int64,
+UInt8 to UInt64, Float32, Float64, Complex32, Complex64, String or TimePoint. (Since 0.25.)"""
+
+
+class Table:
+    """An XISF table: rows of cells, of the types its fields name (since 0.25). It is the value
+    of a property of the type "Table" in :class:`Properties` and :class:`PropertyDict`, and is
+    written to XISF as a ``<Table>`` element (FITS and ASDF do not carry tables)::
+
+        stars = xisfconv.Table([("name", "String"), ("ra", "Float64", "RA (deg)"), ("mag", "Float32")],
+                               [("Vega", 279.2347, 0.03), ("Deneb", 310.3580, 1.25)], caption="Bright stars")
+        xisfconv.write("out.xisf", data, properties={"Catalog:Stars": stars})
+
+    ``fields`` are :class:`TableField` or tuples ``(id, type[, header[, format]])``; ``rows`` are
+    sequences of a value for each field, as a property of that type takes one (a String a str, a
+    TimePoint a datetime or its text, a number a number); ``caption`` is a text. Read from a file,
+    a cell has the Python value of its type (a TimePoint is the text the file has), and a table of
+    other cells (vectors, matrices) is not read: its value is None. The comment of a table is that
+    of its property (:meth:`PropertyDict.comment`).
+    """
+
+    def __init__(self, fields, rows=(), caption=""):
+        self.fields = [field if isinstance(field, TableField) else TableField(*field) for field in fields]
+        self.rows = [tuple(row) for row in rows]
+        self.caption = caption
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __iter__(self):
+        return iter(self.rows)
+
+    def column(self, field):
+        """The values of a field (by its id or its number), one for each row."""
+        if not isinstance(field, numbers.Integral):
+            ids = [f.id for f in self.fields]
+            if field not in ids:
+                raise KeyError(field)
+            field = ids.index(field)
+        return [row[field] for row in self.rows]
+
+    def __eq__(self, other):
+        if not isinstance(other, Table):
+            return NotImplemented
+        return (self.caption == other.caption and self.fields == other.fields and len(self.rows) == len(other.rows) and
+                all(len(a) == len(b) and all(_same_value(x, y) for x, y in zip(a, b)) for a, b in zip(self.rows, other.rows)))
+
+    __hash__ = None
+
+    def __repr__(self):
+        return "<xisfconv.Table %s%d row(s) of %s>" % (repr(self.caption) + ": " if self.caption else "", len(self.rows),
+                                                       ", ".join("%s (%s)" % (f.id, f.type) for f in self.fields))
+
+
+class DataBlock:
+    """The data block of a property of a type this library has no name for (a type of another
+    program, or of a later XISF), as the bytes it holds (since 0.25): the value of such a property
+    in :class:`Properties`, which :func:`write` writes again as it was. ``type`` is its XISF type
+    name, ``data`` the bytes, ``rows`` and ``columns`` the shape its element says (the rows and
+    columns of a type whose name ends in "Matrix", else ``rows`` is its length attribute, 0 for
+    none), ``big_endian`` whether it says its bytes are big-endian."""
+
+    def __init__(self, type, data, rows=0, columns=0, big_endian=False):   # noqa: A002 - the word of XISF
+        if not isinstance(type, str) or not type:
+            raise TypeError("a DataBlock has the name of its type, a str")
+        self.type = type
+        self.data = bytes(data)
+        self.rows = int(rows)
+        self.columns = int(columns)
+        self.big_endian = bool(big_endian)
+
+    def __eq__(self, other):
+        if not isinstance(other, DataBlock):
+            return NotImplemented
+        return (self.type, self.data, self.rows, self.columns, self.big_endian) == \
+            (other.type, other.data, other.rows, other.columns, other.big_endian)
+
+    __hash__ = None
+
+    def __repr__(self):
+        return "<xisfconv.DataBlock %s, %d bytes%s>" % (self.type, len(self.data), ", big-endian" if self.big_endian else "")
+
+
+def _table_handle_set(context, handle, name, key, table, comment):
+    """Gives a table to a property list of the library."""
+    fields = table.fields
+    if not fields:
+        raise ValueError("property %s: a table has at least one field" % key)
+    count = len(fields)
+
+    def texts(values, what):
+        array = (c_char_p * max(len(values), 1))()
+        for i, value in enumerate(values):
+            array[i] = _bytes(value, what) if value is not None else None
+        return array
+
+    cells = []
+    for number, row in enumerate(table.rows):
+        if len(row) != count:
+            raise ValueError("property %s: row %d has %d values for %d fields" % (key, number, len(row), count))
+        for field, value in zip(fields, row):
+            if value is None:
+                raise ValueError("property %s: row %d, field %s has no value" % (key, number, field.id))
+            if field.type not in _CHECKED_TYPES:
+                raise ValueError("property %s: field %s is a %s, and the cells of a table are values (a scalar, a "
+                                 "complex number, a String or a TimePoint)" % (key, field.id, field.type))
+            cells.append(_property_payload("%s (row %d, field %s)" % (key, number, field.id), value, field.type))
+    context.quick(_library.xisfconv_properties_set_table, handle, name,
+                  _bytes(table.caption, "the caption of table %s" % key) if table.caption else None, comment, count,
+                  texts([f.id for f in fields], "the id of a field"), texts([f.type for f in fields], "the type of a field"),
+                  texts([f.header or None for f in fields], "the header of a field"),
+                  texts([f.format or None for f in fields], "the format of a field"), len(table.rows),
+                  texts(cells, "the value of a cell"))
+
+
+def _table_handle_set_as_read(context, handle, name, key, raw, comment):
+    """Gives a table to a property list of the library as a file has it: ``raw`` is what
+    :meth:`Properties._read_table` gave, the caption, the fields and the cells."""
+    caption, fields, cells = raw
+
+    def texts(values, what, empty=""):
+        array = (c_char_p * max(len(values), 1))()
+        for i, value in enumerate(values):
+            array[i] = _bytes(value, what) if value or empty is not None else None
+        return array
+
+    rows = len(cells) // len(fields) if fields else 0
+    context.quick(_library.xisfconv_properties_set_table_as_read, handle, name,
+                  _bytes(caption, "the caption of table %s" % key) if caption else None, comment, len(fields),
+                  texts([f.id for f in fields], "the id of a field"), texts([f.type for f in fields], "the type of a field"),
+                  texts([f.header for f in fields], "the header of a field", None),
+                  texts([f.format for f in fields], "the format of a field", None), rows,
+                  texts(cells, "the value of a cell"))
+
+
 class PropertyDict(dict):
     """XISF properties in memory: ``{id: value}``. This is what an :class:`Image` has and what
     :func:`write` takes.
@@ -1647,7 +1788,9 @@ class PropertyDict(dict):
     goes with it: Boolean, Int32 (Int64 or UInt64 if it does not fit), Float64, Complex64,
     String, TimePoint, and vectors and matrices in the type of their elements (``uint16`` gives
     UI16Vector, ``float64`` F64Matrix, ``complex64`` C32Vector). A NumPy scalar keeps its width
-    (``numpy.float32(0.5)`` is a Float32) and ``bytes`` are a ByteArray.
+    (``numpy.float32(0.5)`` is a Float32) and ``bytes`` are a ByteArray. A :class:`Table` is a
+    table, written as a ``<Table>`` element, and a :class:`DataBlock` the data block of a type
+    this library has no name for, written as the bytes it holds (since 0.25).
 
     :meth:`set` states the type, and a comment and a format, where that is not what is wanted;
     :meth:`type`, :meth:`comment` and :meth:`format` tell them, as for :class:`Properties`. A
@@ -1962,6 +2105,24 @@ def _properties_handle(context, properties, what):
                 # (a property a file has without a type is written again without one)
                 kind = "" if as_read is not None and isinstance(properties, PropertyDict) and key in properties._untyped \
                     else _inferred_type(key, value)
+            if isinstance(value, Table):
+                if kind != "Table":
+                    raise ValueError("property %s: a Table is the value of a property of the type Table, not %s" % (key, kind))
+                if as_read is not None and isinstance(as_read[0], tuple):
+                    _table_handle_set_as_read(context, handle, name, key, as_read[0], comment)
+                else:
+                    _table_handle_set(context, handle, name, key, value, comment)
+                continue
+            if kind == "Table" and not isinstance(value, DataBlock):
+                raise ValueError("property %s: the value of a Table is a xisfconv.Table, not %s" % (key, value.__class__.__name__))
+            if isinstance(value, DataBlock):
+                if kind != value.type:
+                    raise ValueError("property %s: the DataBlock is a %s, and the property a %s" % (key, value.type, kind))
+                data = value.data
+                context.quick(_library.xisfconv_properties_set_bytes, handle, name, _bytes(kind, "a property type"),
+                              data if data else None, len(data), value.rows, value.columns, int(value.big_endian),
+                              comment, form)
+                continue
             array = _element_of(kind)[0] is not None
             if not array and as_read is None and kind not in _CHECKED_TYPES:
                 if kind not in _WIDE_TYPES:
@@ -2065,9 +2226,11 @@ class Properties(Mapping):
     Scalars are bool, int, float, complex or str (a time point is the text the file has);
     vectors and matrices are NumPy arrays in the type of their elements (an F32Vector is
     float32, a UI16Matrix uint16, a C64Vector complex128; up to 0.14 they were all read as
-    float64, and complex ones not at all). A property this library does not read is None: a
-    table, a data block of a type it has no name for. A value of a type it has no name for
-    (Float128) is the text the file has. :meth:`type`, :meth:`comment` and :meth:`format` give
+    float64, and complex ones not at all). A table is a :class:`Table`, and a data block of a type
+    this library has no name for a :class:`DataBlock` of its bytes (since 0.25; both were None
+    before). A property this library does not read is None: a table of other cells than values,
+    a property made of other elements, a data block of a scalar type. A value of a type it has
+    no name for (Float128) is the text the file has. :meth:`type`, :meth:`comment` and :meth:`format` give
     the XISF type name, the comment and the format specification of a property.
 
     A FITS or ASDF file has no properties of its own: it has those of the XISF file it was
@@ -2149,9 +2312,55 @@ class Properties(Mapping):
         stored = self._stored(index)
         if stored == _lib.PROPERTY_ARRAY:
             return self._read_block(index, kind)
+        if stored == _lib.PROPERTY_BYTES:
+            return self._read_bytes(index, kind)
+        if stored == _lib.PROPERTY_TABLE:
+            return self._read_table(index)
         if stored == _lib.PROPERTY_UNREAD:
             return None
         return _scalar_value(kind, value)
+
+    def _read_bytes(self, index, kind):
+        """A data block of a type without a name: a :class:`DataBlock`."""
+        file = self._file
+        size, rows, columns, big = c_size_t(), c_uint64(), c_uint64(), c_int32()
+        with file._context.lock:
+            pointer = file._pointer()
+            file._context.call(_library.xisfconv_property_read_bytes, pointer, self._image, index, None, 0, byref(size),
+                               byref(rows), byref(columns), byref(big))
+            out = ctypes.create_string_buffer(max(size.value, 1))
+            file._context.call(_library.xisfconv_property_read_bytes, pointer, self._image, index, out, size.value,
+                               byref(size), byref(rows), byref(columns), byref(big))
+        return DataBlock(kind, out.raw[:size.value], rows.value, columns.value, bool(big.value))
+
+    def _read_table(self, index, raw=None):
+        """A table: a :class:`Table`. ``raw``, a list, is given the texts the file has: the
+        caption, the fields and the cells row after row."""
+        file = self._file
+        count, rows, caption = c_size_t(), c_size_t(), c_char_p()
+        ident, kind, header, form, value = c_char_p(), c_char_p(), c_char_p(), c_char_p(), c_char_p()
+        with file._context.lock:
+            pointer = file._pointer()
+            file._context.quick(_library.xisfconv_property_table, pointer, self._image, index, byref(count), byref(rows),
+                                byref(caption))
+            fields = []
+            for field in range(count.value):
+                file._context.quick(_library.xisfconv_property_table_field, pointer, self._image, index, field,
+                                    byref(ident), byref(kind), byref(header), byref(form))
+                fields.append(TableField(_text(ident.value), _text(kind.value), _text(header.value), _text(form.value)))
+            cells, texts = [], []
+            for row in range(rows.value):
+                line = []
+                for field in range(count.value):
+                    file._context.quick(_library.xisfconv_property_table_cell, pointer, self._image, index, row, field,
+                                        byref(value))
+                    text = _text(value.value)
+                    texts.append(text)
+                    line.append(_scalar_value(fields[field].type, text))
+                cells.append(tuple(line))
+            if raw is not None:
+                raw[:] = [_text(caption.value), list(fields), texts]
+            return Table(fields, cells, _text(caption.value))
 
     def _read_block(self, index, kind):
         """A vector or a matrix in the type of its elements; None for a data block of any
@@ -2208,6 +2417,11 @@ class Properties(Mapping):
             try:
                 if stored == _lib.PROPERTY_ARRAY:
                     value = self._read_block(index, kind)
+                elif stored == _lib.PROPERTY_BYTES:
+                    value = self._read_bytes(index, kind)
+                elif stored == _lib.PROPERTY_TABLE:
+                    raw = []
+                    value = self._read_table(index, raw)
                 else:
                     value = None if stored == _lib.PROPERTY_UNREAD else _scalar_value(kind, text)
             except Error as e:   # one property that cannot be read does not cost the others
@@ -2220,6 +2434,11 @@ class Properties(Mapping):
                 into._read[key] = (self._as_stored(index, text, stored), value, stored == _lib.PROPERTY_TEXT_BLOCK)
                 if not kind:
                     into._untyped.add(key)
+            elif stored == _lib.PROPERTY_TABLE and value is not None:
+                # written again as the file has it, if it is not touched (a cell that is not a
+                # value of its type, a Boolean "yes", fields with the same id); a copy, as a
+                # Table can be changed in place
+                into._read[key] = (tuple(raw), Table(value.fields, value.rows, value.caption), False)
             if digest is not None and key in solved:
                 into._solution[key] = (digest, value)
         return into

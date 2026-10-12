@@ -7499,6 +7499,32 @@ def masked_unit(data):
     return re.sub(rb"0x[0-9a-fA-F]{16}", b"0x" + b"0" * 16, data)
 
 
+def test_tables():
+    """XISF tables (0.25): --info lists them, a conversion to FITS or ASDF says it does not carry them, a rewrite
+    keeps them as they are, byte for byte in the header."""
+    d = os.path.join(TMP, "tables")
+    os.makedirs(d)
+    table = ('<Table id="Cat:Stars" caption="Bright stars" rows="2" columns="2"><Structure><Field id="name" type="String"/>'
+             '<Field id="mag" type="Float32" format="%.2f"/></Structure><Row><Cell>Vega</Cell><Cell value="0.03"/></Row>'
+             '<Row><Cell>Deneb</Cell><Cell value="1.25"/></Row></Table>')
+    odd = '<Table id="Cat:Vectors"><Structure><Field id="v" type="F64Vector"/></Structure></Table>'
+    long = '<Table id="Cat:Long" caption="a&#13;b&#127;&#x9b;' + "x" * 300 + '"><Structure><Field id="v" type="Int32"/></Structure></Table>'
+    src = os.path.join(d, "t.xisf")
+    write_xisf(src, [image_entry(test_image(np.uint16, 5, 6, 1, 1), children=table + odd + long)])
+    r = run("-I", src)
+    check("Cat:Stars (Table) [table: 2 rows of 2 fields, \"Bright stars\"]" in r.stdout and
+          "Cat:Vectors (Table) [table, not read]" in r.stdout, f"tables: --info lists them: {r.stdout[-400:]}")
+    check("\r" not in r.stdout and "\x7f" not in r.stdout and "\x9b" not in r.stdout and "\"a b  " + "x" * 94 + "...\"" in r.stdout and "x" * 95 not in r.stdout,
+          f"tables: --info shows a caption on its line, shortened: {r.stdout[-400:]}")
+    for to in ("fits", "asdf"):
+        r = run("-t", to, "-o", os.path.join(d, "t." + to), src, expect_ok=False)
+        check(r.returncode == 0 and "the table Cat:Stars is not carried to " + to.upper() in r.stderr and
+              "Cat:Vectors is left out" in r.stderr, f"tables: to {to}, with a warning: {r.stderr[-400:]}")
+    run("-t", "xisf", "-c", "-o", os.path.join(d, "packed.xisf"), src, "-q")
+    check(table.encode() in open(os.path.join(d, "packed.xisf"), "rb").read() and
+          odd.encode() in open(os.path.join(d, "packed.xisf"), "rb").read(), "tables: a rewrite keeps them as they are")
+
+
 def test_standard_input_and_output():
     """"-" as the input reads the standard input, "-o -" writes to the standard output (0.23): the bytes of the file
     that would be written, and nothing else there; a failed run writes nothing."""
@@ -7783,7 +7809,7 @@ if __name__ == "__main__":
               test_asdf_python_files, test_asdf_roundtrips, test_export_from_fits_and_asdf, test_xisf_rewrite,
               test_verify, test_fits_tile_compressed, test_fits_tile_writing, test_property_round_trip,
               test_downsampling_and_thumbnailer, test_distributed_units, test_directories_and_patterns, test_dng, test_debayer,
-              test_compression_level_and_shuffling, test_pieces, test_standard_input_and_output,
+              test_compression_level_and_shuffling, test_pieces, test_standard_input_and_output, test_tables,
               test_documents):
         try:
             t()

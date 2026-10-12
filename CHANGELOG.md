@@ -9,6 +9,36 @@ in [`DEVELOPMENT.md`](DEVELOPMENT.md).
 Under "changed" stands what makes the same command, or the same call, do something else than
 before.
 
+## 0.25.0 (12 October 2026)
+
+**XISF tables, and data blocks of types without a name, through the API.**
+
+Added
+- XISF tables (`<Table>` elements: rows of cells of the types their fields name) are listed
+  with the properties of their image, or of the file for one at the root of the header that no
+  image refers to; a table refers to a structure at the root, or an image to a table at the
+  root, as the specification allows. One whose cells are values (numbers, Boolean, complex
+  numbers, String, TimePoint) is read: `xisfconv_property_table`, `xisfconv_property_table_field`
+  and `xisfconv_property_table_cell` in C (`XISFCONV_PROPERTY_TABLE`), an `xisfconv.Table` in
+  Python. `xisfconv_properties_set_table` and an `xisfconv.Table` among the properties of
+  `write` and `Writer` write one, as a `<Table>` element; `xisfconv_properties_set_table_as_read`
+  writes a table read from a file again as the file has it (Python does that for a table that was
+  not changed).
+- A data block of a type without a name here (`Float128Vector`, a type of another program) is
+  handed over as its bytes: `xisfconv_property_read_bytes` and `xisfconv_properties_set_bytes`
+  (`XISFCONV_PROPERTY_BYTES`), an `xisfconv.DataBlock` in Python. So `read_image` and `write` carry
+  it, as a conversion did.
+- `--info` lists tables with their rows and fields.
+
+Changed
+- Such a data block was `XISFCONV_PROPERTY_UNREAD`, and None in Python; such a table was not
+  listed at all.
+- A conversion to FITS or ASDF says that it does not carry a table (it left them out without a
+  word). A data block of a type without a name whose bytes are big-endian is not carried to FITS
+  or ASDF either, with a warning: their layout has no byte order for it, and it was carried as if
+  little-endian. To XISF its byte order is written again (it was lost).
+- `xisfconv.xisf` leaves tables out with a warning, as the `xisf` package has none.
+
 ## 0.24.0 (12 October 2026)
 
 **An image of an open FITS or ASDF file is read from where it is.**

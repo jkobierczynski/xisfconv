@@ -573,7 +573,35 @@ void printProperties(const Library& lib, xisfconv_file* f, size_t image, const c
         int32_t block = 0;
         lib.check(xisfconv_property_get(f, image, p, &pid, &type, &value, nullptr, &block));
         std::cout << indent << pid << " (" << type << ")";
-        if (block) std::cout << " [data block]";
+        const xisfconv_property_storage stored = xisfconv_property_stored(f, image, p);
+        if (stored == XISFCONV_PROPERTY_TABLE) {
+            size_t fields = 0, rows = 0;
+            const char* caption = "";
+            lib.check(xisfconv_property_table(f, image, p, &fields, &rows, &caption));
+            std::string shown = caption;
+            if (shown.size() > 100) {   // (not inside a character of UTF-8)
+                size_t end = 100;
+                while (end > 0 && (static_cast<unsigned char>(shown[end]) & 0xC0) == 0x80) --end;
+                shown = shown.substr(0, end) + "...";
+            }
+            {   // control characters (C0, DEL, C1) as blanks: they are not for the terminal
+                std::string plain;
+                for (size_t i = 0; i < shown.size(); ++i) {
+                    const unsigned char c = static_cast<unsigned char>(shown[i]);
+                    if (c == 0xC2 && i + 1 < shown.size() && (static_cast<unsigned char>(shown[i + 1]) & 0xE0) == 0x80) {
+                        plain += ' ';
+                        ++i;
+                    } else {
+                        plain += c < 0x20 || c == 0x7F ? ' ' : static_cast<char>(c);
+                    }
+                }
+                shown = plain;
+            }
+            std::cout << " [table: " << rows << (rows == 1 ? " row" : " rows") << " of " << fields << (fields == 1 ? " field" : " fields")
+                      << (shown.empty() ? std::string() : ", \"" + shown + "\"") << "]";
+        } else if (stored == XISFCONV_PROPERTY_UNREAD && std::string(type) == "Table") {
+            std::cout << " [table, not read]";
+        } else if (block) std::cout << " [data block]";
         else {
             std::string v = value;
             if (image != XISFCONV_FILE_PROPERTIES) {

@@ -1488,7 +1488,12 @@ xisfconv_property_storage xisfconv_property_stored(const xisfconv_file* file, si
         if (index >= carried->size()) return XISFCONV_PROPERTY_NONE;
         const Property& p = (*carried)[index];
         PropertyElement e;
-        if (p.array) return propertyElement(p.type, e) ? XISFCONV_PROPERTY_ARRAY : XISFCONV_PROPERTY_UNREAD;
+        if (p.table) return XISFCONV_PROPERTY_TABLE;
+        if (p.array) {
+            return propertyElement(p.type, e) ? XISFCONV_PROPERTY_ARRAY
+                   : isUnnamedBlockType(p.type) ? XISFCONV_PROPERTY_BYTES
+                                                : XISFCONV_PROPERTY_UNREAD;
+        }
         return p.block ? XISFCONV_PROPERTY_TEXT_BLOCK : XISFCONV_PROPERTY_VALUE;
     }
     const auto* list = propertiesOf(file, image);
@@ -1497,6 +1502,8 @@ xisfconv_property_storage xisfconv_property_stored(const xisfconv_file* file, si
         case XisfFile::PropertyStorage::Header: return XISFCONV_PROPERTY_VALUE;
         case XisfFile::PropertyStorage::TextBlock: return XISFCONV_PROPERTY_TEXT_BLOCK;
         case XisfFile::PropertyStorage::Array: return XISFCONV_PROPERTY_ARRAY;
+        case XisfFile::PropertyStorage::Bytes: return XISFCONV_PROPERTY_BYTES;
+        case XisfFile::PropertyStorage::Table: return XISFCONV_PROPERTY_TABLE;
         default: return XISFCONV_PROPERTY_UNREAD;
     }
 } catch (...) {
@@ -1611,7 +1618,10 @@ xisfconv_status xisfconv_property_read(xisfconv_file* file, size_t image, size_t
     if (!file) return XISFCONV_ERR_ARGUMENT;
     return guarded(file->state, file->path.c_str(), [&] {
         if (image != XISFCONV_FILE_PROPERTIES) checkImage(file, image);
-        const bool held = file->propertyHeld && file->propertyImage == image && file->propertyIndex == index;
+        PropertyElement element;
+        // (what xisfconv_property_read_bytes keeps between its calls is no vector or matrix)
+        const bool held = file->propertyHeld && file->propertyImage == image && file->propertyIndex == index &&
+                          file->property.array && propertyElement(file->property.type, element);
         if (!held) {
             file->propertyHeld = false;
             file->property = Property();
@@ -1657,6 +1667,108 @@ xisfconv_status xisfconv_property_read(xisfconv_file* file, size_t image, size_t
         // handed over: not kept any longer
         file->propertyHeld = false;
         file->property = Property();
+    });
+}
+
+xisfconv_status xisfconv_property_read_bytes(xisfconv_file* file, size_t image, size_t index, void* buffer,
+                                             size_t buffer_size, size_t* size, uint64_t* rows, uint64_t* columns,
+                                             int32_t* big_endian) {
+    if (!file) return XISFCONV_ERR_ARGUMENT;
+    return guarded(file->state, file->path.c_str(), [&] {
+        if (image != XISFCONV_FILE_PROPERTIES) checkImage(file, image);
+        // (kept between the call that asks for the size and the one that fetches the bytes, as by xisfconv_property_read)
+        const bool held = file->propertyHeld && file->propertyImage == image && file->propertyIndex == index &&
+                          isUnnamedBlockType(file->property.type) && file->property.array;
+        if (!held) {
+            file->propertyHeld = false;
+            file->property = Property();
+            if (xisfconv_property_stored(file, image, index) != XISFCONV_PROPERTY_BYTES) {
+                if (index >= xisfconv_property_count(file, image)) {
+                    fail(XISFCONV_ERR_INDEX, "property index " + std::to_string(index) + " out of range");
+                }
+                fail(XISFCONV_ERR_NOT_FOUND, "property " + std::to_string(index) + " is not a data block of a type without a name here");
+            }
+            if (const auto* carried = carriedOf(file, image)) {
+                file->property = (*carried)[index];
+            } else {
+                const XisfProperty& x = (*propertiesOf(file, image))[index];
+                try {
+                    file->property = file->xisf->loadPropertyCounted(x, true);
+                } catch (const Error& err) {
+                    throw Error("property '" + x.id + "': " + err.what(), err.kind);
+                }
+            }
+            file->propertyImage = image;
+            file->propertyIndex = index;
+            file->propertyHeld = true;
+        }
+        const Property& p = file->property;
+        if (size) *size = p.data.size();
+        if (rows) *rows = p.rows;
+        if (columns) *columns = isMatrixPropertyType(p.type) ? p.columns : 0;
+        if (big_endian) *big_endian = p.bigEndian ? 1 : 0;
+        if (!buffer) return;
+        if (buffer_size < p.data.size()) {
+            fail(XISFCONV_ERR_BUFFER, "the property holds " + std::to_string(p.data.size()) + " bytes, the buffer " + std::to_string(buffer_size));
+        }
+        if (!p.data.empty()) std::memcpy(buffer, p.data.data(), p.data.size());
+        file->propertyHeld = false;
+        file->property = Property();
+    });
+}
+
+namespace {
+// The table of a property, or a failure that says why there is none.
+const PropertyTable& tableOf(const xisfconv_file* file, size_t image, size_t index) {
+    if (image != XISFCONV_FILE_PROPERTIES) checkImage(file, image);
+    if (const auto* carried = carriedOf(file, image)) {
+        if (index >= carried->size()) fail(XISFCONV_ERR_INDEX, "property index " + std::to_string(index) + " out of range");
+        if ((*carried)[index].table) return *(*carried)[index].table;
+        fail(XISFCONV_ERR_NOT_FOUND, "property " + (*carried)[index].id + " is not a table");
+    }
+    const auto* list = propertiesOf(file, image);
+    if (!list || index >= list->size()) fail(XISFCONV_ERR_INDEX, "property index " + std::to_string(index) + " out of range");
+    const XisfProperty& x = (*list)[index];
+    if (x.table) return *x.table;
+    fail(XISFCONV_ERR_NOT_FOUND, "property " + x.id + " is not a table" + (x.unread.empty() ? std::string() : " that is read: " + x.unread));
+}
+}  // namespace
+
+xisfconv_status xisfconv_property_table(const xisfconv_file* file, size_t image, size_t index, size_t* fields, size_t* rows,
+                                        const char** caption) {
+    if (!file) return XISFCONV_ERR_ARGUMENT;
+    return guarded(file->state, file->path.c_str(), [&] {
+        const PropertyTable& t = tableOf(file, image, index);
+        if (fields) *fields = t.fields.size();
+        if (rows) *rows = t.rowCount();
+        if (caption) *caption = t.caption.c_str();
+    });
+}
+
+xisfconv_status xisfconv_property_table_field(const xisfconv_file* file, size_t image, size_t index, size_t field,
+                                              const char** id, const char** type, const char** header, const char** format) {
+    if (!file) return XISFCONV_ERR_ARGUMENT;
+    return guarded(file->state, file->path.c_str(), [&] {
+        const PropertyTable& t = tableOf(file, image, index);
+        if (field >= t.fields.size()) fail(XISFCONV_ERR_INDEX, "field " + std::to_string(field) + " out of range");
+        const PropertyTable::Field& f = t.fields[field];
+        if (id) *id = f.id.c_str();
+        if (type) *type = f.type.c_str();
+        if (header) *header = f.header.c_str();
+        if (format) *format = f.format.c_str();
+    });
+}
+
+xisfconv_status xisfconv_property_table_cell(const xisfconv_file* file, size_t image, size_t index, size_t row, size_t field,
+                                             const char** value) {
+    if (!file) return XISFCONV_ERR_ARGUMENT;
+    return guarded(file->state, file->path.c_str(), [&] {
+        const PropertyTable& t = tableOf(file, image, index);
+        if (row >= t.rowCount() || field >= t.fields.size()) {
+            fail(XISFCONV_ERR_INDEX, "cell " + std::to_string(row) + ", " + std::to_string(field) + " out of range");
+        }
+        if (!value) fail(XISFCONV_ERR_ARGUMENT, "xisfconv_property_table_cell: value is NULL");
+        *value = t.cells[row * t.fields.size() + field].c_str();
     });
 }
 
@@ -1767,6 +1879,94 @@ xisfconv_status xisfconv_properties_set_array(xisfconv_properties* properties, c
         elementsToOrFromHost(p.data.data(), p.data.size(), e);
         putProperty(properties, std::move(p));
     });
+}
+
+xisfconv_status xisfconv_properties_set_bytes(xisfconv_properties* properties, const char* id, const char* type,
+                                              const void* bytes, size_t size, uint64_t rows, uint64_t columns,
+                                              int32_t big_endian, const char* comment, const char* format) {
+    if (!properties) return XISFCONV_ERR_ARGUMENT;
+    return guarded(properties->state, nullptr, [&] {
+        Property p = propertyHead("xisfconv_properties_set_bytes", id, type, comment, format);
+        if (!isXmlText(p.type)) fail(XISFCONV_ERR_ARGUMENT, "property " + p.id + ": its type is not text that XML can hold");
+        if (!isUnnamedBlockType(p.type)) {
+            fail(XISFCONV_ERR_ARGUMENT, "property " + p.id + ": " + (p.type.empty() ? std::string("a type is needed") :
+                                        p.type + " has a name here: it is given by xisfconv_properties_set, _set_array or _set_table"));
+        }
+        if (!bytes && size) fail(XISFCONV_ERR_ARGUMENT, "property " + p.id + ": bytes is NULL");
+        if (!isMatrixPropertyType(p.type) && columns != 0) fail(XISFCONV_ERR_ARGUMENT, "property " + p.id + ": only a matrix has columns");
+        p.array = true;
+        p.rows = rows;
+        p.columns = columns;
+        p.bigEndian = big_endian != 0;
+        const uint8_t* b = static_cast<const uint8_t*>(bytes);
+        if (size) p.data.assign(b, b + size);
+        putProperty(properties, std::move(p));
+    });
+}
+
+namespace {
+
+// A table given to a property list: checked as xisfconv_properties_set_table says, or, as read
+// (xisfconv_properties_set_table_as_read), only for what makes it a table.
+xisfconv_status setTable(const char* function, bool asRead, xisfconv_properties* properties, const char* id,
+                         const char* caption, const char* comment, size_t fields, const char* const* field_ids,
+                         const char* const* field_types, const char* const* field_headers,
+                         const char* const* field_formats, size_t rows, const char* const* cells) {
+    if (!properties) return XISFCONV_ERR_ARGUMENT;
+    return guarded(properties->state, nullptr, [&] {
+        Property p = propertyHead(function, id, "Table", comment, nullptr);
+        if (fields && (!field_ids || !field_types)) fail(XISFCONV_ERR_ARGUMENT, "property " + p.id + ": field_ids or field_types is NULL");
+        if (rows && fields && !cells) fail(XISFCONV_ERR_ARGUMENT, "property " + p.id + ": cells is NULL");
+        if (fields && rows > std::numeric_limits<size_t>::max() / fields) fail(XISFCONV_ERR_ARGUMENT, "property " + p.id + ": too many cells");
+        auto table = std::make_shared<PropertyTable>();
+        if (caption) table->caption = caption;
+        for (size_t i = 0; i < fields; ++i) {
+            if (!field_ids[i] || !field_types[i]) fail(XISFCONV_ERR_ARGUMENT, "property " + p.id + ": field " + std::to_string(i) + " has no id or type");
+            PropertyTable::Field f;
+            f.id = field_ids[i];
+            f.type = field_types[i];
+            if (field_headers && field_headers[i]) f.header = field_headers[i];
+            if (field_formats && field_formats[i]) f.format = field_formats[i];
+            table->fields.push_back(std::move(f));
+        }
+        for (size_t i = 0; i < rows * fields; ++i) {
+            if (!cells[i]) fail(XISFCONV_ERR_ARGUMENT, "property " + p.id + ": cell " + std::to_string(i / fields) + ", " +
+                                                       std::to_string(i % fields) + " is NULL");
+            table->cells.emplace_back(cells[i]);
+        }
+        std::string problem;
+        if (!asRead) {
+            problem = tableProblem(*table);
+        } else if (table->fields.empty()) {
+            problem = "a table has at least one field";
+        } else {
+            for (const PropertyTable::Field& f : table->fields)
+                if (!isScalarPropertyType(f.type)) problem = "a field is not of a type of value";
+        }
+        if (!problem.empty()) fail(XISFCONV_ERR_ARGUMENT, "table " + p.id + ": " + problem);
+        p.table = std::move(table);
+        putProperty(properties, std::move(p));
+    });
+}
+
+}  // namespace
+
+xisfconv_status xisfconv_properties_set_table(xisfconv_properties* properties, const char* id, const char* caption,
+                                              const char* comment, size_t fields, const char* const* field_ids,
+                                              const char* const* field_types, const char* const* field_headers,
+                                              const char* const* field_formats, size_t rows, const char* const* cells) {
+    return setTable("xisfconv_properties_set_table", false, properties, id, caption, comment, fields, field_ids,
+                    field_types, field_headers, field_formats, rows, cells);
+}
+
+xisfconv_status xisfconv_properties_set_table_as_read(xisfconv_properties* properties, const char* id,
+                                                      const char* caption, const char* comment, size_t fields,
+                                                      const char* const* field_ids, const char* const* field_types,
+                                                      const char* const* field_headers,
+                                                      const char* const* field_formats, size_t rows,
+                                                      const char* const* cells) {
+    return setTable("xisfconv_properties_set_table_as_read", true, properties, id, caption, comment, fields, field_ids,
+                    field_types, field_headers, field_formats, rows, cells);
 }
 
 // ------------------------------------------------------------------------------------------

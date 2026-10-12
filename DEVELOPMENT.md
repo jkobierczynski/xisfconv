@@ -34,6 +34,7 @@ The decisions:
 - [Images in bands (0.22.0)](#images-in-bands-0220)
 - [Files in memory and streams (0.23.0)](#files-in-memory-and-streams-0230)
 - [Images read from their place (0.24.0)](#images-read-from-their-place-0240)
+- [Tables and data blocks of other types (0.25.0)](#tables-and-data-blocks-of-other-types-0250)
 - [The library (libxisfconv)](#the-library-libxisfconv)
 - [The Python package](#the-python-package)
 - [The manual (`docs/manual.html`)](#the-manual-docsmanualhtml)
@@ -411,6 +412,7 @@ brought are in the sections below.
 | | 0.22.0 | Images in bands of rows for programs: `xisfconv_read_rows`, a writer given an image in bands; `FileImage.bands()`, `xisfconv.Writer` |
 | | 0.23.0 | Files in memory and streams: the `_io` functions of the C API, data and file objects in Python, `-` for the standard input and output of the tool |
 | | 0.24.0 | The images of an open FITS or ASDF file read from their place, without the headers before them |
+| | 0.25.0 | XISF tables of values read and written through the API; data blocks of types without a name handed over as their bytes |
 
 ## Purpose and scope
 
@@ -1351,6 +1353,56 @@ number (a thousand small HDUs: 7 s for FITS, 12 s for ASDF).
   passes and the old way does not): a thousand HDUs of 8 x 8 pixels read one by one take 0.1 s
   (FITS) and 0.07 s (ASDF), about the same in bands; the 20 000 arrays of an ASDF file, 1.2 s.
 
+## Tables and data blocks of other types (0.25.0)
+
+Two kinds of property had no place in the API: a data block of a type the library has no name
+for, which a conversion carried as its bytes but `read_image` and `write` dropped, and tables,
+which the library did not list at all.
+
+- **Scope, as decided with the user: tables through the API, of values.** A table is a `<Table>`
+  element (section 11.3 of the specification): a `<Structure>` of `<Field>`s, each with an id and a
+  type, and `<Row>`s of a `<Cell>` per field. Its cells may be of any property type, vectors and
+  matrices in data blocks included; the library reads tables whose fields are of a type of value
+  (the scalars, complex numbers, String, TimePoint), which is what catalogs and logs are, and lists
+  the others as unread. Carrying tables to FITS and ASDF would add to the documented layout of
+  `docs/xisf-properties-in-fits-and-asdf.md`; a conversion says instead that it does not carry
+  them, where it left them out without a word.
+- **Where tables are.** In an image, or at the root of the header; an image may refer to a table at
+  the root by its uid (`<Reference ref=.../>`), and a table to a structure at the root. A table at
+  the root that no image refers to is one of the file, as a `<Property>` at the root is. Tables are
+  listed among the properties, in the order of the header: their ids are those of properties, and
+  a program that reads the properties of an image and writes them again gets them along. The
+  writer puts the tables of an image in it, and those of the file at the root after `<Metadata>`,
+  which holds properties only.
+- **Cells as text.** A cell is held as the text XISF writes its value with (a String its text), as
+  a scalar property is, and checked as one when it is given (`tableProblem`). A String is the
+  content of its cell: the specification gives a String no value attribute (its first examples
+  did, and such a cell is read as well). Its line breaks and tabs are written as character
+  references, so that they come back as they are.
+- **A table read is written again as the file has it.** As for a scalar property
+  (`xisfconv_properties_set_as_read`), a cell that is not a value of its type ("1.0" in an Int32
+  field, a Boolean "yes") or fields of one id are no reason to lose a table: Python keeps the texts
+  of a table it read and, while the `Table` is still equal to what was read, gives them to
+  `xisfconv_properties_set_table_as_read`, which checks only that it is a table and writes what XML
+  cannot hold with blanks. Python keeps a copy of what was read, as a `Table` can be changed in
+  place. A table at the root that many images refer to is parsed once, and shared.
+- **What is not a table that is read**, with the reason kept for the message: no structure, a field
+  of another type, a row with another number of cells than there are fields, a cell in a data
+  block, `rows` or `columns` attributes that disagree with what is there. The `<Property
+  type="Table">` that some files have (a property with element children) stays a property that is
+  not read.
+- **Data blocks of types without a name** (`XISFCONV_PROPERTY_BYTES`): not a scalar type, not a
+  vector or matrix of known elements, not String nor Table. The bytes are what the block holds,
+  decompressed and its checksum verified; nothing is known of their elements, so their byte order
+  is handed over as the block says it, and written so again. That fixed a loss: a conversion carried
+  such bytes and dropped `byteOrder="big"`. FITS and ASDF keep no byte order for them, so a
+  big-endian one is not carried there, with a warning. An Int32 in a data block stays unread: its
+  type has a name, and a value, not bytes, is what it should be.
+- **Python**: `xisfconv.Table` (fields as `TableField` named tuples, rows as tuples of Python
+  values, a caption; equal when all of that is) and `xisfconv.DataBlock` (type, bytes, shape, byte
+  order). `xisfconv.xisf` lists the elements of a file in the order the library does, tables
+  included, and leaves tables out with a warning: the `xisf` package has none.
+
 ## The library (libxisfconv)
 
 Planned in a separate brief with a draft header (not part of the repository), decided as follows
@@ -1739,9 +1791,8 @@ library with one line changed.
 - **What is not read has no value, and says so.** A table, a property made of elements, a block
   of a type without a name: `xisfconv_property_stored` calls them unread, the Python package
   gives None, and `write` leaves them out with a warning. The first version wrote a Table back
-  as an empty value. A conversion does better in one case: it carries a data block of a type it
-  has no name for as the bytes it is, which the property functions of the API cannot hand over
-  (see TODO). A text block is handed over as its bytes also where they are not UTF-8; a NUL
+  as an empty value. Since 0.25 a table of values and a data block of a type without a name are
+  read (see "Tables and data blocks of other types"). A text block is handed over as its bytes also where they are not UTF-8; a NUL
   character ends it, as it ends any C string.
 - **A solution belongs to the keywords it was read with.** An astrometric solution among the
   properties a caller gives is written as it is, and none is made. But a program that reads an

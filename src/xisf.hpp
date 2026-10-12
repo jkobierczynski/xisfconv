@@ -35,6 +35,10 @@ struct XisfProperty {
     bool exactText = false;
     std::string location;
     const xml::Node* node = nullptr;
+    // A <Table> element (type "Table"): the table, or why it is not read (see PropertyTable:
+    // tables of values only).
+    std::shared_ptr<const PropertyTable> table;
+    std::string unread;
 };
 
 struct ColorFilterArray {
@@ -228,7 +232,7 @@ public:
     // How a property is stored, without reading it: a value in the header, a String that is
     // kept as a data block (Property::block), a vector or a matrix, or something that is not
     // read (a table, a block of a type without a name here, a text whose block is damaged).
-    enum class PropertyStorage { Header, TextBlock, Array, Unread };
+    enum class PropertyStorage { Header, TextBlock, Array, Unread, Bytes, Table };
     PropertyStorage propertyStorage(const XisfProperty& property) const;
     // All properties of an image, or (kFileProperties) of the file. One that cannot be read is
     // left out with a warning.
@@ -270,6 +274,10 @@ private:
 
     void parseImage(const xml::Node& node);
     XisfProperty parseProperty(const xml::Node& node);
+    XisfProperty parseTable(const xml::Node& node);
+    std::map<std::string, const xml::Node*> uids_;   // the elements at the root of the header that have a uid
+    std::set<const xml::Node*> referenced_;           // ... and of them those an image refers to
+    std::map<const xml::Node*, XisfProperty> tables_;  // each table that is parsed, once (an image may refer to one many times)
     std::shared_ptr<RandomBytes> raw_;   // the file (or bytes), open while the object lives (and while a source of its pixels does)
     std::map<std::string, std::weak_ptr<RawFile>> opened_;   // the other files of the unit that blocks read from now, by resolved path
 };

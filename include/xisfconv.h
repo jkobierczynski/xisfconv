@@ -53,7 +53,7 @@
 #include <stdint.h>
 
 #define XISFCONV_VERSION_MAJOR 0
-#define XISFCONV_VERSION_MINOR 24
+#define XISFCONV_VERSION_MINOR 25
 #define XISFCONV_VERSION_PATCH 0
 
 #if defined(XISFCONV_STATIC)
@@ -589,14 +589,57 @@ enum {
      * xisfconv_property_get gives the text (up to a NUL character, if a block has one). */
     XISFCONV_PROPERTY_TEXT_BLOCK = 2,
     XISFCONV_PROPERTY_ARRAY      = 3, /* a vector or a matrix; xisfconv_property_read gives it */
-    /* What these functions have no value for: a table or another property made of elements, a
-     * data block of a type without a name here or of a type that is not a vector or a matrix,
-     * a vector without a data block, a text whose block is damaged. What xisfconv_property_get
-     * gives as its value is not one. (A conversion carries a data block of a type it has no
-     * name for as it is, and leaves the others out with a warning.) */
-    XISFCONV_PROPERTY_UNREAD     = 4
+    /* What these functions have no value for: a property made of other elements than a data
+     * block (a <Property> with a <Structure>), a table that is not one of values (see TABLE), a
+     * data block of a type that is not a vector or a matrix but has a name here (an Int32 in a
+     * block), a vector without a data block, a text whose block is damaged. What
+     * xisfconv_property_get gives as its value is not one. A conversion leaves them out with a
+     * warning. */
+    XISFCONV_PROPERTY_UNREAD     = 4,
+    /* (Since 0.25.) A data block of a type without a name here (Float128, a type of another
+     * program): xisfconv_property_read_bytes gives its bytes, and xisfconv_properties_set_bytes
+     * writes them again, as a conversion carries it. (Up to 0.24 such a property was UNREAD.) */
+    XISFCONV_PROPERTY_BYTES      = 5,
+    /* (Since 0.25.) A table (an XISF <Table> element; its type is "Table"): rows of cells of the
+     * types its fields name, each a scalar, a complex number, a String or a TimePoint;
+     * xisfconv_property_table and the functions after it read it, and
+     * xisfconv_properties_set_table writes one. A table of other cells (vectors, matrices, cells
+     * in data blocks), or one that does not hold together, is UNREAD. Tables are listed with the
+     * properties of the image, or of the file for one at the root of the header that no image
+     * refers to (up to 0.24 they were not listed). A conversion to FITS or ASDF does not carry
+     * them, with a warning; a rewrite keeps them as they are. */
+    XISFCONV_PROPERTY_TABLE      = 6
 };
 XISFCONV_API xisfconv_property_storage xisfconv_property_stored(const xisfconv_file *file, size_t image, size_t index);
+
+/* (Since 0.25.) The bytes of a property that xisfconv_property_stored calls
+ * XISFCONV_PROPERTY_BYTES: its data block as it is stored (decompressed, its checksum verified),
+ * byte for byte, since nothing is known of what it holds. Call with buffer = NULL to learn the
+ * size. *rows and *columns (may be NULL) receive the shape the element says: rows and columns of
+ * a type whose name ends in "Matrix", else the length attribute in *rows (0 if it has none) and 0;
+ * *big_endian (may be NULL) 1 if the block says its bytes are big-endian (byteOrder="big"), else
+ * 0. XISFCONV_ERR_NOT_FOUND for another property, XISFCONV_ERR_BUFFER if buffer_size is too
+ * small. */
+XISFCONV_API xisfconv_status xisfconv_property_read_bytes(xisfconv_file *file, size_t image, size_t index, void *buffer,
+                                                          size_t buffer_size, size_t *size, uint64_t *rows,
+                                                          uint64_t *columns, int32_t *big_endian);
+
+/* (Since 0.25.) A table (XISFCONV_PROPERTY_TABLE): the number of its fields (columns) and rows,
+ * and its caption ("" if it has none). The comment of the table is that of the property
+ * (xisfconv_property_get). XISFCONV_ERR_NOT_FOUND for a property that is not a table that is
+ * read. Strings are owned by the file. Any out pointer may be NULL. */
+XISFCONV_API xisfconv_status xisfconv_property_table(const xisfconv_file *file, size_t image, size_t index,
+                                                     size_t *fields, size_t *rows, const char **caption);
+/* A field: its id, its type (an XISF type name of a value: "Float64", "String", "TimePoint"), its
+ * header (the title of its column) and its format, "" where it has none. XISFCONV_ERR_INDEX for
+ * a field beyond the last. */
+XISFCONV_API xisfconv_status xisfconv_property_table_field(const xisfconv_file *file, size_t image, size_t index,
+                                                           size_t field, const char **id, const char **type,
+                                                           const char **header, const char **format);
+/* A cell: its value as xisfconv_property_get gives a value of its field's type (the text of a
+ * String). XISFCONV_ERR_INDEX for a row or a field beyond the last. */
+XISFCONV_API xisfconv_status xisfconv_property_table_cell(const xisfconv_file *file, size_t image, size_t index,
+                                                          size_t row, size_t field, const char **value);
 
 /* The numbers a vector or matrix property is made of. */
 typedef int32_t xisfconv_element;
@@ -860,6 +903,50 @@ XISFCONV_API xisfconv_status xisfconv_properties_set_array(xisfconv_properties *
                                                            const char *type, const void *elements, size_t size,
                                                            uint64_t rows, uint64_t columns, const char *comment,
                                                            const char *format);
+
+/* (Since 0.25.) A property of a type without a name here, as a data block of these bytes,
+ * written as they are: what xisfconv_property_read_bytes gave, with its shape and byte order
+ * (rows and columns for a type whose name ends in "Matrix"; else rows is the length attribute,
+ * 0 for none, and columns is 0). XISFCONV_ERR_ARGUMENT for a type that has a name here (a
+ * scalar, String, TimePoint, a vector or matrix of known elements, Table), for a type that
+ * XML cannot hold, and as for xisfconv_properties_set. The bytes are copied. To FITS and ASDF
+ * the property is carried as a conversion carries one (big-endian bytes are not, with a
+ * warning). */
+XISFCONV_API xisfconv_status xisfconv_properties_set_bytes(xisfconv_properties *properties, const char *id,
+                                                           const char *type, const void *bytes, size_t size,
+                                                           uint64_t rows, uint64_t columns, int32_t big_endian,
+                                                           const char *comment, const char *format);
+
+/* (Since 0.25.) A table: `fields` fields, each with an id, a type of value (as for
+ * xisfconv_properties_set: Boolean, the integers, floating point and complex numbers, String,
+ * TimePoint), and a header and a format (field_headers and field_formats may be NULL, and so may
+ * each of their entries); and `rows` rows of cells, `cells` holding rows x fields values row
+ * after row, each as xisfconv_properties_set takes a value of its field's type. caption and
+ * comment may be NULL. A table has at least one field; field ids are not empty and differ.
+ * XISFCONV_ERR_ARGUMENT for what is wrong, with the row and the field. Written to XISF as a
+ * <Table> element: in its image, or at the root of the header for one of the file. FITS and
+ * ASDF do not carry tables (a warning says so); TIFF and PNG hold no properties. Everything is
+ * copied. */
+XISFCONV_API xisfconv_status xisfconv_properties_set_table(xisfconv_properties *properties, const char *id,
+                                                           const char *caption, const char *comment, size_t fields,
+                                                           const char *const *field_ids, const char *const *field_types,
+                                                           const char *const *field_headers,
+                                                           const char *const *field_formats, size_t rows,
+                                                           const char *const *cells);
+
+/* (Since 0.25.) The same for a table that was read from a file and is written again as it is:
+ * the fields and cells are what xisfconv_property_table_field and xisfconv_property_table_cell
+ * gave, and are not looked at beyond what makes them a table (at least one field, each of a type
+ * of value, and no NULL). So a cell that is not a value of its type ("1.0" in an Int32 field), or
+ * fields with the same id, are written as the file has them. What XML cannot hold is written as
+ * a conversion writes it, with a blank in the place of each such character. */
+XISFCONV_API xisfconv_status xisfconv_properties_set_table_as_read(xisfconv_properties *properties, const char *id,
+                                                                   const char *caption, const char *comment,
+                                                                   size_t fields, const char *const *field_ids,
+                                                                   const char *const *field_types,
+                                                                   const char *const *field_headers,
+                                                                   const char *const *field_formats, size_t rows,
+                                                                   const char *const *cells);
 
 /* ------------------------------------------------------------------------------------------
  * Converting files

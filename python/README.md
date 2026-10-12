@@ -94,9 +94,25 @@ carriage return in it or with white space at its ends is stored as a data block,
 reader finds it as it is (in the header an XML reader makes a line feed of CR LF, and may take
 blanks at the ends for layout); a text that was read from a header is written there again with
 the bytes it has. Vectors, matrices and texts of more than 3072 bytes are compressed with the
-codec of the pixels. A property the library has no value for (a table, a data block of a type
-it has no name for) is None, and is not written: a warning says so. `convert` does carry such
-a data block.
+codec of the pixels.
+
+A table is an `xisfconv.Table` (since 0.25): `fields`, a list of `TableField(id, type, header,
+format)` of types of values (numbers, Boolean, complex, String, TimePoint), `rows`, a list of
+tuples of a value for each field, and `caption`. It is written to XISF as a `<Table>` element, in
+its image or, among `file_properties`, at the root of the file; FITS and ASDF do not carry tables
+(a warning says so).
+
+```python
+stars = xisfconv.Table([("name", "String", "Star"), ("mag", "Float32", "V", "%.2f")],
+                       [("Vega", 0.03), ("Deneb", 1.25)], caption="Bright stars")
+xisfconv.write("out.xisf", data, properties={"Catalog:Stars": stars})
+xisfconv.read_image("out.xisf").properties["Catalog:Stars"].column("mag")    # [0.03, 1.25]
+```
+
+A data block of a type the library has no name for (a type of another program) is an
+`xisfconv.DataBlock` of its bytes, which `write` writes again as it was. A property the library
+has no value for (a table of other cells than values, a data block of a scalar type) is None,
+and is not written: a warning says so.
 
 An astrometric solution among the properties (`PCL:AstrometricSolution:...`) that you give is
 written as it is; without one, it is made from WCS keywords (`wcs=False` turns that off). A

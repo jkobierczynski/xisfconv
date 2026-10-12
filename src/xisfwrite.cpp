@@ -292,6 +292,7 @@ struct PropertyWriter {
                  (isXmlText(p.id) && !p.id.empty() ? " (" + p.id + ")" : std::string()));
             return {};
         }
+        if (p.table) return tableXml(p);
         std::string x = "<Property id=\"" + xmlText(p.id) + "\" type=\"" + xmlText(p.type) + "\"";
         // (an array, not a braced list of std::make_pair: GCC 14 warns that the pairs of such a
         // list may dangle, which they do not, -Wdangling-reference)
@@ -310,6 +311,7 @@ struct PropertyWriter {
             const bool known = propertyElement(p.type, element);
             if (isMatrixPropertyType(p.type)) x += " rows=\"" + std::to_string(p.rows) + "\" columns=\"" + std::to_string(p.columns) + "\"";
             else if (known || p.rows) x += " length=\"" + std::to_string(p.rows) + "\"";
+            if (!known && p.bigEndian) x += " byteOrder=\"big\"";
             // (shuffled by the size of its numbers: a complex number is two of them)
             const size_t item = !known ? 1 : element.kind == 'c' ? element.size / 2 : element.size;
             return x + dataBlock(p.data.data(), p.data.size(), item, p.inHeader);
@@ -327,6 +329,38 @@ struct PropertyWriter {
             return x + " value=\"" + xmlText(madeXmlText(p.text)) + "\"/>\n";
         }
         return x + " value=\"" + xmlText(p.text) + "\"/>\n";
+    }
+
+    // A table: its structure, and a row of cells for each of its rows. A String is the text of
+    // its cell (the specification gives a String no value attribute), its line breaks and tabs
+    // as character references, so that they come back as they are; another value is the value
+    // attribute of its cell. (What is written was checked when it was given, tableProblem; a
+    // table written again as it was read is not, and what XML cannot hold is made text as for a
+    // conversion.)
+    std::string tableXml(const Property& p) {
+        const PropertyTable& t = *p.table;
+        auto xmlText = [](const std::string& s) { return xisfconv::xmlText(isXmlText(s) ? s : madeXmlText(s)); };
+        std::string x = "<Table id=\"" + xmlText(p.id) + "\"";
+        if (!t.caption.empty()) x += " caption=\"" + xmlText(t.caption) + "\"";
+        if (!p.comment.empty()) x += " comment=\"" + xmlText(p.comment) + "\"";
+        x += " rows=\"" + std::to_string(t.rowCount()) + "\" columns=\"" + std::to_string(t.fields.size()) + "\">\n<Structure>\n";
+        for (const PropertyTable::Field& f : t.fields) {
+            x += "<Field id=\"" + xmlText(f.id) + "\" type=\"" + xmlText(f.type) + "\"";
+            if (!f.header.empty()) x += " header=\"" + xmlText(f.header) + "\"";
+            if (!f.format.empty()) x += " format=\"" + xmlText(f.format) + "\"";
+            x += "/>\n";
+        }
+        x += "</Structure>\n";
+        for (size_t row = 0; row < t.rowCount(); ++row) {
+            x += "<Row>";
+            for (size_t i = 0; i < t.fields.size(); ++i) {
+                const std::string& cell = t.cells[row * t.fields.size() + i];
+                if (t.fields[i].type == "String") x += cell.empty() ? "<Cell/>" : "<Cell>" + xmlText(cell) + "</Cell>";
+                else x += "<Cell value=\"" + xmlText(cell) + "\"/>";
+            }
+            x += "</Row>\n";
+        }
+        return x + "</Table>\n";
     }
 };
 
@@ -425,8 +459,12 @@ void writeXisf(const std::string& path, const std::vector<XisfOutImage>& images,
                  (opt.shuffle ? "+sh" : "") + "</Property>\n";
         }
         for (const auto& p : opt.metadata)
-            if (!isFileStorageProperty(p.id)) x += properties.xml(p);
-        x += "</Metadata>\n</xisf>\n";
+            if (!isFileStorageProperty(p.id) && !p.table) x += properties.xml(p);
+        x += "</Metadata>\n";
+        // (the tables of the file are elements of the root: Metadata holds properties)
+        for (const auto& p : opt.metadata)
+            if (p.table) x += properties.xml(p);
+        x += "</xisf>\n";
         layout = false;
         return x;
     };

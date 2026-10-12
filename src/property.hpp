@@ -4,12 +4,26 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "common.hpp"
 
 namespace xisfconv {
+
+// An XISF table (a <Table> element: a property whose value is rows of cells, of the types its
+// fields name). Only tables of values are held here: of scalars, complex numbers, Strings and
+// time points, a cell the value as XISF writes it (the text of a String).
+struct PropertyTable {
+    struct Field {
+        std::string id, type, header, format;
+    };
+    std::string caption;
+    std::vector<Field> fields;
+    std::vector<std::string> cells;   // row after row, a cell for each field
+    size_t rowCount() const { return fields.empty() ? 0 : cells.size() / fields.size(); }
+};
 
 // One property: what a <Property> element of an XISF file says, with the content of its data
 // block if it has one. Nothing is interpreted more than a conversion needs: a property of a
@@ -38,7 +52,25 @@ struct Property {
     // makes itself (the astrometric solution from WCS keywords), which PixInsight was seen to
     // accept in that form. Not carried anywhere.
     bool inHeader = false;
+    // A data block of a type this library has no name for (`array`, not a vector or matrix it
+    // knows): the block said its bytes are big-endian. It is written so again.
+    bool bigEndian = false;
+    // A table (type "Table"; written as a <Table> element).
+    std::shared_ptr<const PropertyTable> table;
 };
+
+// True for the types a value is written from (scalarPropertyProblem): Boolean, the integers,
+// floating point and complex numbers, String and TimePoint, under every name of the specification.
+bool isScalarPropertyType(const std::string& type);
+
+// True for a data block of a type this library has no name for: not a scalar type, not a
+// vector or matrix it knows, not String nor Table. Such a block is carried as its bytes.
+bool isUnnamedBlockType(const std::string& type);
+
+// What is wrong with a table that is given (fields with ids of their own and types of values,
+// a whole number of rows, each cell a value of its field's type, text that XML can hold); empty
+// if nothing is.
+std::string tableProblem(const PropertyTable& table);
 
 // The most data the properties of one file may hold together when they are loaded: what a file
 // of that size can hold uncompressed, and 256 MiB on top for what is compressed. (PixInsight's

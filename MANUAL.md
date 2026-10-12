@@ -1087,7 +1087,8 @@ What to know:
   `xisfconv_properties_set_as_read` takes a property as a file had it, whatever it says, so that
   a program which reads a file and writes it again loses nothing of it, and
   `xisfconv_property_stored` says how the file has it (a value in the header, a text that is
-  kept as data, an array, or something that is not read, like a table). `xisfconv_property_read`
+  kept as data, an array, a table, the bytes of a type without a name, or something that is not
+  read). `xisfconv_property_read`
   gives a vector or a matrix in the type of its elements (complex ones too), where
   `xisfconv_property_read_f64` gives doubles. `xisfconv_wcs_digest` tells such a program whether
   the WCS keywords of an image are still those its solution was read with, and the detail
@@ -1095,6 +1096,16 @@ What to know:
 - The writer also takes a compression level, byte shuffling on or off, and the name of the program
   that writes the file (`compression_level`, `shuffle` and `creator_application` of
   `xisfconv_write_options`).
+- **Tables and data blocks of other types** (since 0.25). XISF tables (`<Table>` elements: rows of
+  cells of the types their fields name) are listed with the properties of their image, or of the
+  file: `xisfconv_property_table`, `_table_field` and `_table_cell` read one whose cells are values
+  (scalars, complex numbers, Strings, time points), and `xisfconv_properties_set_table` gives one
+  to the writer, which writes it as a `<Table>` element (`xisfconv_properties_set_table_as_read`
+  one as a file had it). A table of other cells is listed and not
+  read. A data block of a type the library has no name for (`Float128Vector`, a type of another
+  program) is handed over as its bytes, `xisfconv_property_read_bytes` and
+  `xisfconv_properties_set_bytes`, as a conversion carries it. FITS and ASDF carry no tables: a
+  conversion says so, and a rewrite to XISF keeps them as they are.
 - **Images of an open file are read from where they are** (since 0.24): an open FITS or ASDF
   file keeps the place of each image, so the pixels of one are read without going through the
   headers before it (or the tree of an ASDF file) again. The images of a file of a thousand HDUs
@@ -1252,8 +1263,9 @@ Good to know:
   keywords say them (`IMAGETYP`, `BAYERPAT`, the id as `EXTNAME`), and the keywords gain what the
   conversion wrote: keywords derived from properties, WCS keywords made from a solution, a
   `HISTORY` line for each conversion. (`-t xisf` rewrites an XISF file with everything in it.)
-- What does not come back as a property, each with a warning: a property that is built of other
-  elements (the tables and structures of the specification), one without an id, one whose id or
+- What does not come back as a property, each with a warning: a table (since 0.25 a conversion says
+  so; a rewrite to XISF keeps it), a property that is built of other elements, a data block of a
+  type without a name whose bytes are big-endian, one without an id, one whose id or
   type is not plain ASCII (FITS) or not UTF-8 (ASDF), the second of two properties with the same
   id (ASDF), and what goes beyond the size limit below. A comment, a format or the value of a
   scalar with a character XML has no way to write (a control character) gets a blank in its place.
