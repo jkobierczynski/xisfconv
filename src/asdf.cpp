@@ -583,6 +583,15 @@ public:
 
     std::string treeText() { return readTree(); }
 
+    // The keywords a reader takes from the entries of a header (lines of the tree as the writer
+    // makes them, "  - [NAME, value, comment]").
+    static std::vector<FitsKeyword> headerKeywords(const std::string& entries) {
+        const YamlPtr root = parseYaml("%YAML 1.1\n%TAG ! tag:stsci.edu:asdf/\n---\nheader:\n" + entries);
+        FitsImage img;
+        if (const YamlNode* header = root ? root->get("header") : nullptr) readHeader(*header, img, "");
+        return img.keywords;
+    }
+
     // The tree as it is parsed: a NUL byte, which no valid tree holds, becomes a space, so that
     // names and values taken from it are whole for C callers.
     std::string treeWithoutNul() {
@@ -1084,7 +1093,7 @@ private:
     }
 
     // Reads the [keyword, value, comment] entries of a FITS-tagged header.
-    void readHeader(const YamlNode& header, FitsImage& img, const std::string& label) {
+    static void readHeader(const YamlNode& header, FitsImage& img, const std::string& label) {
         if (!header.isSequence()) return;
         for (const auto& entry : header.items) {
             if (!entry || !entry->isSequence() || entry->items.empty()) continue;
@@ -1490,6 +1499,7 @@ void writeAsdf(const std::string& path, const std::vector<FitsHdu>& hdus, const 
                        "homepage: 'https://github.com/jkobierczynski/xisfconv',\n"
                        "  name: xisfconv, version: \"" + std::string(kVersion) + "\"}\n"
                        "fits: !<tag:astropy.org:astropy/fits/fits-1.0.0>\n";
+    std::vector<std::string> digests(hdus.size());
     for (size_t h = 0; h < hdus.size(); ++h) {
         const FitsHdu& hdu = hdus[h];
         const ImageSource& px = *hdu.pixels;
@@ -1500,13 +1510,20 @@ void writeAsdf(const std::string& path, const std::vector<FitsHdu>& hdus, const 
         const std::string extname = trim(fitsSanitize(hdu.extname));
         if (!extname.empty()) tree += headerEntry("EXTNAME", yamlQuote(extname), "image identifier");
         tree += headerEntry("ROWORDER", yamlQuote(hdu.bottomUp ? "BOTTOM-UP" : "TOP-DOWN"), "order of image rows");
+        std::string entries;
         for (const auto& k : hdu.keywords) {
             const std::string name = toUpper(trim(k.name));
             if (isReservedFitsKeyword(name) || name == "CONTINUE" || name == "LONGSTRN") continue;
             if (!extname.empty() && name == "EXTNAME") continue;
             if (h == 0 && name == "PROGRAM") continue;
-            keywordEntry(k, tree);
+            keywordEntry(k, entries);
         }
+        tree += entries;
+        // The digest of the WCS is that of the keywords as a reader will have them from the tree.
+        if (hdu.wcsCurrent && !hdu.properties.empty())
+            digests[h] = wcsDigest(Reader::headerKeywords(entries), px.width, px.height, hdu.bottomUp);
+        else
+            digests[h] = hdu.wcsDigest;
         tree += "  data: !core/ndarray-1.0.0\n"
                 "    source: " + std::to_string(h) + "\n"
                 "    datatype: " + datatypeName(px.format) + "\n"
@@ -1522,12 +1539,13 @@ void writeAsdf(const std::string& path, const std::vector<FitsHdu>& hdus, const 
     for (const auto& hdu : hdus) carried = carried || !hdu.properties.empty();
     if (carried) {
         tree += "xisf:\n  images:\n";
-        for (const auto& hdu : hdus) {
+        for (size_t h = 0; h < hdus.size(); ++h) {
+            const FitsHdu& hdu = hdus[h];
             if (hdu.properties.empty()) {
                 tree += "  - {}\n";
                 continue;
             }
-            tree += "  - wcs_digest: " + yamlQuote(fitsSanitize(hdu.wcsDigest)) + "\n    properties:\n";
+            tree += "  - wcs_digest: " + yamlQuote(fitsSanitize(digests[h])) + "\n    properties:\n";
             const std::string entries = propertyEntries(hdu.properties, "      ", propertyBlocks);
             if (entries.empty()) tree.insert(tree.size() - 1, " {}");
             tree += entries;

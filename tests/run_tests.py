@@ -6525,6 +6525,57 @@ def test_documents():
     check(center is not None and abs(center[0] - 10.5) < 1e-9 and kept is not None and np.array_equal(kept, [328.178, 47.358]),
           f"... and xisfconv takes the solution of the keywords then, and that of the properties otherwise: {center}, {kept}")
 
+    # The digest is that of the keywords as they are written: one the writer has to change does not make the solution stale.
+    def solved(path, extra):
+        cards = [("CTYPE1", "'RA---TAN'"), ("CTYPE2", "'DEC--TAN'"), ("CRVAL1", "10.5"), ("CRVAL2", "40.25"), ("CRPIX1", "30"),
+                 ("CRPIX2", "20"), ("CD1_1", "-0.001"), ("CD1_2", "0"), ("CD2_1", "0"), ("CD2_2", "0.001")] + extra
+        write_xisf(path, [image_entry(test_image(np.uint16, 40, 60, 1, 80), children="".join(
+            f'<FITSKeyword name="{k}" value="{v}" comment=""/>' for k, v in cards) + "".join([
+            f'<Property id="{P}ProjectionSystem" type="String">Gnomonic</Property>',
+            f64_prop(P + "ReferenceCelestialCoordinates", [11.0, 41.0]),
+            f64_prop(P + "ReferenceImageCoordinates", [30.5, 20.5]),
+            f64_prop(P + "LinearTransformationMatrix", [-0.001, 0, 0, -0.001], 2, 2)]))])
+
+    def comes_back(path):
+        back = os.path.join(d, "back.xisf")
+        run(path, "-o", back, "-f", "-q")
+        center = xisf_property(back, P + "ReferenceCelestialCoordinates")
+        return center is not None and np.allclose(center, [11.0, 41.0])
+
+    for label, extra in (("a text outside ASCII", [("CUNIT1", "'deg\u00b0'")]), ("a text with a tab", [("CTYPE3", "'a\tb'")]),
+                         ("a number too long for a card", [("PV1_1", "1." + "0" * 80)]),
+                         ("a number too large for a double", [("PV1_1", "1e400")]),
+                         ("a complex value with a lower-case exponent", [("PV1_1", "(1e-5, 2)")]),
+                         ("a complex value the tree writes another way", [("PV1_1", "(1,2)")])):
+        src = os.path.join(d, "changed.xisf")
+        solved(src, extra)
+        back = []
+        for name, flags in (("changed.fits", []), ("changed.fits.fz", []), ("changed.asdf", [])):
+            out = os.path.join(d, name)
+            run(src, "-o", out, "-f", "-q", *flags)
+            back.append(name if comes_back(out) else name + " (made from the keywords)")
+        # ... and so through the other container, which takes the solution along as still that of its keywords
+        run(os.path.join(d, "changed.fits"), "-o", os.path.join(d, "via.asdf"), "-f", "-q")
+        run(os.path.join(d, "changed.asdf"), "-o", os.path.join(d, "via.fits"), "-f", "-q")
+        for name in ("via.asdf", "via.fits"):
+            back.append(name if comes_back(os.path.join(d, name)) else name + " (made from the keywords)")
+        check(all("made" not in b for b in back), f"a WCS keyword written changed ({label}) leaves the solution as it was: {back}")
+        if label == "a text outside ASCII":
+            with fits.open(os.path.join(d, "changed.fits")) as hdul:
+                stored, header = hdul["XISF_PROPERTIES"].header["WCSDIGST"], hdul[0].header.copy()
+            check(example.wcs_digest(header, 60, 40, True) == stored,
+                  "... the example program finds the digest of the keywords as the file has them")
+    # A solution that is no longer that of its keywords stays so in the other container.
+    run(edited, "-o", os.path.join(d, "edited.asdf"), "-f", "-q")
+    run(os.path.join(d, "edited.asdf"), "-o", os.path.join(d, "edited.xisf"), "-f", "-q")
+    center = xisf_property(os.path.join(d, "edited.xisf"), P + "ReferenceCelestialCoordinates")
+    check(center is not None and abs(center[0] - 10.5) < 1e-9,
+          f"a solution the keywords were changed after goes to ASDF as stale, and is made from the keywords on the way back: {center}")
+    # ... and so does one of rows said to be in the other order
+    run(os.path.join(d, "changed.fits"), "-o", os.path.join(d, "turned.fits.fz"), "-f", "-q", "-c", "--top-down")
+    check(not comes_back(os.path.join(d, "turned.fits.fz")),
+          "rows given another order on the way from FITS to FITS make the carried solution stale")
+
 
 def test_dng():
     """DNG input: files written byte by byte by tests/dng_files.py, decoded here with numpy; the lossless JPEG

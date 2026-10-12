@@ -7,6 +7,7 @@
 #include <fstream>
 #include <limits>
 
+#include "fitsread.hpp"
 #include "fitstile.hpp"
 
 namespace xisfconv {
@@ -410,9 +411,10 @@ void scalingCards(SampleFormat format, std::vector<std::string>& cards) {
 
 // The cards every image gets after those that describe its storage: who wrote it, its name,
 // the order of its rows, and the keywords it brought along. `tableName`: the EXTNAME of an
-// image without a name, if it needs one.
-void imageCards(const FitsHdu& hdu, const std::vector<FitsKeyword>& keywords, bool first, const char* tableName,
-                std::vector<std::string>& cards) {
+// image without a name, if it needs one. Returns the digest of the WCS to note with its
+// properties: that of the keywords as they are written, if it is taken from them.
+std::string imageCards(const FitsHdu& hdu, const std::vector<FitsKeyword>& keywords, bool first, const char* tableName,
+                       std::vector<std::string>& cards) {
     if (first) cards.push_back(valueCard("PROGRAM", fitsString(std::string("xisfconv ") + kVersion), "software that created this HDU"));
     bool named = !hdu.extname.empty();
     if (named) {
@@ -429,6 +431,10 @@ void imageCards(const FitsHdu& hdu, const std::vector<FitsKeyword>& keywords, bo
     cards.push_back(valueCard("ROWORDER", fitsString(hdu.bottomUp ? "BOTTOM-UP" : "TOP-DOWN"), "order of image rows"));
     const std::vector<std::string> userCards = userKeywordCards(keywords, !hdu.extname.empty(), first);
     cards.insert(cards.end(), userCards.begin(), userCards.end());
+    if (!hdu.wcsCurrent || hdu.properties.empty()) return hdu.wcsDigest;
+    std::string written;
+    for (const auto& c : userCards) written += c;
+    return wcsDigest(fitsCardKeywords(written), hdu.pixels->width, hdu.pixels->height, hdu.bottomUp);
 }
 
 std::string headerBlocks(std::vector<std::string> cards) {
@@ -439,7 +445,7 @@ std::string headerBlocks(std::vector<std::string> cards) {
     return header;
 }
 
-void writePlainImage(std::ofstream& out, const FitsHdu& hdu, bool primary, bool first) {
+std::string writePlainImage(std::ofstream& out, const FitsHdu& hdu, bool primary, bool first) {
     ImageSource& px = *hdu.pixels;
     std::vector<std::string> cards;
     if (primary) cards.push_back(logicalCard("SIMPLE", true, "file conforms to FITS standard"));
@@ -457,10 +463,11 @@ void writePlainImage(std::ofstream& out, const FitsHdu& hdu, bool primary, bool 
         cards.push_back(intCard("GCOUNT", 1, "one data group"));
     }
     scalingCards(px.format, cards);
-    imageCards(hdu, hdu.keywords, first, nullptr, cards);
+    std::string digest = imageCards(hdu, hdu.keywords, first, nullptr, cards);
     const std::string header = headerBlocks(std::move(cards));
     out.write(header.data(), static_cast<std::streamsize>(header.size()));
     writeData(out, px);
+    return digest;
 }
 
 // An image as the tiled image compression convention stores it: a binary table with one row
@@ -468,7 +475,7 @@ void writePlainImage(std::ofstream& out, const FitsHdu& hdu, bool primary, bool 
 // table. A tile is one row of the image, as in the files of fpack and astropy. The table and the
 // sizes in the header are known only when the tiles are compressed: both are written last, into
 // the room left for them.
-void writeTiledImage(std::ofstream& out, const std::string& path, const FitsHdu& hdu, bool first, FitsTiles tiles) {
+std::string writeTiledImage(std::ofstream& out, const std::string& path, const FitsHdu& hdu, bool first, FitsTiles tiles) {
     ImageSource& px = *hdu.pixels;
     const size_t sb = sampleBytes(px.format);
     const bool rice = tiles == FitsTiles::Default && !isFloat(px.format);
@@ -495,7 +502,7 @@ void writeTiledImage(std::ofstream& out, const std::string& path, const FitsHdu&
         else keywords.push_back(k);
     }
     std::vector<std::string> ownCards;
-    imageCards(hdu, keywords, first, "COMPRESSED_IMAGE", ownCards);
+    std::string digest = imageCards(hdu, keywords, first, "COMPRESSED_IMAGE", ownCards);
 
     const int naxis = px.channels > 1 ? 3 : 2;
     auto header = [&](uint64_t heapBytes, uint64_t longestTile) {
@@ -591,6 +598,7 @@ void writeTiledImage(std::ofstream& out, const std::string& path, const FitsHdu&
     out.seekp(tableAt);
     out.write(reinterpret_cast<const char*>(table.data()), static_cast<std::streamsize>(table.size()));
     out.seekp(endAt);
+    return digest;
 }
 
 // The table of XISF properties (see kPropertyTable in fits.hpp).
@@ -716,8 +724,8 @@ void writeFits(const std::string& path, const std::vector<FitsHdu>& hdus, const 
 
     if (options.tiles == FitsTiles::None) {
         for (size_t h = 0; h < hdus.size(); ++h) {
-            writePlainImage(out, hdus[h], h == 0, h == 0);
-            writePropertyTable(out, hdus[h].properties, kPropertyTable, h + 1, hdus[h].wcsDigest);
+            const std::string digest = writePlainImage(out, hdus[h], h == 0, h == 0);
+            writePropertyTable(out, hdus[h].properties, kPropertyTable, h + 1, digest);
             if (!out) throw Error("write error on " + path, ErrorKind::Io);
         }
     } else {
@@ -745,9 +753,9 @@ void writeFits(const std::string& path, const std::vector<FitsHdu>& hdus, const 
             out.write(primary.data(), static_cast<std::streamsize>(primary.size()));
         }
         for (size_t h = 0; h < hdus.size(); ++h) {
-            if (compressed(hdus[h])) writeTiledImage(out, path, hdus[h], h == 0, options.tiles);
-            else writePlainImage(out, hdus[h], h == 0, h == 0);
-            writePropertyTable(out, hdus[h].properties, kPropertyTable, h + 1, hdus[h].wcsDigest);
+            const std::string digest = compressed(hdus[h]) ? writeTiledImage(out, path, hdus[h], h == 0, options.tiles)
+                                                           : writePlainImage(out, hdus[h], h == 0, h == 0);
+            writePropertyTable(out, hdus[h].properties, kPropertyTable, h + 1, digest);
             if (!out) throw Error("write error on " + path, ErrorKind::Io);
         }
     }

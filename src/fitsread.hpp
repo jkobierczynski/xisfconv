@@ -87,4 +87,8 @@ bool looksLikeFits(const std::string& path);
 // Non-string values are returned trimmed and unchanged.
 std::string fitsUnquote(const std::string& value);
 
+// The keywords of an image as a reader takes them from cards of 80 characters one after the
+// other (as fitsCards makes them): long strings whole again, the structural keywords left out.
+std::vector<FitsKeyword> fitsCardKeywords(const std::string& cards);
+
 }  // namespace xisfconv

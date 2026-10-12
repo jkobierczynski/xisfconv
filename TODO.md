@@ -74,13 +74,6 @@ Smaller items, each closing a limitation listed in `MANUAL.md`:
 
 Found when the documents were checked against the program (October 2026), and not changed yet:
 
-- [ ] The digest of the WCS is taken from the keywords of the XISF image before the FITS writer
-      has them. A WCS keyword that cannot be written as it is (text outside ASCII or with a tab,
-      a number too long for a card or too large for a double, a complex value with a lower-case
-      exponent) is written changed or left out, and xisfconv then does not find its own digest
-      on the way back: the solution is made from the keywords, though nothing changed. Through
-      ASDF the same happens to a value that the tree writes another way (`(1,2)`). The digest
-      should be taken from what is written.
 - [ ] A FITS file that ends inside the header of an `XISF_PROPERTIES` table converts without the
       properties and without a warning (what is behind the last whole HDU counts as something
       that does not belong to the file). `--verify` reports it; a conversion should warn.

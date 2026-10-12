@@ -20,7 +20,7 @@ struct AsdfWriteOptions {
 
 // XISF properties in an ASDF file: the key "xisf" of the tree, with
 //   images:    a list with an entry per HDU of "fits", in their order: a mapping that is empty,
-//              or has "properties" and "wcs_digest" (what FitsHdu::wcsDigest holds);
+//              or has "properties" and "wcs_digest" (the digest of the WCS, see FitsHdu);
 //   metadata:  the properties of the file.
 // Properties are a mapping from id to {type, value, comment, format}: type is the XISF type
 // name; value is a YAML scalar of that kind (true, 42, 1.5, "text"; a complex number as

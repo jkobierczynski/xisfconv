@@ -9,6 +9,17 @@ in [`DEVELOPMENT.md`](DEVELOPMENT.md).
 Under "changed" stands what makes the same command, or the same call, do something else than
 before.
 
+## Unreleased
+
+Fixed
+- The digest of the WCS that goes with the XISF properties in FITS and ASDF output (`WCSDIGST`,
+  `wcs_digest`) is taken from the keywords as they are written. A WCS keyword that a FITS card
+  cannot hold as it is (a text outside ASCII or with a tab, a number too long for a card or too
+  large for a double, a complex value with a lower-case exponent), or that an ASDF tree writes
+  another way (`(1,2)`), made the digest that of other keywords: on the way back to XISF the
+  carried astrometric solution was left out and one was made from the keywords. Files written
+  before keep their digest and are read as they were.
+
 ## 0.20.0 (9 October 2026)
 
 **Images read and written a piece at a time.**

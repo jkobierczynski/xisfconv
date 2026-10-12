@@ -225,9 +225,12 @@ solution that was carried would then contradict the image it comes back to.
 
 So a digest of what the properties were written with goes along with them: `WCSDIGST` in the
 header of the table, `wcs_digest` in the tree. xisfconv computes it when it converts an image with
-properties from XISF, with or without a solution among them, and takes it along unchanged from
-FITS to FITS and to ASDF and back (a table that another program wrote without a digest stays
-without one).
+properties from XISF, with or without a solution among them, from the keywords as they are
+written into the file (a keyword that a card cannot hold as it is, is written changed or not at
+all). From FITS to FITS and to ASDF and back it is computed again in the same way while it still
+matches the file it comes from and the rows stay in the order they were, and taken along
+unchanged otherwise: the solution stays the one of other keywords. (A table that another program wrote without a digest stays without
+one.)
 When a file is converted to XISF, the digest is computed again from the file as it is now.
 
 - If it is the same, the properties are the whole truth about the astrometry: a solution among
@@ -289,14 +292,13 @@ A program that changes the WCS of such a file has nothing to do: the digest no l
 that says it. A program that writes a solution of its own into the properties writes the digest
 that goes with its keywords; without one, the solution it wrote is not used.
 
-There are cases in which xisfconv does not get its own digest back. The digest is taken from the
-keywords of the XISF image, and a WCS keyword that cannot be written as a FITS card as it is (a
-text with a character outside ASCII or a tab, a number too long for a card or too large for a
-double, a complex value with a lower-case `e`) is written changed, or left out with a warning.
-In an ASDF tree a value that is no plain number or text may come back written another way
-(`(1,2)` as `(1.0, 2.0)`). The solution of such an image is then made from the keywords on the
-way back, as if another program had changed them. These are not values a plate solution has: the
-plate-solved frames of PixInsight that xisfconv was tried on come back with their solution.
+Since the digest is that of the keywords as they are written, an image whose keywords the writer
+has to change or leave out (a text with a character outside ASCII or a tab, a number too long for
+a card or too large for a double, a complex value with a lower-case `e`, a name with `=` in it;
+in an ASDF tree a complex value `(1,2)`, which comes back as `(1.0, 2.0)`) comes back with its
+solution as well. (xisfconv 0.20.0 and earlier took the digest
+from the keywords of the XISF image: the solution of such an image was made from the keywords on
+the way back, as if another program had changed them.)
 
 ## What xisfconv does with what it finds
 

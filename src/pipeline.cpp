@@ -998,7 +998,7 @@ void convertXisfFile(const std::string& input, const std::string& outPath, Forma
                 if (opt.properties) {
                     hdu.properties = carriedProperties(file, idx, opt.verify);
                     if (!hdu.properties.empty()) {
-                        hdu.wcsDigest = wcsDigest(hdu.keywords, buffers[n]->width, buffers[n]->height, opt.bottomUp);
+                        hdu.wcsCurrent = true;   // (the writer takes the digest from what it writes)
                         info("image " + std::to_string(idx) + ": " + countOf(hdu.properties.size(), "XISF property", "XISF properties") +
                              " taken along");
                     }
@@ -1332,7 +1332,11 @@ void writeImageSet(FitsFile& fits, const ImageSetOrigin& source, const std::stri
             hdu.bottomUp = !topDown;
             if (!history.empty()) hdu.keywords.push_back({"HISTORY", "", history});
             if (opt.properties) {
-                // What was converted from XISF stays what it was, in the other container too.
+                // What was converted from XISF stays what it was, in the other container too: a
+                // solution that is still that of the keywords is noted as theirs as they are
+                // written there, one that is not stays stale.
+                hdu.wcsCurrent = !img.properties.empty() && topDown == img.topDown &&
+                                 wcsDigest(img.keywords, px->width, px->height, !img.topDown) == img.wcsDigest;
                 hdu.properties = std::move(img.properties);
                 hdu.wcsDigest = img.wcsDigest;
             }

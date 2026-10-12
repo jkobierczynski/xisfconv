@@ -20,8 +20,12 @@ struct FitsHdu {
     // The XISF properties the image brings along: written as a binary table behind the image
     // (see kPropertyTable). Empty: no table.
     std::vector<Property> properties;
-    // What the WCS keywords looked like when the properties were taken from an XISF file
-    // (wcsDigest), if they hold an astrometric solution: it goes with them.
+    // What tells a reader whether the WCS keywords are still those an astrometric solution among
+    // the properties was written with (see wcsDigest in property.hpp), noted with the properties.
+    // wcsCurrent: they are, and the writer takes the digest from the keywords as it writes them
+    // (a keyword a card cannot hold as it is is written changed, or not at all). Otherwise the
+    // digest is noted as it is given (that of other keywords: the solution is stale), if any.
+    bool wcsCurrent = false;
     std::string wcsDigest;
 };
 

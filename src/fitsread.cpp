@@ -118,6 +118,25 @@ struct Header {
     }
 };
 
+// Adds one card of 80 characters to a header: a CONTINUE card to the long string it continues,
+// a blank card not at all.
+void addCard(Header& hdr, const std::string& raw) {
+    Card card = parseCard(raw);
+    if (card.name == "CONTINUE" && !hdr.cards.empty() && hdr.cards.back().isString) {
+        // Long-string convention: previous value ends with '&', this card continues it.
+        Card& prev = hdr.cards.back();
+        Card cont;
+        parseValue(card.comment, cont);
+        if (cont.isString && prev.value.size() >= 3 && prev.value[prev.value.size() - 2] == '&') {
+            prev.value = prev.value.substr(0, prev.value.size() - 2) + cont.value.substr(1);
+            if (!cont.comment.empty()) prev.comment += (prev.comment.empty() ? "" : " ") + cont.comment;
+            return;
+        }
+    }
+    if (card.name.empty() && card.comment.empty() && card.value.empty()) return;  // blank card
+    hdr.cards.push_back(std::move(card));
+}
+
 // Reads one header (a whole number of 2880-byte blocks). Returns false at a clean end of file.
 bool readHeader(std::ifstream& in, uint64_t fileSize, uint64_t& pos, Header& hdr, bool primary) {
     if (pos >= fileSize) return false;
@@ -147,24 +166,21 @@ bool readHeader(std::ifstream& in, uint64_t fileSize, uint64_t& pos, Header& hdr
                 end = true;
                 break;
             }
-            Card card = parseCard(raw);
-            if (card.name == "CONTINUE" && !hdr.cards.empty() && hdr.cards.back().isString) {
-                // Long-string convention: previous value ends with '&', this card continues it.
-                Card& prev = hdr.cards.back();
-                Card cont;
-                parseValue(card.comment, cont);
-                if (cont.isString && prev.value.size() >= 3 && prev.value[prev.value.size() - 2] == '&') {
-                    prev.value = prev.value.substr(0, prev.value.size() - 2) + cont.value.substr(1);
-                    if (!cont.comment.empty()) prev.comment += (prev.comment.empty() ? "" : " ") + cont.comment;
-                    continue;
-                }
-            }
-            if (card.name.empty() && card.comment.empty() && card.value.empty()) continue;  // blank card
-            hdr.cards.push_back(std::move(card));
+            addCard(hdr, raw);
             if (hdr.cards.size() > 100000) throw Error("FITS header has too many cards");
         }
     }
     return true;
+}
+
+// The keywords of an image among the cards of its header: what the reader leaves to the header
+// itself (the structure, the name, the keywords of a tile-compressed image) is not among them.
+void imageKeywords(const Header& hdr, bool tiled, std::vector<FitsKeyword>& out) {
+    for (const auto& c : hdr.cards) {
+        if (isReservedFitsKeyword(c.name) || c.name == "EXTNAME" || c.name == "HDUNAME" || c.name == "CONTINUE") continue;
+        if (tiled && isTileKeyword(c.name)) continue;
+        out.push_back({c.name, c.value, c.comment});
+    }
 }
 
 // How the stored samples of an image become those it is read as (BITPIX, BSCALE, BZERO).
@@ -932,13 +948,7 @@ FitsFile readFits(const std::string& path, bool headersOnly, std::optional<size_
         if (hdr.find("BLANK") && bitpix > 0 && (!onlyImage || *onlyImage == file.images.size())) {
             warn(label + ": BLANK (undefined) pixels are kept as ordinary sample values");
         }
-        for (const auto& c : hdr.cards) {
-            if (isReservedFitsKeyword(c.name) || c.name == "EXTNAME" || c.name == "HDUNAME" || c.name == "CONTINUE") {
-                continue;
-            }
-            if (tiled && isTileKeyword(c.name)) continue;
-            img.keywords.push_back({c.name, c.value, c.comment});
-        }
+        imageKeywords(hdr, tiled, img.keywords);
 
         if (!headersOnly && (!onlyImage || *onlyImage == file.images.size()) && inPieces) {
             // The samples are read from the file where they are, as they are asked for; those of a
@@ -991,6 +1001,18 @@ FitsFile readFits(const std::string& path, bool headersOnly, std::optional<size_
         if (onlyImage && file.images.size() > *onlyImage) break;   // the one image that was asked for is read
     }
     return file;
+}
+
+std::vector<FitsKeyword> fitsCardKeywords(const std::string& cards) {
+    Header hdr;
+    for (size_t off = 0; off + 80 <= cards.size(); off += 80) {
+        std::string raw = cards.substr(off, 80);
+        std::replace(raw.begin(), raw.end(), '\0', ' ');
+        addCard(hdr, raw);
+    }
+    std::vector<FitsKeyword> keywords;
+    imageKeywords(hdr, false, keywords);
+    return keywords;
 }
 
 }  // namespace xisfconv
