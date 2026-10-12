@@ -6,7 +6,9 @@
 #pragma once
 
 #include <cstdint>
+#include <filesystem>
 #include <memory>
+#include <ostream>
 #include <string>
 #include <vector>
 
@@ -46,6 +48,8 @@ public:
     // A new file in the temporary directory of the thread that is gone when it is closed, also
     // if the program is stopped (it has no name from the start where the system allows that).
     static std::unique_ptr<RawFile> temporary();
+    // A file that is written: made, or made empty if it is there. nullptr if it cannot be.
+    static std::unique_ptr<RawFile> createForWriting(const std::filesystem::path& path);
     ~RawFile();
     RawFile(const RawFile&) = delete;
     RawFile& operator=(const RawFile&) = delete;
@@ -171,5 +175,44 @@ std::shared_ptr<RandomBytes> sliceBytes(std::shared_ptr<RandomBytes> bytes, uint
 
 // Copies `size` bytes from `position` to the sink, a piece at a time.
 void copyBytes(RandomBytes& from, uint64_t position, uint64_t size, ByteSink& to);
+
+// A file that is written as std::ofstream writes one (binary, made empty first), but through a
+// buffer of its own, straight to the file at the place each byte belongs (pwrite). The reason is
+// fork(): a process forked from a program that is writing a file inherits what an ofstream has
+// not written yet where the C++ library keeps that in a C FILE (libc++ does, on macOS and
+// elsewhere), and exit() in the child writes it to the file a second time, into the middle of
+// what the parent writes. A buffer of this class is memory that nothing in the child writes out.
+class OutputFile : public std::ostream {
+public:
+    explicit OutputFile(const std::filesystem::path& path);
+    ~OutputFile() override;
+    OutputFile(const OutputFile&) = delete;
+    OutputFile& operator=(const OutputFile&) = delete;
+    bool is_open() const { return buffer_.isOpen(); }
+    // Writes what is left and closes the file; failbit if either fails.
+    void close();
+
+private:
+    class Buffer : public std::streambuf {
+    public:
+        bool open(const std::filesystem::path& path);
+        bool close();
+        bool isOpen() const { return file_ != nullptr; }
+
+    protected:
+        int_type overflow(int_type c) override;
+        std::streamsize xsputn(const char* s, std::streamsize n) override;
+        int sync() override;
+        pos_type seekoff(off_type off, std::ios_base::seekdir dir, std::ios_base::openmode which) override;
+        pos_type seekpos(pos_type pos, std::ios_base::openmode which) override;
+
+    private:
+        bool drain();   // what is in the buffer to the file
+        std::unique_ptr<RawFile> file_;
+        std::vector<char> data_;
+        uint64_t at_ = 0;   // where in the file the first byte of the buffer goes
+    };
+    Buffer buffer_;
+};
 
 }  // namespace xisfconv

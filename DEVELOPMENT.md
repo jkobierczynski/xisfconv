@@ -802,7 +802,10 @@ them. The choices:
   written but kept as short as its words: a link is followed only where it leads into the
   directory, a `..` behind a link is refused, and where the system cannot say what a name is,
   that is an error, not a pass. `link/../name` is refused even for a link that stays inside:
-  a header has no reason to write it.
+  a header has no reason to write it. What the system then resolves is the path as its words
+  reduce, which is what it would take (no `..` follows a link): macOS and Windows refuse a path
+  of more than 1024 or 260 characters before they look at it, and `missing/../name` is `name`
+  everywhere, as Windows had it.
 - **The budget of the properties counts bytes the unit brings.** Properties may declare, in
   total, the size of the file plus 256 MiB (so that a small header cannot ask for gigabytes).
   For a unit, "the file" is the header plus the blocks its header names in data blocks files,
@@ -1175,6 +1178,20 @@ reads an image a piece at a time and writes it as it reads it.
   `xisfconv_context_cancel` there, the Python package for Ctrl-C; the tool catches SIGINT and
   SIGTERM and cancels its context. The stages and their numbers stay what they were, so a
   handler that counts the reports per stage sees the same first and last ones.
+- **Output files are written by the library's own buffer** (`OutputFile`, an `std::ostream`
+  that writes with `pwrite` at the place each byte belongs), not by `std::ofstream`. libc++
+  keeps what an ofstream has not written yet in a C `FILE`, and a process forked while a file was
+  being written (Python's `os.fork` in a program with a thread inside a call) writes that again
+  into the file when it ends by `exit()`, which flushes every `FILE` it inherited. Before 0.20 a
+  block went out in one write, which passes the buffer by, and a fork rarely found anything in
+  it; with images in pieces there nearly always is, and macOS CI found a rewrite whose read-back
+  failed (one byte more in the middle of its output). libstdc++ does not buffer in a `FILE`, so
+  Linux never showed it; `tests/capi_test.c` forks at every progress report and fails on a libc++
+  build without the change. Files that are only read stay `std::ifstream` or `RawFile`, safe for
+  another reason: such a child's `exit()` moves the place in a file it shares with the parent
+  where a libc++ ifstream on glibc or musl had read ahead, and every read of the library seeks
+  to its place first (`RawFile` reads with `pread`). A reader that reads an ifstream on, without
+  seeking, would not be safe from a fork.
 - **What stays whole**: an image the library reads into memory (`xisfconv_read_pixels`, which
   now also reads through a source and gathers it), an array it is given to write (the writer
   reads it through a source that borrows it), the properties of a file, the table of the tiles of

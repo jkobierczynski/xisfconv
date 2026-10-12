@@ -19,7 +19,7 @@ void put32be(std::vector<uint8_t>& v, uint32_t x) {
 
 class ChunkWriter {
 public:
-    explicit ChunkWriter(const std::string& path) : path_(path), out_(toPath(path), std::ios::binary | std::ios::trunc) {
+    explicit ChunkWriter(const std::string& path) : path_(path), out_(toPath(path)) {
         if (!out_) throw Error("cannot create " + path, ErrorKind::Io);
         static const uint8_t sig[8] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'};
         out_.write(reinterpret_cast<const char*>(sig), 8);
@@ -46,7 +46,7 @@ public:
 
 private:
     std::string path_;
-    std::ofstream out_;
+    OutputFile out_;
 };
 
 uint8_t paeth(int a, int b, int c) {

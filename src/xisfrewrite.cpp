@@ -288,16 +288,16 @@ Packed compressBlock(const std::shared_ptr<RandomBytes>& raw, size_t itemSize, c
 }
 
 // Copies bytes into the file, a piece at a time.
-void writeBytes(std::ofstream& out, RandomBytes& bytes) {
+void writeBytes(std::ostream& out, RandomBytes& bytes) {
     struct File : ByteSink {
-        std::ofstream& out;
-        explicit File(std::ofstream& o) : out(o) {}
+        std::ostream& out;
+        explicit File(std::ostream& o) : out(o) {}
         void write(const uint8_t* data, size_t n) override { out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(n)); }
     } file(out);
     copyBytes(bytes, 0, bytes.size(), file);
 }
 
-void writeZeros(std::ofstream& out, uint64_t count) {
+void writeZeros(std::ostream& out, uint64_t count) {
     static const std::vector<char> zeros(65536, 0);
     while (count > 0) {
         const uint64_t n = std::min<uint64_t>(count, zeros.size());
@@ -419,7 +419,7 @@ XisfRewriteResult rewriteXisf(const std::string& input, const std::string& outpu
     const std::vector<uint64_t> blockIds = distributed ? newXisbIds(storedCount) : std::vector<uint64_t>();
     std::vector<XisbOutBlock> index;
 
-    std::ofstream out(toPath(blocksOutput), std::ios::binary | std::ios::trunc);
+    OutputFile out(toPath(blocksOutput));
     if (!out) throw Error("cannot create " + blocksOutput, ErrorKind::Io);
     writeZeros(out, firstPosition);
     uint64_t pos = firstPosition;
@@ -594,7 +594,7 @@ XisfRewriteResult rewriteXisf(const std::string& input, const std::string& outpu
         out.write(reinterpret_cast<const char*>(head.data()), static_cast<std::streamsize>(head.size()));
         out.close();
         if (!out) throw Error("write error on " + blocksOutput, ErrorKind::Io);
-        std::ofstream headerFile(toPath(output), std::ios::binary | std::ios::trunc);
+        OutputFile headerFile(toPath(output));
         if (!headerFile) throw Error("cannot create " + output, ErrorKind::Io);
         headerFile.write(header.data(), static_cast<std::streamsize>(header.size()));
         headerFile.close();

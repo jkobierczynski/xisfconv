@@ -80,7 +80,7 @@ Entry undefinedBytes(uint16_t tag, const std::vector<uint8_t>& bytes) {
 
 class Output {
 public:
-    Output(const std::string& path, bool big) : path_(path), out_(toPath(path), std::ios::binary | std::ios::trunc), big_(big) {
+    Output(const std::string& path, bool big) : path_(path), out_(toPath(path)), big_(big) {
         if (!out_) throw Error("cannot create " + path, ErrorKind::Io);
     }
     uint64_t pos() const { return pos_; }
@@ -117,7 +117,7 @@ public:
 
 private:
     std::string path_;
-    std::ofstream out_;
+    OutputFile out_;
     bool big_;
     uint64_t pos_ = 0;
 };

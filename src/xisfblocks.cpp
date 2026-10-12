@@ -629,6 +629,7 @@ std::string XisfExternalFiles::resolve(const XisfLocation& location, const std::
         }
     }
     std::error_code ec;
+    fs::path resolved = path;   // what the system is asked to resolve
     if (policy_ == ExternalFiles::HeaderDirectory && !redirected) {
         // Where a symbolic link below the directory leads is not told, nor whether there is
         // something: a header could ask about any file of the machine that way. So the path is
@@ -679,10 +680,13 @@ std::string XisfExternalFiles::resolve(const XisfLocation& location, const std::
                 if (ec3 || !insideDirectory(leadsTo)) throw refused();
             }
         }
-        const fs::path real = realPath(path, ec);
+        // The path as its words reduce is the path the system would take (there is no .. behind a
+        // link), and one that a system with a short limit to the length of a path takes as well.
+        resolved = part;
+        const fs::path real = realPath(resolved, ec);
         if (!ec && !insideDirectory(real)) throw refused();   // (it was not when the names were gone through)
     }
-    const fs::path real = realPath(path, ec);
+    const fs::path real = realPath(resolved, ec);
     if (ec) {
         throw Error(what + " is in " + shown + ", which is not there or cannot be reached (" + ec.message() + "); a "
                     "distributed XISF unit is its header file and the files that header names" +

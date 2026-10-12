@@ -5205,6 +5205,10 @@ def test_distributed_units():
         check(said["with space.dat"] == said["no such file.dat"], "... the same way whether there is a file where it leads or not")
         r, got = converted(unit_of("long.xish", 'location="path(@header_dir/' + "below/../" * 600 + 'whole.dat)"'))
         check(got is not None and np.array_equal(got, as_planes(a)), f"a long path that stays inside is followed: {r.stderr.strip()[-200:]}")
+        # (the path is resolved as its words reduce: as Windows does, and below a limit to its length on any system)
+        r, got = converted(unit_of("long.xish", 'location="path(@header_dir/no such directory/../whole.dat)"'))
+        check(got is not None and np.array_equal(got, as_planes(a)),
+              f"a path through a name that is not there and back is the file its words spell: {r.stderr.strip()[-200:]}")
     # a block that is one of many is left out with a warning; the image is converted
     unit = unit_of("property.xish", 'location="path(@header_dir/whole.dat)"', 'location="path(%s)"' % outside)
     r, got = converted(unit)

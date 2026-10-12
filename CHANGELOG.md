@@ -12,6 +12,12 @@ before.
 ## Unreleased
 
 Fixed
+- A process forked while the library wrote a file (in Python, `os.fork()` while another thread
+  converted or rewrote one) could write part of that file a second time into it when the child
+  ended: the output was damaged, and a rewrite failed when it read its output back. Seen on
+  macOS, whose C++ library keeps unwritten output in a C `FILE` that the child's `exit()`
+  flushes; since 0.20.0, which writes images in pieces, nearly every moment of writing was such
+  a moment. The library now writes its files through a buffer of its own.
 - A refusal to follow a header through a symbolic link that leads out of its directory read
   differently, for a path that goes through the link and back (`@header_dir/link/../name`),
   depending on whether there was a file where it led: "behind a symbolic link" when there was,

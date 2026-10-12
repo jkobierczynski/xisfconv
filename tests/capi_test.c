@@ -18,6 +18,11 @@
 
 #include "xisfconv.h"
 
+#ifndef _WIN32
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+
 static int g_checks = 0, g_failed = 0;
 
 #define CHECK(cond, what)                                              \
@@ -977,6 +982,35 @@ static void test_kept_messages_and_cancel(xisfconv_context *ctx) {
 
 /* Since 0.20 an image is read and written a piece at a time: a long step reports more than once
  * (every 8 MiB or so the last report again) and is stopped there, within one image. */
+#ifndef _WIN32
+/* Forks at every report; the child ends at once, by exit(), as a program's child that does not exec. */
+static int32_t on_progress_fork(void *user, const char *stage, uint64_t done, uint64_t total) {
+    pid_t child;
+    (void)user;
+    (void)stage;
+    (void)done;
+    (void)total;
+    child = fork();
+    if (child == 0) exit(0);
+    if (child > 0) waitpid(child, NULL, 0);
+    return 0;
+}
+
+static int same_files(const char *a, const char *b) {
+    FILE *fa = fopen(a, "rb"), *fb = fopen(b, "rb");
+    int same = fa && fb, ca, cb;
+    while (same) {
+        ca = getc(fa);
+        cb = getc(fb);
+        if (ca != cb) same = 0;
+        if (ca == EOF || cb == EOF) break;
+    }
+    if (fa) fclose(fa);
+    if (fb) fclose(fb);
+    return same;
+}
+#endif
+
 static void test_pieces(xisfconv_context *ctx) {
     enum { LW = 4000, LH = 3000 };
     xisfconv_writer *w = NULL;
@@ -1022,6 +1056,19 @@ static void test_pieces(xisfconv_context *ctx) {
     CHECK(xisfconv_rewrite(ctx, path_of("large.xisf"), path_of("large-stopped.xisf"), NULL, NULL) == XISFCONV_ERR_CANCELLED &&
               !file_exists(path_of("large-stopped.xisf")) && !file_exists(path_of("large-stopped.xisf.part")),
           "so is a rewrite of one block");
+#ifndef _WIN32
+    /* A process forked while a file is written, which ends by exit(), does not write into it:
+       what the C++ library of the platform holds for a file in a C FILE would be written by the
+       child a second time (libc++ does, on macOS). */
+    xisfconv_context_set_progress_handler(ctx, on_progress_fork, NULL);
+    CHECK(xisfconv_rewrite(ctx, path_of("large.xisf"), path_of("large-forked.xisf"), NULL, NULL) == XISFCONV_OK,
+          "a rewrite with processes forked from it while it writes (read back and compared)");
+    CHECK(xisfconv_convert(ctx, path_of("large.xisf"), path_of("large-forked.fits"), NULL) == XISFCONV_OK &&
+              same_files(path_of("large.fits"), path_of("large-forked.fits")),
+          "a conversion with processes forked from it while it writes: the file it would be without them");
+    remove(path_of("large-forked.xisf"));
+    remove(path_of("large-forked.fits"));
+#endif
     xisfconv_context_set_progress_handler(ctx, NULL, NULL);
     remove(path_of("large.xisf"));
     remove(path_of("large.fits"));

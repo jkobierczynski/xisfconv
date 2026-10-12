@@ -271,7 +271,7 @@ void storedSamples(SampleFormat format, const uint8_t* s, size_t count, uint8_t*
     }
 }
 
-void writeZeros(std::ofstream& out, uint64_t count) {
+void writeZeros(std::ostream& out, uint64_t count) {
     const std::vector<char> zeros(static_cast<size_t>(std::min<uint64_t>(count, 1u << 16)), 0);
     for (uint64_t done = 0; done < count;) {
         const uint64_t n = std::min<uint64_t>(count - done, zeros.size());
@@ -281,9 +281,9 @@ void writeZeros(std::ofstream& out, uint64_t count) {
 }
 
 // Fills the last block of a data unit of `bytes` bytes.
-void padBlock(std::ofstream& out, uint64_t bytes) { writeZeros(out, (kBlock - bytes % kBlock) % kBlock); }
+void padBlock(std::ostream& out, uint64_t bytes) { writeZeros(out, (kBlock - bytes % kBlock) % kBlock); }
 
-void writeData(std::ofstream& out, ImageSource& px) {
+void writeData(std::ostream& out, ImageSource& px) {
     const size_t sb = sampleBytes(px.format);
     std::vector<uint8_t> buf;
     forEachBand(px, [&](uint64_t, uint64_t, uint64_t rows, const uint8_t* data) {
@@ -445,7 +445,7 @@ std::string headerBlocks(std::vector<std::string> cards) {
     return header;
 }
 
-std::string writePlainImage(std::ofstream& out, const FitsHdu& hdu, bool primary, bool first) {
+std::string writePlainImage(std::ostream& out, const FitsHdu& hdu, bool primary, bool first) {
     ImageSource& px = *hdu.pixels;
     std::vector<std::string> cards;
     if (primary) cards.push_back(logicalCard("SIMPLE", true, "file conforms to FITS standard"));
@@ -475,7 +475,7 @@ std::string writePlainImage(std::ofstream& out, const FitsHdu& hdu, bool primary
 // table. A tile is one row of the image, as in the files of fpack and astropy. The table and the
 // sizes in the header are known only when the tiles are compressed: both are written last, into
 // the room left for them.
-std::string writeTiledImage(std::ofstream& out, const std::string& path, const FitsHdu& hdu, bool first, FitsTiles tiles) {
+std::string writeTiledImage(std::ostream& out, const std::string& path, const FitsHdu& hdu, bool first, FitsTiles tiles) {
     ImageSource& px = *hdu.pixels;
     const size_t sb = sampleBytes(px.format);
     const bool rice = tiles == FitsTiles::Default && !isFloat(px.format);
@@ -552,10 +552,10 @@ std::string writeTiledImage(std::ofstream& out, const std::string& path, const F
         return headerBlocks(std::move(cards));
     };
 
-    const std::ofstream::pos_type headerAt = out.tellp();
+    const std::ostream::pos_type headerAt = out.tellp();
     const std::string placeholder = header(0, 0);
     out.write(placeholder.data(), static_cast<std::streamsize>(placeholder.size()));
-    const std::ofstream::pos_type tableAt = out.tellp();
+    const std::ostream::pos_type tableAt = out.tellp();
     writeZeros(out, tableBytes);
 
     std::vector<uint8_t> table(static_cast<size_t>(tableBytes));
@@ -589,7 +589,7 @@ std::string writeTiledImage(std::ofstream& out, const std::string& path, const F
         }
     });
     padBlock(out, tableBytes + heap);
-    const std::ofstream::pos_type endAt = out.tellp();
+    const std::ostream::pos_type endAt = out.tellp();
 
     const std::string finished = header(heap, longest);
     if (finished.size() != placeholder.size()) throw Error("the header of the compressed image changed its size (internal error)");
@@ -602,7 +602,7 @@ std::string writeTiledImage(std::ofstream& out, const std::string& path, const F
 }
 
 // The table of XISF properties (see kPropertyTable in fits.hpp).
-void writePropertyTable(std::ofstream& out, const std::vector<Property>& all, const char* name, size_t number,
+void writePropertyTable(std::ostream& out, const std::vector<Property>& all, const char* name, size_t number,
                         const std::string& digest) {
     // The id and the type are text columns, which hold printable ASCII: that is what XISF
     // allows them to be.
@@ -719,7 +719,7 @@ void writePropertyTable(std::ofstream& out, const std::vector<Property>& all, co
 }  // namespace
 
 void writeFits(const std::string& path, const std::vector<FitsHdu>& hdus, const FitsWriteOptions& options) {
-    std::ofstream out(toPath(path), std::ios::binary | std::ios::trunc);
+    OutputFile out(toPath(path));
     if (!out) throw Error("cannot create " + path, ErrorKind::Io);
 
     if (options.tiles == FitsTiles::None) {

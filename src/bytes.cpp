@@ -134,6 +134,21 @@ std::unique_ptr<RawFile> RawFile::temporary() {
     return file;
 }
 
+std::unique_ptr<RawFile> RawFile::createForWriting(const std::filesystem::path& path) {
+    std::unique_ptr<RawFile> file(new RawFile());
+    file->path_ = fromPath(path);
+#ifdef _WIN32
+    if (_wsopen_s(&file->fd_, path.c_str(), _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY | _O_NOINHERIT, _SH_DENYNO,
+                  _S_IREAD | _S_IWRITE) != 0) {
+        file->fd_ = -1;
+    }
+#else
+    file->fd_ = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0666);
+#endif
+    if (file->fd_ < 0) return nullptr;
+    return file;
+}
+
 RawFile::~RawFile() {
     if (fd_ < 0) return;
 #ifdef _WIN32
@@ -359,6 +374,94 @@ void copyBytes(RandomBytes& from, uint64_t position, uint64_t size, ByteSink& to
         done += n;
         progressTick(n);
     }
+}
+
+// ---------------------------------------------------------------------------------- OutputFile
+
+OutputFile::OutputFile(const std::filesystem::path& path) : std::ostream(nullptr) {
+    rdbuf(&buffer_);
+    if (!buffer_.open(path)) setstate(std::ios_base::failbit);
+}
+
+OutputFile::~OutputFile() { buffer_.close(); }
+
+void OutputFile::close() {
+    if (!buffer_.close()) setstate(std::ios_base::failbit);
+}
+
+bool OutputFile::Buffer::open(const std::filesystem::path& path) {
+    file_ = RawFile::createForWriting(path);
+    if (!file_) return false;
+    data_.assign(size_t(1) << 16, '\0');
+    at_ = 0;
+    setp(data_.data(), data_.data() + data_.size());
+    return true;
+}
+
+bool OutputFile::Buffer::drain() {
+    if (!file_) return false;
+    const size_t n = static_cast<size_t>(pptr() - pbase());
+    try {
+        if (n) file_->write(at_, pbase(), n);
+    } catch (...) {   // (also what goes wrong while the error is told: this runs in a destructor too)
+        return false;
+    }
+    at_ += n;
+    setp(data_.data(), data_.data() + data_.size());
+    return true;
+}
+
+bool OutputFile::Buffer::close() {
+    if (!file_) return false;
+    const bool written = drain();
+    file_.reset();   // (closes it)
+    setp(nullptr, nullptr);
+    return written;
+}
+
+OutputFile::Buffer::int_type OutputFile::Buffer::overflow(int_type c) {
+    if (!drain()) return traits_type::eof();
+    if (traits_type::eq_int_type(c, traits_type::eof())) return traits_type::not_eof(c);
+    *pptr() = traits_type::to_char_type(c);
+    pbump(1);
+    return c;
+}
+
+std::streamsize OutputFile::Buffer::xsputn(const char* s, std::streamsize n) {
+    if (n <= 0) return 0;
+    if (static_cast<size_t>(n) < data_.size() || !file_) return std::streambuf::xsputn(s, n);
+    // (what does not fit the buffer goes to the file as it is)
+    if (!drain()) return 0;
+    try {
+        file_->write(at_, s, static_cast<size_t>(n));
+    } catch (...) {
+        return 0;
+    }
+    at_ += static_cast<uint64_t>(n);
+    return n;
+}
+
+int OutputFile::Buffer::sync() { return drain() ? 0 : -1; }
+
+OutputFile::Buffer::pos_type OutputFile::Buffer::seekoff(off_type off, std::ios_base::seekdir dir, std::ios_base::openmode which) {
+    if (!(which & std::ios_base::out) || !drain()) return pos_type(off_type(-1));
+    int64_t base = 0;
+    if (dir == std::ios_base::cur) base = static_cast<int64_t>(at_);
+    else if (dir == std::ios_base::end) {
+        try {
+            base = static_cast<int64_t>(file_->size());
+        } catch (...) {
+            return pos_type(off_type(-1));
+        }
+    }
+    const int64_t to = base + static_cast<int64_t>(off);
+    if (to < 0) return pos_type(off_type(-1));
+    at_ = static_cast<uint64_t>(to);
+    return pos_type(off_type(to));
+}
+
+OutputFile::Buffer::pos_type OutputFile::Buffer::seekpos(pos_type pos, std::ios_base::openmode which) {
+    return seekoff(off_type(pos), std::ios_base::beg, which);
 }
 
 }  // namespace xisfconv

@@ -431,7 +431,7 @@ void writeXisf(const std::string& path, const std::vector<XisfOutImage>& images,
         return x;
     };
 
-    const auto writeBlocks = [&](std::ofstream& out, const std::string& name, uint64_t pos) {
+    const auto writeBlocks = [&](OutputFile& out, const std::string& name, uint64_t pos) {
         const std::vector<char> zeros(kAlignment, 0);
         for (size_t i = 0; i < blocks.size(); ++i) {
             if (positions[i] > pos) out.write(zeros.data(), static_cast<std::streamsize>(positions[i] - pos));
@@ -442,8 +442,8 @@ void writeXisf(const std::string& path, const std::vector<XisfOutImage>& images,
                 });
             } else if (blocks[i].stored) {
                 struct File : ByteSink {
-                    std::ofstream& out;
-                    explicit File(std::ofstream& o) : out(o) {}
+                    std::ostream& out;
+                    explicit File(std::ostream& o) : out(o) {}
                     void write(const uint8_t* data, size_t n) override {
                         out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(n));
                     }
@@ -479,13 +479,13 @@ void writeXisf(const std::string& path, const std::vector<XisfOutImage>& images,
             index[i] = {blockIds[i], p, blocks[i].size, blocks[i].uncompressed};
             p = alignUp(p + blocks[i].size);
         }
-        std::ofstream data(toPath(opt.blocksPath), std::ios::binary | std::ios::trunc);
+        OutputFile data(toPath(opt.blocksPath));
         if (!data) throw Error("cannot create " + opt.blocksPath, ErrorKind::Io);
         const std::vector<uint8_t> head = xisbIndexBytes(index);
         data.write(reinterpret_cast<const char*>(head.data()), static_cast<std::streamsize>(head.size()));
         writeBlocks(data, opt.blocksPath, head.size());
 
-        std::ofstream out(toPath(path), std::ios::binary | std::ios::trunc);
+        OutputFile out(toPath(path));
         if (!out) throw Error("cannot create " + path, ErrorKind::Io);
         out.write(header.data(), static_cast<std::streamsize>(header.size()));
         out.close();
@@ -510,7 +510,7 @@ void writeXisf(const std::string& path, const std::vector<XisfOutImage>& images,
     }
     if (header.size() > 0xFFFFFFFFull) throw Error("XISF header too large");
 
-    std::ofstream out(toPath(path), std::ios::binary | std::ios::trunc);
+    OutputFile out(toPath(path));
     if (!out) throw Error("cannot create " + path, ErrorKind::Io);
     const uint32_t len = static_cast<uint32_t>(header.size());
     const unsigned char preamble[16] = {'X', 'I', 'S', 'F', '0', '1', '0', '0',

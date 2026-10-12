@@ -1487,7 +1487,7 @@ private:
 }  // namespace
 
 void writeAsdf(const std::string& path, const std::vector<FitsHdu>& hdus, const AsdfWriteOptions& options) {
-    std::ofstream out(toPath(path), std::ios::binary | std::ios::trunc);
+    OutputFile out(toPath(path));
     if (!out) throw Error("cannot create " + path, ErrorKind::Io);
 
     std::string tree = "#ASDF 1.0.0\n"
@@ -1578,10 +1578,10 @@ void writeAsdf(const std::string& path, const std::vector<FitsHdu>& hdus, const 
     // The pixels of each image, a piece at a time: the header of the block, with the sizes and
     // the digest of what follows, is written again once they are known.
     struct Out : ByteSink {
-        std::ofstream& out;
+        std::ostream& out;
         Hasher md5{"md5"};
         uint64_t size = 0;
-        explicit Out(std::ofstream& o) : out(o) {}
+        explicit Out(std::ostream& o) : out(o) {}
         void write(const uint8_t* data, size_t n) override {
             out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(n));
             md5.update(data, n);
@@ -1594,7 +1594,7 @@ void writeAsdf(const std::string& path, const std::vector<FitsHdu>& hdus, const 
         const std::string& codec = options.codec;
         if (!codec.empty() && codec != "zlib" && codec != "zstd") throw Error("ASDF output: unknown codec " + codec);
         const uint8_t zero[16] = {};
-        const std::ofstream::pos_type headerAt = out.tellp();
+        const std::ostream::pos_type headerAt = out.tellp();
         const std::string placeholder = blockHeader(codec, 0, bytes, zero);
         out.write(placeholder.data(), static_cast<std::streamsize>(placeholder.size()));
         Out stored(out);
@@ -1609,7 +1609,7 @@ void writeAsdf(const std::string& path, const std::vector<FitsHdu>& hdus, const 
         if (!out) throw Error("write error on " + path, ErrorKind::Io);
         const std::vector<uint8_t> digest = stored.md5.finish();
         const std::string header = blockHeader(codec, stored.size, bytes, digest.data());
-        const std::ofstream::pos_type endAt = out.tellp();
+        const std::ostream::pos_type endAt = out.tellp();
         out.seekp(headerAt);
         out.write(header.data(), static_cast<std::streamsize>(header.size()));
         out.seekp(endAt);
