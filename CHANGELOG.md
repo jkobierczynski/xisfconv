@@ -12,6 +12,13 @@ before.
 ## Unreleased
 
 Fixed
+- A refusal to follow a header through a symbolic link that leads out of its directory read
+  differently, for a path that goes through the link and back (`@header_dir/link/../name`),
+  depending on whether there was a file where it led: "behind a symbolic link" when there was,
+  "not there" when there was not. It now reads the same both times, as `MANUAL.md` says. A path
+  out through a symbolic link and back in by `..` was followed or refused depending on what
+  the link led to; a `..` behind a link is now refused by default (`--external-files anywhere`
+  allows it), also behind a link that stays in the directory.
 - A FITS file that ends inside the header of an HDU (one that was not copied whole) converted
   without what that HDU held, and without a word: a table of XISF properties cut off there was
   lost silently. The remains are now skipped with a warning, as a table is, that names the

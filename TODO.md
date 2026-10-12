@@ -74,9 +74,6 @@ Smaller items, each closing a limitation listed in `MANUAL.md`:
 
 Found when the documents were checked against the program (October 2026), and not changed yet:
 
-- [ ] `MANUAL.md` says a refusal does not tell whether there is something where a symbolic link
-      leads. For a path that goes through a link and back (`link/../name`, the link leading to a
-      directory outside) the message differs between a file that is there and one that is not.
 - [ ] `--dump-header` of a FITS file prints what `--info` prints (the keywords without the
       structural ones, and the properties), where the help says "all keywords". Either the
       cards as they are, or other words.

@@ -791,6 +791,18 @@ them. The choices:
   message does not say where it leads, and reads the same whether or not there is a file there:
   a header that could ask "is there a file at X" of any path would be a small oracle for
   whoever sees the messages of a service.
+  The first version asked the system where the whole path leads, and went through it name by
+  name only when there was nothing there, as its words reduce. `link/../name` (the link leading
+  out) is `name` to the words but beside the link's target to the system, so a file there was
+  refused as behind a link and its absence reported as "not there" (found when the documents
+  were checked against the program, 0.20.x). Going through the path as written instead let a
+  long path hide the link (a name longer than the system takes is no link to `lstat`), and a
+  path out through a link and back in by `..` was followed if the link's target was a
+  directory and refused if not. So the path is now gone through name by name first, as it is
+  written but kept as short as its words: a link is followed only where it leads into the
+  directory, a `..` behind a link is refused, and where the system cannot say what a name is,
+  that is an error, not a pass. `link/../name` is refused even for a link that stays inside:
+  a header has no reason to write it.
 - **The budget of the properties counts bytes the unit brings.** Properties may declare, in
   total, the size of the file plus 256 MiB (so that a small header cannot ask for gigabytes).
   For a unit, "the file" is the header plus the blocks its header names in data blocks files,

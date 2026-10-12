@@ -449,7 +449,8 @@ The files `.xish` and `.xisb`; the options `-t xish` and `--external-files`.
   which files are read: one that names `/etc/passwd`, or a file of another user, as the pixels of
   an image would have a conversion copy that file into its output. So by default a header is
   followed only to files **in its own directory and below it**, named `path(@header_dir/...)`; a
-  path that leaves the directory (`..`, a symbolic link that leads out), an absolute path and a
+  path that leaves the directory (`..`, a symbolic link that leads out, a `..` behind a symbolic
+  link, which the system takes from where the link leads), an absolute path and a
   `file:` URL are refused, and the message says how to allow them:
   `--external-files anywhere`. `--external-files none` opens no file but the header. And only a
   **header file that is named as one** (`.xish`) is followed at all: a monolithic `.xisf` file

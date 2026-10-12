@@ -5155,6 +5155,56 @@ def test_distributed_units():
         os.symlink("whole.dat", inside)
         r, got = converted(unit_of("inside.xish", 'location="path(@header_dir/inside.dat)"'))
         check(got is not None and np.array_equal(got, as_planes(a)), f"a link that stays in the directory is followed: {r.stderr.strip()[:200]}")
+        # ... and a path through a link and back (link/../name) is not an oracle either: the system takes the
+        # .. from where the link leads, the words of the path from the link itself
+        os.makedirs(os.path.join(elsewhere, "sub"), exist_ok=True)
+        open(os.path.join(elsewhere, "sub", "with space.dat"), "wb").write(pixels)
+        out_dir = os.path.join(policy, "outdir")
+        if os.path.lexists(out_dir):
+            os.remove(out_dir)
+        os.symlink(os.path.join(elsewhere, "sub"), out_dir)
+        said = {}
+        for name in ("with space.dat", "no such file.dat"):
+            r, got = converted(unit_of("back.xish", f'location="path(@header_dir/outdir/../{name})"'))
+            said[name] = r.stderr.replace(name, "NAME")
+            check(r.returncode == 1 and got is None and "behind a symbolic link that does not lead to a file in the directory" in r.stderr
+                  and "elsewhere" not in r.stderr, f"a path through a link out and back is not followed ({name}): {r.stderr.strip()[:300]}")
+        check(said["with space.dat"] == said["no such file.dat"],
+              f"... and reads the same whether there is a file where it leads or not: {said}")
+        if os.name != "nt":   # (Windows takes the .. by the words of the path: the file would be one of the directory)
+            r, got = converted(unit_of("back.xish", 'location="path(@header_dir/outdir/../with space.dat)"'), "--external-files", "anywhere")
+            check(got is not None and np.array_equal(got, as_planes(a)), f"... unless that is allowed: {r.stderr.strip()[:200]}")
+        # A .. behind a link is refused, also where the link stays inside: going out through a link and back in by
+        # .. would tell whether, and where, there is what the link leads to.
+        in_dir = os.path.join(policy, "indir")
+        if os.path.lexists(in_dir):
+            os.remove(in_dir)
+        os.symlink("below", in_dir)
+        r, got = converted(unit_of("back.xish", 'location="path(@header_dir/indir/whole.dat)"'))
+        check(got is not None and np.array_equal(got, as_planes(a)), f"a path through a link that stays inside is followed: {r.stderr.strip()[:200]}")
+        r, got = converted(unit_of("back.xish", 'location="path(@header_dir/indir/../whole.dat)"'))
+        check(r.returncode == 1 and got is None and "which goes back by .. behind a symbolic link" in r.stderr,
+              f"... and back by .. it is not: {r.stderr.strip()[:200]}")
+        here_dir = os.path.basename(policy)
+        for target, exists in (("sub", True), ("no such directory", False)):
+            loop = os.path.join(policy, "below", "loop")   # (one down: the words of the path stay in the directory)
+            if os.path.lexists(loop):
+                os.remove(loop)
+            os.symlink(os.path.join(elsewhere, target), loop)
+            r, got = converted(unit_of("back.xish", f'location="path(@header_dir/below/loop/../../{here_dir}/whole.dat)"'))
+            said[exists] = r.stderr
+            check(r.returncode == 1 and got is None and "behind a symbolic link" in r.stderr,
+                  f"a path out through a link and back in is refused ({'the link leads to a directory' if exists else 'to nothing'}): "
+                  f"{r.stderr.strip()[:200]}")
+        check(said[True] == said[False], "... the same way whether there is something where the link leads or not")
+        # ... and a long path is no way around the check (a path longer than the system takes, of which the words are short)
+        for name in ("with space.dat", "no such file.dat"):
+            r, got = converted(unit_of("long.xish", 'location="path(@header_dir/' + "below/../" * 600 + f'outdir/{name})"'))
+            said[name] = r.stderr.replace(name, "NAME")
+            check(r.returncode == 1 and got is None and "behind a symbolic link" in r.stderr, f"a long path through a link out is refused ({name}): {r.stderr.strip()[-200:]}")
+        check(said["with space.dat"] == said["no such file.dat"], "... the same way whether there is a file where it leads or not")
+        r, got = converted(unit_of("long.xish", 'location="path(@header_dir/' + "below/../" * 600 + 'whole.dat)"'))
+        check(got is not None and np.array_equal(got, as_planes(a)), f"a long path that stays inside is followed: {r.stderr.strip()[-200:]}")
     # a block that is one of many is left out with a warning; the image is converted
     unit = unit_of("property.xish", 'location="path(@header_dir/whole.dat)"', 'location="path(%s)"' % outside)
     r, got = converted(unit)

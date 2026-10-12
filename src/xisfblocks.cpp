@@ -62,22 +62,45 @@ fs::path realPath(const fs::path& path, std::error_code& ec) {
     return fs::path(name);
 }
 
-bool isLink(const fs::path& path) {
-    WIN32_FIND_DATAW found;
-    if (path.native().find_first_of(L"*?") != std::wstring::npos) return false;   // (no file has such a name; a search would take them for a pattern)
-    const HANDLE search = FindFirstFileW(path.c_str(), &found);
-    if (search == INVALID_HANDLE_VALUE) return false;
-    FindClose(search);
-    return (found.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 &&
-           (found.dwReserved0 == IO_REPARSE_TAG_SYMLINK || found.dwReserved0 == IO_REPARSE_TAG_MOUNT_POINT);
+// What stands at a path, its last name not followed: nothing, a link (any reparse point: a
+// symbolic link, a junction, also a file of a cloud folder), something else; Unknown where the
+// system does not say (`why`). (Asked of the path, not by listing its directory, which a
+// directory one may only pass through does not allow.)
+enum class Entry { Missing, Link, Other, Unknown };
+
+Entry entryAt(const fs::path& path, std::error_code& why) {
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        const DWORD error = GetLastError();
+        if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) return Entry::Missing;
+        why = std::error_code(static_cast<int>(error), std::system_category());
+        return Entry::Unknown;
+    }
+    return (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ? Entry::Link : Entry::Other;
+}
+
+// A name Windows does not take as it is written: it drops dots and blanks at the end of a name.
+bool changedByWindows(const fs::path& name) {
+    const std::wstring& n = name.native();
+    return n != L"." && n != L".." && !n.empty() && (n.back() == L'.' || n.back() == L' ');
 }
 #else
 fs::path realPath(const fs::path& path, std::error_code& ec) { return fs::canonical(path, ec); }
 
-bool isLink(const fs::path& path) {
-    std::error_code ec;
-    return fs::is_symlink(fs::symlink_status(path, ec));
+enum class Entry { Missing, Link, Other, Unknown };
+
+Entry entryAt(const fs::path& path, std::error_code& why) {
+    const fs::file_status status = fs::symlink_status(path, why);
+    if (why) {
+        if (why != std::errc::no_such_file_or_directory && why != std::errc::not_a_directory) return Entry::Unknown;
+        why.clear();
+        return Entry::Missing;
+    }
+    if (status.type() == fs::file_type::not_found) return Entry::Missing;
+    return fs::is_symlink(status) ? Entry::Link : Entry::Other;
 }
+
+bool changedByWindows(const fs::path&) { return false; }
 #endif
 
 uint64_t le64(const unsigned char* p) {
@@ -606,26 +629,60 @@ std::string XisfExternalFiles::resolve(const XisfLocation& location, const std::
         }
     }
     std::error_code ec;
-    const fs::path real = realPath(path, ec);
     if (policy_ == ExternalFiles::HeaderDirectory && !redirected) {
         // Where a symbolic link below the directory leads is not told, nor whether there is
-        // something: a header could ask about any file of the machine that way.
+        // something: a header could ask about any file of the machine that way. So the path is
+        // gone through name by name, as it is written, before the system resolves the whole of
+        // it: a link is followed only where it leads to the directory or below, and is refused
+        // the same way whether it leads out or to nothing; a .. behind a link, which would be
+        // taken from where the link leads, is refused as well (a path that goes out through a
+        // link and back in would tell where the link leads). Up to the first link the names are
+        // the directory's own, and the path stays as its words reduce, short.
         static const char* const kLink = ", behind a symbolic link that does not lead to a file in the directory of the header";
-        bool inside = false;
-        if (!ec) {
-            std::error_code ec2;
-            const fs::path directory = realPath(headerDir_, ec2);
+        const auto refused = [&] { return NotAllowed(what + " is in " + shown + kLink + kUnlessAllowed); };
+        std::error_code ec2;
+        const fs::path directory = realPath(headerDir_, ec2);
+        const auto insideDirectory = [&](const fs::path& real) {
             const fs::path below = ec2 ? fs::path() : real.lexically_relative(directory);
-            inside = !(ec2 || below.empty() || *below.begin() == ".." || below.is_absolute() || below.has_root_name());
-            if (!inside) throw NotAllowed(what + " is in " + shown + kLink + kUnlessAllowed);
-        } else {
-            fs::path part = headerDir_;
-            for (const fs::path& name : toPath(location.target).lexically_normal()) {
-                part /= name;
-                if (isLink(part)) throw NotAllowed(what + " is in " + shown + kLink + kUnlessAllowed);
+            return !(ec2 || below.empty() || *below.begin() == ".." || below.is_absolute() || below.has_root_name());
+        };
+        fs::path part = headerDir_;
+        bool throughLink = false;
+        for (const fs::path& name : toPath(location.target)) {
+            if (name.empty() || name == ".") continue;
+            // (d:name further on, which Windows would take for a path on drive D:)
+            if (name.has_root_name() || name.has_root_directory() || changedByWindows(name)) {
+                throw Error(what + ": '" + location.target + "' is not a path below @header_dir");
+            }
+            if (name == "..") {
+                if (throughLink) {
+                    throw NotAllowed(what + " is in @header_dir/" + location.target + ", which goes back by .. behind a symbolic link"
+                                     " (from where the link leads)" + kUnlessAllowed);
+                }
+                part = part.parent_path();   // (the words of the path do not climb out: see above)
+                continue;
+            }
+            part /= name;
+            std::error_code why;
+            const Entry entry = entryAt(part, why);
+            // (Nothing there: said below, if the system says so too. The names behind it are gone
+            // through all the same, as Windows takes missing\..\link by its words.)
+            if (entry == Entry::Missing) continue;
+            if (entry == Entry::Unknown) {
+                throw Error(what + " is in " + shown + ", which cannot be reached (" + why.message() + "); a distributed XISF unit "
+                            "is its header file and the files that header names", ErrorKind::Io);
+            }
+            if (entry == Entry::Link) {
+                throughLink = true;
+                std::error_code ec3;
+                const fs::path leadsTo = realPath(part, ec3);
+                if (ec3 || !insideDirectory(leadsTo)) throw refused();
             }
         }
+        const fs::path real = realPath(path, ec);
+        if (!ec && !insideDirectory(real)) throw refused();   // (it was not when the names were gone through)
     }
+    const fs::path real = realPath(path, ec);
     if (ec) {
         throw Error(what + " is in " + shown + ", which is not there or cannot be reached (" + ec.message() + "); a "
                     "distributed XISF unit is its header file and the files that header names" +
