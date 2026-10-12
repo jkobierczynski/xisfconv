@@ -54,6 +54,20 @@ VerifyReport verifyAsdf(const Input& input);
 inline VerifyReport verifyAsdf(const std::string& path) { return verifyAsdf(Input::file(path)); }
 
 // Returns the YAML tree of an ASDF file as text (from the %YAML directive to the closing "...").
+// The pixels of one image of a file that was read before (with headersOnly): `described` is
+// the image as that read gave it, and its array is read from its place (FitsImage::place),
+// without parsing the tree again. An Error (Format) if the file is not the one any more (its
+// tree, by its size and time where they tell, else by a digest of the tree). `seen`, if given,
+// is set when the tree was found to be the one as of a size and a time that tell from then on:
+// the places of the images of the file take them, and are no longer `recent`.
+struct AsdfFileSeen {
+    bool seen = false;
+    uint64_t fileSize = 0;
+    int64_t fileTime = 0;
+};
+FitsImage readAsdfImage(const Input& input, const FitsImage& described, bool verifyChecksums = true, bool inPieces = false,
+                        AsdfFileSeen* seen = nullptr);
+
 std::string readAsdfTree(const Input& input);
 inline std::string readAsdfTree(const std::string& path) { return readAsdfTree(Input::file(path)); }
 

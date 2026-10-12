@@ -33,6 +33,7 @@ The decisions:
 - [Images in pieces (0.20.0)](#images-in-pieces-0200)
 - [Images in bands (0.22.0)](#images-in-bands-0220)
 - [Files in memory and streams (0.23.0)](#files-in-memory-and-streams-0230)
+- [Images read from their place (0.24.0)](#images-read-from-their-place-0240)
 - [The library (libxisfconv)](#the-library-libxisfconv)
 - [The Python package](#the-python-package)
 - [The manual (`docs/manual.html`)](#the-manual-docsmanualhtml)
@@ -409,6 +410,7 @@ brought are in the sections below.
 | 12 October | 0.21.0 | Fixes: the digest of the WCS as written, cut-off FITS remains told, refusals through symbolic links, files written safely across fork() |
 | | 0.22.0 | Images in bands of rows for programs: `xisfconv_read_rows`, a writer given an image in bands; `FileImage.bands()`, `xisfconv.Writer` |
 | | 0.23.0 | Files in memory and streams: the `_io` functions of the C API, data and file objects in Python, `-` for the standard input and output of the tool |
+| | 0.24.0 | The images of an open FITS or ASDF file read from their place, without the headers before them |
 
 ## Purpose and scope
 
@@ -1308,6 +1310,46 @@ to a stream; 0.23 lets a caller hand over the bytes and take the stream.
 - **The tour has a chapter for it** (`memory`): it opens the frame from memory and converts it to
   FITS through a write function; the tests hold that file against the `frame.fits` of the chapter
   "convert", byte for byte.
+
+## Images read from their place (0.24.0)
+
+An open FITS or ASDF file kept the headers of its images, and read the pixels of one by reading
+the file again from its start with "only this image": every header before it was parsed again,
+and for ASDF the whole tree. Reading the images of a file one by one cost the square of their
+number (a thousand small HDUs: 7 s for FITS, 12 s for ASDF).
+
+- **The readers note where each image is** (`FitsImage::place`): for FITS where the header of its
+  HDU begins and its number; for ASDF the block of the array, where the header of that block
+  begins, the offset, the number of samples, the datatype, the byte order and the layout. That is
+  what reading the pixels needs after the tree; the rest of the image (geometry, keywords,
+  properties) is what the open file has already.
+- **`readFitsImage` reads one HDU** from its place: the same loop as `readFits`, begun at that
+  header and stopped after it, so that one header is parsed and its pixels read by the same code
+  (tile compression, BLANK, BZERO) as before. **`readAsdfImage` reads one block header** and the
+  array from it, without the tree. The C API's `loadPixels` and the bands of `xisfconv_read_rows`
+  go through both, and fall back to the old way where no place is known (DNG reads its one image
+  as before).
+- **A file that changed is said to have changed.** The handle reads the file again for every
+  image (it is not kept open); if what is at the place is not an image HDU of that number, not a
+  block, or not of the geometry the open file has, the read fails with a Format error that says
+  so, as a read of a changed file did before. A FITS image has its header parsed again.
+- **The tree of an ASDF file is checked without parsing it.** The tree says what an array is
+  (datatype, byte order, shape, the keywords of an HDU), and a tree edited in place, the blocks
+  where they were, would give other pixels without a word (the review found it). The place keeps
+  a digest of the file up to the end of the tree, and the size of the file and the time of its
+  last change. Where those are what they were, the file is taken to be the same. Where either is
+  not, or the file had been changed less than three seconds before it was opened (a second change
+  may then fall in the same tick of the clock: MinGW's file times have seconds, as Wine showed),
+  the tree is read and digested again. Found the same as of a size and a time past that moment,
+  those become what the next reads of every image of the open file compare with: a `touch`, or a
+  file opened right after it was written, costs a reading of the tree or a few, not one for every
+  image. (A digest for every image made the reads of a file of 50 000 arrays quadratic again,
+  2.8 ms each, the review measured.) A file changed in place that is given back its time
+  (`touch -r`) is not told. Bytes in memory are not looked at: they stay as they are while the
+  file is open, the caller's word, or the library's for a stream.
+- Measured, and held in `python/tests/test_places.py` (under 3 s, so that a slow CI machine
+  passes and the old way does not): a thousand HDUs of 8 x 8 pixels read one by one take 0.1 s
+  (FITS) and 0.07 s (ASDF), about the same in bands; the 20 000 arrays of an ASDF file, 1.2 s.
 
 ## The library (libxisfconv)
 

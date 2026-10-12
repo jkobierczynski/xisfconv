@@ -1095,6 +1095,10 @@ What to know:
 - The writer also takes a compression level, byte shuffling on or off, and the name of the program
   that writes the file (`compression_level`, `shuffle` and `creator_application` of
   `xisfconv_write_options`).
+- **Images of an open file are read from where they are** (since 0.24): an open FITS or ASDF
+  file keeps the place of each image, so the pixels of one are read without going through the
+  headers before it (or the tree of an ASDF file) again. The images of a file of a thousand HDUs
+  are read one after the other in a fifth of a second, where 0.23 took seconds.
 - **Files in memory and streams** (since 0.23). `xisfconv_open_io`, `xisfconv_detect_format_io`,
   `xisfconv_verify_io`, `xisfconv_convert_io`, `xisfconv_rewrite_io` and `xisfconv_writer_new_io`
   take an `xisfconv_io` where the others take a path: a path, bytes in memory, or a function that

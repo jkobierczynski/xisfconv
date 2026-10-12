@@ -55,6 +55,25 @@ struct FitsImage {
     // row of cfaWidth by cfaHeight cells, relative to the first pixel of the image.
     std::string cfaPattern;
     int cfaWidth = 0, cfaHeight = 0;
+    // FITS and ASDF input: where the reader found the image, so that its pixels are read again
+    // without going through what is before it in the file (readFitsImage, readAsdfImage).
+    struct Place {
+        bool known = false;
+        uint64_t header = 0;            // FITS: where the header of its HDU begins
+        size_t hdu = 0;                 // FITS: the number of that HDU
+        uint64_t block = 0;             // ASDF: the block the array is in,
+        uint64_t blockHeader = 0;       //   where the header of that block begins,
+        uint64_t offset = 0;            //   where the array is in its data,
+        uint64_t elements = 0;          //   its number of samples,
+        std::string datatype;           //   their datatype as the tree names it,
+        bool bigEndian = false;         //   their byte order,
+        bool interleaved = false;       //   and whether the channels are the last axis;
+        uint64_t treeEnd = 0;           //   where the tree ends,
+        uint64_t treeDigest = 0;        //   a digest of the file up to there (that it is the same tree),
+        uint64_t fileSize = 0;          //   and the size of the file and the time of its last change
+        int64_t fileTime = 0;           //   (where they are what they were, the tree is not read to tell,
+        bool recent = false;            //   unless the file was changed a moment before it was opened)
+    } place;
 };
 
 struct FitsFile {
@@ -77,6 +96,12 @@ inline FitsFile readFits(const std::string& path, bool headersOnly = false, std:
                          bool inPieces = false) {
     return readFits(Input::file(path), headersOnly, onlyImage, inPieces);
 }
+
+// The pixels of one image of a file that was read before (with headersOnly): `described` is
+// the image as that read gave it, and the image is read from its place (FitsImage::place),
+// without the headers before it. An Error (Format) if the file does not have that image there
+// any more.
+FitsImage readFitsImage(const Input& input, const FitsImage& described, bool inPieces = false);
 
 // Sets dataMin, dataMax and hasNaN from floating point pixels (no-op for integer data).
 void updateFloatRange(FitsImage& img);

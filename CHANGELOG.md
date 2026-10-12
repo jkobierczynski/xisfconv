@@ -9,6 +9,19 @@ in [`DEVELOPMENT.md`](DEVELOPMENT.md).
 Under "changed" stands what makes the same command, or the same call, do something else than
 before.
 
+## 0.24.0 (12 October 2026)
+
+**An image of an open FITS or ASDF file is read from where it is.**
+
+Changed
+- Library and Python: an open FITS or ASDF file keeps the place of each of its images, and the
+  pixels of one (`xisfconv_read_pixels`, `xisfconv_read_rows`, `FileImage.read()`, `bands()`) are
+  read from there, without going through the headers before it, or the tree of an ASDF file,
+  again. Reading the images of a file of a thousand small HDUs one after the other took 7 seconds
+  for FITS and 12 for ASDF, and takes a fifth of a second at most. The pixels are the same.
+- A file that was replaced after it was opened, so that an image is no longer where it was, gives
+  `XISFCONV_ERR_FORMAT` (`xisfconv.FormatError`) saying that it has changed.
+
 ## 0.23.0 (12 October 2026)
 
 **Files in memory and streams.**

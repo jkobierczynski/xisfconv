@@ -466,26 +466,48 @@ const std::vector<FitsKeyword>& cardsOf(const xisfconv_file* f, size_t image) {
     return isXisf(f) ? f->xisf->images()[image].keywords : f->fits.images[image].keywords;
 }
 
+// Image `image` of a FITS, ASDF or DNG file with its pixels, read again: of FITS and ASDF from
+// where the image is in the file, as it was found when the file was opened (the headers before
+// it are not read again). Checks that it is still the image it was.
+FitsImage readImageAgain(xisfconv_file* f, size_t image, bool verify, bool inPieces) {
+    const FitsImage& described = f->fits.images[image];
+    FitsImage img;
+    if (f->format != XISFCONV_FORMAT_DNG && described.place.known) {
+        AsdfFileSeen seen;
+        img = f->format == XISFCONV_FORMAT_ASDF ? readAsdfImage(f->input, described, verify, inPieces, &seen)
+                                                : readFitsImage(f->input, described, inPieces);
+        if (seen.seen) {
+            for (FitsImage& other : f->fits.images) {
+                other.place.recent = false;
+                other.place.fileSize = seen.fileSize;
+                other.place.fileTime = seen.fileTime;
+            }
+        }
+    } else {
+        FitsFile all = f->format == XISFCONV_FORMAT_ASDF ? readAsdf(f->input, false, verify, image, inPieces)
+                       : f->format == XISFCONV_FORMAT_DNG ? readDng(f->input, false, inPieces)
+                                                          : readFits(f->input, false, image, inPieces);
+        if (image >= all.images.size() || !all.images[image].hasData) {
+            fail(XISFCONV_ERR_FORMAT, "image " + std::to_string(image) + " cannot be read (has the file changed since it was opened?)");
+        }
+        img = std::move(all.images[image]);
+    }
+    // The caller sized its buffer by what the headers said when the file was opened.
+    if (img.pixels.width != described.pixels.width || img.pixels.height != described.pixels.height ||
+        img.pixels.channels != described.pixels.channels) {
+        fail(XISFCONV_ERR_FORMAT, "image " + std::to_string(image) + " is not the image it was when the file was opened: "
+                                  "the file has changed");
+    }
+    return img;
+}
+
 // Reads the pixels of a FITS or ASDF image into the handle, unless they are there already.
 void loadPixels(xisfconv_file* f, size_t image, bool verify) {
     // Pixels that were loaded without verifying their checksum do not serve a caller who wants it verified.
     if (isXisf(f) || (f->loaded && *f->loaded == image && (f->loadedVerified || !verify))) return;
     f->loaded.reset();
     f->loadedImage = FitsImage();
-    FitsFile all = f->format == XISFCONV_FORMAT_ASDF ? readAsdf(f->input, false, verify, image)
-                   : f->format == XISFCONV_FORMAT_DNG ? readDng(f->input)
-                                                      : readFits(f->input, false, image);
-    if (image >= all.images.size() || !all.images[image].hasData) {
-        fail(XISFCONV_ERR_FORMAT, "image " + std::to_string(image) + " cannot be read (has the file changed since it was opened?)");
-    }
-    // The caller sized its buffer by what the headers said when the file was opened.
-    const PixelBuffer& then = f->fits.images[image].pixels;
-    const PixelBuffer& now = all.images[image].pixels;
-    if (now.width != then.width || now.height != then.height || now.channels != then.channels) {
-        fail(XISFCONV_ERR_FORMAT, "image " + std::to_string(image) + " is not the image it was when the file was opened: "
-                                  "the file has changed");
-    }
-    f->loadedImage = std::move(all.images[image]);
+    f->loadedImage = readImageAgain(f, image, verify, false);
     f->loaded = image;
     f->loadedVerified = verify;
     Known& k = f->known[image];
@@ -1874,18 +1896,7 @@ xisfconv_file::Bands& bandsOf(xisfconv_file* f, size_t image, bool verify) {
         b.lower = img.lowerBound;
         b.upper = img.upperBound;
     } else {
-        FitsFile all = f->format == XISFCONV_FORMAT_ASDF ? readAsdf(f->input, false, verify, image, true)
-                       : f->format == XISFCONV_FORMAT_DNG ? readDng(f->input, false, true)
-                                                          : readFits(f->input, false, image, true);
-        if (image >= all.images.size() || !all.images[image].hasData) {
-            fail(XISFCONV_ERR_FORMAT, "image " + std::to_string(image) + " cannot be read (has the file changed since it was opened?)");
-        }
-        FitsImage& img = all.images[image];
-        const PixelBuffer& then = f->fits.images[image].pixels;
-        if (img.pixels.width != then.width || img.pixels.height != then.height || img.pixels.channels != then.channels) {
-            fail(XISFCONV_ERR_FORMAT, "image " + std::to_string(image) + " is not the image it was when the file was opened: "
-                                      "the file has changed");
-        }
+        FitsImage img = readImageAgain(f, image, verify, true);
         b.source = img.pieces ? img.pieces : bufferSource(std::make_shared<const PixelBuffer>(std::move(img.pixels)));
         b.topDown = img.topDown;
         Known& k = f->known[image];

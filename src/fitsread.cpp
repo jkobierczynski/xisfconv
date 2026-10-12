@@ -860,7 +860,11 @@ VerifyReport verifyFits(const Input& input) {
     return report;
 }
 
-FitsFile readFits(const Input& input, bool headersOnly, std::optional<size_t> onlyImage, bool inPieces) {
+namespace {
+// readFits, from the HDU of `start` on when it is given: `onlyImage` is then the number of the
+// image there, and file.images holds that image alone.
+FitsFile readFitsFrom(const Input& input, bool headersOnly, std::optional<size_t> onlyImage, bool inPieces,
+                      const FitsImage::Place* start) {
     FitsFile file;
     file.path = input.name;
     const std::shared_ptr<RandomBytes> bytes = input.open();
@@ -868,12 +872,16 @@ FitsFile readFits(const Input& input, bool headersOnly, std::optional<size_t> on
     in.seekg(0, std::ios::end);
     file.fileSize = static_cast<uint64_t>(in.tellg());
 
-    uint64_t pos = 0;
+    uint64_t pos = start ? start->header : 0;
+    // The number of the first image in file.images: 0, or that of the image `start` is the place of.
+    const size_t firstImage = start && onlyImage ? *onlyImage : 0;
+    const auto asked = [&] { return !onlyImage || *onlyImage == firstImage + file.images.size(); };
     // The image the HDU before the current one became, if it became one: a table of XISF
     // properties belongs to it.
     std::optional<size_t> imageBefore;
     uint64_t budget = propertyBudget(file.fileSize);   // what the XISF properties of the file may hold together
-    for (size_t hduIndex = 0;; ++hduIndex) {
+    for (size_t hduIndex = start ? start->hdu : 0;; ++hduIndex) {
+        if (start && hduIndex > start->hdu) break;   // (the HDU there was not the image)
         Header hdr;
         const uint64_t headerPos = pos;
         bool cutOff = false;
@@ -1010,12 +1018,15 @@ FitsFile readFits(const Input& input, bool headersOnly, std::optional<size_t> on
             img.hasRowOrder = true;
             img.topDown = rowOrder == "TOP-DOWN";
         }
-        if (hdr.find("BLANK") && bitpix > 0 && (!onlyImage || *onlyImage == file.images.size())) {
+        if (hdr.find("BLANK") && bitpix > 0 && asked()) {
             warn(label + ": BLANK (undefined) pixels are kept as ordinary sample values");
         }
         imageKeywords(hdr, tiled, img.keywords);
+        img.place.known = true;
+        img.place.header = headerPos;
+        img.place.hdu = hduIndex;
 
-        if (!headersOnly && (!onlyImage || *onlyImage == file.images.size()) && inPieces) {
+        if (!headersOnly && asked() && inPieces) {
             // The samples are read from the file where they are, as they are asked for; those of a
             // tile-compressed image are decompressed first (into memory, or a temporary file).
             std::shared_ptr<RandomBytes> unit = sliceBytes(bytes, dataPos, dataBytes);
@@ -1043,7 +1054,7 @@ FitsFile readFits(const Input& input, bool headersOnly, std::optional<size_t> on
             decodeSamples(img, unit);
             if (tiled) img.note += ", " + tile.algorithm + " tile compression";
             img.hasData = true;
-        } else if (!headersOnly && (!onlyImage || *onlyImage == file.images.size())) {
+        } else if (!headersOnly && asked()) {
             std::vector<uint8_t> raw = readBytes(in, dataPos, dataBytes, label);
             if (tiled) {
                 try {
@@ -1062,9 +1073,25 @@ FitsFile readFits(const Input& input, bool headersOnly, std::optional<size_t> on
         }
         file.images.push_back(std::move(img));
         imageBefore = file.images.size() - 1;
-        if (onlyImage && file.images.size() > *onlyImage) break;   // the one image that was asked for is read
+        if (onlyImage && firstImage + file.images.size() > *onlyImage) break;   // the one image that was asked for is read
     }
     return file;
+}
+}  // namespace
+
+FitsFile readFits(const Input& input, bool headersOnly, std::optional<size_t> onlyImage, bool inPieces) {
+    return readFitsFrom(input, headersOnly, onlyImage, inPieces, nullptr);
+}
+
+FitsImage readFitsImage(const Input& input, const FitsImage& described, bool inPieces) {
+    if (!described.place.known) throw Error("internal error: the place of the image is not known");
+    // (the number of the image only tells which image is the one asked for: here the first that is found)
+    FitsFile one = readFitsFrom(input, false, size_t(0), inPieces, &described.place);
+    if (one.images.empty() || one.images[0].hduIndex != described.place.hdu || !one.images[0].hasData) {
+        throw Error("HDU " + std::to_string(described.place.hdu) + " is not the image it was when the file was opened "
+                    "(has the file changed?)", ErrorKind::Format);
+    }
+    return std::move(one.images[0]);
 }
 
 std::vector<FitsKeyword> fitsCardKeywords(const std::string& cards) {

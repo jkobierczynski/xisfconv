@@ -53,7 +53,7 @@
 #include <stdint.h>
 
 #define XISFCONV_VERSION_MAJOR 0
-#define XISFCONV_VERSION_MINOR 23
+#define XISFCONV_VERSION_MINOR 24
 #define XISFCONV_VERSION_PATCH 0
 
 #if defined(XISFCONV_STATIC)
@@ -396,7 +396,15 @@ XISFCONV_API xisfconv_status xisfconv_keywords_fits_text(const xisfconv_keywords
  *         them, cut to the active area and linearized, not demosaiced; its rows are top-down.
  *         Its metadata are FITS keywords (INSTRUME, EXPTIME, ISOSPEED, DATE-OBS or DATE-LOC,
  *         FOCALLEN, BAYERPAT, BLKLEVEL, WHTLEVEL); the previews are listed as skipped.
- * Opening reads the headers only. Pixels are read by xisfconv_read_pixels.
+ * Opening reads the headers only. Pixels are read by xisfconv_read_pixels. (Since 0.24) The
+ * place of each image of a FITS or ASDF file is kept with the open file, and its pixels are read
+ * from there: the headers before it, and the tree of an ASDF file, are not read again, so the
+ * images of a file of a thousand HDUs are read one after the other as fast as one. A file that
+ * was replaced after it was opened, so that an image is no longer where it was or no longer
+ * the image it was, gives XISFCONV_ERR_FORMAT. (Of an ASDF file the tree is looked at again
+ * when the size of the file or the time of its last change is another, or the file had been
+ * changed a moment before it was opened: a file changed in place that keeps both, its time set
+ * back, is taken for the one that was opened.)
  * ---------------------------------------------------------------------------------------- */
 
 typedef struct xisfconv_file xisfconv_file;

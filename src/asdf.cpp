@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <chrono>
+#include <filesystem>
 #include <fstream>
 #include <limits>
 #include <set>
@@ -362,6 +364,7 @@ uint64_t getBE(const uint8_t* p, int bytes) {
 }
 
 struct Block {
+    uint64_t headerPos = 0;   // where the block begins (its magic)
     uint64_t dataPos = 0, allocated = 0, used = 0, dataSize = 0;
     std::string compression;
     uint8_t checksum[16] = {};
@@ -574,7 +577,7 @@ public:
     Reader(const Input& input, bool headersOnly, bool verify, std::optional<size_t> onlyImage = std::nullopt,
            bool inPieces = false)
         : bytes_(input.open()), in_(bytes_), headersOnly_(headersOnly), verify_(verify), onlyImage_(onlyImage),
-          inPieces_(inPieces) {
+          inPieces_(inPieces), fromMemory_(input.inMemory()), path_(input.path) {
         file_.path = input.name;
         in_.seekg(0, std::ios::end);
         file_.fileSize = static_cast<uint64_t>(in_.tellg());
@@ -642,9 +645,64 @@ public:
         return report;
     }
 
+    // The pixels of an image from its place (see readAsdfImage).
+    FitsImage readImage(const FitsImage& described, AsdfFileSeen* seen) {
+        const FitsImage::Place& at = described.place;
+        const std::string label = described.source.empty() ? std::string("the image") : described.source;
+        auto changed = [&] {
+            return Error(label + " is not where it was when the file was opened (has the file changed?)", ErrorKind::Format);
+        };
+        if (!at.known) throw Error("internal error: the place of the image is not known");
+        const DType* dt = findDatatype(at.datatype);
+        if (!dt) throw changed();
+        // The tree says what the array is (its datatype, shape, byte order, the keywords of an
+        // HDU): it has to be the tree the place was found in. (Reading it costs far less than
+        // parsing it.)
+        // (bytes in memory stay as they are while the file is open: the caller's word, and the
+        // library's for a stream; a file that has the size and the time of its last change it had
+        // then is taken to be the same, and only one that does not is read to tell)
+        treeEnd_ = at.treeEnd;
+        if (treeEnd_ > file_.fileSize) throw changed();
+        const int64_t time = fileTime();
+        const bool same = file_.fileSize == at.fileSize && at.fileTime != 0 && time == at.fileTime;
+        if (!fromMemory_ && !(same && !at.recent)) {
+            if (treeDigest() != at.treeDigest) throw changed();
+            // The tree is the one that was opened, as of a size and a time that are past the
+            // moment: a change from now on changes them. They are what the next read compares
+            // with, so that a file that was changed a moment before it was opened, or whose time
+            // changed and not its tree (touch), has its tree read again until then, not for every
+            // image after.
+            if (seen && time != 0 && !isRecent(time)) *seen = {true, file_.fileSize, time};
+        }
+        const std::optional<Block> block = blockAt(at.blockHeader, static_cast<size_t>(at.block));
+        if (!block) throw changed();
+        only_.emplace(static_cast<size_t>(at.block), *block);   // (the block keeps its number, for what is said about it)
+        const uint64_t size = checkedMul(at.elements, dt->size, "array size");
+        const uint64_t available = block->compression.empty() ? block->used : block->dataSize;
+        if (at.offset > available || size > available - at.offset) throw changed();
+        FitsImage img = described;
+        img.pixels.data = std::vector<uint8_t>();
+        img.pieces = nullptr;
+        if (inPieces_) {
+            decodeSamples(img, blockSource(static_cast<size_t>(at.block), at.offset, size, label), *dt, at.bigEndian,
+                          at.interleaved);
+        } else {
+            std::vector<uint8_t> raw = blockData(static_cast<size_t>(at.block), at.offset, size, label);
+            decodeSamples(img, raw, *dt, at.bigEndian, at.interleaved);
+        }
+        img.hasData = true;
+        return img;
+    }
+
     FitsFile run() {
+        fileTime_ = fileTime();   // (before the tree is read: a change while it is read changes the time after it)
+        // A file changed a moment ago may be changed again within the same tick of its clock
+        // (that of the file system, or the second of a time that has no finer one): its time
+        // tells nothing then, and the tree is read to tell, until the moment is past.
+        recent_ = fileTime_ != 0 && isRecent(fileTime_);
         const YamlPtr root = parseYaml(treeWithoutNul());
         if (!root || !root->isMapping()) throw Error("the ASDF tree is not a mapping");
+        treeDigest_ = treeDigest();
         scanBlocks();
         file_.formatNote += ", " + std::to_string(blocks_.size()) + " binary block(s)";
         YamlPtr carried;
@@ -671,12 +729,18 @@ private:
     bool headersOnly_, verify_;
     std::optional<size_t> onlyImage_;
     bool inPieces_ = false;
+    bool fromMemory_ = false;
+    std::string path_;                    // the file (nothing for bytes in memory)
+    int64_t fileTime_ = 0;                // when it was changed last, as the reader found it
+    bool recent_ = false;                 // ... a moment before it was read
     uint64_t treeEnd_ = 0;
     uint64_t scanEnd_ = 0;  // where the block scan stopped
     std::vector<Block> blocks_;
     std::set<const YamlNode*> visited_;
     std::vector<std::pair<size_t, size_t>> hduImages_;   // the HDUs of the tree's "fits" that are images: their place there and in file_.images
     uint64_t propertyBudget_ = 0;         // what the XISF properties may still hold together (see propertyBudget)
+    std::optional<std::pair<size_t, Block>> only_;   // readImage: the one block that is read, and its number
+    uint64_t treeDigest_ = 0;             // of the bytes before the end of the tree (FitsImage::Place::treeDigest)
     std::optional<size_t> cachedBlock_;   // the block the property read last is in, decompressed and verified:
     std::vector<uint8_t> cachedData_;     //   many small values may share one block
 
@@ -762,42 +826,96 @@ private:
         }
         scanEnd_ = pos;
         while (file_.fileSize - pos >= 6 + kBlockHeaderSize) {
-            const auto start = readAt(pos, 6);
-            if (std::memcmp(start.data(), kBlockMagic, 4) != 0) break;  // block index or end of file
-            const std::string label = "block " + std::to_string(blocks_.size());
-            const uint64_t headerSize = getBE(start.data() + 4, 2);
-            if (headerSize < kBlockHeaderSize) throw Error(label + ": invalid header size");
-            const auto h = readAt(pos + 6, kBlockHeaderSize);
-            Block b;
-            const uint32_t flags = static_cast<uint32_t>(getBE(h.data(), 4));
-            for (int i = 4; i < 8 && h[i] != 0; ++i) b.compression += static_cast<char>(h[i]);
-            b.compression = trim(b.compression);
-            b.allocated = getBE(h.data() + 8, 8);
-            b.used = getBE(h.data() + 16, 8);
-            b.dataSize = getBE(h.data() + 24, 8);
-            std::memcpy(b.checksum, h.data() + 32, 16);
-            for (uint8_t c : b.checksum)
-                if (c) b.hasChecksum = true;
-            b.dataPos = pos + 6 + headerSize;
-            if (b.dataPos > file_.fileSize) throw Error(label + ": header extends beyond the end of the file");
-            if (flags & kFlagStreamed) {
-                // A streamed block is the last one and runs to the end of the file.
-                b.allocated = b.used = b.dataSize = file_.fileSize - b.dataPos;
-                b.hasChecksum = false;
-                b.streamed = true;
-                blocks_.push_back(b);
+            std::optional<Block> b = blockAt(pos, blocks_.size());
+            if (!b) break;   // block index or end of file
+            blocks_.push_back(*b);
+            if (b->streamed) {
                 scanEnd_ = file_.fileSize;
                 break;
             }
-            if (b.used > b.allocated) throw Error(label + ": used size exceeds allocated size");
-            if (b.allocated > file_.fileSize - b.dataPos) {
-                throw Error(label + ": data extends beyond the end of the file (truncated?)");
-            }
-            blocks_.push_back(b);
             if (blocks_.size() > 1000000) throw Error("too many binary blocks");
-            pos = b.dataPos + b.allocated;
+            pos = b->dataPos + b->allocated;
             scanEnd_ = pos;
         }
+    }
+
+    // When the file was changed last (0 if that cannot be told, or for bytes in memory).
+    int64_t fileTime() const {
+        if (fromMemory_) return 0;
+        std::error_code ec;
+        const auto t = std::filesystem::last_write_time(toPath(path_), ec);
+        return ec ? 0 : static_cast<int64_t>(t.time_since_epoch().count());
+    }
+
+    // True if a time of a file is less than three seconds ago (or to come).
+    static bool isRecent(int64_t time) {
+        using Clock = std::filesystem::file_time_type::clock;
+        const int64_t now = static_cast<int64_t>(Clock::now().time_since_epoch().count());
+        const int64_t moment = static_cast<int64_t>(
+            std::chrono::duration_cast<std::filesystem::file_time_type::duration>(std::chrono::seconds(3)).count());
+        return time > now - moment;
+    }
+
+    const Block& blockNumbered(size_t index) const {
+        if (only_ && only_->first == index) return only_->second;
+        return blocks_.at(index);
+    }
+
+    // A digest of the bytes from the start of the file to the end of the tree: whether the tree
+    // is still the one a place was found in. (Eight bytes at a time, FNV-1a's way: not against
+    // forgery, against a change. Reading the tree costs a small part of parsing it.)
+    uint64_t treeDigest() {
+        uint64_t h = 1469598103934665603ull ^ treeEnd_;
+        for (uint64_t at = 0; at < treeEnd_;) {
+            const uint64_t n = std::min<uint64_t>(treeEnd_ - at, uint64_t(1) << 20);
+            auto piece = readAt(at, n);
+            piece.resize((piece.size() + 7) / 8 * 8, 0);
+            for (size_t i = 0; i < piece.size(); i += 8) {
+                uint64_t w;
+                std::memcpy(&w, piece.data() + i, 8);
+                h = (h ^ w) * 1099511628211ull;
+                h ^= h >> 29;
+            }
+            at += n;
+        }
+        return h;
+    }
+
+    // The header of the block that begins at `pos` (the block numbered `index`); nothing if no
+    // block begins there.
+    std::optional<Block> blockAt(uint64_t pos, size_t index) {
+        if (pos > file_.fileSize || file_.fileSize - pos < 6 + kBlockHeaderSize) return std::nullopt;
+        const auto start = readAt(pos, 6);
+        if (std::memcmp(start.data(), kBlockMagic, 4) != 0) return std::nullopt;
+        const std::string label = "block " + std::to_string(index);
+        const uint64_t headerSize = getBE(start.data() + 4, 2);
+        if (headerSize < kBlockHeaderSize) throw Error(label + ": invalid header size");
+        const auto h = readAt(pos + 6, kBlockHeaderSize);
+        Block b;
+        b.headerPos = pos;
+        const uint32_t flags = static_cast<uint32_t>(getBE(h.data(), 4));
+        for (int i = 4; i < 8 && h[i] != 0; ++i) b.compression += static_cast<char>(h[i]);
+        b.compression = trim(b.compression);
+        b.allocated = getBE(h.data() + 8, 8);
+        b.used = getBE(h.data() + 16, 8);
+        b.dataSize = getBE(h.data() + 24, 8);
+        std::memcpy(b.checksum, h.data() + 32, 16);
+        for (uint8_t c : b.checksum)
+            if (c) b.hasChecksum = true;
+        b.dataPos = pos + 6 + headerSize;
+        if (b.dataPos > file_.fileSize) throw Error(label + ": header extends beyond the end of the file");
+        if (flags & kFlagStreamed) {
+            // A streamed block is the last one and runs to the end of the file.
+            b.allocated = b.used = b.dataSize = file_.fileSize - b.dataPos;
+            b.hasChecksum = false;
+            b.streamed = true;
+            return b;
+        }
+        if (b.used > b.allocated) throw Error(label + ": used size exceeds allocated size");
+        if (b.allocated > file_.fileSize - b.dataPos) {
+            throw Error(label + ": data extends beyond the end of the file (truncated?)");
+        }
+        return b;
     }
 
     // Highest block index that an array in the tree refers to.
@@ -828,7 +946,7 @@ private:
 
     // Returns `count` bytes at `offset` of the (decompressed) data of a block.
     std::vector<uint8_t> blockData(size_t index, uint64_t offset, uint64_t count, const std::string& label) {
-        const Block& b = blocks_[index];
+        const Block& b = blockNumbered(index);
         const std::string where = "block " + std::to_string(index);
         const uint64_t available = b.compression.empty() ? b.used : b.dataSize;
         if (offset > available || count > available - offset) {
@@ -890,7 +1008,7 @@ private:
     // `keep` false: the block is only checked (its checksum, and that it decompresses), and nothing is returned.
     std::shared_ptr<RandomBytes> blockSource(size_t index, uint64_t offset, uint64_t count, const std::string& label,
                                              bool keep = true) {
-        const Block& b = blocks_[index];
+        const Block& b = blockNumbered(index);
         const std::string where = "block " + std::to_string(index);
         const uint64_t available = b.compression.empty() ? b.used : b.dataSize;
         if (offset > available || count > available - offset) {
@@ -1240,6 +1358,19 @@ private:
                       ", block " + std::to_string(blockIndex) +
                       (block.compression.empty() ? "" : ", " + block.compression + " compressed");
         img.note = dt->name;
+        img.place.known = true;
+        img.place.block = blockIndex;
+        img.place.blockHeader = block.headerPos;
+        img.place.offset = offset;
+        img.place.elements = elements;
+        img.place.datatype = datatype->value;
+        img.place.bigEndian = bigEndian;
+        img.place.interleaved = interleaved;
+        img.place.treeEnd = treeEnd_;
+        img.place.treeDigest = treeDigest_;
+        img.place.fileSize = file_.fileSize;
+        img.place.fileTime = fileTime_;
+        img.place.recent = recent_;
         if (!headersOnly_ && (!onlyImage_ || *onlyImage_ == file_.images.size()) && inPieces_) {
             auto bytes = blockSource(static_cast<size_t>(blockIndex), offset, checkedMul(elements, dt->size, "array size"), path);
             decodeSamples(img, bytes, *dt, bigEndian, interleaved);
@@ -1650,6 +1781,12 @@ void writeAsdf(const std::string& path, const std::vector<FitsHdu>& hdus, const 
     out.write(index.data(), static_cast<std::streamsize>(index.size()));
     out.close();
     if (!out) throw Error("write error on " + path, ErrorKind::Io);
+}
+
+FitsImage readAsdfImage(const Input& input, const FitsImage& described, bool verifyChecksums, bool inPieces,
+                        AsdfFileSeen* seen) {
+    Reader reader(input, false, verifyChecksums, std::nullopt, inPieces);
+    return reader.readImage(described, seen);
 }
 
 FitsFile readAsdf(const Input& input, bool headersOnly, bool verifyChecksums, std::optional<size_t> onlyImage, bool inPieces) {

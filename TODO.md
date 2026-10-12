@@ -116,9 +116,9 @@ Next, in this order (what 0.20 made cheap comes first):
 2. [x] **Reading from and writing to memory and streams**: the `_io` functions of the C API
    (`xisfconv_io`: a path, bytes in memory, a read or write function), data and file objects in
    Python, `-` for the standard input and output of the tool. (0.23.0)
-3. [ ] Reading one image of a FITS or ASDF file without going through the headers before it again
-   (a file with a thousand HDUs is read image by image in half a minute): the place of each
-   image, kept with the open file.
+3. [x] **Reading one image of a FITS or ASDF file from its place**, kept with the open file,
+   without going through the headers before it again (a thousand HDUs read one by one: 7 s for
+   FITS, 12 s for ASDF before, a fifth of a second at most now). (0.24.0)
 4. [ ] Hand a data block of a property type without a name over the API as its bytes, so that
    `read_image` and `write` carry it as a conversion does; and tables.
 5. [ ] Write LZ4 blocks to ASDF (its own layout of chunks, which is read).

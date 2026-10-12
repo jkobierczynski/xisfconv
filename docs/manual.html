@@ -9,7 +9,7 @@
 <title>xisfconv library manual: C, C++ and Python</title>
 <meta name="description" content="How to read and write PixInsight XISF images with libxisfconv from C, C++ and Python, with example programs run on a real frame and the complete API reference.">
 <meta name="generator" content="docs/make_manual.py">
-<meta name="xisfconv-manual-sources" content="a6cbcbfb0e0f7e810cb6c20f1fb2199c473341a229f642529ecdc5daf77fca1e">
+<meta name="xisfconv-manual-sources" content="fff918b25f7f928e66ceebdba99c2414e47375889dc7409219996e6e5b004baa">
 <script>
 (function () {
   var root = document.documentElement;
@@ -250,7 +250,7 @@ pre.decl { padding: 0.8rem 1rem; overflow-x: auto; background: var(--panel); bor
 <nav class="side" aria-label="Manual">
   <div>
     <a class="brand" href="#top">xisfconv</a>
-    <p class="brand-version">Library manual, 0.23.0</p>
+    <p class="brand-version">Library manual, 0.24.0</p>
   </div>
   <p class="side-label" id="language-label">Show the examples in</p>
   <div class="switch" role="group" aria-labelledby="language-label">
@@ -266,7 +266,7 @@ pre.decl { padding: 0.8rem 1rem; overflow-x: auto; background: var(--panel); bor
 <main id="top">
 
 <header class="hero">
-  <p class="hero-version">libxisfconv 0.23.0, the library manual</p>
+  <p class="hero-version">libxisfconv 0.24.0, the library manual</p>
   <h1>Reading and writing XISF images from C, C++ and Python</h1>
   <p class="lede">libxisfconv reads PixInsight XISF, FITS and ASDF images into arrays and writes arrays as XISF, FITS, ASDF, TIFF or
   PNG. This manual shows how to use it from each of the three languages, with programs that ran on one real frame.
@@ -344,7 +344,7 @@ be used with <code>pkg-config --static</code>; the CMake package is installed wi
 <div class="code plain"><pre><code>pip<span class="t-w"> </span>install<span class="t-w"> </span>.<span class="t-w">                    </span><span class="t-c1"># from a checkout: builds the library and installs the package</span>
 pip<span class="t-w"> </span>install<span class="t-w"> </span><span class="t-s2">&quot;.[astropy]&quot;</span><span class="t-w">         </span><span class="t-c1"># the same, with astropy</span></code></pre></div>
 <p>The package needs Python 3.10 or later and NumPy. It brings its own copy of the library, so nothing else has to be
-installed. At the time of version 0.23.0 the package is not on PyPI yet; once it is, <code>pip install xisfconv</code>
+installed. At the time of version 0.24.0 the package is not on PyPI yet; once it is, <code>pip install xisfconv</code>
 does the same without a checkout.</p>
 
 <h3 id="first">A first program</h3>
@@ -2496,7 +2496,7 @@ wrote compat.xisf</samp></pre></div>
 
 <!-- ============================================================================================ -->
 <h2 id="c-reference">C API reference</h2>
-<p class="part-lede">The declarations of <code>xisfconv.h</code>, version 0.23.0, in the order of the header. C++ programs use the same ones.</p>
+<p class="part-lede">The declarations of <code>xisfconv.h</code>, version 0.24.0, in the order of the header. C++ programs use the same ones.</p>
 <p>Two things of the header are not listed below. The macros <code>XISFCONV_VERSION_MAJOR</code>,
 <code>XISFCONV_VERSION_MINOR</code> and <code>XISFCONV_VERSION_PATCH</code> are the version a program was compiled with;
 <code>xisfconv_version</code> gives the one it runs with. And a program that links the static library defines
@@ -2675,7 +2675,7 @@ ASDF  the HDUs of FITS-tagged nodes, then every other 2-D or 3-D numeric array
 DNG   one image (since 0.18): the raw image, the samples of the sensor as the camera recorded
       them, cut to the active area and linearized, not demosaiced; its rows are top-down.
       Its metadata are FITS keywords (INSTRUME, EXPTIME, ISOSPEED, DATE-OBS or DATE-LOC,
-      FOCALLEN, BAYERPAT, BLKLEVEL, WHTLEVEL); the previews are listed as skipped.</pre><p>Opening reads the headers only. Pixels are read by <a href="#c-xisfconv_read_pixels"><code>xisfconv_read_pixels</code></a>.</p></div>
+      FOCALLEN, BAYERPAT, BLKLEVEL, WHTLEVEL); the previews are listed as skipped.</pre><p>Opening reads the headers only. Pixels are read by <a href="#c-xisfconv_read_pixels"><code>xisfconv_read_pixels</code></a>. (Since 0.24) The place of each image of a FITS or ASDF file is kept with the open file, and its pixels are read from there: the headers before it, and the tree of an ASDF file, are not read again, so the images of a file of a thousand HDUs are read one after the other as fast as one. A file that was replaced after it was opened, so that an image is no longer where it was or no longer the image it was, gives <a href="#c-XISFCONV_ERR_FORMAT"><code>XISFCONV_ERR_FORMAT</code></a>. (Of an ASDF file the tree is looked at again when the size of the file or the time of its last change is another, or the file had been changed a moment before it was opened: a file changed in place that keeps both, its time set back, is taken for the one that was opened.)</p></div>
 <div class="entry"><pre class="decl"><code><span class="t-k">typedef</span><span class="t-w"> </span><span class="t-k">struct</span><span class="t-w"> </span><span class="t-nc">xisfconv_file</span><span class="t-w"> </span><span class="t-n def" id="c-xisfconv_file">xisfconv_file</span><span class="t-p">;</span></code></pre></div>
 <div class="entry"><pre class="decl"><code><a href="#c-xisfconv_status"><span class="t-n">xisfconv_status</span></a><span class="t-w"> </span><a href="#c-xisfconv_detect_format"><span class="t-nf"><span class="def" id="c-xisfconv_detect_format">xisfconv_detect_format</span></span></a><span class="t-p">(</span><a href="#c-xisfconv_context"><span class="t-n">xisfconv_context</span></a><span class="t-w"> </span><span class="t-o">*</span><span class="t-n">ctx</span><span class="t-p">,</span><span class="t-w"> </span><span class="t-k">const</span><span class="t-w"> </span><span class="t-kt">char</span><span class="t-w"> </span><span class="t-o">*</span><span class="t-n">path</span><span class="t-p">,</span><span class="t-w"> </span><a href="#c-xisfconv_format"><span class="t-n">xisfconv_format</span></a><span class="t-w"> </span><span class="t-o">*</span><span class="t-n">out</span><span class="t-p">);</span></code></pre><div class="doc"><p>Looks at the first bytes of the file: FITS, ASDF and DNG are recognized by their signature (DNG: a TIFF file whose first directory has the tag DNGVersion; a TIFF file without it is not one, and gives <a href="#c-XISFCONV_ERR_FORMAT"><code>XISFCONV_ERR_FORMAT</code></a>), XISF by its (a monolithic file) or by being an XML document whose root element is xisf (the header file of a distributed unit). <a href="#c-XISFCONV_ERR_FORMAT"><code>XISFCONV_ERR_FORMAT</code></a> if it is none of them (an XISF data blocks file, .xisb, is none: it is read through its header file), <a href="#c-XISFCONV_ERR_IO"><code>XISFCONV_ERR_IO</code></a> if it cannot be read.</p></div></div>
 <div class="entry"><pre class="decl"><code><a href="#c-xisfconv_status"><span class="t-n">xisfconv_status</span></a><span class="t-w"> </span><a href="#c-xisfconv_open"><span class="t-nf"><span class="def" id="c-xisfconv_open">xisfconv_open</span></span></a><span class="t-p">(</span><a href="#c-xisfconv_context"><span class="t-n">xisfconv_context</span></a><span class="t-w"> </span><span class="t-o">*</span><span class="t-n">ctx</span><span class="t-p">,</span><span class="t-w"> </span><span class="t-k">const</span><span class="t-w"> </span><span class="t-kt">char</span><span class="t-w"> </span><span class="t-o">*</span><span class="t-n">path</span><span class="t-p">,</span><span class="t-w"> </span><a href="#c-xisfconv_file"><span class="t-n">xisfconv_file</span></a><span class="t-w"> </span><span class="t-o">**</span><span class="t-n">out</span><span class="t-p">);</span>
@@ -3205,7 +3205,7 @@ name         what messages call it: NULL (default) is "&lt;memory&gt;" for data,
 
 <!-- ============================================================================================ -->
 <h2 id="python-reference">Python API reference</h2>
-<p class="part-lede">The package <code>xisfconv</code>, version 0.23.0: its functions and classes with their own documentation.</p>
+<p class="part-lede">The package <code>xisfconv</code>, version 0.24.0: its functions and classes with their own documentation.</p>
 <div class="doc"><p>xisfconv: PixInsight XISF images as NumPy arrays, and conversion between XISF, FITS and ASDF.</p><p>Reading:</p><div class="code small"><pre><code><span class="t-kn">import</span><span class="t-w"> </span><span class="t-nn">xisfconv</span>
 
 <span class="t-n">data</span> <span class="t-o">=</span> <span class="t-n">xisfconv</span><span class="t-o">.</span><a href="#py-read"><span class="t-n">read</span></a><span class="t-p">(</span><span class="t-s2">&quot;m31.xisf&quot;</span><span class="t-p">)</span>              <span class="t-c1"># [height, width] or [height, width, channels]</span>
