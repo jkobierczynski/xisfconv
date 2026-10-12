@@ -15,7 +15,7 @@ from ctypes import (CFUNCTYPE, POINTER, Structure, c_char, c_char_p, c_double, c
 
 # The library version this module was written for. In 0.x every release may change the layout
 # of the structures, so another library is refused.
-API_VERSION = (0, 22)
+API_VERSION = (0, 23)
 
 # ------------------------------------------------------------------------------------------
 # Constants of xisfconv.h
@@ -287,6 +287,24 @@ class WriteOptions(Structure):
     ]
 
 
+# xisfconv_io: a file, bytes in memory, or a function the bytes are read from or written to
+READ_FN = CFUNCTYPE(c_int64, c_void_p, c_void_p, c_uint64)
+WRITE_FN = CFUNCTYPE(c_int32, c_void_p, c_void_p, c_uint64)
+
+
+class Io(Structure):
+    _fields_ = [
+        ("struct_size", c_size_t),
+        ("path", c_char_p),
+        ("data", c_void_p),
+        ("size", c_uint64),
+        ("read", READ_FN),
+        ("write", WRITE_FN),
+        ("user", c_void_p),
+        ("name", c_char_p),
+    ]
+
+
 # ------------------------------------------------------------------------------------------
 # Function declarations: name -> (result type, argument types)
 # ------------------------------------------------------------------------------------------
@@ -398,6 +416,13 @@ _FUNCTIONS = {
     "xisfconv_image_init": (None, [POINTER(Image), c_size_t]),
     "xisfconv_write_options_init": (None, [POINTER(WriteOptions), c_size_t]),
     "xisfconv_writer_new": (_status, [_p, _str, POINTER(WriteOptions), _pp]),
+    "xisfconv_io_init": (None, [POINTER(Io), c_size_t]),
+    "xisfconv_detect_format_io": (_status, [_p, POINTER(Io), POINTER(c_int32)]),
+    "xisfconv_open_io": (_status, [_p, POINTER(Io), _pp]),
+    "xisfconv_convert_io": (_status, [_p, POINTER(Io), POINTER(Io), POINTER(ConvertOptions)]),
+    "xisfconv_rewrite_io": (_status, [_p, POINTER(Io), POINTER(Io), POINTER(RewriteOptions), POINTER(RewriteResult)]),
+    "xisfconv_verify_io": (_status, [_p, POINTER(Io), _pp]),
+    "xisfconv_writer_new_io": (_status, [_p, POINTER(Io), POINTER(WriteOptions), _pp]),
     "xisfconv_writer_add_image": (_status, [_p, POINTER(Image)]),
     "xisfconv_writer_begin_image": (_status, [_p, POINTER(Image)]),
     "xisfconv_writer_add_rows": (_status, [_p, c_void_p, c_uint64, c_uint64]),

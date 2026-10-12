@@ -584,6 +584,71 @@ static int rewrite_and_verify(xisfconv_context *ctx, const char *path) {
 
 /* ------------------------------------------------------------------------------------------ */
 
+/* [memory] */
+/* A file need not be a file: bytes in memory (a download, a field of a database, a member of an
+   archive) or a stream (a pipe, a socket). The functions that end in _io take where a file comes
+   from or goes to as an xisfconv_io. */
+static int32_t write_to(void *user, const void *data, uint64_t size) {
+    return fwrite(data, 1, (size_t)size, (FILE *)user) == size ? 0 : 1;
+}
+
+static int memory(xisfconv_context *ctx, const char *path) {
+    FILE *in = fopen(path, "rb"), *out = NULL;
+    unsigned char *bytes = NULL;
+    long size = -1;
+    xisfconv_io input, output;
+    xisfconv_file *file = NULL;
+    xisfconv_convert_options options;
+    xisfconv_status status;
+
+    /* the frame in memory, as a program that got it from elsewhere has it */
+    if (in && fseek(in, 0, SEEK_END) == 0) size = ftell(in);
+    if (size >= 0) bytes = (unsigned char *)malloc(size ? (size_t)size : 1);
+    if (in && bytes) {
+        rewind(in);
+        if (fread(bytes, 1, (size_t)size, in) != (size_t)size) size = -1;
+    }
+    if (in) fclose(in);
+    if (!bytes || size < 0) {
+        free(bytes);
+        fprintf(stderr, "%s cannot be read\n", path);
+        return 1;
+    }
+
+    /* The bytes are borrowed, not copied: they stay as they are until the file is closed. */
+    xisfconv_io_init(&input, sizeof input);
+    input.data = bytes;
+    input.size = (uint64_t)size;
+    input.name = "frame in memory"; /* what messages call it */
+    status = xisfconv_open_io(ctx, &input, &file);
+    if (status == XISFCONV_OK) {
+        printf("opened %llu bytes in memory: %s, %llu image(s)\n", (unsigned long long)xisfconv_file_size(file),
+               xisfconv_file_format(file) == XISFCONV_FORMAT_XISF ? "XISF" : "another format",
+               (unsigned long long)xisfconv_image_count(file));
+        xisfconv_close(file);
+    }
+
+    /* Converted to FITS for a function that is given the bytes of the file once it is complete:
+       the name says the format, as the name of a file does. */
+    out = status == XISFCONV_OK ? fopen(out_path("memory.fits"), "wb") : NULL;
+    if (status == XISFCONV_OK && out) {
+        xisfconv_io_init(&output, sizeof output);
+        output.write = write_to;
+        output.user = out;
+        output.name = "memory.fits";
+        xisfconv_convert_options_init(&options, sizeof options);
+        status = xisfconv_convert_io(ctx, &input, &output, &options);
+        if (status == XISFCONV_OK) printf("wrote memory.fits through a function: %ld bytes\n", ftell(out));
+    }
+    if (out) fclose(out);
+    free(bytes);
+    if (status != XISFCONV_OK) return failed(ctx, "memory");
+    return out ? 0 : 1;
+}
+/* [/memory] */
+
+/* ------------------------------------------------------------------------------------------ */
+
 /* [units] */
 static int units(xisfconv_context *ctx, const char *path) {
     xisfconv_rewrite_options options;
@@ -743,7 +808,8 @@ int main(int argc, char **argv) {
         int (*run)(xisfconv_context *, const char *);
     } chapters[] = {{"inspect", inspect},  {"pixels", pixels},   {"stretch", stretch},
                     {"write", write_crop}, {"bands", bands},     {"convert", convert},
-                    {"rewrite", rewrite_and_verify},             {"units", units},
+                    {"rewrite", rewrite_and_verify},             {"memory", memory},
+                    {"units", units},
                     {"wcs", wcs},          {"progress", progress_and_errors}};
     xisfconv_context *ctx;
     xisfconv_format format = XISFCONV_FORMAT_AUTO;

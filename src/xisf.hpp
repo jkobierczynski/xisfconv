@@ -139,7 +139,11 @@ public:
     // `redirect`: see XisfBlocksRedirect.
     // `verifying`: what is wrong with the index of a data blocks file of the unit is no warning,
     // it is kept for indexProblems().
-    explicit XisfFile(const std::string& path, const XisfBlocksRedirect* redirect = nullptr, bool verifying = false);
+    explicit XisfFile(const std::string& path, const XisfBlocksRedirect* redirect = nullptr, bool verifying = false)
+        : XisfFile(Input::file(path), redirect, verifying) {}
+    // (since 0.23: also bytes in memory, which have no directory: a header there is followed to no
+    // file by @header_dir/)
+    explicit XisfFile(const Input& input, const XisfBlocksRedirect* redirect = nullptr, bool verifying = false);
 
     const std::string& path() const { return path_; }
     uint64_t fileSize() const { return fileSize_; }
@@ -266,7 +270,7 @@ private:
 
     void parseImage(const xml::Node& node);
     XisfProperty parseProperty(const xml::Node& node);
-    std::shared_ptr<RawFile> raw_;   // the file, open while the object lives (and while a source of its pixels does)
+    std::shared_ptr<RandomBytes> raw_;   // the file (or bytes), open while the object lives (and while a source of its pixels does)
     std::map<std::string, std::weak_ptr<RawFile>> opened_;   // the other files of the unit that blocks read from now, by resolved path
 };
 

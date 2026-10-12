@@ -2,7 +2,7 @@
 .\" Copyright (C) 2026 Jurgen Kobierczynski
 .\" The manual page of the command line tool. Its options are those of "xisfconv --help", and its
 .\" version that of include/xisfconv.h: tests/run_tests.py holds both against the program.
-.TH XISFCONV 1 "2026-10-12" "xisfconv 0.22.0" "User Commands"
+.TH XISFCONV 1 "2026-10-12" "xisfconv 0.23.0" "User Commands"
 .SH NAME
 xisfconv \- convert between PixInsight XISF, FITS and ASDF images; read DNG; export TIFF and PNG
 .SH SYNOPSIS
@@ -31,6 +31,22 @@ The output is named after the input, with the extension of its format, and is wr
 unless
 .B \-d
 names a directory.
+.PP
+An input of
+.B \-
+is the standard input, which is read into memory before it is converted, and
+.B "\-o \-"
+writes the output to the standard output, once it is complete and checked (with
+.BR \-t ,
+since that name says no format); nothing else is written there, and nothing at all if the run
+fails. The standard input is the only input of a run, and needs
+.B \-o
+unless it is only looked at
+.RB ( \-I ", " \-\-dump\-header ", " \-\-verify ).
+A file or a directory named
+.B \-
+is
+.BR ./\- .
 .PP
 An XISF input is a monolithic file
 .RI ( .xisf )
@@ -137,7 +153,9 @@ beside it. (PixInsight itself opens monolithic
 files only.)
 .TP
 .BR \-o ", " \-\-output " \fIfile\fR"
-The name of the output file, for a single input.
+The name of the output file, for a single input;
+.B \-
+for the standard output.
 .TP
 .BR \-d ", " \-\-outdir " \fIdir\fR"
 The directory for the output files. The default is next to each input. The files of a directory
@@ -503,6 +521,15 @@ Write a distributed unit, and pack it into one file again:
 .nf
 xisfconv \-t xish light_0001.xisf
 xisfconv light_0001.xish \-t xisf \-o packed.xisf
+.fi
+.RE
+.PP
+In a pipe: a file from another program converted to FITS for the next, and a check of a download:
+.PP
+.RS
+.nf
+some\-program | xisfconv \-t fits \-o \- \- | next\-program
+curl \-s https://example.org/m31.xisf | xisfconv \-\-verify \-
 .fi
 .RE
 .SH NOTES

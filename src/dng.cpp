@@ -332,8 +332,7 @@ struct Ifd {
 
 class Tiff {
 public:
-    explicit Tiff(const std::string& path) : path_(path), in_(toPath(path), std::ios::binary) {
-        if (!in_) failToOpen(path);
+    explicit Tiff(const Input& input) : path_(input.name), bytes_(input.open()), in_(bytes_) {
         in_.seekg(0, std::ios::end);
         size_ = static_cast<uint64_t>(in_.tellg());
         in_.seekg(0);
@@ -492,7 +491,8 @@ public:
 
 private:
     std::string path_;
-    std::ifstream in_;
+    std::shared_ptr<RandomBytes> bytes_;   // the file (or bytes in memory)
+    InputStream in_;
     uint64_t size_ = 0;
     uint64_t first_ = 0;
     uint64_t entries_ = 0;
@@ -787,9 +787,9 @@ void readSamples(Tiff& tiff, const RawLayout& r, const SamplePut& put) {
 // Reading a DNG file
 // ------------------------------------------------------------------------------------------
 
-bool looksLikeDng(const std::string& path) {
+namespace {
+bool looksLikeDngStream(std::istream& in) {
     try {
-        std::ifstream in(toPath(path), std::ios::binary);
         uint8_t h[8];
         if (!in.read(reinterpret_cast<char*>(h), 8)) return false;
         const bool little = h[0] == 'I' && h[1] == 'I';
@@ -814,10 +814,22 @@ bool looksLikeDng(const std::string& path) {
     }
     return false;
 }
+}  // namespace
+
+bool looksLikeDng(const std::string& path) {
+    if (std::shared_ptr<RandomBytes> bytes = virtualFileBytes(path)) return looksLikeDng(std::move(bytes));
+    std::ifstream in(toPath(path), std::ios::binary);
+    return looksLikeDngStream(in);
+}
+
+bool looksLikeDng(std::shared_ptr<RandomBytes> bytes) {
+    InputStream in(std::move(bytes));
+    return looksLikeDngStream(in);
+}
 
 // readDng; `digest`, if given, names the digest of the raw data the file carries ("" if none).
-static FitsFile readDngFile(const std::string& path, bool headersOnly, std::string* digest, bool inPieces = false) {
-    Tiff tiff(path);
+static FitsFile readDngFile(const Input& input, bool headersOnly, std::string* digest, bool inPieces = false) {
+    Tiff tiff(input);
     Directories dirs = readDirectories(tiff);
     if (digest) {
         digest->clear();
@@ -829,7 +841,7 @@ static FitsFile readDngFile(const std::string& path, bool headersOnly, std::stri
         }
     }
     FitsFile file;
-    file.path = path;
+    file.path = input.name;
     file.fileSize = tiff.size();
     const Ifd& ifd0 = dirs.images.front();
 
@@ -1108,14 +1120,14 @@ static FitsFile readDngFile(const std::string& path, bool headersOnly, std::stri
     return file;
 }
 
-FitsFile readDng(const std::string& path, bool headersOnly, bool inPieces) { return readDngFile(path, headersOnly, nullptr, inPieces); }
+FitsFile readDng(const Input& input, bool headersOnly, bool inPieces) { return readDngFile(input, headersOnly, nullptr, inPieces); }
 
-VerifyReport verifyDng(const std::string& path) {
+VerifyReport verifyDng(const Input& input) {
     VerifyReport report;
     FitsFile file;
     std::string digest;
     try {
-        file = readDngFile(path, false, &digest, true);   // (the raw image decoded into a store, not into memory)
+        file = readDngFile(input, false, &digest, true);   // (the raw image decoded into a store, not into memory)
     } catch (const Unsupported& e) {
         // (a raw image this reader does not decode, in a file that may well be intact)
         report.summary = "the raw image is not read";

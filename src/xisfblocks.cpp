@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Jurgen Kobierczynski
 #include "xisfblocks.hpp"
 
+#include "bytes.hpp"
 #include "property.hpp"
 
 #ifdef _WIN32
@@ -493,7 +494,14 @@ std::string xmlRootNameAtStart(const std::string& head) {
     }
 }
 
+bool looksLikeXisfHeaderFile(RandomBytes& bytes) {
+    std::string head(static_cast<size_t>(std::min<uint64_t>(kXmlBeginning, bytes.size())), '\0');
+    bytes.read(0, head.size(), reinterpret_cast<uint8_t*>(&head[0]));
+    return xmlRootNameAtStart(head) == "xisf";
+}
+
 bool looksLikeXisfHeaderFile(const std::string& path) {
+    if (const std::shared_ptr<RandomBytes> bytes = virtualFileBytes(path)) return looksLikeXisfHeaderFile(*bytes);
     std::ifstream file(toPath(path), std::ios::binary);
     if (!file) return false;
     std::string head(kXmlBeginning, '\0');
@@ -606,6 +614,10 @@ std::string XisfExternalFiles::resolve(const XisfLocation& location, const std::
     }
     static const char* const kUnlessAllowed = "; a header is followed only to files in its own directory unless that is "
                                               "allowed (--external-files anywhere)";
+    if (location.headerDir && !redirected && inMemory_) {
+        throw NotAllowed(what + " is in @header_dir/" + location.target + ", and the header is in memory, where it has no "
+                         "directory");
+    }
     if (!notFollowed_.empty() && policy_ != ExternalFiles::Anywhere && !redirected) {
         throw NotAllowed(what + " is in another file (" + shown + "), and " + notFollowed_ + ": only a header file (.xish) is "
                          "followed to its data unless that is allowed (--external-files anywhere)");

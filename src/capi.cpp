@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "asdf.hpp"
+#include "bytes.hpp"
 #include "codecs.hpp"
 #include "common.hpp"
 #include "convert.hpp"
@@ -111,8 +112,9 @@ struct xisfconv_keywords {
 struct xisfconv_file {
     StatePtr state;
     std::string path;                 // as the caller named it: for messages
-    std::string readPath;             // absolute: FITS and ASDF pixels are read from the file again later,
-                                      //   when the working directory may be another one
+    Input input;                      // FITS and ASDF pixels are read from it again later: a file by its
+                                      //   absolute path (the working directory may be another one then),
+                                      //   or the bytes in memory
     xisfconv_format format = XISFCONV_FORMAT_XISF;
     std::unique_ptr<XisfFile> xisf;   // XISF
     FitsFile fits;                    // FITS and ASDF: the headers
@@ -161,6 +163,9 @@ struct xisfconv_writer {
     // where they are kept, and how many have come.
     std::shared_ptr<Store> rows;
     uint64_t rowsGiven = 0;
+    // xisfconv_writer_new_io: the file goes to this function, not to `path` (which is its name).
+    xisfconv_write_fn write = nullptr;
+    void* writeUser = nullptr;
 };
 
 namespace {
@@ -221,6 +226,7 @@ xisfconv_status guarded(const StatePtr& state, const char* path, Body&& body) no
             s->hostProgressFailed = false;
         }
         const Running running(s);
+        const VirtualFileFrame ownFiles;   // (the files in memory of a call this one is made from are not its own)
         const ExternalFilesScope followed(s->externalFiles);
         const ProgressScope reports([s](const char* stage, uint64_t done, uint64_t total) {
             if (s->cancel.exchange(false)) return false;
@@ -466,9 +472,9 @@ void loadPixels(xisfconv_file* f, size_t image, bool verify) {
     if (isXisf(f) || (f->loaded && *f->loaded == image && (f->loadedVerified || !verify))) return;
     f->loaded.reset();
     f->loadedImage = FitsImage();
-    FitsFile all = f->format == XISFCONV_FORMAT_ASDF ? readAsdf(f->readPath, false, verify, image)
-                   : f->format == XISFCONV_FORMAT_DNG ? readDng(f->readPath)
-                                                      : readFits(f->readPath, false, image);
+    FitsFile all = f->format == XISFCONV_FORMAT_ASDF ? readAsdf(f->input, false, verify, image)
+                   : f->format == XISFCONV_FORMAT_DNG ? readDng(f->input)
+                                                      : readFits(f->input, false, image);
     if (image >= all.images.size() || !all.images[image].hasData) {
         fail(XISFCONV_ERR_FORMAT, "image " + std::to_string(image) + " cannot be read (has the file changed since it was opened?)");
     }
@@ -878,28 +884,225 @@ xisfconv_status xisfconv_keywords_fits_text(const xisfconv_keywords* kw, const c
 // Opening files
 // ------------------------------------------------------------------------------------------
 
+namespace {
+
+// ------------------------------------------------------------------------------------------
+// Files in memory and streams: an xisfconv_io for one call
+// ------------------------------------------------------------------------------------------
+
+// What messages call an input or output (before it is looked at more closely).
+std::string ioName(const xisfconv_io* io) {
+    if (!io || io->struct_size < sizeof(size_t)) return {};
+    xisfconv_io given;
+    xisfconv_io_init(&given, sizeof given);
+    std::memcpy(static_cast<void*>(&given), io, std::min(io->struct_size, sizeof given));
+    if (given.path) return given.path;
+    if (given.name && *given.name) return given.name;
+    return given.data ? "<memory>" : given.write ? "<output stream>" : "<input stream>";
+}
+
+// An input or output of a call as the caller described it. A file is named by its path; bytes
+// in memory and a stream are files of their name for the call (VirtualFileScope), which the
+// pipeline reads and writes as it does a file.
+class CallIo {
+public:
+    CallIo(const xisfconv_io* given, bool output, const char* function) {
+        const std::string which = output ? "output" : "input";
+        if (!given) fail(XISFCONV_ERR_ARGUMENT, std::string(function) + ": " + which + " is NULL");
+        const xisfconv_io io = optionsFrom(given, xisfconv_io_init);
+        const int set = (io.path != nullptr) + (io.data != nullptr) + (io.read != nullptr) + (io.write != nullptr);
+        if (set != 1) {
+            fail(XISFCONV_ERR_ARGUMENT, std::string(function) + ": the " + which + " is one of path, data, read and write, "
+                                        "and " + std::to_string(set) + " of them are set");
+        }
+        if (output ? (io.data || io.read) : io.write != nullptr) {
+            fail(XISFCONV_ERR_ARGUMENT, std::string(function) + ": " +
+                                        (output ? "data and read are for input; output goes to a path or a write function"
+                                                : "write is for output; input comes from a path, data or a read function"));
+        }
+        name_ = ioName(given);
+        if (io.path) {
+            if (!*io.path) fail(XISFCONV_ERR_ARGUMENT, std::string(function) + ": the path of the " + which + " is empty");
+            return;
+        }
+        if (io.data) {
+            bytes_ = std::make_shared<MemoryBytes>(static_cast<const uint8_t*>(io.data), io.size);
+        } else if (io.read) {
+            bytes_ = readStream(io);
+        } else {
+            write_ = io.write;
+            user_ = io.user;
+            store_ = std::make_shared<Store>();
+        }
+        scope_ = bytes_ ? std::make_unique<VirtualFileScope>(name_, bytes_) : std::make_unique<VirtualFileScope>(name_, store_);
+    }
+
+    // The name the pipeline is given: the path of a file, else the name of the file of the call.
+    const std::string& name() const { return name_; }
+
+    // An input and an output of a call are two files: under one name, the one would be taken
+    // for the other (a file in memory has no place on the disk to tell it from the file there).
+    static void distinct(const CallIo& in, const CallIo& out) {
+        // (two files are the pipeline's to tell apart, by what the system says of them)
+        if (in.name_ == out.name_ && !(in.isFile() && out.isFile())) {
+            fail(XISFCONV_ERR_ARGUMENT, "the input and the output have the same name, " + in.name_ +
+                                        ": give the one in memory or the stream another name");
+        }
+    }
+    bool isFile() const { return !scope_; }
+    // Of an input that is not a file: what it is read from.
+    Input input() const { return isFile() ? Input::file(name_) : Input::memory(name_, bytes_); }
+
+    // An output that goes to a stream: the file that was written, to the caller's function.
+    void send() const {
+        if (!write_) return;
+        const std::shared_ptr<RandomBytes> bytes = virtualFileBytes(name_);
+        if (!bytes) fail(XISFCONV_ERR_INTERNAL, name_ + ": the output is not there");
+        const uint64_t size = bytes->size();
+        std::vector<uint8_t> buffer(static_cast<size_t>(std::min<uint64_t>(size, uint64_t(1) << 20)));
+        progress("writing", 0, size);
+        for (uint64_t at = 0; at < size;) {
+            const size_t n = static_cast<size_t>(std::min<uint64_t>(buffer.size(), size - at));
+            bytes->read(at, n, buffer.data());
+            const int32_t status = write_(user_, buffer.data(), n);
+            if (status != 0) {
+                throw Error(name_ + ": the write function returned " + std::to_string(status) + " after " + std::to_string(at) +
+                            " bytes", ErrorKind::Io);
+            }
+            at += n;
+            progressTick(n);
+        }
+    }
+
+private:
+    std::string name_;
+    std::shared_ptr<RandomBytes> bytes_;   // input
+    std::shared_ptr<Store> store_;         // output to a stream (until it is written)
+    xisfconv_write_fn write_ = nullptr;
+    void* user_ = nullptr;
+    std::unique_ptr<VirtualFileScope> scope_;
+
+    // A stream is read to its end: the readers go back and forth.
+    std::shared_ptr<RandomBytes> readStream(const xisfconv_io& io) const {
+        auto store = std::make_shared<Store>();
+        std::vector<uint8_t> buffer(size_t(1) << 20);
+        progress("reading", 0, 0);
+        for (;;) {
+            const int64_t n = io.read(io.user, buffer.data(), buffer.size());
+            if (n == 0) break;
+            if (n < 0) {
+                throw Error(name_ + ": the read function returned " + std::to_string(n) + " after " +
+                            std::to_string(store->size()) + " bytes", ErrorKind::Io);
+            }
+            if (static_cast<uint64_t>(n) > buffer.size()) {
+                throw Error(name_ + ": the read function said it read " + std::to_string(n) + " bytes into a buffer of " +
+                            std::to_string(buffer.size()), ErrorKind::Io);
+            }
+            store->append(buffer.data(), static_cast<size_t>(n));
+            progressTick(static_cast<uint64_t>(n));
+        }
+        return store;
+    }
+};
+
+void detectFormat(const Input& input, xisfconv_format* out) {
+    const std::shared_ptr<RandomBytes> bytes = input.open();
+    if (looksLikeFits(*bytes)) {
+        *out = XISFCONV_FORMAT_FITS;
+    } else if (looksLikeAsdf(*bytes)) {
+        *out = XISFCONV_FORMAT_ASDF;
+    } else if (looksLikeDng(bytes)) {
+        *out = XISFCONV_FORMAT_DNG;
+    } else {
+        uint8_t signature[8] = {};
+        const bool eight = bytes->size() >= 8;
+        if (eight) bytes->read(0, 8, signature);
+        if ((!eight || std::memcmp(signature, "XISF0100", 8) != 0) && !looksLikeXisfHeaderFile(*bytes)) {
+            throw Error(eight && std::memcmp(signature, "XISB0100", 8) == 0
+                            ? "an XISF data blocks file (.xisb): it is read through the header file of its unit (.xish)"
+                            : "not an XISF, FITS, ASDF or DNG file");
+        }
+        *out = XISFCONV_FORMAT_XISF;
+    }
+}
+
+// Opens a file, or bytes as a file: `input` is what the pixels are read from later.
+xisfconv_file* openFile(const StatePtr& state, const std::string& path, Input input) {
+    auto f = std::make_unique<xisfconv_file>();
+    f->state = state;
+    f->path = path;
+    f->input = std::move(input);
+    xisfconv_format format = XISFCONV_FORMAT_XISF;
+    if (f->input.inMemory()) {
+        const std::shared_ptr<RandomBytes> bytes = f->input.open();
+        format = looksLikeFits(*bytes) ? XISFCONV_FORMAT_FITS
+                 : looksLikeAsdf(*bytes) ? XISFCONV_FORMAT_ASDF
+                 : looksLikeDng(bytes)   ? XISFCONV_FORMAT_DNG
+                                         : XISFCONV_FORMAT_XISF;
+    } else {
+        const InputFormat kind = detectInputFormat(path);
+        format = kind == InputFormat::Fits   ? XISFCONV_FORMAT_FITS
+                 : kind == InputFormat::Asdf ? XISFCONV_FORMAT_ASDF
+                 : kind == InputFormat::Dng  ? XISFCONV_FORMAT_DNG
+                                             : XISFCONV_FORMAT_XISF;
+    }
+    // (a file is read by the name it was given here, and later by its absolute path)
+    const Input now = f->input.inMemory() ? f->input : Input::file(path);
+    f->format = format;
+    if (format == XISFCONV_FORMAT_FITS) {
+        f->fits = readFits(now, true);
+    } else if (format == XISFCONV_FORMAT_ASDF) {
+        f->fits = readAsdf(now, true, true);
+    } else if (format == XISFCONV_FORMAT_DNG) {
+        f->fits = readDng(now, true);
+    } else {
+        f->xisf = std::make_unique<XisfFile>(now);
+    }
+    const size_t n = imageCount(f.get());
+    f->known.resize(n);
+    if (f->format == XISFCONV_FORMAT_DNG) {
+        // The samples of a DNG image are what its header says, unsigned integers: known before they are read.
+        for (size_t i = 0; i < n; ++i) {
+            f->known[i].known = true;
+            f->known[i].format = f->fits.images[i].pixels.format;
+            f->known[i].mapping = f->fits.images[i].note;
+        }
+    }
+    for (size_t i = 0; i < n; ++i) {
+        auto kw = std::make_unique<xisfconv_keywords>();
+        kw->state = state;
+        kw->readOnly = true;
+        kw->cards = cardsOf(f.get(), i);
+        f->keywords.push_back(std::move(kw));
+    }
+    return f.release();
+}
+
+}  // namespace
+
+void xisfconv_io_init(xisfconv_io* io, size_t struct_size) {
+    xisfconv_io defaults;
+    std::memset(static_cast<void*>(&defaults), 0, sizeof defaults);
+    initStruct(io, struct_size, defaults);
+}
+
 xisfconv_status xisfconv_detect_format(xisfconv_context* ctx, const char* path, xisfconv_format* out) {
     if (!ctx) return XISFCONV_ERR_ARGUMENT;
     return guarded(ctx->state, path, [&] {
         if (!path || !out) fail(XISFCONV_ERR_ARGUMENT, "xisfconv_detect_format: path or out is NULL");
         mustBeReadable(path);
-        if (looksLikeFits(path)) {
-            *out = XISFCONV_FORMAT_FITS;
-        } else if (looksLikeAsdf(path)) {
-            *out = XISFCONV_FORMAT_ASDF;
-        } else if (looksLikeDng(path)) {
-            *out = XISFCONV_FORMAT_DNG;
-        } else {
-            std::ifstream again(toPath(path), std::ios::binary);
-            char signature[8] = {};
-            again.read(signature, 8);
-            if ((again.gcount() != 8 || std::memcmp(signature, "XISF0100", 8) != 0) && !looksLikeXisfHeaderFile(path)) {
-                throw Error(again.gcount() == 8 && std::memcmp(signature, "XISB0100", 8) == 0
-                                ? "an XISF data blocks file (.xisb): it is read through the header file of its unit (.xish)"
-                                : "not an XISF, FITS, ASDF or DNG file");
-            }
-            *out = XISFCONV_FORMAT_XISF;
-        }
+        detectFormat(Input::file(path), out);
+    });
+}
+
+xisfconv_status xisfconv_detect_format_io(xisfconv_context* ctx, const xisfconv_io* input, xisfconv_format* out) {
+    if (!ctx) return XISFCONV_ERR_ARGUMENT;
+    const std::string name = ioName(input);
+    return guarded(ctx->state, name.c_str(), [&] {
+        if (!out) fail(XISFCONV_ERR_ARGUMENT, "xisfconv_detect_format_io: out is NULL");
+        const CallIo in(input, false, "xisfconv_detect_format_io");
+        if (in.isFile()) mustBeReadable(in.name().c_str());
+        detectFormat(in.input(), out);
     });
 }
 
@@ -908,44 +1111,26 @@ xisfconv_status xisfconv_open(xisfconv_context* ctx, const char* path, xisfconv_
     if (out) *out = nullptr;
     return guarded(ctx->state, path, [&] {
         if (!path || !out) fail(XISFCONV_ERR_ARGUMENT, "xisfconv_open: path or out is NULL");
-        auto f = std::make_unique<xisfconv_file>();
-        f->state = ctx->state;
-        f->path = path;
         std::error_code absoluteError;
         const std::filesystem::path absolute = std::filesystem::absolute(toPath(path), absoluteError);
-        f->readPath = absoluteError ? std::string(path) : fromPath(absolute);
-        const InputFormat kind = detectInputFormat(path);
-        if (kind == InputFormat::Fits) {
-            f->format = XISFCONV_FORMAT_FITS;
-            f->fits = readFits(path, true);
-        } else if (kind == InputFormat::Asdf) {
-            f->format = XISFCONV_FORMAT_ASDF;
-            f->fits = readAsdf(path, true, true);
-        } else if (kind == InputFormat::Dng) {
-            f->format = XISFCONV_FORMAT_DNG;
-            f->fits = readDng(path, true);
+        *out = openFile(ctx->state, path, Input::file(absoluteError ? std::string(path) : fromPath(absolute)));
+    });
+}
+
+xisfconv_status xisfconv_open_io(xisfconv_context* ctx, const xisfconv_io* input, xisfconv_file** out) {
+    if (!ctx) return XISFCONV_ERR_ARGUMENT;
+    if (out) *out = nullptr;
+    const std::string name = ioName(input);
+    return guarded(ctx->state, name.c_str(), [&] {
+        if (!out) fail(XISFCONV_ERR_ARGUMENT, "xisfconv_open_io: out is NULL");
+        const CallIo in(input, false, "xisfconv_open_io");
+        if (in.isFile()) {
+            std::error_code absoluteError;
+            const std::filesystem::path absolute = std::filesystem::absolute(toPath(in.name()), absoluteError);
+            *out = openFile(ctx->state, in.name(), Input::file(absoluteError ? in.name() : fromPath(absolute)));
         } else {
-            f->format = XISFCONV_FORMAT_XISF;
-            f->xisf = std::make_unique<XisfFile>(path);
+            *out = openFile(ctx->state, in.name(), in.input());
         }
-        const size_t n = imageCount(f.get());
-        f->known.resize(n);
-        if (f->format == XISFCONV_FORMAT_DNG) {
-            // The samples of a DNG image are what its header says, unsigned integers: known before they are read.
-            for (size_t i = 0; i < n; ++i) {
-                f->known[i].known = true;
-                f->known[i].format = f->fits.images[i].pixels.format;
-                f->known[i].mapping = f->fits.images[i].note;
-            }
-        }
-        for (size_t i = 0; i < n; ++i) {
-            auto kw = std::make_unique<xisfconv_keywords>();
-            kw->state = ctx->state;
-            kw->readOnly = true;
-            kw->cards = cardsOf(f.get(), i);
-            f->keywords.push_back(std::move(kw));
-        }
-        *out = f.release();
     });
 }
 
@@ -1008,7 +1193,7 @@ xisfconv_status xisfconv_header_text(xisfconv_file* file, const char** text, siz
             if (isXisf(file)) {
                 file->headerText = file->xisf->headerXml();
             } else if (file->format == XISFCONV_FORMAT_ASDF) {
-                file->headerText = readAsdfTree(file->readPath);
+                file->headerText = readAsdfTree(file->input);
             } else {
                 std::string all;
                 for (const auto& img : file->fits.images) {
@@ -1689,9 +1874,9 @@ xisfconv_file::Bands& bandsOf(xisfconv_file* f, size_t image, bool verify) {
         b.lower = img.lowerBound;
         b.upper = img.upperBound;
     } else {
-        FitsFile all = f->format == XISFCONV_FORMAT_ASDF ? readAsdf(f->readPath, false, verify, image, true)
-                       : f->format == XISFCONV_FORMAT_DNG ? readDng(f->readPath, false, true)
-                                                          : readFits(f->readPath, false, image, true);
+        FitsFile all = f->format == XISFCONV_FORMAT_ASDF ? readAsdf(f->input, false, verify, image, true)
+                       : f->format == XISFCONV_FORMAT_DNG ? readDng(f->input, false, true)
+                                                          : readFits(f->input, false, image, true);
         if (image >= all.images.size() || !all.images[image].hasData) {
             fail(XISFCONV_ERR_FORMAT, "image " + std::to_string(image) + " cannot be read (has the file changed since it was opened?)");
         }
@@ -1992,11 +2177,9 @@ void xisfconv_convert_options_init(xisfconv_convert_options* options, size_t str
     initStruct(options, struct_size, defaults);
 }
 
-xisfconv_status xisfconv_convert(xisfconv_context* ctx, const char* input, const char* output,
-                                 const xisfconv_convert_options* options) {
-    if (!ctx) return XISFCONV_ERR_ARGUMENT;
-    return guarded(ctx->state, input, [&] {
-        if (!input || !output) fail(XISFCONV_ERR_ARGUMENT, "xisfconv_convert: input or output is NULL");
+namespace {
+// A conversion of the file (or the file of the call) `input` to `output`.
+void convertNamed(const std::string& input, bool inputIsFile, const std::string& output, const xisfconv_convert_options* options) {
         const xisfconv_convert_options o = optionsFrom(options, xisfconv_convert_options_init);
         ConvertOptions c;
         c.stretch = stretchFrom(o.stretch);
@@ -2030,10 +2213,32 @@ xisfconv_status xisfconv_convert(xisfconv_context* ctx, const char* input, const
         c.level = o.compression_level;
         c.shuffle = o.shuffle != 0;
         const Format format = outputFormat(o.output_format, output);
-        mustBeReadable(input);
+        if (inputIsFile) mustBeReadable(input.c_str());
         const InputFormat kind = detectInputFormat(input);
         if (kind == InputFormat::Xisf) convertXisfFile(input, output, format, c);
         else convertFitsOrAsdfFile(input, kind, output, format, c);
+}
+}  // namespace
+
+xisfconv_status xisfconv_convert(xisfconv_context* ctx, const char* input, const char* output,
+                                 const xisfconv_convert_options* options) {
+    if (!ctx) return XISFCONV_ERR_ARGUMENT;
+    return guarded(ctx->state, input, [&] {
+        if (!input || !output) fail(XISFCONV_ERR_ARGUMENT, "xisfconv_convert: input or output is NULL");
+        convertNamed(input, true, output, options);
+    });
+}
+
+xisfconv_status xisfconv_convert_io(xisfconv_context* ctx, const xisfconv_io* input, const xisfconv_io* output,
+                                    const xisfconv_convert_options* options) {
+    if (!ctx) return XISFCONV_ERR_ARGUMENT;
+    const std::string name = ioName(input);
+    return guarded(ctx->state, name.c_str(), [&] {
+        const CallIo in(input, false, "xisfconv_convert_io");
+        const CallIo out(output, true, "xisfconv_convert_io");
+        CallIo::distinct(in, out);
+        convertNamed(in.name(), in.isFile(), out.name(), options);
+        out.send();
     });
 }
 
@@ -2077,6 +2282,21 @@ xisfconv_status xisfconv_rewrite(xisfconv_context* ctx, const char* input, const
     });
 }
 
+xisfconv_status xisfconv_rewrite_io(xisfconv_context* ctx, const xisfconv_io* input, const xisfconv_io* output,
+                                    const xisfconv_rewrite_options* options, xisfconv_rewrite_result* result) {
+    if (!ctx) return XISFCONV_ERR_ARGUMENT;
+    const std::string name = ioName(input);
+    return guarded(ctx->state, name.c_str(), [&] {
+        const CallIo in(input, false, "xisfconv_rewrite_io");
+        const CallIo out(output, true, "xisfconv_rewrite_io");
+        CallIo::distinct(in, out);
+        const xisfconv_rewrite_options o = optionsFrom(options, xisfconv_rewrite_options_init);
+        const XisfFileRewrite done = rewriteXisfFile(in.name(), out.name(), false, o.overwrite != 0, rewriteOptionsFrom(o));
+        out.send();
+        fillResult(done, result);
+    });
+}
+
 xisfconv_status xisfconv_rewrite_in_place(xisfconv_context* ctx, const char* path, const xisfconv_rewrite_options* options,
                                           xisfconv_rewrite_result* result) {
     if (!ctx) return XISFCONV_ERR_ARGUMENT;
@@ -2101,11 +2321,8 @@ xisfconv_status xisfconv_stored_as_requested(xisfconv_context* ctx, const char* 
 // Verifying
 // ------------------------------------------------------------------------------------------
 
-xisfconv_status xisfconv_verify(xisfconv_context* ctx, const char* path, xisfconv_report** out) {
-    if (!ctx) return XISFCONV_ERR_ARGUMENT;
-    if (out) *out = nullptr;
-    return guarded(ctx->state, path, [&] {
-        if (!path || !out) fail(XISFCONV_ERR_ARGUMENT, "xisfconv_verify: path or out is NULL");
+namespace {
+xisfconv_report* verifyNamed(const char* path) {
         auto report = std::make_unique<xisfconv_report>();
         // Whatever goes wrong while reading the file is a finding about the file.
         try {
@@ -2129,7 +2346,27 @@ xisfconv_status xisfconv_verify(xisfconv_context* ctx, const char* path, xisfcon
         } catch (const std::exception& e) {
             report->report.problems.push_back(e.what());
         }
-        *out = report.release();
+        return report.release();
+}
+}  // namespace
+
+xisfconv_status xisfconv_verify(xisfconv_context* ctx, const char* path, xisfconv_report** out) {
+    if (!ctx) return XISFCONV_ERR_ARGUMENT;
+    if (out) *out = nullptr;
+    return guarded(ctx->state, path, [&] {
+        if (!path || !out) fail(XISFCONV_ERR_ARGUMENT, "xisfconv_verify: path or out is NULL");
+        *out = verifyNamed(path);
+    });
+}
+
+xisfconv_status xisfconv_verify_io(xisfconv_context* ctx, const xisfconv_io* input, xisfconv_report** out) {
+    if (!ctx) return XISFCONV_ERR_ARGUMENT;
+    if (out) *out = nullptr;
+    const std::string name = ioName(input);
+    return guarded(ctx->state, name.c_str(), [&] {
+        if (!out) fail(XISFCONV_ERR_ARGUMENT, "xisfconv_verify_io: out is NULL");
+        const CallIo in(input, false, "xisfconv_verify_io");
+        *out = verifyNamed(in.name().c_str());
     });
 }
 
@@ -2191,17 +2428,21 @@ void xisfconv_write_options_init(xisfconv_write_options* options, size_t struct_
     initStruct(options, struct_size, defaults);
 }
 
-xisfconv_status xisfconv_writer_new(xisfconv_context* ctx, const char* path, const xisfconv_write_options* options,
-                                    xisfconv_writer** out) {
-    if (!ctx) return XISFCONV_ERR_ARGUMENT;
-    if (out) *out = nullptr;
-    return guarded(ctx->state, path, [&] {
-        if (!path || !*path || !out) fail(XISFCONV_ERR_ARGUMENT, "xisfconv_writer_new: path or out is NULL");
+namespace {
+// A writer of the file `path`, or of the file of that name that goes to `write`.
+xisfconv_writer* newWriter(const StatePtr& state, const std::string& path, const xisfconv_write_options* options,
+                           xisfconv_write_fn write, void* user) {
         const xisfconv_write_options o = optionsFrom(options, xisfconv_write_options_init);
         auto w = std::make_unique<xisfconv_writer>();
-        w->state = ctx->state;
+        w->state = state;
         w->path = path;
+        w->write = write;
+        w->writeUser = user;
         w->format = outputFormat(o.format, path);
+        if (write && w->format == Format::Xisf && isXisfHeaderName(path)) {
+            fail(XISFCONV_ERR_ARGUMENT, path + ": a header file (.xish) has its data in a file beside it, and output to a "
+                                        "stream is one file; write a monolithic unit (.xisf)");
+        }
         codecFrom(o.codec, w->options);
         w->options.checksum = checksumName(o.checksum, false);
         if (o.subblock_size == 0) fail(XISFCONV_ERR_ARGUMENT, "invalid subblock size");
@@ -2212,8 +2453,8 @@ xisfconv_status xisfconv_writer_new(xisfconv_context* ctx, const char* path, con
         // the file is looked at again when it is written)
         // (a file: what is not one, a directory say, is said for what it is then)
         std::error_code there;
-        if (!w->options.force && std::filesystem::is_regular_file(std::filesystem::status(toPath(path), there))) {
-            throw Error(std::string(path) + " already exists (use --force to overwrite)", ErrorKind::Exists);
+        if (!write && !w->options.force && std::filesystem::is_regular_file(std::filesystem::status(toPath(path), there))) {
+            throw Error(path + " already exists (use --force to overwrite)", ErrorKind::Exists);
         }
         checkRowOrder(o.row_order);
         w->rowOrder = o.row_order;
@@ -2239,7 +2480,30 @@ xisfconv_status xisfconv_writer_new(xisfconv_context* ctx, const char* path, con
             for (const Property& p : o.properties->items)
                 if (!isFileStorageProperty(p.id)) w->images.properties.push_back(p);
         }
-        *out = w.release();
+        return w.release();
+}
+}  // namespace
+
+xisfconv_status xisfconv_writer_new(xisfconv_context* ctx, const char* path, const xisfconv_write_options* options,
+                                    xisfconv_writer** out) {
+    if (!ctx) return XISFCONV_ERR_ARGUMENT;
+    if (out) *out = nullptr;
+    return guarded(ctx->state, path, [&] {
+        if (!path || !*path || !out) fail(XISFCONV_ERR_ARGUMENT, "xisfconv_writer_new: path or out is NULL");
+        *out = newWriter(ctx->state, path, options, nullptr, nullptr);
+    });
+}
+
+xisfconv_status xisfconv_writer_new_io(xisfconv_context* ctx, const xisfconv_io* output, const xisfconv_write_options* options,
+                                       xisfconv_writer** out) {
+    if (!ctx) return XISFCONV_ERR_ARGUMENT;
+    if (out) *out = nullptr;
+    const std::string name = ioName(output);
+    return guarded(ctx->state, name.c_str(), [&] {
+        if (!out) fail(XISFCONV_ERR_ARGUMENT, "xisfconv_writer_new_io: out is NULL");
+        const CallIo checked(output, true, "xisfconv_writer_new_io");   // (what it is is said now)
+        const xisfconv_io o = optionsFrom(output, xisfconv_io_init);
+        *out = newWriter(ctx->state, checked.name(), options, o.write, o.user);
     });
 }
 
@@ -2288,8 +2552,9 @@ void noImageInRows(const xisfconv_writer* writer) {
 }
 
 // The directory a file is written to: where the temporary files for it go.
-std::string directoryOfOutput(const std::string& path) {
-    const std::filesystem::path parent = toPath(path).parent_path();
+std::string directoryOfOutput(const xisfconv_writer* writer) {
+    if (writer->write) return {};   // (the system's temporary directory)
+    const std::filesystem::path parent = toPath(writer->path).parent_path();
     return parent.empty() ? std::string(".") : fromPath(parent);
 }
 }  // namespace
@@ -2331,7 +2596,7 @@ xisfconv_status xisfconv_writer_begin_image(xisfconv_writer* writer, const xisfc
         img.pixels.channels = in.channels;
         describeImage(in, img, writer->images.images.size());
         // The rows are kept as the whole buffer of xisfconv_writer_add_image would hold them.
-        const TempDirectoryScope temporaries(directoryOfOutput(writer->path));
+        const TempDirectoryScope temporaries(directoryOfOutput(writer));
         auto rows = std::make_shared<Store>(bytes);
         img.pieces = storedSource(rows, in.width, in.height, in.channels, img.pixels.format, StoredLayout());
         writer->images.images.push_back(std::move(img));
@@ -2358,7 +2623,7 @@ xisfconv_status xisfconv_writer_add_rows(xisfconv_writer* writer, const void* ro
             fail(XISFCONV_ERR_BUFFER, "a band of " + std::to_string(rows) + " rows has " + std::to_string(plane * img.pixels.channels) +
                                           " bytes, the buffer " + std::to_string(size));
         }
-        const TempDirectoryScope temporaries(directoryOfOutput(writer->path));
+        const TempDirectoryScope temporaries(directoryOfOutput(writer));
         const uint8_t* in = static_cast<const uint8_t*>(rows_data);
         const uint64_t channelBytes = height * rowBytes;
         for (uint64_t c = 0; c < img.pixels.channels; ++c) {
@@ -2409,9 +2674,21 @@ xisfconv_status xisfconv_writer_finish(xisfconv_writer* writer) {
             }
         }
         ImageSetOrigin origin;
-        origin.defaultName = fromPath(toPath(writer->path).stem());
+        origin.defaultName = writer->write && !writer->path.empty() && writer->path.front() == '<'
+                                 ? std::string() : fromPath(toPath(writer->path).stem());
         origin.notes = false;
-        writeImageSet(writer->images, origin, writer->path, writer->format, writer->options);
+        if (!writer->write) {
+            writeImageSet(writer->images, origin, writer->path, writer->format, writer->options);
+            return;
+        }
+        xisfconv_io io;
+        xisfconv_io_init(&io, sizeof io);
+        io.write = writer->write;
+        io.user = writer->writeUser;
+        io.name = writer->path.c_str();
+        const CallIo out(&io, true, "xisfconv_writer_finish");
+        writeImageSet(writer->images, origin, out.name(), writer->format, writer->options);
+        out.send();
     });
 }
 

@@ -9,6 +9,7 @@ import atexit
 import contextlib
 import ctypes
 import datetime
+import io
 import logging
 import math
 import numbers
@@ -154,6 +155,9 @@ def _bytes(text, what="text"):
 def _path(path):
     """A file name as the library wants it: UTF-8 on Windows, the bytes of the name elsewhere."""
     name = os.fspath(path)
+    if isinstance(name, bytes) and b"\0" in name:
+        raise ValueError("the file name contains a NUL character (bytes are a file name, as in os; the contents of a "
+                         "file are given as memoryview(data))")
     if sys.platform == "win32":
         if isinstance(name, bytes):
             name = os.fsdecode(name)
@@ -165,6 +169,142 @@ def _path(path):
     if b"\0" in data:
         raise ValueError("the file name contains a NUL character")
     return data
+
+
+def _is_path(value):
+    """A file name: a string, bytes (the bytes of a name, as everywhere in os) or a path object."""
+    return isinstance(value, (str, bytes)) or hasattr(value, "__fspath__")
+
+
+class _Io:
+    """An input or output of a call as the library takes it (xisfconv_io): a file by its name;
+    bytes in memory, borrowed (an object with the buffer protocol: bytearray, memoryview, a
+    NumPy array, mmap; kept here, and by an open file for as long as it is open); or a binary
+    file object, read to its end or written when the file is complete. What the file object
+    raises is kept, and raised in place of the error of the library (`raise_kept`)."""
+
+    def __init__(self, what, output=False):
+        self.what = what
+        self.struct = _lib.struct(_lib.Io, _library.xisfconv_io_init)
+        self.kept = None              # what the file object raised
+        self._readinto = True         # readinto() works, as far as is known
+        self._keep = []
+        self.path = None
+        if _is_path(what):
+            self.path = what
+            self.struct.path = _path(what)
+            self.label = what         # (messages name the file)
+            return
+        if isinstance(what, io.TextIOBase):
+            raise TypeError("the %s is a file object opened in text mode; open it in binary mode (\"%s\"), or use its "
+                            "buffer (sys.%s.buffer)" % ("output" if output else "input", "wb" if output else "rb",
+                                                       "stdout" if output else "stdin"))
+        view = None
+        if not output:
+            # data in memory first: an mmap has read() too, and is read where it is
+            try:
+                view = memoryview(what)
+            except TypeError:
+                pass
+        self.stream = view is None
+        if output:
+            if not hasattr(what, "write"):
+                raise TypeError("the output is a file name or a binary file object to write to, not %s" %
+                                type(what).__name__)
+            callback = _lib.WRITE_FN(self._write)
+            self.struct.write = callback
+        elif view is None:
+            if not (hasattr(what, "readinto") or hasattr(what, "read")):
+                raise TypeError("the input is a file name, data in memory (bytes-like: memoryview, bytearray, ...) "
+                                "or a binary file object to read from, not %s" % type(what).__name__)
+            callback = _lib.READ_FN(self._read)
+            self.struct.read = callback
+        else:
+            if not view.c_contiguous:
+                raise TypeError("data in memory is read as one run of bytes: this %s is not contiguous (give a "
+                                "copy, bytes(data) wrapped in a memoryview)" % type(what).__name__)
+            data = np.frombuffer(view.cast("B") if view.ndim != 1 or view.format != "B" else view,
+                                 dtype=np.uint8)              # (no copy, of read-only buffers too)
+            callback = data
+            address = data.ctypes.data if data.size else None
+            if not address:                                   # (no bytes, but bytes that are there)
+                callback = ctypes.create_string_buffer(1)
+                address = ctypes.addressof(callback)
+            self.struct.data = address
+            self.struct.size = data.size
+        self._keep.append(callback)
+        name = getattr(what, "name", None)                    # (that of a file object: "frame.fits", "<stdin>")
+        if isinstance(name, str) and name and "\0" not in name:
+            self.struct.name = name.encode("utf-8", "surrogateescape")
+            self.label = name
+        else:
+            self.label = "<memory>" if self.struct.data else "<output stream>" if output else "<input stream>"
+
+    @property
+    def pointer(self):
+        return byref(self.struct)
+
+    def raise_kept(self):
+        """Raises what the file object raised during the call, if it did."""
+        kept, self.kept = self.kept, None
+        if kept is not None:
+            raise kept
+
+    def _read(self, user, buffer, size):
+        try:
+            size = min(int(size), 1 << 24)
+            readinto = getattr(self.what, "readinto", None) if self._readinto else None
+            got = None
+            if readinto is not None:
+                try:
+                    got = readinto(memoryview((ctypes.c_char * size).from_address(buffer)).cast("B"))
+                except NotImplementedError:      # (io.RawIOBase's, of a class that has read() alone)
+                    self._readinto = readinto = None
+            if readinto is None:
+                data = self.what.read(size)
+                if isinstance(data, str):
+                    raise TypeError("the input gives text: a file object opened in binary mode gives the bytes")
+                got = None if data is None else len(data)
+                if got:
+                    if got > size:
+                        raise ValueError("read(%d) gave %d bytes" % (size, got))
+                    ctypes.memmove(buffer, bytes(data), got)
+            if got is None:
+                raise BlockingIOError("the input has no bytes now (a stream that does not block); xisfconv reads "
+                                      "one that waits for them")
+            return int(got)
+        except BaseException as error:    # (KeyboardInterrupt too: raised once the library has come back)
+            if self.kept is None:
+                self.kept = error
+            return -1
+
+    def _write(self, user, data, size):
+        try:
+            view = memoryview(ctypes.string_at(data, size))
+            while view:
+                written = self.what.write(view)
+                if written is None:
+                    raise BlockingIOError("the output takes no bytes now (a stream that does not block); xisfconv "
+                                          "writes to one that waits")
+                if not 0 < written <= len(view):
+                    raise OSError("the output took %d of %d bytes" % (written, len(view)))
+                view = view[written:]
+            return 0
+        except BaseException as error:
+            if self.kept is None:
+                self.kept = error
+            return 1
+
+
+def _io_call(context, ios, function, *arguments, **keywords):
+    """context.call for a function that reads or writes through file objects: what they raised
+    is raised in place of the error of the library it brought about."""
+    try:
+        context.call(function, *arguments, **keywords)
+    except BaseException:
+        for one in ios:
+            one.raise_kept()
+        raise
 
 
 # The messages of the library are those of the command line tool and name its options. Here they
@@ -2558,13 +2698,19 @@ class File:
     _resource = None
     _context = None
     _count = 0
+    _source = None
     path = None
 
     def __init__(self, path, *, external_files=None, _shown=None):
         # (_shown: the name for messages, if `path` is a temporary copy of what the caller gave)
-        #: the name the file was opened with
-        self.path = path
-        name = _path(path)
+        source = _Io(path)
+        if source.path is None and _shown is None:
+            _shown = source.label
+        #: the name the file was opened with ("<memory>" or the name of a file object for one
+        #: that was not opened by its name)
+        self.path = path if source.path is not None else source.label
+        # (the bytes in memory, which the library reads where they are until the file is closed)
+        self._source = source if source.struct.data else None
         # (Nothing that is done with an open file has steps: opening, reading an image and
         # reading keywords are each one piece of work for the library. Should that change, the
         # context needs `steps`, or Ctrl-C will not stop those calls.)
@@ -2576,7 +2722,12 @@ class File:
         # one step once there is one. Whatever interrupts this, the handle is closed once.
         self._resource = resource = _own(self, _library.xisfconv_close, None)
         try:
-            self._context.call(_library.xisfconv_open, self._context.pointer, name, byref(handle))
+            if source.path is not None:
+                self._context.call(_library.xisfconv_open, self._context.pointer, source.struct.path, byref(handle))
+            else:
+                # a stream is read to its end during the call: Ctrl-C stops it
+                _io_call(self._context, (source,), _library.xisfconv_open_io, self._context.pointer, source.pointer,
+                         byref(handle), stoppable=source.stream)
             resource._as_parameter_ = handle.value
         except BaseException:
             if resource._as_parameter_ is None:     # nobody owns the handle yet
@@ -2620,6 +2771,7 @@ class File:
             self._handle = None
             _release(self._resource)
             context.release()
+            self._source = None           # (the library has let go of the data in memory)
 
     @property
     def closed(self):
@@ -2763,18 +2915,45 @@ def open(path, *, external_files=None):   # noqa: A001 - the name is the point, 
     of an image, a warning for a property. Nothing is ever fetched from a network. (This is a
     rule for files from people you do not know, not a sandbox: it does not hold against
     somebody who changes the directory while the file is read.)
+
+    A file need not be a file (since 0.23). ``path`` may also be the file itself:
+
+    data in memory
+        an object with the buffer protocol: ``memoryview(data)``, a ``bytearray``, a NumPy
+        array, an ``mmap``. (``bytes`` are a file name, as in ``os``: the contents of a file
+        go as ``memoryview(data)``.) The data is borrowed, not copied: the library reads it
+        where it is, and the :class:`File` keeps it for as long as it is open.
+    a binary file object
+        ``sys.stdin.buffer``, an ``io.BytesIO``, a file opened with ``"rb"``, a pipe or a
+        socket: it is read to its end first (every format is read at random places), and
+        what it gave is kept in memory up to ``XISFCONV_MEMORY_LIMIT`` (256 MiB by default),
+        beyond that in a temporary file in the system's temporary directory. What it raises is
+        raised here.
+
+    Messages and :attr:`File.path` call it "<memory>", "<input stream>", or the name of the
+    file object. A header of a distributed unit in memory has no directory: the data blocks it
+    names by ``path(@header_dir/...)`` are not found (:class:`NotAllowedError`). Every function
+    that reads a file takes what this one takes: :func:`read`, :func:`read_image`,
+    :func:`detect_format`, :func:`verify`, and the input of :func:`convert` and :func:`rewrite`.
     """
     return File(path, external_files=external_files)
 
 
 def detect_format(path):
     """"xisf", "fits", "asdf" or "dng", from the first bytes of the file. :class:`FormatError`
-    if it is none of them."""
+    if it is none of them. ``path`` is a file name, data in memory or a binary file object, as
+    for :func:`open`."""
     context = _Context.borrow()
     with context.lock:
-        context.about(path)
+        source = _Io(path)
+        context.about(source.label)
         out = c_int32()
-        context.call(_library.xisfconv_detect_format, context.pointer, _path(path), byref(out))
+        if source.path is not None:
+            context.call(_library.xisfconv_detect_format, context.pointer, source.struct.path, byref(out))
+        else:
+            context.shown = source.label
+            _io_call(context, (source,), _library.xisfconv_detect_format_io, context.pointer, source.pointer, byref(out),
+                     stoppable=True)
         return _FORMAT_NAMES[out.value]
 
 
@@ -2795,7 +2974,8 @@ def read(path, image=0, *, sample_format=None, row_order="top-down", channels="l
     """Reads one image of a file into a NumPy array: ``xisfconv.read("m31.xisf")``.
 
     ``image`` is the number of the image in the file, or its name. For the array and the
-    options see :meth:`FileImage.read`; for ``external_files`` see :func:`open`.
+    options see :meth:`FileImage.read`; for ``path``, which may be data in memory or a file
+    object, and ``external_files`` see :func:`open`.
     """
     with File(path, external_files=external_files) as file:
         return _one_image(file, image).read(sample_format, row_order=row_order, channels=channels, verify=verify,
@@ -2805,7 +2985,8 @@ def read(path, image=0, *, sample_format=None, row_order="top-down", channels="l
 def read_image(path, image=0, *, sample_format=None, row_order="top-down", channels="last", verify=True, bounds=None,
                properties=True, external_files=None):
     """Reads one image of a file with its keywords, name, bounds, ICC profile and properties:
-    an :class:`Image`. See :meth:`FileImage.read_image`; for ``external_files`` see :func:`open`."""
+    an :class:`Image`. See :meth:`FileImage.read_image`; for ``path`` and ``external_files``
+    see :func:`open`."""
     with File(path, external_files=external_files) as file:
         return _one_image(file, image).read_image(sample_format, row_order=row_order, channels=channels,
                                                   verify=verify, bounds=bounds, properties=properties)
@@ -2900,6 +3081,10 @@ def write(path, images, *, format=None, codec=None, checksum=None, stored_row_or
     given; BAYERPAT and WCS keywords are converted when the rows are stored in the other order.
 
     The file is written under the name ``path + ".part"`` and renamed when it is complete.
+    ``path`` may also be a binary file object (``sys.stdout.buffer``, an ``io.BytesIO``; since
+    0.23): the file is written to it when it is complete, and nothing is if writing fails. Its
+    format is then ``format``, or what the extension of the file object's name says; a
+    distributed unit (.xish), which is two files, cannot go to one.
     """
     if isinstance(images, Image) or not isinstance(images, (list, tuple)):
         images = [images]
@@ -2938,7 +3123,8 @@ class Writer:
     image given in bands in memory up to ``XISFCONV_MEMORY_LIMIT`` (256 MiB by default) and
     beyond that in a temporary file beside the output. The file is the one :func:`write` makes
     of the same images given whole, byte for byte. A ``with`` block that ends in an exception
-    writes nothing (:meth:`discard`).
+    writes nothing (:meth:`discard`). ``path`` may also be a binary file object, as for
+    :func:`write`: the file is written to it when the writer is closed.
     """
 
     _handle = None
@@ -2962,15 +3148,18 @@ class Writer:
             if not isinstance(creator, str):
                 raise TypeError("creator is the name of a program, a string")
             options.creator_application = _bytes(creator, "creator")
-        #: the name of the file that is written
-        self.path = path
+        target = _Io(path, output=True)
+        #: the name of the file that is written ("<output stream>" or the name of a file object for one
+        #: that was not opened by its name)
+        self.path = path if target.path is not None else target.label
+        self._target = target         # (a file object is written to when the writer is closed)
         self._progress = progress
-        self._kind = _written_format(format, path)
+        self._kind = _written_format(format, self.path)
         self._wcs = wcs
         self._count = 0              # images given
         self._rows = None            # of the image given in bands: [height, rows given, width, channels, dtype]
         self._several = None         # (write(): whether a message names the image by its number)
-        self._context = context = _Context(path, reading=False)
+        self._context = context = _Context(self.path, reading=False)
         self._resource = resource = _own(self, _library.xisfconv_writer_discard, None)
         handle = c_void_p()
         with context.lock:
@@ -2978,7 +3167,8 @@ class Writer:
             try:
                 options.properties = whole
                 try:
-                    context.call(_library.xisfconv_writer_new, context.pointer, _path(path), byref(options), byref(handle))
+                    context.call(_library.xisfconv_writer_new_io, context.pointer, target.pointer, byref(options),
+                                 byref(handle))
                     resource._as_parameter_ = handle.value
                 except BaseException:
                     if resource._as_parameter_ is None and handle.value:   # nobody owns the writer yet
@@ -3114,8 +3304,8 @@ class Writer:
             resource._as_parameter_ = None
             self._handle = None
             self._rows = None
-            self._context.call(_library.xisfconv_writer_finish, handle, progress=self._progress,
-                               unstarted=lambda: _library.xisfconv_writer_discard(handle))
+            _io_call(self._context, (self._target,), _library.xisfconv_writer_finish, handle, progress=self._progress,
+                     unstarted=lambda: _library.xisfconv_writer_discard(handle))
 
     def discard(self):
         """Frees the writer without writing anything."""
@@ -3232,6 +3422,12 @@ def convert(input, output, *, format=None, sample_format=None, image=None, stret
     a name that ends in ".xish" is written as a distributed unit: the header there, the data
     blocks in the file of the same name that ends in ".xisb".
 
+    Neither needs to be a file (since 0.23): the input may be data in memory or a binary file
+    object, as for :func:`open`, and the output a binary file object (``sys.stdout.buffer``,
+    an ``io.BytesIO``), which is given the file when it is complete and has been checked, and
+    nothing if the conversion fails. Its format is ``format``, or what the extension of the
+    file object's name says.
+
     format
         Of the output; None: from the extension of ``output``.
     sample_format
@@ -3309,11 +3505,14 @@ def convert(input, output, *, format=None, sample_format=None, image=None, stret
     options.debayer = int(bool(debayer))
     options.compression_level = _level(level)
     options.shuffle = _shuffle(shuffle)
+    source, target = _Io(input), _Io(output, output=True)
     context = _Context.borrow()
     with context.lock:
-        context.about(input, other=output, external_files=external_files)
-        context.call(_library.xisfconv_convert, context.pointer, _path(input), _path(output), byref(options),
-                    progress=progress)
+        context.about(source.label, other=target.label, external_files=external_files)
+        if source.path is None:
+            context.shown = source.label
+        _io_call(context, (source, target), _library.xisfconv_convert_io, context.pointer, source.pointer, target.pointer,
+                 byref(options), progress=progress)
 
 
 RewriteResult = namedtuple("RewriteResult", "input_size output_size blocks compressed decompressed kept checksums "
@@ -3376,7 +3575,9 @@ def rewrite(input, output, *, codec=None, checksum=None, image=None, verify=True
     output, by its name: ``rewrite("frame.xish", "frame.xisf")`` packs a distributed unit into
     one file, and ``rewrite("frame.xisf", "frame.xish")`` writes ``frame.xish`` (the header)
     and ``frame.xisb`` (every data block) beside it. Whatever files the input has its blocks
-    in, all of them end up in the output.
+    in, all of them end up in the output. The input may also be data in memory or a binary
+    file object, and the output a binary file object, as for :func:`convert` (since 0.23); the
+    output is then one monolithic file.
 
     codec
         None or "keep": leave every block as it is stored. "none", "zlib", "zstd", or
@@ -3400,11 +3601,14 @@ def rewrite(input, output, *, codec=None, checksum=None, image=None, verify=True
     """
     options = _rewrite_options(codec, checksum, image, verify, read_back, subblock_size, overwrite, level, shuffle)
     result = _lib.struct(_lib.RewriteResult, _library.xisfconv_rewrite_result_init)
+    source, target = _Io(input), _Io(output, output=True)
     context = _Context.borrow()
     with context.lock:
-        context.about(input, other=output, external_files=external_files)
-        context.call(_library.xisfconv_rewrite, context.pointer, _path(input), _path(output), byref(options),
-                     byref(result), progress=progress)
+        context.about(source.label, other=target.label, external_files=external_files)
+        if source.path is None:
+            context.shown = source.label
+        _io_call(context, (source, target), _library.xisfconv_rewrite_io, context.pointer, source.pointer, target.pointer,
+                 byref(options), byref(result), progress=progress)
         return _rewrite_result(result)
 
 
@@ -3488,16 +3692,20 @@ def verify(path, *, progress=None, external_files=None):
     a :class:`Report`. A damaged or unreadable file is not an exception here: its report says
     "failed" and why. Of a distributed XISF unit (its header file, .xish) every block is read
     from the file the header names for it; a block in a file the header is not followed to
-    (``external_files``, see :func:`open`) is reported as not checked."""
+    (``external_files``, see :func:`open`) is reported as not checked. ``path`` may also be
+    data in memory or a binary file object, as for :func:`open`."""
+    source = _Io(path)
     context = _Context.borrow()
     with context.lock:
-        context.about(path, external_files=external_files)
+        context.about(source.label, external_files=external_files)
+        if source.path is None:
+            context.shown = source.label
         handle = c_void_p()
-        context.call(_library.xisfconv_verify, context.pointer, _path(path), byref(handle), progress=progress,
-                     undo=lambda: _library.xisfconv_report_free(handle))
+        _io_call(context, (source,), _library.xisfconv_verify_io, context.pointer, source.pointer, byref(handle),
+                 progress=progress, undo=lambda: _library.xisfconv_report_free(handle))
         try:
             report = Report()
-            report.path = path
+            report.path = path if source.path is not None else source.label
             report.verdict = _VERDICTS.get(_library.xisfconv_report_verdict(handle), "failed")
             report.format = _FORMAT_NAMES.get(_library.xisfconv_report_format(handle), "")
             report.summary = _text(_library.xisfconv_report_summary(handle))

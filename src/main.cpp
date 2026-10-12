@@ -193,14 +193,17 @@ void usage(std::ostream& os) {
           "       not yet what is written are converted (-t says what; a directory of one format needs\n"
           "       no -t). An argument with * or ? that names no file is a pattern for the names it\n"
           "       matches, on every system (cmd and PowerShell leave patterns to the program).\n"
-          "       xisfconv --verify <file or directory>... checks files without converting them.\n\n"
+          "       xisfconv --verify <file or directory>... checks files without converting them.\n"
+          "       - as the input is the standard input (with -o, or -I, --dump-header, --verify), and\n"
+          "       -o - writes to the standard output (with -t): cat a.xisf | xisfconv -t fits -o - - > a.fits\n\n"
           "Output:\n"
           "  -t, --to <fits|asdf|tiff|png|xisf|xish>\n"
           "                              output format (default: fits for XISF input, xisf for FITS, ASDF and\n"
           "                              DNG input, or taken from -o's extension). xish: XISF as a distributed\n"
           "                              unit, the header in <name>.xish and the data blocks in <name>.xisb\n"
           "                              beside it (PixInsight itself opens monolithic .xisf files only)\n"
-          "  -o, --output <file>         output file name (single input only)\n"
+          "  -o, --output <file>         output file name (single input only); - is the standard output, which\n"
+          "                              gets the file once it is complete (nothing if the run fails)\n"
           "  -d, --outdir <dir>          directory for output files (default: next to each input). The files\n"
           "                              of a directory given as input keep their places below it\n"
           "  -f, --force                 overwrite existing output files\n"
@@ -403,10 +406,84 @@ struct Library {
     }
 };
 
+// ---------------------------------------------------------------- standard input and output
+
+// "-" as the input is the standard input, and "-o -" the standard output. The standard input is
+// read into memory before anything is done with it (every format is read at random places), and
+// handed to the library as bytes in memory; a file for the standard output is written to it once
+// it is complete and has been checked: a failed run writes nothing there.
+const char* const kStdin = "-";
+std::vector<uint8_t> g_stdin;
+
+bool isStdio(const std::string& name) { return name == kStdin; }
+
+// What messages call the input or the output.
+std::string shown(const std::string& name, bool output = false) {
+    return isStdio(name) ? (output ? "<stdout>" : "<stdin>") : name;
+}
+
+void binaryMode(FILE* stream) {
+#ifdef _WIN32
+    _setmode(_fileno(stream), _O_BINARY);
+#else
+    (void)stream;
+#endif
+}
+
+void readStdin() {
+    binaryMode(stdin);
+    std::vector<uint8_t> buffer(size_t(1) << 20);
+    for (;;) {
+        const size_t n = std::fread(buffer.data(), 1, buffer.size(), stdin);
+        g_stdin.insert(g_stdin.end(), buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(n));
+        if (n < buffer.size()) break;
+    }
+    if (std::ferror(stdin)) throw Error("<stdin>: " + std::string(std::strerror(errno)));
+}
+
+extern "C" int32_t writeStdout(void*, const void* data, uint64_t size) {
+    return std::fwrite(data, 1, static_cast<size_t>(size), stdout) == size ? 0 : 1;
+}
+
+xisfconv_io inputIo(const std::string& input) {
+    static const uint8_t none = 0;
+    xisfconv_io io;
+    xisfconv_io_init(&io, sizeof io);
+    if (isStdio(input)) {
+        io.data = g_stdin.empty() ? &none : g_stdin.data();
+        io.size = g_stdin.size();
+        io.name = "<stdin>";
+    } else {
+        io.path = input.c_str();
+    }
+    return io;
+}
+
+xisfconv_io outputIo(const std::string& output) {
+    xisfconv_io io;
+    xisfconv_io_init(&io, sizeof io);
+    if (isStdio(output)) {
+        binaryMode(stdout);   // (Windows: the bytes as they are, not \n as \r\n)
+        io.write = writeStdout;
+        io.name = "<stdout>";
+    } else {
+        io.path = output.c_str();
+    }
+    return io;
+}
+
+// The output is complete on the standard output.
+void flushStdout() {
+    if (std::fflush(stdout) != 0) throw Error("<stdout>: " + std::string(std::strerror(errno)));
+}
+
 // A file opened through the library, closed when it goes out of scope.
 struct OpenFile {
     xisfconv_file* file = nullptr;
-    OpenFile(const Library& lib, const std::string& path) { lib.check(xisfconv_open(lib.ctx, path.c_str(), &file)); }
+    OpenFile(const Library& lib, const std::string& path) {
+        const xisfconv_io in = inputIo(path);
+        lib.check(xisfconv_open_io(lib.ctx, &in, &file));
+    }
     ~OpenFile() { xisfconv_close(file); }
     OpenFile(const OpenFile&) = delete;
     OpenFile& operator=(const OpenFile&) = delete;
@@ -708,7 +785,12 @@ void rewriteXisfInput(const Library& lib, const std::string& input, const Option
         lib.check(xisfconv_rewrite_in_place(lib.ctx, input.c_str(), &r, &done));
     } else {
         output = outputPathFor(input, opt, XISFCONV_FORMAT_XISF);
-        lib.check(xisfconv_rewrite(lib.ctx, input.c_str(), output.c_str(), &r, &done));
+        const xisfconv_io in = inputIo(input), out = outputIo(output);
+        lib.check(xisfconv_rewrite_io(lib.ctx, &in, &out, &r, &done));
+        if (isStdio(output)) {
+            flushStdout();
+            return;   // (nothing but the file goes to the standard output)
+        }
     }
     if (opt.quiet) return;
     if (opt.inPlace && !done.changed) {
@@ -730,8 +812,17 @@ void rewriteXisfInput(const Library& lib, const std::string& input, const Option
     char percent[32];
     std::snprintf(percent, sizeof percent, "%.1f%%",
                   done.input_size ? 100.0 * static_cast<double>(done.output_size) / static_cast<double>(done.input_size) : 100.0);
-    std::cout << input << " -> " << output << ": " << megabytes(done.input_size) << " -> " << megabytes(done.output_size)
+    std::cout << shown(input) << " -> " << output << ": " << megabytes(done.input_size) << " -> " << megabytes(done.output_size)
               << " (" << percent << "); " << what << (done.read_back ? "; read back and compared with the input" : "") << "\n";
+}
+
+void convertTo(const Library& lib, const std::string& input, const std::string& outPath, const Options& opt,
+               xisfconv_format format) {
+    const xisfconv_convert_options c = conversionOptions(opt, format);
+    const xisfconv_io in = inputIo(input), out = outputIo(outPath);
+    lib.check(xisfconv_convert_io(lib.ctx, &in, &out, &c));
+    if (isStdio(outPath)) flushStdout();   // (and nothing else goes there)
+    else if (!opt.quiet) std::cout << shown(input) << " -> " << outPath << "\n";
 }
 
 void convertXisfInput(const Library& lib, const std::string& input, const Options& opt) {
@@ -754,21 +845,31 @@ void convertXisfInput(const Library& lib, const std::string& input, const Option
             std::cout.write(header, static_cast<std::streamsize>(size));   // all of it, whatever bytes it holds
             std::cout << "\n";
         } else if (opt.info) {
-            printXisfInfo(lib, input, file.file);
+            printXisfInfo(lib, shown(input), file.file);
         } else {
             throw Error("--in-place is for rewriting XISF files as XISF");
         }
         return;
     }
     const std::string outPath = outputPathFor(input, opt, format);
-    const xisfconv_convert_options c = conversionOptions(opt, format);
-    lib.check(xisfconv_convert(lib.ctx, input.c_str(), outPath.c_str(), &c));
-    if (!opt.quiet) std::cout << input << " -> " << outPath << "\n";
+    convertTo(lib, input, outPath, opt, format);
 }
 
 // Converts a FITS, ASDF or DNG file. The readers deliver the images in the same form.
 void convertFitsOrAsdfInput(const Library& lib, const std::string& input, xisfconv_format inputFormat, const Options& opt) {
     const bool asdfInput = inputFormat == XISFCONV_FORMAT_ASDF;
+    if (isStdio(input) && (opt.treeJson || (asdfInput && opt.dumpHeader))) {
+        if (opt.treeJson) throw Error("--asdf-tree-json needs a file");
+        // (the tree as it is stored, byte for byte: what the open file has for its header)
+        const OpenFile file(lib, input);
+        const char* tree = "";
+        size_t size = 0;
+        lib.check(xisfconv_header_text(file.file, &tree, &size));
+        std::cout.flush();
+        binaryMode(stdout);
+        std::cout.write(tree, static_cast<std::streamsize>(size));
+        return;
+    }
     if (asdfInput && opt.treeJson) {
         size_t size = 0;
         lib.check(xisfconv_asdf_tree_json(lib.ctx, input.c_str(), nullptr, 0, &size));
@@ -793,9 +894,9 @@ void convertFitsOrAsdfInput(const Library& lib, const std::string& input, xisfco
     }
     if (opt.info || opt.dumpHeader) {
         const OpenFile file(lib, input);
-        if (asdfInput) printAsdfInfo(lib, input, file.file);
-        else if (inputFormat == XISFCONV_FORMAT_DNG) printDngInfo(lib, input, file.file);
-        else printFitsInfo(lib, input, file.file);
+        if (asdfInput) printAsdfInfo(lib, shown(input), file.file);
+        else if (inputFormat == XISFCONV_FORMAT_DNG) printDngInfo(lib, shown(input), file.file);
+        else printFitsInfo(lib, shown(input), file.file);
         return;
     }
     xisfconv_format format = XISFCONV_FORMAT_XISF;
@@ -805,9 +906,7 @@ void convertFitsOrAsdfInput(const Library& lib, const std::string& input, xisfco
     }
     if (opt.inPlace) throw Error("--in-place is for rewriting XISF files as XISF");
     const std::string outPath = outputPathFor(input, opt, format);
-    const xisfconv_convert_options c = conversionOptions(opt, format);
-    lib.check(xisfconv_convert(lib.ctx, input.c_str(), outPath.c_str(), &c));
-    if (!opt.quiet) std::cout << input << " -> " << outPath << "\n";
+    convertTo(lib, input, outPath, opt, format);
 }
 
 // ---------------------------------------------------------------- arguments
@@ -976,12 +1075,35 @@ bool parseArgs(int argc, char** argv, Options& opt, int& exitCode) {
         return false;
     }
     if (opt.codecNone) opt.compress = false;
+    const bool fromStdin = std::find(opt.inputs.begin(), opt.inputs.end(), kStdin) != opt.inputs.end();
+    if (fromStdin && opt.inputs.size() > 1) throw Error("- (the standard input) is the only input of a run");
     if (opt.verifyMode) return true;
+    const bool inspects = opt.info || opt.dumpHeader || opt.treeJson;
+    if (fromStdin && !inspects) {
+        if (opt.inPlace) throw Error("--in-place replaces a file, and the standard input is none");
+        if (opt.output.empty()) {
+            throw Error("the standard input has no name to name the output after: give one with -o (-o - for the "
+                        "standard output)");
+        }
+    }
+    if (isStdio(opt.output)) {
+        if (inspects) throw Error("-o - is for the file that is written; --info and --dump-header print to the standard output");
+        if (!opt.outdir.empty()) throw Error("-o - writes to the standard output, not into a directory (-d)");
+        if (opt.skipExisting) throw Error("--skip-existing is for outputs that are files");
+        if (opt.inPlace) throw Error("--in-place cannot be combined with -o or -d");
+        if (!opt.format) {
+            throw Error("-o - writes to the standard output, whose name says no format: add --to fits|asdf|tiff|png|xisf");
+        }
+        if (opt.distributed) {
+            throw Error("-t xish writes a header file and a data blocks file beside it, and the standard output is one "
+                        "stream: use -t xisf");
+        }
+    }
     if (opt.inPlace && (!opt.output.empty() || !opt.outdir.empty())) throw Error("--in-place cannot be combined with -o or -d");
     if (opt.skipExisting && opt.force) throw Error("--skip-existing leaves outputs that exist and --force writes over them: give one of the two");
     if (opt.skipExisting && opt.inPlace) throw Error("--skip-existing is for outputs under names of their own; --in-place replaces the input itself");
     if (!opt.output.empty() && opt.inputs.size() > 1) throw Error("-o/--output can only be used with a single input");
-    if (!opt.output.empty() && !opt.format && !formatFromExtension(opt.output)) {
+    if (!opt.output.empty() && !isStdio(opt.output) && !opt.format && !formatFromExtension(opt.output)) {
         throw Error("cannot infer output format from '" + opt.output + "'; add --to fits|asdf|tiff|png|xisf|xish");
     }
     if (!opt.output.empty() && !opt.format && formatFromExtension(opt.output) == XISFCONV_FORMAT_DNG) {
@@ -989,7 +1111,7 @@ bool parseArgs(int argc, char** argv, Options& opt, int& exitCode) {
     }
     // The kind of an XISF unit goes with the name of its file: .xish is a header file, any
     // other name a monolithic file.
-    if (!opt.output.empty() && opt.format && *opt.format == XISFCONV_FORMAT_XISF) {
+    if (!opt.output.empty() && !isStdio(opt.output) && opt.format && *opt.format == XISFCONV_FORMAT_XISF) {
         const bool header = lowerExt(opt.output) == ".xish";
         if (opt.distributed && !header) {
             throw Error("-t xish writes a header file, whose name ends in .xish (and its data blocks into the file of "
@@ -1423,7 +1545,7 @@ Plan planInputs(const std::vector<Name>& names, const Options& opt) {
     Plan plan;
     for (const auto& name : names) {
         std::error_code ec;
-        if (!fs::is_directory(toPath(name.path), ec)) {
+        if (isStdio(name.path) || !fs::is_directory(toPath(name.path), ec)) {
             plan.inputs.push_back({name.path, std::string()});
             continue;
         }
@@ -1466,7 +1588,7 @@ int verifyFiles(const Library& lib, const Options& opt, const std::vector<Name>&
     for (const auto& name : names) {
         const std::string& input = name.path;
         std::error_code ec;
-        if (!fs::is_directory(toPath(input), ec)) {
+        if (isStdio(input) || !fs::is_directory(toPath(input), ec)) {
             files.push_back(input);
             continue;
         }
@@ -1482,7 +1604,8 @@ int verifyFiles(const Library& lib, const Options& opt, const std::vector<Name>&
     for (const auto& f : files) {
         xisfconv_report* report = nullptr;
         std::vector<std::string> problems;
-        const xisfconv_status status = xisfconv_verify(lib.ctx, f.c_str(), &report);
+        const xisfconv_io in = inputIo(f);
+        const xisfconv_status status = xisfconv_verify_io(lib.ctx, &in, &report);
         if (g_interrupted) {
             xisfconv_report_free(report);
             std::cerr << "xisfconv: interrupted\n";
@@ -1495,7 +1618,7 @@ int verifyFiles(const Library& lib, const Options& opt, const std::vector<Name>&
         }
         if (!problems.empty()) {
             ++failed;
-            std::cout << f << ": FAILED\n";
+            std::cout << shown(f) << ": FAILED\n";
             for (std::string p : problems) {
                 // Hints meant for conversions do not apply here.
                 for (const char* hint : {" (use --no-verify to convert anyway)", " (the file is damaged; --no-verify skips this check)"}) {
@@ -1516,7 +1639,7 @@ int verifyFiles(const Library& lib, const Options& opt, const std::vector<Name>&
         const bool complete = notChecked == 0;
         ++(complete ? ok : partly);
         if (!(opt.quiet && complete)) {
-            std::cout << f << ": " << (complete ? "OK" : "NOT FULLY CHECKED") << " (" << kind << ", " << xisfconv_report_summary(report)
+            std::cout << shown(f) << ": " << (complete ? "OK" : "NOT FULLY CHECKED") << " (" << kind << ", " << xisfconv_report_summary(report)
                       << "; ";
             if (verified) std::cout << plural(verified, "checksum") << " verified";
             else std::cout << "no checksums " << (complete ? "in the file" : "verified");
@@ -1553,6 +1676,14 @@ int convertFiles(const Library& lib, Options& opt) {
     opt.inputs.clear();
     for (const auto& e : unreadable) std::cerr << "error: " << e << "\n";
     for (const auto& pattern : unmatched) std::cerr << "error: " << pattern << ": no file matches this pattern\n";
+    if (names.size() == 1 && isStdio(names[0].path)) {
+        try {
+            readStdin();
+        } catch (const Error& e) {
+            std::cerr << "error: " << e.what() << "\n";
+            return 1;
+        }
+    }
     if (opt.verifyMode) return verifyFiles(lib, opt, names, unmatched.size() + unreadable.size());
     Plan plan;
     try {
@@ -1576,11 +1707,12 @@ int convertFiles(const Library& lib, Options& opt) {
     std::map<FileId, std::u32string> writtenIds;   // the same outputs, by the file they became
     for (auto& in : plan.inputs) {
         // A file that is neither FITS, ASDF nor DNG goes to the XISF reader, which says what is wrong with it.
-        in.image = xisfconv_detect_format(lib.ctx, in.path.c_str(), &in.format) == XISFCONV_OK;
+        const xisfconv_io io = inputIo(in.path);
+        in.image = xisfconv_detect_format_io(lib.ctx, &io, &in.format) == XISFCONV_OK;
         if (!in.image) in.format = XISFCONV_FORMAT_XISF;
         if (converts && in.image) {
             inputKeys.insert(sameFileKey(in.path));
-            if (const auto id = fileId(in.path)) inputIds.insert(*id);
+            if (const auto id = isStdio(in.path) ? std::nullopt : fileId(in.path)) inputIds.insert(*id);
         }
     }
     for (const auto& in : plan.inputs) {
@@ -1595,7 +1727,9 @@ int convertFiles(const Library& lib, Options& opt) {
             if (converts && in.image) {
                 planned = outputPathFor(input, own, formatFor(in.format, own));
                 key = sameFileKey(planned);
-                const std::optional<FileId> id = fileId(planned), ownId = fileId(input);
+                const bool toStdout = isStdio(planned);
+                const std::optional<FileId> id = toStdout ? std::nullopt : fileId(planned),
+                                            ownId = isStdio(input) ? std::nullopt : fileId(input);
                 const bool nameItself = key == sameFileKey(input);           // (the library says what it thinks of that)
                 const bool itself = nameItself || (id && id == ownId);       // ... and of a second name of the input
                 // Two inputs with one output: the second is refused, whatever else is asked for.
@@ -1610,7 +1744,7 @@ int convertFiles(const Library& lib, Options& opt) {
                                 "directories of their own with -d)");
                 }
                 std::error_code ec;
-                const bool there = !nameItself && fs::exists(fs::symlink_status(toPath(planned), ec));
+                const bool there = !nameItself && !toStdout && fs::exists(fs::symlink_status(toPath(planned), ec));
                 if (opt.skipExisting && there) {
                     if (!opt.quiet) std::cout << input << ": " << planned << " exists; passed over\n";
                     ++passedOver;
@@ -1641,19 +1775,19 @@ int convertFiles(const Library& lib, Options& opt) {
             }
             ++done;
         } catch (const std::bad_alloc&) {
-            std::cerr << "error: " << input << ": out of memory\n";
+            std::cerr << "error: " << shown(input) << ": out of memory\n";
             ++failures;
             removeEmpty(made);
         } catch (const std::exception& e) {
             removeEmpty(made);
             // (a file that failed for another reason before the interrupt came says so)
-            if (g_interrupted && dynamic_cast<const Cancelled*>(&e)) return interrupted(input);
-            std::cerr << "error: " << input << ": " << e.what() << "\n";
+            if (g_interrupted && dynamic_cast<const Cancelled*>(&e)) return interrupted(shown(input));
+            std::cerr << "error: " << shown(input) << ": " << e.what() << "\n";
             ++failures;
         }
         if (g_interrupted) return interrupted(std::string());
     }
-    if ((plan.many || expanded) && !opt.quiet && !(opt.info || opt.dumpHeader || opt.treeJson)) {
+    if ((plan.many || expanded) && !opt.quiet && !(opt.info || opt.dumpHeader || opt.treeJson) && !isStdio(opt.output)) {
         std::cout << "\n" << done << (done == 1 ? " file " : " files ") << (opt.inPlace ? "done" : "converted") << ", " << passedOver
                   << " passed over, " << failures << " failed\n";
         if (inTheWay) {

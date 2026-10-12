@@ -98,16 +98,14 @@ XisfChecksumState XisfFile::verifyBlockChecksum(RandomBytes& bytes, const std::s
     return XisfChecksumState::Verified;
 }
 
-XisfFile::XisfFile(const std::string& path, const XisfBlocksRedirect* redirect, bool verifying) : path_(path) {
+XisfFile::XisfFile(const Input& input, const XisfBlocksRedirect* redirect, bool verifying) : path_(input.name) {
     // (the file is kept open: it is the one that was named, also when the working directory
     // changes before its pixels are read)
-    raw_ = RawFile::openForReading(path);
-    std::error_code directoryError;
-    if (std::filesystem::is_directory(toPath(path), directoryError)) throw Error("is a directory, not a file", ErrorKind::Io);
+    raw_ = input.open();
     fileSize_ = raw_->size();
     auto readAt = [&](uint64_t position, void* out, size_t n) {
         try {
-            if (n) raw_->read(position, out, n);
+            if (n) raw_->read(position, static_cast<size_t>(n), static_cast<uint8_t*>(out));
             return true;
         } catch (const Error&) {
             return false;
@@ -173,6 +171,7 @@ XisfFile::XisfFile(const std::string& path, const XisfBlocksRedirect* redirect, 
     // specification says both. A file that is neither is not followed to other files by its own
     // word (a file somebody was sent as "an image" would otherwise read the files beside it).
     external_ = std::make_unique<XisfExternalFiles>(path_, redirect, verifying);
+    if (input.inMemory()) external_->inMemory();
     if (!headerFile_) external_->notAHeaderToFollow("this is a monolithic XISF file, which holds all of its data");
     else if (!isXisfHeaderName(path_)) external_->notAHeaderToFollow("this header file does not have the name of one");
     unitSize_ = fileSize_;
@@ -448,7 +447,7 @@ XisfBlockView XisfFile::openStoredBlock(const xml::Node& element, const std::str
                 throw Error("data block at " + std::to_string(loc.position) + "+" + std::to_string(loc.size) +
                             " lies beyond the end of the file (truncated download?)");
             }
-            block.bytes = std::make_shared<FileBytes>(raw_, loc.position, loc.size);
+            block.bytes = sliceBytes(raw_, loc.position, loc.size);
             block.attachment = true;
             block.position = loc.position;
             break;

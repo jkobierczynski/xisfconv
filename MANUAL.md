@@ -37,6 +37,7 @@ say what to know before reading those.
 - [Previews in the file manager](#previews-in-the-file-manager)
 - [Sample conversion](#sample-conversion)
 - [Large images](#large-images)
+- [Pipes: standard input and output](#pipes-standard-input-and-output)
 - [The library (libxisfconv)](#the-library-libxisfconv)
 - [Python](#python)
 - [Limitations](#limitations)
@@ -67,6 +68,7 @@ xisfconv -t xish light_0001.xisf              # -> light_0001.xish + light_0001.
 xisfconv light_0001.xish -t xisf              # ... and packed into one file again
 xisfconv --verify ~/astro/2026                # check every XISF, FITS, ASDF and DNG file below a folder
 xisfconv --info light_0001.xisf               # geometry, codecs, FITS keywords, properties
+cat frame.xisf | xisfconv -t fits -o - - > frame.fits   # from the standard input to the standard output
 ```
 
 ## Options
@@ -944,6 +946,34 @@ What is still held whole: an image that the library or the Python package reads 
 the properties of a file (see [Limitations](#limitations)); and a DNG file's raw image, which is
 decoded once (into memory or a temporary file, as above).
 
+## Pipes: standard input and output
+
+Since 0.23 an input of `-` is the standard input, and `-o -` writes the output to the standard
+output, so that the program stands in a pipe:
+
+```
+some-program | xisfconv -t fits -o - - | next-program
+xisfconv -t png -s -b u8 --resize 800 -o - frame.xisf > preview.png
+curl -s https://example.org/m31.xisf | xisfconv --verify -
+ssh observatory cat /data/light_0001.fits | xisfconv -c -o light_0001.xisf -
+```
+
+- The standard output gets the file and nothing else: the line that names what was written is
+  left out, and warnings and notes go to the standard error as always. The file is written there
+  once it is complete and has been checked, where a file would get its name: a run that fails
+  writes nothing, and its exit status says so. Until then it is held as the parts of a large
+  conversion are (in memory up to `XISFCONV_MEMORY_LIMIT`, beyond that in a temporary file).
+- `-o -` needs `-t`: the standard output has no name to say the format. A distributed unit
+  (`-t xish`) is two files and cannot go there.
+- The standard input is read to its end before anything is done with it (every format is read
+  at random places), into memory: a run takes the size of the file in memory for it. It is the
+  only input of its run, and needs `-o` (a file, or `-`) unless it is only looked at (`-I`,
+  `--dump-header`, `--verify`): it has no name to name an output after. Messages call it
+  `<stdin>`. An XISF header that comes this way has no directory, so the data blocks it names
+  by `path(@header_dir/...)` are not found; a monolithic file is what goes through a pipe.
+- A file or a directory whose name is `-` is `./-`.
+- On Windows both are switched to binary mode, so that nothing is changed on the way.
+
 ## The library (libxisfconv)
 
 Everything the tool does is done by a library with a plain C API, declared in
@@ -1065,6 +1095,17 @@ What to know:
 - The writer also takes a compression level, byte shuffling on or off, and the name of the program
   that writes the file (`compression_level`, `shuffle` and `creator_application` of
   `xisfconv_write_options`).
+- **Files in memory and streams** (since 0.23). `xisfconv_open_io`, `xisfconv_detect_format_io`,
+  `xisfconv_verify_io`, `xisfconv_convert_io`, `xisfconv_rewrite_io` and `xisfconv_writer_new_io`
+  take an `xisfconv_io` where the others take a path: a path, bytes in memory, or a function that
+  the bytes are read from (input) or written to (output). Bytes in memory are borrowed, not
+  copied, and stay as they are while the call runs, and for `xisfconv_open_io` until the file is
+  closed. A stream is read to its end first. Output to a function is given to it when the file is
+  complete and checked, and not at all if the call fails; its format is the one the options name,
+  or the one the extension of the `name` of the `xisfconv_io` says. Bytes and streams have no
+  directory: a header in memory does not find the data blocks it names by `path(@header_dir/...)`,
+  and a distributed unit cannot be written to a stream. See "Files in memory and streams" in
+  [the manual of the library](docs/manual.html).
 
 The library is licensed under the LGPL (version 3 or later), so that programs under other licences
 can use it; the command line tool remains under the GPL.
@@ -1160,6 +1201,13 @@ Good to know:
   (since 0.22): `FileImage.bands()` and `FileImage.read_rows()`, and `xisfconv.Writer` with
   `begin_image` and `add_rows`, which hold no more than a band and the memory limit. `convert`
   and `rewrite` hold no image whole.
+- Files need not be files (since 0.23): every function that reads a file takes data in memory
+  (`memoryview(data)`, a `bytearray`, a NumPy array, an `mmap`) or a binary file object
+  (`sys.stdin.buffer`, `io.BytesIO`, a file opened with `"rb"`) where it takes a name, and
+  `convert`, `rewrite`, `write` and `Writer` write to a binary file object
+  (`xisfconv.convert(memoryview(data), sys.stdout.buffer, format="fits")`). Data in memory is
+  borrowed, and kept by an open `File` for as long as it is open; `bytes` are a file name, as
+  everywhere in `os`. What a file object raises (a full disk, a broken pipe) is raised as it is.
 - `CCDData.read` hands the image to astropy's own FITS reader as a FITS file in memory, so that
   units, mask and uncertainty behave exactly as with FITS; that takes about four times the size
   of the image in memory.

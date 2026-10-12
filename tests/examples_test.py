@@ -26,8 +26,8 @@ if len(sys.argv) < 2:
     sys.exit(__doc__)
 WHERE = os.path.abspath(sys.argv[1])
 TMP = tempfile.mkdtemp(prefix="xisfconv-examples-")
-CHAPTERS = ["inspect", "pixels", "stretch", "write", "bands", "convert", "rewrite", "units", "wcs", "progress"]
-WRITTEN = ["back.xisf", "bands.fits", "crop.xisf", "frame.fits", "packed.xisf", "preview.png", "smaller.xisf", "stretched.png",
+CHAPTERS = ["inspect", "pixels", "stretch", "write", "bands", "convert", "rewrite", "memory", "units", "wcs", "progress"]
+WRITTEN = ["back.xisf", "bands.fits", "crop.xisf", "frame.fits", "memory.fits", "packed.xisf", "preview.png", "smaller.xisf", "stretched.png",
            "there.fits", "unit.xisb", "unit.xish"]
 
 passed = 0
@@ -204,6 +204,11 @@ def test_tour(frame, width, height):
               and found["rewrite"][1] == "smaller.xisf is stored as asked: yes"
               and found["rewrite"][2] == "verdict OK: 1 image, 2 data blocks; 2 checksum(s) verified" and len(found["rewrite"]) == 3,
               "tour.%s, rewrite: %s" % (lang, found["rewrite"]))
+        fits_size = os.path.getsize(os.path.join(work, "out", "frame.fits"))
+        check(found["memory"] == ["opened %d bytes in memory: XISF, 1 image(s)" % os.path.getsize(frame),
+                                  "wrote memory.fits through a function: %d bytes" % fits_size] and
+              open(os.path.join(work, "out", "memory.fits"), "rb").read() == open(os.path.join(work, "out", "frame.fits"), "rb").read(),
+              "tour.%s, memory: the conversion of the chapter convert, in memory: %s" % (lang, found["memory"]))
         check(re.match(r"unit.xish is a distributed unit: header \d+ bytes, \d+ bytes with its data$", found["units"][0]) is not None
               and found["units"][1:] == ["  data in unit.xisb", "with XISFCONV_EXTERNAL_NONE: not allowed", "with the default: read",
                                          "packed into packed.xisf"], "tour.%s, units: %s" % (lang, found["units"]))

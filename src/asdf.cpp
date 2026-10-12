@@ -571,12 +571,11 @@ bool scalarUInt(const YamlNode* node, uint64_t& out) {
 
 class Reader {
 public:
-    Reader(const std::string& path, bool headersOnly, bool verify, std::optional<size_t> onlyImage = std::nullopt,
+    Reader(const Input& input, bool headersOnly, bool verify, std::optional<size_t> onlyImage = std::nullopt,
            bool inPieces = false)
-        : in_(toPath(path), std::ios::binary), headersOnly_(headersOnly), verify_(verify), onlyImage_(onlyImage),
+        : bytes_(input.open()), in_(bytes_), headersOnly_(headersOnly), verify_(verify), onlyImage_(onlyImage),
           inPieces_(inPieces) {
-        file_.path = path;
-        if (!in_) failToOpen(path);
+        file_.path = input.name;
         in_.seekg(0, std::ios::end);
         file_.fileSize = static_cast<uint64_t>(in_.tellg());
     }
@@ -666,12 +665,12 @@ public:
     }
 
 private:
-    std::ifstream in_;
+    std::shared_ptr<RandomBytes> bytes_;   // the file (or bytes in memory), open while the reader lives
+    InputStream in_;
     FitsFile file_;
     bool headersOnly_, verify_;
     std::optional<size_t> onlyImage_;
     bool inPieces_ = false;
-    std::shared_ptr<RawFile> raw_;   // the file again, for the arrays that are read in pieces
     uint64_t treeEnd_ = 0;
     uint64_t scanEnd_ = 0;  // where the block scan stopped
     std::vector<Block> blocks_;
@@ -898,9 +897,8 @@ private:
             throw Error(label + ": the array needs " + std::to_string(count) + " bytes at offset " +
                         std::to_string(offset) + ", but " + where + " holds " + std::to_string(available));
         }
-        if (!raw_) raw_ = RawFile::openForReading(file_.path);
         if (b.dataPos > file_.fileSize || b.used > file_.fileSize - b.dataPos) throw Error("unexpected end of file");
-        auto stored = std::make_shared<FileBytes>(raw_, b.dataPos, b.used, "read error");
+        auto stored = sliceBytes(bytes_, b.dataPos, b.used);
         auto digestOf = [](RandomBytes& bytes) {
             Hasher h("md5");
             std::vector<uint8_t> piece;
@@ -1654,22 +1652,30 @@ void writeAsdf(const std::string& path, const std::vector<FitsHdu>& hdus, const 
     if (!out) throw Error("write error on " + path, ErrorKind::Io);
 }
 
-FitsFile readAsdf(const std::string& path, bool headersOnly, bool verifyChecksums, std::optional<size_t> onlyImage, bool inPieces) {
-    Reader reader(path, headersOnly, verifyChecksums, onlyImage, inPieces);
+FitsFile readAsdf(const Input& input, bool headersOnly, bool verifyChecksums, std::optional<size_t> onlyImage, bool inPieces) {
+    Reader reader(input, headersOnly, verifyChecksums, onlyImage, inPieces);
     return reader.run();
 }
 
-VerifyReport verifyAsdf(const std::string& path) {
-    Reader reader(path, false, true);
+VerifyReport verifyAsdf(const Input& input) {
+    Reader reader(input, false, true);
     return reader.verifyAll();
 }
 
-std::string readAsdfTree(const std::string& path) {
-    Reader reader(path, true, false);
+std::string readAsdfTree(const Input& input) {
+    Reader reader(input, true, false);
     return reader.treeText();
 }
 
+bool looksLikeAsdf(RandomBytes& bytes) {
+    uint8_t buf[5] = {};
+    if (bytes.size() < 5) return false;
+    bytes.read(0, 5, buf);
+    return std::memcmp(buf, "#ASDF", 5) == 0;
+}
+
 bool looksLikeAsdf(const std::string& path) {
+    if (const std::shared_ptr<RandomBytes> bytes = virtualFileBytes(path)) return looksLikeAsdf(*bytes);
     std::ifstream in(toPath(path), std::ios::binary);
     char buf[5] = {};
     in.read(buf, 5);

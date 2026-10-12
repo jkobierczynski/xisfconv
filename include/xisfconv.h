@@ -53,7 +53,7 @@
 #include <stdint.h>
 
 #define XISFCONV_VERSION_MAJOR 0
-#define XISFCONV_VERSION_MINOR 22
+#define XISFCONV_VERSION_MINOR 23
 #define XISFCONV_VERSION_PATCH 0
 
 #if defined(XISFCONV_STATIC)
@@ -1184,6 +1184,74 @@ XISFCONV_API xisfconv_status xisfconv_writer_add_rows(xisfconv_writer *writer, c
 XISFCONV_API xisfconv_status xisfconv_writer_finish(xisfconv_writer *writer);
 /* Drops a writer without writing anything. NULL is allowed. */
 XISFCONV_API void xisfconv_writer_discard(xisfconv_writer *writer);
+
+/* ------------------------------------------------------------------------------------------
+ * Memory and streams (since 0.23)
+ *
+ * The functions that end in _io take where a file comes from, or goes to, as an xisfconv_io: a
+ * file by its path, as the other functions take it; bytes in memory; or a function that the
+ * bytes are read from or written to (a pipe, a socket, a file object of another language).
+ * Exactly one of path, data, read and write is set (data counts as set when it is not NULL,
+ * also with size 0); data and read are for input, write for output; else XISFCONV_ERR_ARGUMENT.
+ *
+ *   path         a file, as for the functions without _io.
+ *   data, size   bytes in memory, borrowed: they are read where they are, not copied. They stay
+ *                as they are while the call runs, and for xisfconv_open_io until the file is
+ *                closed.
+ *   read         input from a stream: called with a buffer and its size for the next bytes,
+ *                and returns how many it put there (at most size), 0 at the end, or less than 0
+ *                for an error (XISFCONV_ERR_IO). Every format is read at random places, so the
+ *                stream is read to its end first, and kept in memory up to
+ *                XISFCONV_MEMORY_LIMIT, beyond that in a temporary file in the system's
+ *                temporary directory.
+ *   write        output to a stream: called with the bytes of the file, in order, a piece at a
+ *                time, when the file is complete and has been checked (where a file would get
+ *                its name); returns 0, or anything else for an error (XISFCONV_ERR_IO, and no
+ *                more is written). A call that fails before then writes nothing. Until then the
+ *                file is held as a stream that is read is.
+ *   user         handed to read and write.
+ *   name         what messages call it: NULL (default) is "<memory>" for data, "<input stream>"
+ *                for read and "<output stream>" for write. For output, its extension names the format when the options
+ *                leave it at XISFCONV_FORMAT_AUTO (as that of a path does: "image.fits.fz" is
+ *                tile-compressed FITS). An input and an output of one call have different
+ *                names.
+ *
+ * An XISF header in memory has no directory: the data blocks it names by path(@header_dir/...)
+ * cannot be found (XISFCONV_ERR_NOT_ALLOWED); blocks in files by absolute paths are read as
+ * for a header file, as far as xisfconv_context_set_external_files allows. Output to a stream
+ * is one file: a distributed unit (.xish) is XISFCONV_ERR_ARGUMENT, as is a rewrite in place.
+ * The file of xisfconv_open_io is the input: its xisfconv_file_size is the number of bytes.
+ * ---------------------------------------------------------------------------------------- */
+
+typedef int64_t (*xisfconv_read_fn)(void *user, void *buffer, uint64_t size);
+typedef int32_t (*xisfconv_write_fn)(void *user, const void *data, uint64_t size);
+
+typedef struct xisfconv_io {
+    size_t struct_size;
+    const char *path;
+    const void *data;
+    uint64_t size;
+    xisfconv_read_fn read;
+    xisfconv_write_fn write;
+    void *user;
+    const char *name;
+} xisfconv_io;
+
+XISFCONV_API void xisfconv_io_init(xisfconv_io *io, size_t struct_size);
+
+XISFCONV_API xisfconv_status xisfconv_detect_format_io(xisfconv_context *ctx, const xisfconv_io *input,
+                                                       xisfconv_format *out);
+XISFCONV_API xisfconv_status xisfconv_open_io(xisfconv_context *ctx, const xisfconv_io *input, xisfconv_file **out);
+XISFCONV_API xisfconv_status xisfconv_convert_io(xisfconv_context *ctx, const xisfconv_io *input,
+                                                 const xisfconv_io *output, const xisfconv_convert_options *options);
+XISFCONV_API xisfconv_status xisfconv_rewrite_io(xisfconv_context *ctx, const xisfconv_io *input,
+                                                 const xisfconv_io *output, const xisfconv_rewrite_options *options,
+                                                 xisfconv_rewrite_result *result);
+XISFCONV_API xisfconv_status xisfconv_verify_io(xisfconv_context *ctx, const xisfconv_io *input,
+                                                xisfconv_report **out);
+/* The images are written when xisfconv_writer_finish is called, as by xisfconv_writer_new. */
+XISFCONV_API xisfconv_status xisfconv_writer_new_io(xisfconv_context *ctx, const xisfconv_io *output,
+                                                    const xisfconv_write_options *options, xisfconv_writer **out);
 
 /* ------------------------------------------------------------------------------------------
  * Diagnostics

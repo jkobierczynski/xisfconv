@@ -41,17 +41,24 @@ void writeAsdf(const std::string& path, const std::vector<FitsHdu>& hdus, const 
 // Throws xisfconv::Error on malformed files.
 // With onlyImage the pixels of that one image are read and the others are left as headers.
 // With inPieces they are not read into memory: each image gets a source of them (FitsImage::pieces).
-FitsFile readAsdf(const std::string& path, bool headersOnly = false, bool verifyChecksums = true,
+FitsFile readAsdf(const Input& input, bool headersOnly = false, bool verifyChecksums = true,
                   std::optional<size_t> onlyImage = std::nullopt, bool inPieces = false);
+inline FitsFile readAsdf(const std::string& path, bool headersOnly = false, bool verifyChecksums = true,
+                         std::optional<size_t> onlyImage = std::nullopt, bool inPieces = false) {
+    return readAsdf(Input::file(path), headersOnly, verifyChecksums, onlyImage, inPieces);
+}
 
 // Parses the tree and reads every binary block: MD5 checksums are verified, compressed blocks
 // are decompressed.
-VerifyReport verifyAsdf(const std::string& path);
+VerifyReport verifyAsdf(const Input& input);
+inline VerifyReport verifyAsdf(const std::string& path) { return verifyAsdf(Input::file(path)); }
 
 // Returns the YAML tree of an ASDF file as text (from the %YAML directive to the closing "...").
-std::string readAsdfTree(const std::string& path);
+std::string readAsdfTree(const Input& input);
+inline std::string readAsdfTree(const std::string& path) { return readAsdfTree(Input::file(path)); }
 
 // True if the file starts with the ASDF signature.
 bool looksLikeAsdf(const std::string& path);
+bool looksLikeAsdf(RandomBytes& bytes);
 
 }  // namespace xisfconv

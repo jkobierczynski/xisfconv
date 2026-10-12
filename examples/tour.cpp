@@ -447,6 +447,50 @@ void rewrite_and_verify(const xisf::Context& ctx, const std::string& path) {
 }
 // [/rewrite]
 
+// [memory]
+// A file need not be a file: bytes in memory (a download, a field of a database, a member of an
+// archive) or a stream (a pipe, a socket). The functions that end in _io take where a file comes
+// from or goes to as an xisfconv_io.
+void memory(const xisf::Context& ctx, const std::string& path) {
+    // the frame in memory, as a program that got it from elsewhere has it
+    std::ifstream in(path, std::ios::binary | std::ios::ate);
+    std::vector<char> bytes(in ? static_cast<size_t>(in.tellg()) : 0);
+    if (!in || !in.seekg(0).read(bytes.data(), static_cast<std::streamsize>(bytes.size()))) {
+        throw std::runtime_error(path + " cannot be read");
+    }
+
+    // The bytes are borrowed, not copied: they stay as they are until the file is closed.
+    auto input = xisf::defaults(xisfconv_io_init);
+    input.data = bytes.data();
+    input.size = bytes.size();
+    input.name = "frame in memory";  // what messages call it
+    xisfconv_file* raw = nullptr;
+    xisf::check(ctx, xisfconv_open_io(ctx.get(), &input, &raw));
+    const xisf::File file(raw);
+    std::printf("opened %llu bytes in memory: %s, %llu image(s)\n", ull(xisfconv_file_size(file.get())),
+                xisfconv_file_format(file.get()) == XISFCONV_FORMAT_XISF ? "XISF" : "another format",
+                ull(xisfconv_image_count(file.get())));
+
+    // Converted to FITS for a function that is given the bytes of the file once it is complete:
+    // the name says the format, as the name of a file does. Here they go into a vector.
+    std::vector<unsigned char> fits;
+    auto output = xisf::defaults(xisfconv_io_init);
+    output.write = [](void* user, const void* data, uint64_t size) -> int32_t {
+        auto* to = static_cast<std::vector<unsigned char>*>(user);
+        const auto* from = static_cast<const unsigned char*>(data);
+        to->insert(to->end(), from, from + size);
+        return 0;
+    };
+    output.user = &fits;
+    output.name = "memory.fits";
+    auto options = xisf::defaults(xisfconv_convert_options_init);
+    xisf::check(ctx, xisfconv_convert_io(ctx.get(), &input, &output, &options));
+    std::ofstream(out_path("memory.fits"), std::ios::binary).write(reinterpret_cast<const char*>(fits.data()),
+                                                                   static_cast<std::streamsize>(fits.size()));
+    std::printf("wrote memory.fits through a function: %llu bytes\n", ull(fits.size()));
+}
+// [/memory]
+
 // ---------------------------------------------------------------------------------------------
 
 // [units]
@@ -596,7 +640,7 @@ int main(int argc, char** argv) {
     static const std::pair<const char*, void (*)(const xisf::Context&, const std::string&)> chapters[] = {
         {"inspect", inspect},  {"pixels", pixels},   {"stretch", stretch},
         {"write", write_crop}, {"bands", bands}, {"convert", convert}, {"rewrite", rewrite_and_verify},
-        {"units", units},      {"wcs", wcs},         {"progress", progress_and_errors}};
+        {"memory", memory},    {"units", units},     {"wcs", wcs},      {"progress", progress_and_errors}};
     if (argc < 3) {
         std::fprintf(stderr, "usage: %s <image.xisf> <output directory> [chapter]\n", argv[0]);
         return 2;

@@ -11,6 +11,7 @@
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <map>
 #include <random>
 
 #ifdef _WIN32
@@ -314,6 +315,16 @@ void Store::write(uint64_t position, const uint8_t* data, size_t n) {
     else std::memcpy(memory_.data() + position, data, n);
 }
 
+void Store::put(uint64_t position, const uint8_t* data, size_t n) {
+    if (position > size_) {
+        static const uint8_t zeros[4096] = {};
+        while (size_ < position) append(zeros, static_cast<size_t>(std::min<uint64_t>(sizeof zeros, position - size_)));
+    }
+    const size_t within = static_cast<size_t>(std::min<uint64_t>(n, size_ - position));
+    if (within) write(position, data, within);
+    if (within < n) append(data + within, n - within);
+}
+
 // Small writes that follow each other (the lines of a tile, the runs of a row) are collected
 // and go to the file together.
 void Store::toFile(uint64_t position, const uint8_t* data, size_t n) {
@@ -390,19 +401,31 @@ void OutputFile::close() {
 }
 
 bool OutputFile::Buffer::open(const std::filesystem::path& path) {
-    file_ = RawFile::createForWriting(path);
-    if (!file_) return false;
+    try {
+        store_ = virtualFileForWriting(fromPath(path));
+    } catch (...) {
+        return false;
+    }
+    if (!store_) {
+        file_ = RawFile::createForWriting(path);
+        if (!file_) return false;
+    }
     data_.assign(size_t(1) << 16, '\0');
     at_ = 0;
     setp(data_.data(), data_.data() + data_.size());
     return true;
 }
 
+void OutputFile::Buffer::put(uint64_t position, const char* data, size_t n) {
+    if (store_) store_->put(position, reinterpret_cast<const uint8_t*>(data), n);
+    else file_->write(position, data, n);
+}
+
 bool OutputFile::Buffer::drain() {
-    if (!file_) return false;
+    if (!isOpen()) return false;
     const size_t n = static_cast<size_t>(pptr() - pbase());
     try {
-        if (n) file_->write(at_, pbase(), n);
+        if (n) put(at_, pbase(), n);
     } catch (...) {   // (also what goes wrong while the error is told: this runs in a destructor too)
         return false;
     }
@@ -412,9 +435,10 @@ bool OutputFile::Buffer::drain() {
 }
 
 bool OutputFile::Buffer::close() {
-    if (!file_) return false;
+    if (!isOpen()) return false;
     const bool written = drain();
     file_.reset();   // (closes it)
+    store_.reset();
     setp(nullptr, nullptr);
     return written;
 }
@@ -429,11 +453,11 @@ OutputFile::Buffer::int_type OutputFile::Buffer::overflow(int_type c) {
 
 std::streamsize OutputFile::Buffer::xsputn(const char* s, std::streamsize n) {
     if (n <= 0) return 0;
-    if (static_cast<size_t>(n) < data_.size() || !file_) return std::streambuf::xsputn(s, n);
+    if (static_cast<size_t>(n) < data_.size() || !isOpen()) return std::streambuf::xsputn(s, n);
     // (what does not fit the buffer goes to the file as it is)
     if (!drain()) return 0;
     try {
-        file_->write(at_, s, static_cast<size_t>(n));
+        put(at_, s, static_cast<size_t>(n));
     } catch (...) {
         return 0;
     }
@@ -449,7 +473,7 @@ OutputFile::Buffer::pos_type OutputFile::Buffer::seekoff(off_type off, std::ios_
     if (dir == std::ios_base::cur) base = static_cast<int64_t>(at_);
     else if (dir == std::ios_base::end) {
         try {
-            base = static_cast<int64_t>(file_->size());
+            base = static_cast<int64_t>(store_ ? store_->size() : file_->size());
         } catch (...) {
             return pos_type(off_type(-1));
         }
@@ -461,6 +485,125 @@ OutputFile::Buffer::pos_type OutputFile::Buffer::seekoff(off_type off, std::ios_
 }
 
 OutputFile::Buffer::pos_type OutputFile::Buffer::seekpos(pos_type pos, std::ios_base::openmode which) {
+    return seekoff(off_type(pos), std::ios_base::beg, which);
+}
+
+// ------------------------------------------------------------------------------- virtual files
+
+namespace {
+struct VirtualFile {
+    std::shared_ptr<RandomBytes> bytes;   // a file that is read
+    std::shared_ptr<Store> store;         // a file that is written
+};
+thread_local std::map<std::string, VirtualFile> t_virtualFiles;
+}  // namespace
+
+VirtualFileFrame::VirtualFileFrame() {
+    if (t_virtualFiles.empty()) return;   // (nothing to set aside)
+    outer_ = std::make_shared<std::map<std::string, VirtualFile>>(std::move(t_virtualFiles));
+    t_virtualFiles.clear();
+}
+
+VirtualFileFrame::~VirtualFileFrame() {
+    if (!outer_) return;
+    t_virtualFiles = std::move(*std::static_pointer_cast<std::map<std::string, VirtualFile>>(outer_));
+}
+
+VirtualFileScope::VirtualFileScope(std::string name, std::shared_ptr<RandomBytes> bytes) : name_(std::move(name)) {
+    if (!t_virtualFiles.emplace(name_, VirtualFile{std::move(bytes), nullptr}).second) {
+        throw Error("two inputs or outputs of one call have the same name, " + name_, ErrorKind::Argument);
+    }
+}
+
+VirtualFileScope::VirtualFileScope(std::string name, std::shared_ptr<Store> store) : name_(std::move(name)) {
+    if (!t_virtualFiles.emplace(name_, VirtualFile{nullptr, std::move(store)}).second) {
+        throw Error("two inputs or outputs of one call have the same name, " + name_, ErrorKind::Argument);
+    }
+}
+
+VirtualFileScope::~VirtualFileScope() { t_virtualFiles.erase(name_); }
+
+bool isVirtualFile(const std::string& name) { return t_virtualFiles.count(name) != 0; }
+
+std::shared_ptr<RandomBytes> virtualFileBytes(const std::string& name) {
+    const auto found = t_virtualFiles.find(name);
+    if (found == t_virtualFiles.end()) return nullptr;
+    return found->second.bytes ? found->second.bytes : found->second.store;
+}
+
+std::shared_ptr<Store> virtualFileForWriting(const std::string& name) {
+    const auto found = t_virtualFiles.find(name);
+    if (found == t_virtualFiles.end()) return nullptr;
+    if (!found->second.store) throw Error(name + " is an input; it cannot be written", ErrorKind::Argument);
+    found->second.store = std::make_shared<Store>();
+    return found->second.store;
+}
+
+// --------------------------------------------------------------------------------------- Input
+
+Input Input::file(const std::string& path) {
+    if (std::shared_ptr<RandomBytes> bytes = virtualFileBytes(path)) return memory(path, std::move(bytes));
+    Input in;
+    in.name = path;
+    in.path = path;
+    return in;
+}
+
+Input Input::memory(std::string name, std::shared_ptr<RandomBytes> bytes) {
+    Input in;
+    in.name = std::move(name);
+    in.bytes = std::move(bytes);
+    return in;
+}
+
+std::shared_ptr<RandomBytes> Input::open() const {
+    if (inMemory()) return bytes;
+    std::error_code ec;
+    if (std::filesystem::is_directory(toPath(path), ec)) throw Error("is a directory, not a file", ErrorKind::Io);
+    std::shared_ptr<RawFile> file = RawFile::openForReading(path);
+    const uint64_t size = file->size();
+    return std::make_shared<FileBytes>(std::move(file), 0, size, "read error in " + path);
+}
+
+InputStream::InputStream(std::shared_ptr<RandomBytes> bytes) : std::istream(nullptr), buffer_(std::move(bytes)) {
+    rdbuf(&buffer_);
+}
+
+InputStream::Buffer::int_type InputStream::Buffer::underflow() {
+    if (gptr() < egptr()) return traits_type::to_int_type(*gptr());
+    const uint64_t next = at_ + static_cast<uint64_t>(egptr() - eback());
+    const uint64_t size = bytes_->size();
+    if (next >= size) return traits_type::eof();
+    const size_t n = static_cast<size_t>(std::min<uint64_t>(data_.size(), size - next));
+    bytes_->read(next, n, reinterpret_cast<uint8_t*>(data_.data()));   // (an error is an exception: the stream sets badbit)
+    at_ = next;
+    setg(data_.data(), data_.data(), data_.data() + n);
+    return traits_type::to_int_type(*gptr());
+}
+
+std::streamsize InputStream::Buffer::showmanyc() {
+    const uint64_t here = at_ + static_cast<uint64_t>(gptr() - eback());
+    const uint64_t size = bytes_->size();
+    return here < size ? static_cast<std::streamsize>(std::min<uint64_t>(size - here, 1u << 30)) : -1;
+}
+
+InputStream::Buffer::pos_type InputStream::Buffer::seekoff(off_type off, std::ios_base::seekdir dir, std::ios_base::openmode which) {
+    if (!(which & std::ios_base::in)) return pos_type(off_type(-1));
+    const int64_t here = static_cast<int64_t>(at_ + static_cast<uint64_t>(gptr() - eback()));
+    const int64_t base = dir == std::ios_base::beg ? 0 : dir == std::ios_base::cur ? here : static_cast<int64_t>(bytes_->size());
+    const int64_t to = base + static_cast<int64_t>(off);
+    if (to < 0) return pos_type(off_type(-1));
+    // (within the buffer the bytes are there already; elsewhere the next read fetches them)
+    if (static_cast<uint64_t>(to) >= at_ && static_cast<uint64_t>(to) <= at_ + static_cast<uint64_t>(egptr() - eback())) {
+        setg(eback(), eback() + (static_cast<uint64_t>(to) - at_), egptr());
+    } else {
+        at_ = static_cast<uint64_t>(to);
+        setg(data_.data(), data_.data(), data_.data());
+    }
+    return pos_type(off_type(to));
+}
+
+InputStream::Buffer::pos_type InputStream::Buffer::seekpos(pos_type pos, std::ios_base::openmode which) {
     return seekoff(off_type(pos), std::ios_base::beg, which);
 }
 

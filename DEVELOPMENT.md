@@ -32,6 +32,7 @@ The decisions:
 - [Structure of the code](#structure-of-the-code)
 - [Images in pieces (0.20.0)](#images-in-pieces-0200)
 - [Images in bands (0.22.0)](#images-in-bands-0220)
+- [Files in memory and streams (0.23.0)](#files-in-memory-and-streams-0230)
 - [The library (libxisfconv)](#the-library-libxisfconv)
 - [The Python package](#the-python-package)
 - [The manual (`docs/manual.html`)](#the-manual-docsmanualhtml)
@@ -407,6 +408,7 @@ brought are in the sections below.
 | | 0.20.0 | Images read and written a piece at a time; BigTIFF; Ctrl-C within one image |
 | 12 October | 0.21.0 | Fixes: the digest of the WCS as written, cut-off FITS remains told, refusals through symbolic links, files written safely across fork() |
 | | 0.22.0 | Images in bands of rows for programs: `xisfconv_read_rows`, a writer given an image in bands; `FileImage.bands()`, `xisfconv.Writer` |
+| | 0.23.0 | Files in memory and streams: the `_io` functions of the C API, data and file objects in Python, `-` for the standard input and output of the tool |
 
 ## Purpose and scope
 
@@ -1256,6 +1258,57 @@ handed over and got back whole arrays. 0.22 gives it the pieces too, on what 0.2
   package loaded; reading it whole takes 288 MiB (`python/tests/test_bands.py` holds it below
   100 MiB).
 
+## Files in memory and streams (0.23.0)
+
+0.20 made every reader take its bytes through one interface (`RandomBytes`) and every writer write
+to a stream; 0.23 lets a caller hand over the bytes and take the stream.
+
+- **One description, `xisfconv_io`**, of where a file comes from or goes to: a path, bytes in
+  memory, or a function the bytes are read from or written to, with a `user` pointer and a
+  `name`. Six functions take it (`xisfconv_open_io`, `_detect_format_io`, `_verify_io`,
+  `_convert_io`, `_rewrite_io`, `_writer_new_io`); the functions that take paths stay as they are.
+  One struct instead of a function per kind keeps the number of entry points down and lets a
+  binding pass whatever it has through one path (the Python package now calls the `_io` functions
+  for file names too).
+- **Memory is borrowed**, as the user chose: no copy, the caller keeps the bytes until the call
+  returns (or the file is closed). A copy would double the memory of a large file for no gain to a
+  caller who has the bytes anyway; Python keeps a reference with the open file, and a `bytearray`
+  cannot be resized while it is lent out.
+- **A stream is read to its end first.** Every format is read at random places (an XISF header
+  points anywhere, FITS headers are skipped over, an ASDF index is at the end), so a stream is
+  collected into a `Store` (memory up to the limit, then an unlinked temporary file) before it is
+  read. Reading without rewinding would mean a reader per format that never seeks, and buys
+  nothing for files that have to be complete before they can be checked anyway.
+- **Output to a stream is a file that is renamed.** The pipeline writes as it writes a file: its
+  output is a `Store` under a name for the call, and only when the conversion has succeeded (where
+  a file is renamed into place) are its bytes given to the function. So a call that fails gives
+  nothing, and the output can still be read back (`rewrite` compares every block) and the FITS
+  index written at the end, as for a file. The cost is holding the output until then.
+- **How: virtual files.** Rather than thread an output and input object through every function of
+  the pipeline, a call registers its memory input and its stream output under their names in a
+  table of the thread (`VirtualFileScope`), for as long as it runs. `Input::file(name)` returns
+  the bytes for such a name, `OutputFile` writes into its store, and the steps around a file on
+  disk (the `.part` name, the rename, the checks of what is there, the sync, the directory for
+  temporary files) are skipped for it. The readers take an `Input` (a path, or bytes) and read
+  through `InputStream`, an `istream` over `RandomBytes`. Names of one call must differ: an
+  input and an output of one name would be the same file to the pipeline, and are refused.
+- **What has no place in memory**: a header in memory has no directory, so a block named by
+  `path(@header_dir/...)` is refused with `NotAllowed` (the check comes before the others, so that
+  the message says why), and a distributed unit, two files, cannot go to one stream. Absolute paths
+  are followed as for any header, as far as the context allows.
+- **The tool: `-` and `-o -`.** The standard input is read into memory once and handed over as
+  bytes (the tool asks several questions of its input: its format, then the conversion), and
+  the standard output is a write function; nothing else goes to the standard output then (the
+  line naming the output is left out), and `-o -` needs `-t`. Both are binary on Windows.
+- **Python: data and file objects where a name is taken.** `bytes` stay a file name (they are one
+  in `os`, and a program may have one), so data goes as `memoryview(data)` or any other object with
+  the buffer protocol; a file object is told by `read`/`readinto` and `write`. An exception that a
+  file object raises inside the library's call is kept and raised when the call returns, in place
+  of the I/O error the library reports for it, so `OSError(ENOSPC)` comes out as itself.
+- **The tour has a chapter for it** (`memory`): it opens the frame from memory and converts it to
+  FITS through a write function; the tests hold that file against the `frame.fits` of the chapter
+  "convert", byte for byte.
+
 ## The library (libxisfconv)
 
 Planned in a separate brief with a draft header (not part of the repository), decided as follows
@@ -1795,7 +1848,7 @@ library with one line changed.
   Python. What they print is held against what they must print for those files (most lines word
   for word, numbers that depend on the arithmetic of the machine by their form and range), and
   what they write is read back.
-- `tests/run_tests.py` drives the built program (about 6870 checks at 0.22.0 when run as root with rawpy and imagecodecs installed, 13 more with OpenXISF beside it). The Python packages it
+- `tests/run_tests.py` drives the built program (about 6940 checks at 0.23.0 when run as root with rawpy and imagecodecs installed, 13 more with OpenXISF beside it). The Python packages it
   needs are listed at its top; the `asdf` packages and the external tools (`tiffcp`, `fitsverify`,
   `pngcheck`, `fpack`/`funpack`) are used when installed and their checks skipped when not.
 - Every format is checked against an implementation that shares no code with xisfconv: astropy

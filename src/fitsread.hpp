@@ -71,17 +71,23 @@ struct FitsFile {
 // a file carries are read in both cases but the last.
 // Throws xisfconv::Error on malformed files.
 // With inPieces the pixels are not read into memory: each image gets a source of them (FitsImage::pieces).
-FitsFile readFits(const std::string& path, bool headersOnly = false, std::optional<size_t> onlyImage = std::nullopt,
+FitsFile readFits(const Input& input, bool headersOnly = false, std::optional<size_t> onlyImage = std::nullopt,
                   bool inPieces = false);
+inline FitsFile readFits(const std::string& path, bool headersOnly = false, std::optional<size_t> onlyImage = std::nullopt,
+                         bool inPieces = false) {
+    return readFits(Input::file(path), headersOnly, onlyImage, inPieces);
+}
 
 // Sets dataMin, dataMax and hasNaN from floating point pixels (no-op for integer data).
 void updateFloatRange(FitsImage& img);
 
 // Checks the structure of every HDU and its CHECKSUM / DATASUM keywords where present.
-VerifyReport verifyFits(const std::string& path);
+VerifyReport verifyFits(const Input& input);
+inline VerifyReport verifyFits(const std::string& path) { return verifyFits(Input::file(path)); }
 
 // True if the file starts with a FITS primary header.
 bool looksLikeFits(const std::string& path);
+bool looksLikeFits(RandomBytes& bytes);
 
 // Returns the content of a FITS string value ('...' with doubled quotes), trimmed.
 // Non-string values are returned trimmed and unchanged.

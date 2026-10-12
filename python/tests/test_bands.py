@@ -27,8 +27,9 @@ def files(tmp_path):
     data = float_image()
     gray = sample("uint16", (29, 37), seed=4)
     made = []
+    zstd = "zstd" if xisfconv.codec_available("zstd", True) else "zlib"     # (a build without libzstd)
     for name, options in (("plain.xisf", {}), ("zlib.xisf", {"codec": "zlib", "checksum": "sha1"}),
-                          ("zstd-big.xisf", {"codec": "zstd"}), ("plain.fits", {}),
+                          ("zstd-big.xisf", {"codec": zstd}), ("plain.fits", {}),
                           ("tiles.fits.fz", {"codec": True}), ("zlib.asdf", {"codec": "zlib"})):
         path = tmp_path / name
         xisfconv.write(path, [data, gray], **options)

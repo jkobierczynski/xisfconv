@@ -163,6 +163,39 @@ is written, when the `with` block ends (or by `close()`), in memory up to 256 Mi
 in a temporary file beside the output (`XISFCONV_MEMORY_LIMIT` sets the amount). A block that
 ends in an exception writes nothing, and neither does an image whose last row has not come.
 
+## Files in memory and streams
+
+A file need not be on a disk (since 0.23). Every function that reads a file takes, where it takes
+its name, data in memory (`memoryview(data)`, a `bytearray`, a NumPy array, an `mmap`) or a binary
+file object (`sys.stdin.buffer`, an `io.BytesIO`, a file opened with `"rb"`); `convert`,
+`rewrite`, `write` and `Writer` also write to a binary file object:
+
+```python
+data = download("https://example.org/m31.xisf")              # bytes, from wherever they came
+with xisfconv.open(memoryview(data)) as f:                    # borrowed: read where they are
+    pixels = f[0].read()
+
+out = io.BytesIO()
+xisfconv.convert(memoryview(data), out, format="fits")        # out.getvalue(): the FITS file
+xisfconv.write(sys.stdout.buffer, pixels, format="png")       # a PNG on the standard output
+xisfconv.convert(sys.stdin.buffer, "m31.xisf")                # what comes through a pipe
+```
+
+- `bytes` are a file name, as everywhere in `os`; the contents of a file go as
+  `memoryview(data)`. Data in memory is not copied: the library reads it where it is, and an open
+  `File` keeps it (a `bytearray` cannot be resized meanwhile).
+- A file object that is read is read to its end first, since every format is read at random
+  places; what it gave is kept in memory up to `XISFCONV_MEMORY_LIMIT`, beyond that in a
+  temporary file.
+- A file object that is written to gets the file when it is complete and has been checked,
+  and nothing if the call fails. Its format is `format=`, or what the extension of the file
+  object's name says (`open("m31.fits", "wb")`). A distributed unit (`.xish`) is two files and
+  cannot go to one.
+- What the file object raises, a full disk or a broken pipe, is raised by the call as it is.
+- Messages and `File.path` call the input `<memory>`, `<input stream>` or the name of the file
+  object. A header of a distributed unit in memory has no directory: the data blocks it names by
+  `path(@header_dir/...)` are not found (`NotAllowedError`).
+
 ## Whole files
 
 What the command line tool does, with the same options:

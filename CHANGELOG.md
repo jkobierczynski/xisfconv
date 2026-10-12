@@ -9,6 +9,29 @@ in [`DEVELOPMENT.md`](DEVELOPMENT.md).
 Under "changed" stands what makes the same command, or the same call, do something else than
 before.
 
+## 0.23.0 (12 October 2026)
+
+**Files in memory and streams.**
+
+Added
+- C API: `xisfconv_open_io`, `xisfconv_detect_format_io`, `xisfconv_verify_io`,
+  `xisfconv_convert_io`, `xisfconv_rewrite_io` and `xisfconv_writer_new_io` take an
+  `xisfconv_io` where the others take a path: a path, bytes in memory (borrowed, not copied), or
+  a function the bytes are read from or written to. A stream that is read is read to its end
+  first; output to a function is given to it when the file is complete and checked, and not at
+  all if the call fails. The format of such output is the one the options name, or the one the
+  extension of its name says.
+- Python: every function that reads a file takes data in memory (`memoryview`, `bytearray`, a
+  NumPy array, `mmap`) or a binary file object where it takes a name, and `convert`, `rewrite`,
+  `write` and `Writer` write to a binary file object. What the file object raises is raised.
+- The tool: `-` as the input reads the standard input, `-o -` writes to the standard output (with
+  `-t`), so that it stands in a pipe: `cat a.xisf | xisfconv -t fits -o - - > a.fits`.
+- The tour of the manual has a chapter "Files in memory and streams" in C, C++ and Python.
+
+Changed
+- The Python package calls the `_io` functions of the library, also for file names; it needs
+  libxisfconv 0.23.
+
 ## 0.22.0 (12 October 2026)
 
 **Images in bands of rows, for programs that use the library.**

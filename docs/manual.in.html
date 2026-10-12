@@ -557,6 +557,25 @@ its output back and compares every block with the input.</p>
 PixInsight saves with them. <code>xisfconv_rewrite_in_place</code> and <code>xisfconv.rewrite_in_place</code> do the
 same to a file under its own name, and leave the file alone when it is already stored as asked.</p>
 
+<h3 id="memory">Files in memory and streams</h3>
+<p>A file does not have to be on a disk. A program may have it in memory, downloaded or taken out of an archive or a database,
+or get it from a pipe, and may want to send what it writes onward the same way. This chapter reads the frame into memory,
+opens it there, and converts it to FITS for a function that is given the bytes of the new file.</p>
+<!--@tabs memory-->
+<p>In C and C++ the functions whose names end in <code>_io</code> take an <code>xisfconv_io</code> where the others take a path:
+a path still, bytes in memory, or a function that the bytes are read from or written to, with a pointer of the program's own
+that the function is given. Bytes in memory are borrowed: the library reads them where they are, so they stay as they are
+while the call runs, and, for a file that is opened, until it is closed. A stream is read to its end before anything else
+happens, because every format is read at random places; what it gave is kept in memory up to
+<code>XISFCONV_MEMORY_LIMIT</code>, beyond that in a temporary file. In Python the functions that take the name of a file
+take data in memory (a <code>memoryview</code>, a <code>bytearray</code>, a NumPy array) or a binary file object as well;
+<code>bytes</code> stay a file name, as everywhere in Python's <code>os</code>.</p>
+<p>Output to a function or a file object is held as a file would be, and handed over when it is complete and has been checked,
+where a file would get its name: a call that fails hands over nothing. Its format is the one the options name, or the one
+the extension of the name given to it says, so <code>memory.fits</code> here is FITS. A distributed unit is two files and
+cannot go to one stream, and a header in memory has no directory where the data blocks it names by
+<code>path(@header_dir/...)</code> could be found.</p>
+
 <h3 id="units">Distributed units</h3>
 <p>XISF allows an image to live in more than one file: a header file, <code>.xish</code>, which is the XML header and nothing
 else, and the files that header names, where the data is. The library writes the data into one data blocks file,

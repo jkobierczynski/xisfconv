@@ -16,6 +16,8 @@
 
 namespace xisfconv {
 
+class RandomBytes;
+
 // The location attribute of an element with a data block (XISF 1.0, section 10.3):
 //   inline:encoding                        the block is the text of the element
 //   embedded                               ... of its Data child element
@@ -119,6 +121,7 @@ constexpr size_t kXmlBeginning = 65536;
 // True if the file is an XML document whose root element is xisf, as far as its beginning
 // tells: the header file of a distributed unit.
 bool looksLikeXisfHeaderFile(const std::string& path);
+bool looksLikeXisfHeaderFile(RandomBytes& bytes);
 
 // True for the name of an XISF header file: it ends in .xish, in any case of the letters. (The
 // specification ties the kind of a file to its suffix: .xisf monolithic, .xish a header, .xisb
@@ -166,6 +169,8 @@ public:
     // (.xish). `why` says which, for the message. Such a file is followed only where a header
     // may lead anywhere.
     void notAHeaderToFollow(const std::string& why) { notFollowed_ = why; }
+    // The header is in memory: it has no directory, and @header_dir/ leads nowhere.
+    void inMemory() { inMemory_ = true; }
 
     struct Block {
         std::vector<uint8_t> bytes;
@@ -214,6 +219,7 @@ private:
     ExternalFiles policy_;
     XisfBlocksRedirect redirect_;
     bool problemsAreKept_ = false;
+    bool inMemory_ = false;
     std::string notFollowed_;
     std::vector<std::string> indexProblems_;
     // by resolved path; an index that could not be read is not read again for the next block

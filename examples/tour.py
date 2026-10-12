@@ -10,6 +10,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 Copyright (C) 2026 Jurgen Kobierczynski
 """
 import datetime
+import io
 import logging
 import os
 import sys
@@ -222,6 +223,27 @@ def rewrite_and_verify(path):
     return 0
 # [/rewrite]
 
+# [memory]
+def memory(path):
+    # A file need not be a file: bytes in memory (a download, a field of a database, a member of an
+    # archive) or a stream (a pipe, a socket). Wherever a function takes the name of a file it takes
+    # data in memory (bytes-like: memoryview, bytearray, a NumPy array) or a binary file object.
+    with open(path, "rb") as f:
+        data = f.read()                       # the frame, as a program that got it from elsewhere has it
+    # Bytes are a file name, as everywhere in Python: the data goes as memoryview(data). It is
+    # borrowed, not copied, and kept for as long as the file is open.
+    with xisfconv.open(memoryview(data)) as f:
+        print("opened %d bytes in memory: %s, %d image(s)" % (f.size, f.format.upper(), len(f)))
+
+    # Converted to FITS into a file object, which is given the bytes once the file is complete.
+    out = io.BytesIO()
+    xisfconv.convert(memoryview(data), out, format="fits")
+    with open(out_path("memory.fits"), "wb") as f:
+        f.write(out.getbuffer())
+    print("wrote memory.fits through a file object: %d bytes" % len(out.getvalue()))
+    return 0
+# [/memory]
+
 
 # [units]
 def units(path):
@@ -374,7 +396,8 @@ def like_the_xisf_package(path):
 
 # [main]
 CHAPTERS = [("inspect", inspect), ("pixels", pixels), ("stretch", stretch), ("write", write_crop),
-            ("bands", bands), ("convert", convert), ("rewrite", rewrite_and_verify), ("units", units), ("wcs", wcs),
+            ("bands", bands), ("convert", convert), ("rewrite", rewrite_and_verify), ("memory", memory),
+            ("units", units), ("wcs", wcs),
             ("progress", progress_and_errors), ("astropy", with_astropy), ("compat", like_the_xisf_package)]
 
 

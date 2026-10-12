@@ -363,7 +363,8 @@ XisfRewriteResult rewriteXisf(const std::string& input, const std::string& outpu
 
     {
         std::error_code ec;
-        if (std::filesystem::exists(toPath(output), ec) && std::filesystem::equivalent(toPath(input), toPath(output), ec)) {
+        if (!isVirtualFile(input) && !isVirtualFile(output) && std::filesystem::exists(toPath(output), ec) &&
+            std::filesystem::equivalent(toPath(input), toPath(output), ec)) {
             throw Error("internal error: the output of a rewrite is its input");
         }
     }
@@ -627,7 +628,8 @@ XisfRewriteResult rewriteXisf(const std::string& input, const std::string& outpu
                      !removed.empty() || in.headerFile() != distributed;
     std::error_code ec;
     result.inputSize = in.unitSize();
-    result.outputSize = static_cast<uint64_t>(std::filesystem::file_size(toPath(output), ec));
+    if (const std::shared_ptr<RandomBytes> virtualOutput = virtualFileBytes(output)) result.outputSize = virtualOutput->size();
+    else result.outputSize = static_cast<uint64_t>(std::filesystem::file_size(toPath(output), ec));
     if (distributed) result.outputSize += static_cast<uint64_t>(std::filesystem::file_size(toPath(opt.blocksPath), ec));
     return result;
 }

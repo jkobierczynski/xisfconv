@@ -262,7 +262,7 @@ std::string stretchDescription(const std::string& how, const std::vector<Stretch
 using InputFiles = std::vector<std::string>;
 
 bool isOneOf(const std::string& path, const InputFiles* files) {
-    if (!files) return false;
+    if (!files || isVirtualFile(path)) return false;
     std::error_code ec;
     if (!fs::exists(toPath(path), ec)) return false;
     for (const std::string& file : *files)
@@ -281,6 +281,7 @@ InputFiles inputFilesOf(const XisfFile& file) {
 }
 
 std::string partPathFor(const std::string& outPath, const std::string& input, bool force, const InputFiles* others = nullptr) {
+    if (isVirtualFile(outPath)) return outPath;   // (in memory: it is complete or not handed over at all)
     const std::string tmpPath = outPath + ".part";
     std::error_code ec;
     // Only a plain file of that name is ever written over: through a link the data would land
@@ -309,6 +310,7 @@ std::string partPathFor(const std::string& outPath, const std::string& input, bo
 
 // Asks the system to put a file's data (or a directory's entries) on the disk.
 void syncToDisk(const std::string& path, bool directory) {
+    if (isVirtualFile(path)) return;
 #ifdef _WIN32
     if (directory) return;
     const int fd = _wopen(toPath(path).c_str(), _O_RDWR | _O_BINARY);
@@ -362,6 +364,7 @@ void removeSetAside(const std::string& aside) {
 // std::filesystem::filesystem_error, an I/O error; `keptAs`, if given, is then the name the file
 // that was there is under, should it not have been put back.
 void replaceFile(const std::string& tmpPath, const std::string& outPath, std::string* keptAs = nullptr) {
+    if (isVirtualFile(outPath)) return;
     std::error_code ec;
     fs::rename(toPath(tmpPath), toPath(outPath), ec);
     if (!ec) return;
@@ -388,6 +391,7 @@ void replaceFile(const std::string& tmpPath, const std::string& outPath, std::st
 }
 
 void removeFile(const std::string& path) {
+    if (isVirtualFile(path)) return;
     std::error_code ec;
     fs::remove(toPath(path), ec);
 }
@@ -441,6 +445,7 @@ void replaceUnit(const std::string& tmpPath, const std::string& outPath, const s
 // An output replaces a file of its name. A directory or a device of that name is left alone,
 // whatever the caller allows: renaming a file over /dev/null would take the device away.
 void notInPlaceOfSomethingElse(const std::string& outPath) {
+    if (isVirtualFile(outPath)) return;
     std::error_code ec;
     const fs::file_status status = fs::status(toPath(outPath), ec);
     if (!ec && fs::exists(status) && !fs::is_regular_file(status)) {
@@ -451,18 +456,27 @@ void notInPlaceOfSomethingElse(const std::string& outPath) {
 
 // Refuses an output that exists (unless it may be overwritten) or that is the input itself.
 void checkOutput(const std::string& outPath, const std::string& input, bool force, const InputFiles* others = nullptr) {
+    if (isVirtualFile(outPath)) return;
     notInPlaceOfSomethingElse(outPath);
     if (isOneOf(outPath, others)) {
         throw Error("the output, " + outPath + ", is a file the input reads its data from; name another one", ErrorKind::Argument);
     }
     if (fs::exists(toPath(outPath)) && !force) throw Error(outPath + " already exists (use --force to overwrite)", ErrorKind::Exists);
-    if (!input.empty() && fs::exists(toPath(outPath)) && fs::equivalent(toPath(outPath), toPath(input))) {
+    if (!input.empty() && !isVirtualFile(input) && fs::exists(toPath(outPath)) && fs::equivalent(toPath(outPath), toPath(input))) {
         throw Error("output would overwrite the input file", ErrorKind::Argument);
     }
 }
 
 // The data blocks file that is written beside an XISF header file: where it goes, the temporary
 // file it is written to first, and the name the header has for it. Nothing for any other output.
+// A distributed unit is two files: written to memory or a stream, there would be one of them.
+void notTwoFilesInMemory(const std::string& outPath) {
+    if (isVirtualFile(outPath)) {
+        throw Error(outPath + ": a header file (.xish) has its data in a file beside it, and output to memory or a stream "
+                    "is one file; write a monolithic unit (.xisf)", ErrorKind::Argument);
+    }
+}
+
 struct BlocksOutput {
     std::string path, tmpPath, name;
     bool wanted() const { return !path.empty(); }
@@ -471,6 +485,7 @@ struct BlocksOutput {
 BlocksOutput blocksOutputFor(const std::string& outPath, const std::string& input, bool force, const InputFiles* others = nullptr) {
     BlocksOutput blocks;
     if (outPath.empty() || !isXisfHeaderName(outPath)) return blocks;
+    notTwoFilesInMemory(outPath);
     blocks.path = xisfBlocksPathFor(outPath);
     blocks.name = fromPath(toPath(blocks.path).filename());
     checkOutput(blocks.path, input, force, others);
@@ -527,8 +542,10 @@ std::string asdfCodec(const ConvertOptions& opt) {
     return opt.codec.empty() ? "zlib" : opt.codec;
 }
 
-// The directory a file is written to: where the temporary files of its conversion go.
+// The directory a file is written to: where the temporary files of its conversion go (those of
+// the system for a file in memory).
 std::string directoryOf(const std::string& path) {
+    if (isVirtualFile(path)) return {};
     const fs::path parent = toPath(path).parent_path();
     return parent.empty() ? std::string(".") : fromPath(parent);
 }
@@ -542,6 +559,12 @@ Source sourceOf(const FitsImage& img) {
 
 }  // namespace
 
+std::string defaultImageName(const std::string& path) {
+    // (a file in memory or a stream under the name it has when it was given none, "<memory>", has none)
+    if (!path.empty() && path.front() == '<' && isVirtualFile(path)) return {};
+    return fromPath(toPath(path).stem());
+}
+
 InputFormat detectInputFormat(const std::string& path) {
     if (looksLikeFits(path)) return InputFormat::Fits;
     if (looksLikeAsdf(path)) return InputFormat::Asdf;
@@ -552,18 +575,21 @@ InputFormat detectInputFormat(const std::string& path) {
 XisfFileRewrite rewriteXisfFile(const std::string& input, const std::string& output, bool inPlace, bool force,
                                 XisfRewriteOptions ropt) {
     XisfFileRewrite done;
+    const bool inMemory = isVirtualFile(input) || isVirtualFile(output);
+    if (inMemory && inPlace) throw Error("a file in memory or from a stream is not rewritten in place", ErrorKind::Argument);
+    if (isXisfHeaderName(output)) notTwoFilesInMemory(output);
     // In place, the file itself is replaced, not a link that leads to it.
     std::error_code pathError;
     const fs::path real = fs::canonical(toPath(input), pathError);
     const std::string outPath = !inPlace ? output : pathError ? input : fromPath(real);
     done.output = outPath;
-    const bool same = fs::exists(toPath(outPath)) && fs::equivalent(toPath(outPath), toPath(input));
+    const bool same = !inMemory && fs::exists(toPath(outPath)) && fs::equivalent(toPath(outPath), toPath(input));
     if (same && !inPlace) {
         throw Error("the output would overwrite the input file; add --in-place to replace it, or name another file "
                     "or directory with -o or -d", ErrorKind::Argument);
     }
     if (!same) notInPlaceOfSomethingElse(outPath);
-    const fs::perms permissions = fs::status(toPath(input)).permissions();
+    const fs::perms permissions = same ? fs::status(toPath(input)).permissions() : fs::perms::unknown;
     const auto readOnly = [](fs::perms p) {
         return (p & (fs::perms::owner_write | fs::perms::group_write | fs::perms::others_write)) == fs::perms::none;
     };
@@ -600,7 +626,7 @@ XisfFileRewrite rewriteXisfFile(const std::string& input, const std::string& out
     if (!same && readByInput(outPath)) {
         throw Error("the output, " + outPath + ", is a file the input reads its data from; name another one", ErrorKind::Argument);
     }
-    if (!same && fs::exists(toPath(outPath)) && !force) {
+    if (!same && !isVirtualFile(outPath) && fs::exists(toPath(outPath)) && !force) {
         throw Error(outPath + " already exists (use --force to overwrite)", ErrorKind::Exists);
     }
     std::string blocksPath, blocksTmp, blocksName;
@@ -1121,7 +1147,7 @@ void convertFitsOrAsdfFile(const std::string& input, InputFormat kind, const std
     ImageSetOrigin origin;
     origin.format = inputName;
     origin.input = input;
-    origin.defaultName = fromPath(toPath(input).stem());
+    origin.defaultName = defaultImageName(input);
     if (dngInput) {
         // The rows of a DNG file are top-down. As from XISF: FITS and ASDF output has them
         // bottom-up, the FITS convention, unless --top-down keeps them as they are.

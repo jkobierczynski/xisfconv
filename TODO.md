@@ -113,9 +113,9 @@ Next, in this order (what 0.20 made cheap comes first):
    whose images do not fit their memory: `xisfconv_read_rows` and `FileImage.bands()`; a writer
    that takes an image a band at a time (`xisfconv_writer_begin_image`,
    `xisfconv_writer_add_rows`; `xisfconv.Writer`). (0.22.0)
-2. [ ] Reading from and writing to memory instead of files, and input that cannot be rewound
-   (a pipe). The readers take their bytes through one interface already and the writers write
-   to a stream: what is left is the API.
+2. [x] **Reading from and writing to memory and streams**: the `_io` functions of the C API
+   (`xisfconv_io`: a path, bytes in memory, a read or write function), data and file objects in
+   Python, `-` for the standard input and output of the tool. (0.23.0)
 3. [ ] Reading one image of a FITS or ASDF file without going through the headers before it again
    (a file with a thousand HDUs is read image by image in half a minute): the place of each
    image, kept with the open file.

@@ -66,6 +66,10 @@ struct ImageSetOrigin {
     bool notes = true;        // report how each image was mapped (sample type, row order, bounds)
 };
 
+// The name of a file without its extension, for an image that has none ("" for a file in memory
+// or a stream that has no name either).
+std::string defaultImageName(const std::string& path);
+
 // Writes images that are in memory in the form the FITS and ASDF readers deliver, to any output
 // format. This is the second half of convertFitsOrAsdfFile; the images are consumed.
 void writeImageSet(FitsFile& images, const ImageSetOrigin& origin, const std::string& output, Format format,

@@ -23,13 +23,18 @@ namespace xisfconv {
 // compression, floating point data).
 // With inPieces the raw image is decoded into a store (memory, or a temporary file where it is
 // large) and read from there a piece at a time (FitsImage::pieces).
-FitsFile readDng(const std::string& path, bool headersOnly = false, bool inPieces = false);
+FitsFile readDng(const Input& input, bool headersOnly = false, bool inPieces = false);
+inline FitsFile readDng(const std::string& path, bool headersOnly = false, bool inPieces = false) {
+    return readDng(Input::file(path), headersOnly, inPieces);
+}
 
 // Reads the raw image as readDng does and reports what it found; the previews are not read.
-VerifyReport verifyDng(const std::string& path);
+VerifyReport verifyDng(const Input& input);
+inline VerifyReport verifyDng(const std::string& path) { return verifyDng(Input::file(path)); }
 
 // True for a TIFF file whose first directory says it is a DNG file (DNGVersion).
 bool looksLikeDng(const std::string& path);
+bool looksLikeDng(std::shared_ptr<RandomBytes> bytes);
 
 // Lossless JPEG (ITU-T T.81, the lossless process with Huffman coding, SOF3), as DNG uses it for
 // raw data. Decodes one complete JPEG stream into its samples, line after line, the components of

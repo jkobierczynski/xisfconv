@@ -2941,6 +2941,441 @@ static void test_distributed_units(xisfconv_context *ctx) {
     xisfconv_close(f);
 }
 
+/* ---- memory and streams (0.23) ---- */
+
+typedef struct {
+    const unsigned char *data;
+    size_t size, at, step;
+    long fail_at;   /* -1: never */
+} source_stream;
+
+static int64_t source_read(void *user, void *buffer, uint64_t size) {
+    source_stream *s = (source_stream *)user;
+    size_t n = s->size - s->at;
+    if (s->fail_at >= 0 && s->at >= (size_t)s->fail_at) return -1;
+    if (n > s->step) n = s->step;
+    if (n > size) n = (size_t)size;
+    memcpy(buffer, s->data + s->at, n);
+    s->at += n;
+    return (int64_t)n;
+}
+
+typedef struct {
+    unsigned char *data;
+    size_t size, capacity;
+    int calls, fail_at;   /* fail_at: the call that fails (1 = the first), 0: none */
+} sink_stream;
+
+static int32_t sink_write(void *user, const void *data, uint64_t size) {
+    sink_stream *s = (sink_stream *)user;
+    ++s->calls;
+    if (s->fail_at && s->calls >= s->fail_at) return 7;
+    if (s->size + size > s->capacity) {
+        size_t capacity = (s->size + (size_t)size) * 2 + 64;
+        unsigned char *more = (unsigned char *)realloc(s->data, capacity);
+        if (!more) return 1;
+        s->data = more;
+        s->capacity = capacity;
+    }
+    memcpy(s->data + s->size, data, (size_t)size);
+    s->size += (size_t)size;
+    return 0;
+}
+
+static void sink_reset(sink_stream *s) {
+    free(s->data);
+    memset(s, 0, sizeof *s);
+}
+
+static unsigned char *read_whole(const char *path, size_t *size) {
+    FILE *f = fopen(path, "rb");
+    unsigned char *data;
+    long n;
+    *size = 0;
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    data = (unsigned char *)malloc(n > 0 ? (size_t)n : 1);
+    if (data && fread(data, 1, (size_t)n, f) != (size_t)n) {
+        free(data);
+        data = NULL;
+    }
+    fclose(f);
+    if (data) *size = (size_t)n;
+    return data;
+}
+
+static int same_bytes_as_file(const unsigned char *data, size_t size, const char *path) {
+    size_t n = 0;
+    unsigned char *file = read_whole(path, &n);
+    const int same = file && n == size && memcmp(file, data, size) == 0;
+    free(file);
+    return same;
+}
+
+static xisfconv_io memory_io(const void *data, size_t size, const char *name) {
+    xisfconv_io io;
+    xisfconv_io_init(&io, sizeof io);
+    io.data = data;
+    io.size = size;
+    io.name = name;
+    return io;
+}
+
+static xisfconv_io path_io(const char *path) {
+    xisfconv_io io;
+    xisfconv_io_init(&io, sizeof io);
+    io.path = path;
+    return io;
+}
+
+static xisfconv_io sink_io(sink_stream *sink, const char *name) {
+    xisfconv_io io;
+    xisfconv_io_init(&io, sizeof io);
+    io.write = sink_write;
+    io.user = sink;
+    io.name = name;
+    return io;
+}
+
+static xisfconv_io source_io(source_stream *source, const char *name) {
+    xisfconv_io io;
+    xisfconv_io_init(&io, sizeof io);
+    io.read = source_read;
+    io.user = source;
+    io.name = name;
+    return io;
+}
+
+/* The two files have the same images, pixel for pixel (and band for band). */
+static int same_images(xisfconv_file *a, xisfconv_file *b) {
+    size_t i, n = xisfconv_image_count(a);
+    if (n == 0 || n != xisfconv_image_count(b)) return 0;
+    for (i = 0; i < n; ++i) {
+        uint64_t sa = 0, sb = 0, band;
+        unsigned char *pa, *pb, *rows;
+        xisfconv_image_info info;
+        int same;
+        if (xisfconv_pixels_size(a, i, NULL, &sa) != XISFCONV_OK || xisfconv_pixels_size(b, i, NULL, &sb) != XISFCONV_OK ||
+            sa != sb || sa == 0)
+            return 0;
+        pa = (unsigned char *)malloc((size_t)sa);
+        pb = (unsigned char *)malloc((size_t)sb);
+        rows = (unsigned char *)malloc((size_t)sb);
+        same = pa && pb && rows && xisfconv_read_pixels(a, i, NULL, pa, sa) == XISFCONV_OK &&
+               xisfconv_read_pixels(b, i, NULL, pb, sb) == XISFCONV_OK && memcmp(pa, pb, (size_t)sa) == 0;
+        xisfconv_image_info_init(&info, sizeof info);
+        /* a band of the middle rows of all channels */
+        if (same && xisfconv_image_info_get(b, i, &info) == XISFCONV_OK && info.height > 2) {
+            const uint64_t sample = sa / (info.width * info.height * info.channels), first = 1, count = info.height - 2;
+            uint64_t c;
+            band = count * info.width * sample;
+            same = xisfconv_read_rows(b, i, NULL, first, count, rows, band * info.channels) == XISFCONV_OK;
+            for (c = 0; same && c < info.channels; ++c)
+                same = memcmp(rows + c * band, pa + (c * info.height + first) * info.width * sample, (size_t)band) == 0;
+        }
+        free(pa);
+        free(pb);
+        free(rows);
+        if (!same) return 0;
+    }
+    return 1;
+}
+
+typedef struct {
+    const unsigned char *bytes;
+    size_t size;
+    int calls, failed;
+} nested_call;
+
+static int32_t nested_progress(void *user, const char *stage, uint64_t done, uint64_t total) {
+    nested_call *n = (nested_call *)user;
+    xisfconv_context *other = xisfconv_context_new();
+    xisfconv_io io = memory_io(n->bytes, n->size, NULL);
+    xisfconv_format format = XISFCONV_FORMAT_AUTO;
+    (void)stage;
+    (void)done;
+    (void)total;
+    if (n->calls < 3) {
+        ++n->calls;
+        if (!other || xisfconv_detect_format_io(other, &io, &format) != XISFCONV_OK || format != XISFCONV_FORMAT_XISF) ++n->failed;
+    }
+    xisfconv_context_free(other);
+    return 0;
+}
+
+static void test_memory_and_streams(xisfconv_context *ctx) {
+    static const char *names[] = {"io.xisf", "io.fits", "io.fits.fz", "io.asdf", "io-z.xisf"};
+    static const char garbage[] = "not a file of any format, as anyone can see";
+    xisfconv_write_options wo;
+    xisfconv_convert_options co;
+    xisfconv_rewrite_options ro;
+    xisfconv_rewrite_result rr;
+    xisfconv_writer *w = NULL;
+    xisfconv_image img;
+    xisfconv_report *report = NULL;
+    xisfconv_file *a = NULL, *b = NULL;
+    xisfconv_format format = XISFCONV_FORMAT_AUTO, expected = XISFCONV_FORMAT_AUTO;
+    xisfconv_io in, out;
+    sink_stream sink;
+    source_stream source;
+    unsigned char *bytes;
+    size_t size = 0, n;
+    memset(&sink, 0, sizeof sink);
+
+    /* files to begin with: XISF with two images, and what it converts to */
+    xisfconv_write_options_init(&wo, sizeof wo);
+    wo.overwrite = 1;
+    CHECK(xisfconv_writer_new(ctx, path_of("io.xisf"), &wo, &w) == XISFCONV_OK, "a writer for the files of the io tests");
+    xisfconv_image_init(&img, sizeof img);
+    img.width = W;
+    img.height = H;
+    img.pixels = g_gray;
+    img.sample_format = XISFCONV_SAMPLE_UINT16;
+    img.name = "gray";
+    CHECK(xisfconv_writer_add_image(w, &img) == XISFCONV_OK, "... its first image");
+    img.channels = 3;
+    img.pixels = g_rgb;
+    img.sample_format = XISFCONV_SAMPLE_FLOAT32;
+    img.name = "rgb";
+    CHECK(xisfconv_writer_add_image(w, &img) == XISFCONV_OK && xisfconv_writer_finish(w) == XISFCONV_OK, "... and its second");
+    xisfconv_convert_options_init(&co, sizeof co);
+    co.overwrite = 1;
+    for (n = 1; n < 4; ++n) CHECK(xisfconv_convert(ctx, path_of("io.xisf"), path_of(names[n]), &co) == XISFCONV_OK, names[n]);
+    xisfconv_rewrite_options_init(&ro, sizeof ro);
+    ro.codec = XISFCONV_CODEC_ZLIB;
+    ro.checksum = XISFCONV_CHECKSUM_SHA1;
+    ro.overwrite = 1;
+    CHECK(xisfconv_rewrite(ctx, path_of("io.xisf"), path_of("io-z.xisf"), &ro, NULL) == XISFCONV_OK, "a compressed copy");
+
+    /* reading: from memory and from a stream, what the file gives */
+    for (n = 0; n < sizeof names / sizeof names[0]; ++n) {
+        bytes = read_whole(path_of(names[n]), &size);
+        if (!bytes) {
+            CHECK(0, names[n]);
+            continue;
+        }
+        in = memory_io(bytes, size, NULL);
+        CHECK(xisfconv_detect_format(ctx, path_of(names[n]), &expected) == XISFCONV_OK &&
+                  xisfconv_detect_format_io(ctx, &in, &format) == XISFCONV_OK && format == expected,
+              "the format of bytes in memory");
+        a = b = NULL;
+        CHECK(xisfconv_open(ctx, path_of(names[n]), &a) == XISFCONV_OK && xisfconv_open_io(ctx, &in, &b) == XISFCONV_OK,
+              "a file and its bytes in memory are opened");
+        if (a && b) {
+            CHECK(xisfconv_file_format(b) == expected && xisfconv_file_size(b) == size, "... as what they are");
+            CHECK(same_images(a, b), "... and have the same images");
+        }
+        xisfconv_close(b);
+        b = NULL;
+        source.data = bytes;
+        source.size = size;
+        source.at = 0;
+        source.step = 1000;
+        source.fail_at = -1;
+        in = source_io(&source, NULL);
+        CHECK(xisfconv_open_io(ctx, &in, &b) == XISFCONV_OK && source.at == size, "a stream is read to its end and opened");
+        if (a && b) CHECK(same_images(a, b), "... with the same images");
+        xisfconv_close(a);
+        xisfconv_close(b);
+        a = b = NULL;
+        in = memory_io(bytes, size, names[n]);
+        CHECK(xisfconv_verify_io(ctx, &in, &report) == XISFCONV_OK && xisfconv_report_verdict(report) == XISFCONV_VERDICT_OK,
+              "bytes in memory are verified");
+        CHECK(n != 4 || xisfconv_report_verified(report) == 2, "... their checksums too");
+        xisfconv_report_free(report);
+        report = NULL;
+        free(bytes);
+    }
+
+    /* converting, rewriting and writing to a stream: the bytes a file gets */
+    bytes = read_whole(path_of("io.xisf"), &size);
+    if (!bytes) {
+        CHECK(0, "io.xisf");
+        return;
+    }
+    in = memory_io(bytes, size, NULL);
+    out = sink_io(&sink, "out.fits");
+    CHECK(xisfconv_convert_io(ctx, &in, &out, &co) == XISFCONV_OK && sink.size > 0, "a conversion from memory to a stream");
+    CHECK(same_bytes_as_file(sink.data, sink.size, path_of("io.fits")), "... gives the bytes of the file");
+    sink_reset(&sink);
+    out = path_io(path_of("from-memory.fits"));
+    CHECK(xisfconv_convert_io(ctx, &in, &out, &co) == XISFCONV_OK && bytes_equal_files(path_of("from-memory.fits"), path_of("io.fits")),
+          "a conversion from memory to a file");
+    source.data = bytes;
+    source.size = size;
+    source.at = 0;
+    source.step = 3;
+    source.fail_at = -1;
+    in = source_io(&source, NULL);
+    out = path_io(path_of("from-stream.fits.fz"));
+    CHECK(xisfconv_convert_io(ctx, &in, &out, &co) == XISFCONV_OK &&
+              bytes_equal_files(path_of("from-stream.fits.fz"), path_of("io.fits.fz")),
+          "a conversion from a stream to a file, its format by the name");
+    in = memory_io(bytes, size, NULL);
+    out = sink_io(&sink, NULL);
+    CHECK(xisfconv_convert_io(ctx, &in, &out, &co) == XISFCONV_ERR_ARGUMENT && sink.calls == 0,
+          "a stream without a name or a format has no format");
+    co.output_format = XISFCONV_FORMAT_ASDF;
+    CHECK(xisfconv_convert_io(ctx, &in, &out, &co) == XISFCONV_OK && same_bytes_as_file(sink.data, sink.size, path_of("io.asdf")),
+          "... with a format it has one");
+    co.output_format = XISFCONV_FORMAT_AUTO;
+    sink_reset(&sink);
+
+    xisfconv_rewrite_result_init(&rr, sizeof rr);
+    out = sink_io(&sink, NULL);
+    CHECK(xisfconv_rewrite_io(ctx, &in, &out, &ro, &rr) == XISFCONV_OK && rr.output_size == sink.size && rr.input_size == size &&
+              rr.read_back == 1 && rr.compressed == 2,
+          "a rewrite from memory to a stream");
+    {
+        xisfconv_io back = memory_io(sink.data, sink.size, NULL);
+        CHECK(xisfconv_open(ctx, path_of("io.xisf"), &a) == XISFCONV_OK && xisfconv_open_io(ctx, &back, &b) == XISFCONV_OK &&
+                  same_images(a, b),
+              "... has the images");
+        xisfconv_close(a);
+        xisfconv_close(b);
+        a = b = NULL;
+    }
+    sink_reset(&sink);
+    out = path_io(path_of("rewritten.xisf"));
+    CHECK(xisfconv_rewrite_io(ctx, &in, &out, &ro, &rr) == XISFCONV_OK && (long)rr.output_size == file_size(path_of("rewritten.xisf")),
+          "a rewrite from memory to a file");
+    ro.overwrite = 0;
+    CHECK(xisfconv_rewrite_io(ctx, &in, &out, &ro, &rr) == XISFCONV_ERR_EXISTS, "... which is not overwritten without leave");
+    out = sink_io(&sink, "unit.xish");
+    CHECK(xisfconv_rewrite_io(ctx, &in, &out, &ro, &rr) == XISFCONV_ERR_ARGUMENT && sink.calls == 0,
+          "a distributed unit is not one stream");
+
+    xisfconv_write_options_init(&wo, sizeof wo);
+    wo.format = XISFCONV_FORMAT_FITS;
+    out = sink_io(&sink, NULL);
+    CHECK(xisfconv_writer_new_io(ctx, &out, &wo, &w) == XISFCONV_OK, "a writer to a stream");
+    xisfconv_image_init(&img, sizeof img);
+    img.width = W;
+    img.height = H;
+    img.pixels = g_gray;
+    img.sample_format = XISFCONV_SAMPLE_UINT16;
+    img.name = "gray";
+    CHECK(xisfconv_writer_add_image(w, &img) == XISFCONV_OK, "... takes an image");
+    img.pixels = NULL;
+    CHECK(xisfconv_writer_begin_image(w, &img) == XISFCONV_OK && xisfconv_writer_add_rows(w, g_gray, H, sizeof g_gray) == XISFCONV_OK,
+          "... and one in bands");
+    CHECK(sink.calls == 0 && xisfconv_writer_finish(w) == XISFCONV_OK && sink.size > 0, "... and writes them when it finishes");
+    wo.overwrite = 1;
+    CHECK(xisfconv_writer_new(ctx, path_of("written.fits"), &wo, &w) == XISFCONV_OK && xisfconv_writer_begin_image(w, &img) == XISFCONV_OK &&
+              xisfconv_writer_add_rows(w, g_gray, H, sizeof g_gray) == XISFCONV_OK,
+          "the same to a file");
+    img.pixels = g_gray;
+    CHECK(xisfconv_writer_add_image(w, &img) == XISFCONV_OK && xisfconv_writer_finish(w) == XISFCONV_OK, "...");
+    /* (the images in the other order: the same file is not expected; the two images are) */
+    {
+        xisfconv_io back = memory_io(sink.data, sink.size, NULL);
+        CHECK(xisfconv_open(ctx, path_of("written.fits"), &a) == XISFCONV_OK && xisfconv_open_io(ctx, &back, &b) == XISFCONV_OK &&
+                  same_images(a, b),
+              "... has the images of the stream");
+        xisfconv_close(a);
+        xisfconv_close(b);
+        a = b = NULL;
+    }
+    sink_reset(&sink);
+    wo.format = XISFCONV_FORMAT_AUTO;
+    out = sink_io(&sink, "unit.xish");
+    CHECK(xisfconv_writer_new_io(ctx, &out, &wo, &w) == XISFCONV_ERR_ARGUMENT && w == NULL, "a writer of a distributed unit to a stream");
+
+    /* names: a file in memory is not taken for the file of its name, nor the reverse */
+    in = path_io(path_of("io.fits"));
+    out = sink_io(&sink, path_of("io.fits"));
+    CHECK(xisfconv_convert_io(ctx, &in, &out, &co) == XISFCONV_ERR_ARGUMENT && strstr(xisfconv_error_message(ctx), "same name") &&
+              sink.calls == 0,
+          "a file and an output stream of its name");
+    in = memory_io(bytes, size, path_of("rewritten.xisf"));
+    out = path_io(path_of("rewritten.xisf"));
+    ro.overwrite = 1;
+    CHECK(xisfconv_rewrite_io(ctx, &in, &out, &ro, &rr) == XISFCONV_ERR_ARGUMENT && file_size(path_of("rewritten.xisf")) > 0,
+          "bytes in memory under the name of the output file");
+    {
+        /* a name that is no name on the disk */
+        char long_name[5000];
+        memset(long_name, 'n', sizeof long_name - 1);
+        long_name[sizeof long_name - 1] = 0;
+        in = memory_io(bytes, size, long_name);
+        out = sink_io(&sink, NULL);
+        CHECK(xisfconv_rewrite_io(ctx, &in, &out, &ro, &rr) == XISFCONV_OK && sink.size == rr.output_size,
+              "a rewrite of bytes with a long name");
+        sink_reset(&sink);
+    }
+    {
+        /* a call from the progress handler of another has files in memory of its own names */
+        nested_call nested;
+        nested.bytes = bytes;
+        nested.size = size;
+        nested.calls = nested.failed = 0;
+        xisfconv_context_set_progress_handler(ctx, nested_progress, &nested);
+        in = memory_io(bytes, size, NULL);
+        out = sink_io(&sink, "nested.fits");
+        CHECK(xisfconv_convert_io(ctx, &in, &out, &co) == XISFCONV_OK && nested.calls > 0 && nested.failed == 0,
+              "calls from a progress handler, with the same names");
+        xisfconv_context_set_progress_handler(ctx, NULL, NULL);
+        sink_reset(&sink);
+    }
+
+    /* what goes wrong */
+    in = memory_io(bytes, size, NULL);
+    in.path = path_of("io.xisf");
+    out = sink_io(&sink, "x.fits");
+    CHECK(xisfconv_convert_io(ctx, &in, &out, &co) == XISFCONV_ERR_ARGUMENT && strstr(xisfconv_error_message(ctx), "2 of them"),
+          "an input is one thing");
+    CHECK(xisfconv_convert_io(ctx, NULL, &out, &co) == XISFCONV_ERR_ARGUMENT, "an input is something");
+    in = memory_io(bytes, size, NULL);
+    out = memory_io(bytes, size, "x.fits");
+    CHECK(xisfconv_convert_io(ctx, &in, &out, &co) == XISFCONV_ERR_ARGUMENT, "bytes in memory are no output");
+    out = sink_io(&sink, "x.fits");
+    in.write = sink_write;
+    in.data = NULL;
+    CHECK(xisfconv_convert_io(ctx, &in, &out, &co) == XISFCONV_ERR_ARGUMENT, "a write function is no input");
+    in = memory_io(bytes, size, "x.fits");
+    CHECK(xisfconv_convert_io(ctx, &in, &out, &co) == XISFCONV_ERR_ARGUMENT, "an input and an output of the same name");
+    in = memory_io(garbage, sizeof garbage, NULL);
+    CHECK(xisfconv_convert_io(ctx, &in, &out, &co) == XISFCONV_ERR_FORMAT && sink.calls == 0, "a failed conversion writes nothing");
+    CHECK(xisfconv_detect_format_io(ctx, &in, &format) == XISFCONV_ERR_FORMAT, "bytes of no format");
+    CHECK(xisfconv_verify_io(ctx, &in, &report) == XISFCONV_OK && xisfconv_report_verdict(report) == XISFCONV_VERDICT_FAILED,
+          "... fail to verify");
+    xisfconv_report_free(report);
+    report = NULL;
+    source.data = bytes;
+    source.size = size;
+    source.at = 0;
+    source.step = 1000;
+    source.fail_at = 2000;
+    in = source_io(&source, "broken pipe");
+    CHECK(xisfconv_convert_io(ctx, &in, &out, &co) == XISFCONV_ERR_IO && strstr(xisfconv_error_message(ctx), "broken pipe") &&
+              sink.calls == 0,
+          "a stream that fails");
+    in = memory_io(bytes, size, NULL);
+    sink.fail_at = 1;
+    CHECK(xisfconv_convert_io(ctx, &in, &out, &co) == XISFCONV_ERR_IO && strstr(xisfconv_error_message(ctx), "write function"),
+          "an output that fails");
+    sink_reset(&sink);
+    {
+        /* a header in memory has no directory for the data beside it */
+        unsigned char *header;
+        size_t header_size = 0;
+        xisfconv_write_options_init(&wo, sizeof wo);
+        wo.overwrite = 1;
+        CHECK(write_gray(ctx, path_of("io.xish"), &wo, NULL, NULL, 0) == XISFCONV_OK, "a distributed unit");
+        header = read_whole(path_of("io.xish"), &header_size);
+        in = memory_io(header, header_size, NULL);
+        out = sink_io(&sink, "x.fits");
+        CHECK(xisfconv_convert_io(ctx, &in, &out, &co) == XISFCONV_ERR_NOT_ALLOWED && sink.calls == 0 &&
+                  strstr(xisfconv_error_message(ctx), "in memory"),
+              "its header in memory");
+        free(header);
+    }
+    free(bytes);
+    sink_reset(&sink);
+}
+
 static void test_lifetime(void) {
     xisfconv_context *ctx = xisfconv_context_new();
     xisfconv_file *f = NULL;
@@ -3021,6 +3456,7 @@ int main(int argc, char **argv) {
     test_carried_properties(ctx);
     test_given_properties(ctx);
     test_distributed_units(ctx);
+    test_memory_and_streams(ctx);
     xisfconv_context_free(ctx);
     test_lifetime();
 

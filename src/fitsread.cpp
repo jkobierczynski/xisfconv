@@ -140,7 +140,7 @@ void addCard(Header& hdr, const std::string& raw) {
 // Reads one header (a whole number of 2880-byte blocks). Returns false at a clean end of file.
 // `cutOff`: set instead of throwing for the header of an extension that the end of the file cuts
 // off before its END card.
-bool readHeader(std::ifstream& in, uint64_t fileSize, uint64_t& pos, Header& hdr, bool primary, bool* cutOff = nullptr) {
+bool readHeader(std::istream& in, uint64_t fileSize, uint64_t& pos, Header& hdr, bool primary, bool* cutOff = nullptr) {
     if (pos >= fileSize) return false;
     std::string block(kBlock, ' ');
     bool end = false, first = true;
@@ -181,7 +181,7 @@ bool readHeader(std::ifstream& in, uint64_t fileSize, uint64_t& pos, Header& hdr
 
 // True if [from, to) of the file holds nothing but padding (zeros or blanks), as what follows the
 // last HDU may. `count`: the bytes that are not, all of them counted (else it stops at the first).
-bool onlyPadding(std::ifstream& in, uint64_t from, uint64_t to, uint64_t* count = nullptr) {
+bool onlyPadding(std::istream& in, uint64_t from, uint64_t to, uint64_t* count = nullptr) {
     in.clear();
     in.seekg(static_cast<std::streamoff>(from));
     std::vector<char> buf(65536);
@@ -202,7 +202,7 @@ bool onlyPadding(std::ifstream& in, uint64_t from, uint64_t to, uint64_t* count 
 
 // What the skipped HDUs of a file say of the remains of HDU `hduIndex`, [from, to) of the file:
 // that of a table of XISF properties is named, since what was carried is not restored.
-std::string remainsOfHdu(std::ifstream& in, uint64_t from, uint64_t to, size_t hduIndex, std::optional<size_t> imageBefore) {
+std::string remainsOfHdu(std::istream& in, uint64_t from, uint64_t to, size_t hduIndex, std::optional<size_t> imageBefore) {
     // (the name of a table may stand in a later block of its header than the first)
     std::string start(static_cast<size_t>(std::min<uint64_t>(to - from, 16 * kBlock)), ' ');
     in.clear();
@@ -495,10 +495,18 @@ std::string fitsUnquote(const std::string& value) {
 }
 
 bool looksLikeFits(const std::string& path) {
+    if (const std::shared_ptr<RandomBytes> bytes = virtualFileBytes(path)) return looksLikeFits(*bytes);
     std::ifstream in(toPath(path), std::ios::binary);
     char buf[9] = {};
     in.read(buf, 9);
     return in.gcount() == 9 && std::string(buf, 9) == "SIMPLE  =";
+}
+
+bool looksLikeFits(RandomBytes& bytes) {
+    uint8_t buf[9] = {};
+    if (bytes.size() < 9) return false;
+    bytes.read(0, 9, buf);
+    return std::memcmp(buf, "SIMPLE  =", 9) == 0;
 }
 
 namespace {
@@ -697,7 +705,7 @@ std::vector<Property> propertiesFromTable(const Header& hdr, const std::string& 
     return properties;
 }
 
-std::vector<uint8_t> readBytes(std::ifstream& in, uint64_t pos, uint64_t size, const std::string& label) {
+std::vector<uint8_t> readBytes(std::istream& in, uint64_t pos, uint64_t size, const std::string& label) {
     if (size > std::numeric_limits<size_t>::max() / 2) throw Error("image too large for this platform");
     std::vector<uint8_t> raw(static_cast<size_t>(size));
     in.clear();
@@ -711,7 +719,7 @@ std::vector<uint8_t> readBytes(std::ifstream& in, uint64_t pos, uint64_t size, c
 // 32-bit ones' complement sum of big-endian words (the FITS checksum convention) over `size`
 // bytes at `pos`. A last incomplete word counts as if it were padded with zeros, as do the
 // missing bytes of a data unit that was left unpadded.
-uint32_t onesComplementSum(std::ifstream& in, uint64_t pos, uint64_t size) {
+uint32_t onesComplementSum(std::istream& in, uint64_t pos, uint64_t size) {
     std::vector<uint8_t> buf(static_cast<size_t>(std::min<uint64_t>(size + 4, 1u << 20)));
     uint64_t sum = 0;
     in.clear();
@@ -741,11 +749,10 @@ uint32_t onesComplementAdd(uint32_t a, uint32_t b) {
 
 }  // namespace
 
-VerifyReport verifyFits(const std::string& path) {
+VerifyReport verifyFits(const Input& input) {
     VerifyReport report;
-    std::ifstream in(toPath(path), std::ios::binary);
-    if (!in) failToOpen(path);
-    std::shared_ptr<RawFile> rawFile;   // the file again, for tiles read one at a time
+    const std::shared_ptr<RandomBytes> bytes = input.open();
+    InputStream in(bytes);
     in.seekg(0, std::ios::end);
     const uint64_t fileSize = static_cast<uint64_t>(in.tellg());
 
@@ -811,9 +818,8 @@ VerifyReport verifyFits(const std::string& path) {
                     if (d == 0) empty = true;
                 if (!empty) {
                     // (decompressed a tile at a time, and forgotten)
-                    if (!rawFile) rawFile = RawFile::openForReading(path);
-                    FileBytes unit(rawFile, dataPos, dataBytes, label + ": read error in image data");
-                    decodeTiledImage(tile, unit, [](uint64_t, const uint8_t*, size_t) {});
+                    const std::shared_ptr<RandomBytes> unit = sliceBytes(bytes, dataPos, dataBytes);
+                    decodeTiledImage(tile, *unit, [](uint64_t, const uint8_t*, size_t) {});
                 }
             } catch (const Unsupported& e) {
                 report.notChecked.push_back(label + ": " + e.what());
@@ -854,16 +860,15 @@ VerifyReport verifyFits(const std::string& path) {
     return report;
 }
 
-FitsFile readFits(const std::string& path, bool headersOnly, std::optional<size_t> onlyImage, bool inPieces) {
+FitsFile readFits(const Input& input, bool headersOnly, std::optional<size_t> onlyImage, bool inPieces) {
     FitsFile file;
-    file.path = path;
-    std::ifstream in(toPath(path), std::ios::binary);
-    if (!in) failToOpen(path);
+    file.path = input.name;
+    const std::shared_ptr<RandomBytes> bytes = input.open();
+    InputStream in(bytes);
     in.seekg(0, std::ios::end);
     file.fileSize = static_cast<uint64_t>(in.tellg());
 
     uint64_t pos = 0;
-    std::shared_ptr<RawFile> rawFile;   // the file again, for the images that are read in pieces
     // The image the HDU before the current one became, if it became one: a table of XISF
     // properties belongs to it.
     std::optional<size_t> imageBefore;
@@ -1013,8 +1018,7 @@ FitsFile readFits(const std::string& path, bool headersOnly, std::optional<size_
         if (!headersOnly && (!onlyImage || *onlyImage == file.images.size()) && inPieces) {
             // The samples are read from the file where they are, as they are asked for; those of a
             // tile-compressed image are decompressed first (into memory, or a temporary file).
-            if (!rawFile) rawFile = RawFile::openForReading(path);
-            std::shared_ptr<RandomBytes> unit = std::make_shared<FileBytes>(rawFile, dataPos, dataBytes, label + ": read error in image data");
+            std::shared_ptr<RandomBytes> unit = sliceBytes(bytes, dataPos, dataBytes);
             if (tiled) {
                 try {
                     uint64_t total = elements;

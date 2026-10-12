@@ -93,7 +93,7 @@ STRUCTS = {"xisfconv_image_info": _lib.ImageInfo, "xisfconv_read_options": _lib.
            "xisfconv_stretch_params": _lib.StretchParams, "xisfconv_convert_options": _lib.ConvertOptions,
            "xisfconv_rewrite_options": _lib.RewriteOptions, "xisfconv_rewrite_result": _lib.RewriteResult,
            "xisfconv_image": _lib.Image, "xisfconv_write_options": _lib.WriteOptions,
-           "xisfconv_progress_report": _lib.ProgressReport}
+           "xisfconv_progress_report": _lib.ProgressReport, "xisfconv_io": _lib.Io}
 
 
 def test_structures_have_the_fields_of_the_header():

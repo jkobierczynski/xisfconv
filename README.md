@@ -68,6 +68,9 @@ xisfconv --info light_0001.xisf               # geometry, codecs, FITS keywords,
   output beyond 4 GiB is BigTIFF, and Ctrl-C stops a conversion within one image without leaving
   a half-written file. Programs that use the library read and write such images in bands of
   rows, in C and in Python.
+- **In a pipe**: `-` reads the standard input and `-o -` writes the standard output
+  (`cat a.xisf | xisfconv -t fits -o - - > a.fits`); the library and the Python package read
+  files from memory and streams and write them to streams.
 - **Careful with files**: output is written under another name and renamed when it is complete,
   nothing is overwritten unless asked, no file is written twice in a run or over a file the run
   reads, a rewrite is read back and compared before it replaces anything, and the header of a

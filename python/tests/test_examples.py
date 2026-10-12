@@ -20,7 +20,7 @@ import xisfconv
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
 EXAMPLES = os.path.join(ROOT, "examples")
-CHAPTERS = ["inspect", "pixels", "stretch", "write", "bands", "convert", "rewrite", "units", "wcs", "progress"]
+CHAPTERS = ["inspect", "pixels", "stretch", "write", "bands", "convert", "rewrite", "memory", "units", "wcs", "progress"]
 PYTHON_ONLY = ["astropy", "compat"]
 
 pytestmark = pytest.mark.skipif(not os.path.exists(os.path.join(EXAMPLES, "tour.py")),
@@ -114,6 +114,10 @@ def test_tour(work):
     assert found["convert"] == ["wrote frame.fits", "wrote preview.png"]
     assert re.fullmatch(r"\d+ -> \d+ bytes: 2 block\(s\) compressed, 0 kept, 2 checksum\(s\), read back: yes", found["rewrite"][0])
     assert found["rewrite"][1:] == ["smaller.xisf is stored as asked: yes", "verdict OK: 1 image, 2 data blocks; 2 checksum(s) verified"]
+    assert found["memory"] == ["opened %d bytes in memory: XISF, 1 image(s)" % os.path.getsize(str(work / "small.xisf")),
+                               "wrote memory.fits through a file object: %d bytes" % os.path.getsize(str(work / "out" / "frame.fits"))]
+    with open(str(work / "out" / "memory.fits"), "rb") as a, open(str(work / "out" / "frame.fits"), "rb") as b:
+        assert a.read() == b.read()      # (the conversion of the chapter "convert", in memory)
     assert re.fullmatch(r"unit.xish is a distributed unit: header \d+ bytes, \d+ bytes with its data", found["units"][0])
     assert found["units"][1:] == ["  data in unit.xisb", 'with external_files="none": not allowed', "with the default: read",
                                   "packed into packed.xisf"]
@@ -123,7 +127,7 @@ def test_tour(work):
     assert len(notes) == 3 and "taken along" in notes[0] and "32-bit float" in notes[1] and "restored" in notes[2]
     assert found["progress"][-3:] == ["  rewriting 0 of 2", "  rewriting 1 of 2", "stopped: by the handler; a file is left: no"]
 
-    written = ["back.xisf", "bands.fits", "crop.xisf", "frame.fits", "packed.xisf", "preview.png", "smaller.xisf", "stretched.png",
+    written = ["back.xisf", "bands.fits", "crop.xisf", "frame.fits", "memory.fits", "packed.xisf", "preview.png", "smaller.xisf", "stretched.png",
                "there.fits", "unit.xisb", "unit.xish"]
     try:
         import astropy  # noqa: F401

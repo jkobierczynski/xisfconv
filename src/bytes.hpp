@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <istream>
 #include <memory>
 #include <ostream>
 #include <string>
@@ -141,6 +142,8 @@ public:
     // That the store will hold `size` bytes in all: room for exactly that many, in memory or the file.
     void reserve(uint64_t size);
     void write(uint64_t position, const uint8_t* data, size_t n);
+    // The same at any place: beyond the end, the store grows (with zeros where nothing was written).
+    void put(uint64_t position, const uint8_t* data, size_t n);
     // The bytes, if they are in memory (nullptr if they are in a file).
     const uint8_t* memory() const { return file_ ? nullptr : memory_.data(); }
     const uint8_t* contiguous() const override { return memory(); }
@@ -176,6 +179,82 @@ std::shared_ptr<RandomBytes> sliceBytes(std::shared_ptr<RandomBytes> bytes, uint
 // Copies `size` bytes from `position` to the sink, a piece at a time.
 void copyBytes(RandomBytes& from, uint64_t position, uint64_t size, ByteSink& to);
 
+// Bytes that stand for a file during one call, under a name that is valid in this thread while
+// the scope lives: Input::file takes the bytes for the file of that name (bytes in memory, what a
+// stream brought), and OutputFile writes the file of that name into the store (a file that goes
+// to a stream when it is complete). The steps around a file that is written (a temporary name,
+// the rename, the checks of what is there) are skipped for it: see isVirtualFile.
+// The virtual files of one call: a call of the API made while another runs (from its progress
+// handler) has its own, and finds none of the other's.
+class VirtualFileFrame {
+public:
+    VirtualFileFrame();
+    ~VirtualFileFrame();
+    VirtualFileFrame(const VirtualFileFrame&) = delete;
+    VirtualFileFrame& operator=(const VirtualFileFrame&) = delete;
+
+private:
+    std::shared_ptr<void> outer_;
+};
+
+class VirtualFileScope {
+public:
+    VirtualFileScope(std::string name, std::shared_ptr<RandomBytes> bytes);   // a file that is read
+    VirtualFileScope(std::string name, std::shared_ptr<Store> store);         // a file that is written
+    ~VirtualFileScope();
+    VirtualFileScope(const VirtualFileScope&) = delete;
+    VirtualFileScope& operator=(const VirtualFileScope&) = delete;
+
+private:
+    std::string name_;
+};
+bool isVirtualFile(const std::string& name);
+// The bytes of a virtual file (of one that is written: what has been written), or nullptr.
+std::shared_ptr<RandomBytes> virtualFileBytes(const std::string& name);
+// The store a virtual file is written into, made empty (as a file that is opened for writing), or nullptr.
+std::shared_ptr<Store> virtualFileForWriting(const std::string& name);
+
+// What a reader reads: a file, by its path, or bytes it is handed (borrowed memory, or what a
+// stream brought, kept in a Store). `name` is what messages call it: the path of a file, the name
+// a caller gave bytes in memory.
+struct Input {
+    std::string name;
+    std::string path;                     // a file: its path; empty for bytes in memory
+    std::shared_ptr<RandomBytes> bytes;   // bytes in memory (a file is opened by open())
+
+    static Input file(const std::string& path);
+    static Input memory(std::string name, std::shared_ptr<RandomBytes> bytes);
+    bool inMemory() const { return path.empty(); }
+    // The bytes to read: of a file, the file opened now (failToOpen if it cannot be).
+    std::shared_ptr<RandomBytes> open() const;
+};
+
+// Bytes read as a stream: what std::ifstream is to a file, for any RandomBytes (with seeking).
+class InputStream : public std::istream {
+public:
+    explicit InputStream(std::shared_ptr<RandomBytes> bytes);
+    InputStream(const InputStream&) = delete;
+    InputStream& operator=(const InputStream&) = delete;
+
+private:
+    class Buffer : public std::streambuf {
+    public:
+        explicit Buffer(std::shared_ptr<RandomBytes> bytes) : bytes_(std::move(bytes)), data_(size_t(1) << 16) {}
+
+    protected:
+        int_type underflow() override;
+        pos_type seekoff(off_type off, std::ios_base::seekdir dir, std::ios_base::openmode which) override;
+        pos_type seekpos(pos_type pos, std::ios_base::openmode which) override;
+        std::streamsize showmanyc() override;
+
+    private:
+        std::shared_ptr<RandomBytes> bytes_;
+        std::vector<char> data_;
+        uint64_t at_ = 0;   // where in the bytes the buffer begins
+    };
+    Buffer buffer_;
+};
+
 // A file that is written as std::ofstream writes one (binary, made empty first), but through a
 // buffer of its own, straight to the file at the place each byte belongs (pwrite). The reason is
 // fork(): a process forked from a program that is writing a file inherits what an ofstream has
@@ -197,7 +276,7 @@ private:
     public:
         bool open(const std::filesystem::path& path);
         bool close();
-        bool isOpen() const { return file_ != nullptr; }
+        bool isOpen() const { return file_ != nullptr || store_ != nullptr; }
 
     protected:
         int_type overflow(int_type c) override;
@@ -208,7 +287,9 @@ private:
 
     private:
         bool drain();   // what is in the buffer to the file
+        void put(uint64_t position, const char* data, size_t n);   // to the file or the store
         std::unique_ptr<RawFile> file_;
+        std::shared_ptr<Store> store_;   // the file is a virtual one (see VirtualFileScope)
         std::vector<char> data_;
         uint64_t at_ = 0;   // where in the file the first byte of the buffer goes
     };

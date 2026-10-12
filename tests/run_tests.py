@@ -24,6 +24,7 @@ Usage: python3 tests/run_tests.py path/to/xisfconv
 """
 import base64
 import hashlib
+import io
 import os
 import shutil
 import struct
@@ -7498,6 +7499,112 @@ def masked_unit(data):
     return re.sub(rb"0x[0-9a-fA-F]{16}", b"0x" + b"0" * 16, data)
 
 
+def test_standard_input_and_output():
+    """"-" as the input reads the standard input, "-o -" writes to the standard output (0.23): the bytes of the file
+    that would be written, and nothing else there; a failed run writes nothing."""
+    d = os.path.join(TMP, "stdio")
+    os.makedirs(d)
+
+    def piped(*args, data=b"", env=None):
+        e = dict(os.environ)
+        e.update(env or {})
+        return subprocess.run([EXE, *args], input=data, capture_output=True, env=e)
+
+    rng = np.random.default_rng(23)
+    write_xisf(os.path.join(d, "a.xisf"), [image_entry(test_image(np.uint16, 31, 45, 3, 1), codec="zlib", shuffle_item=2,
+                                                       checksum="sha1"),
+                                          image_entry(test_image(np.float32, 17, 23, 1, 2))])
+    fits.HDUList([fits.PrimaryHDU(rng.integers(0, 4000, (27, 33)).astype(np.int16)),
+                  fits.CompImageHDU(rng.integers(0, 4000, (21, 19)).astype(np.int16), compression_type="RICE_1")]
+                 ).writeto(os.path.join(d, "b.fits"))
+    run(os.path.join(d, "b.fits"), "-o", os.path.join(d, "c.asdf"), "--codec", "zlib", "-q")
+    inputs = ["a.xisf", "b.fits", "c.asdf"]
+    for name in inputs:
+        data = open(os.path.join(d, name), "rb").read()
+        for to, ending in (("fits", ".fits"), ("asdf", ".asdf"), ("tiff", ".tif"), ("png", ".png"), ("fits", ".fits.fz")):
+            if name.endswith(ending):
+                continue
+            compress = ["-c"] if ending == ".fits.fz" else []
+            expected = os.path.join(d, name + ending)
+            run(os.path.join(d, name), "-o", expected, "-q", "-f", *compress)
+            want = open(expected, "rb").read()
+            # (a TIFF page is named after the file the image comes from, and the standard input has no name)
+            def same(got):
+                if ending != ".tif":
+                    return got == want
+                pages = lambda b: [p.asarray() for p in tifffile.TiffFile(io.BytesIO(b)).pages]
+                return len(pages(got)) == len(pages(want)) and all(np.array_equal(x, y) for x, y in zip(pages(got), pages(want)))
+            r = piped("-t", to, *compress, "-o", "-", "-", data=data)
+            check(r.returncode == 0 and same(r.stdout), f"stdio: {name} from the standard input to the standard output as "
+                                                         f"{ending}: {r.stderr.decode(errors='replace')[-200:]}")
+            r = piped("-t", to, *compress, "-o", "-", os.path.join(d, name))
+            check(r.returncode == 0 and r.stdout == want, f"stdio: {name} to the standard output as {ending}")
+            out = os.path.join(d, "from-stdin-" + name + ending)
+            r = piped("-o", out, *compress, "-", data=data)
+            check(r.returncode == 0 and same(open(out, "rb").read()) and r.stdout.decode().strip() == f"<stdin> -> {out}",
+                  f"stdio: {name} from the standard input to {ending}: {r.stdout!r} {r.stderr!r}")
+        # inspection: what the file gives, under another name
+        for option in ("--info", "--dump-header", "--verify"):
+            by_name = run(option, os.path.join(d, name), expect_ok=False)
+            r = piped(option, "-", data=data)
+            check(r.returncode == by_name.returncode and
+                  r.stdout.decode().replace("\r\n", "\n").replace("<stdin>", "@") ==   # (text, read as bytes)
+                  by_name.stdout.replace(os.path.join(d, name), "@"),
+                  f"stdio: {option} of {name} from the standard input")
+    # XISF out: rewritten (and converted) to the standard output, the same images
+    data = open(os.path.join(d, "a.xisf"), "rb").read()
+    r = piped("-t", "xisf", "--codec", "zstd" if "zstd" in run("--version").stdout else "zlib", "--checksum", "sha256",
+              "-o", "-", "-", data=data)
+    check(r.returncode == 0 and r.stdout[:8] == b"XISF0100", f"stdio: a rewrite to the standard output: {r.stderr!r}")
+    v = piped("--verify", "-", data=r.stdout)
+    check(v.returncode == 0 and b"2 checksums verified" in v.stdout, f"stdio: ... which is intact: {v.stdout!r}")
+    back = piped("-t", "fits", "-o", "-", "-", data=r.stdout)
+    run(os.path.join(d, "a.xisf"), "-o", os.path.join(d, "a2.fits"), "-q", "-f")
+    check(back.stdout == open(os.path.join(d, "a2.fits"), "rb").read(), "stdio: ... and has the images of the input")
+    r = piped("-t", "xisf", "-o", "-", "-", data=open(os.path.join(d, "b.fits"), "rb").read())
+    check(r.returncode == 0 and r.stdout[:8] == b"XISF0100" and piped("--verify", "-", data=r.stdout).returncode == 0,
+          "stdio: FITS to XISF on the standard output")
+    # through a temporary file: an input beyond the memory limit
+    r = piped("-t", "fits", "-o", "-", "-", data=data, env={"XISFCONV_MEMORY_LIMIT": "1000"})
+    check(r.returncode == 0 and r.stdout == open(os.path.join(d, "a2.fits"), "rb").read(),
+          f"stdio: beyond the memory limit: {r.stderr!r}")
+
+    # what is refused, and what fails: nothing on the standard output
+    for args, says in ((["-"], "no name to name the output after"),
+                       (["-o", "-", os.path.join(d, "a.xisf")], "add --to"),
+                       (["-", os.path.join(d, "a.xisf"), "-o", "x.fits"], "the only input"),
+                       (["-t", "xish", "-o", "-", "-"], "one stream"),
+                       (["--in-place", "-"], "standard input is none"),
+                       (["-I", "-o", "-", os.path.join(d, "a.xisf")], "print to the standard output"),
+                       (["-t", "fits", "-o", "-", "-d", d, os.path.join(d, "a.xisf")], "not into a directory"),
+                       (["-t", "fits", "-o", "-", d], "is a directory")):
+        r = piped(*args, data=data)
+        check(r.returncode == 2 and says in r.stderr.decode() and r.stdout == b"",
+              f"stdio: {args} is refused ({says}): {r.returncode} {r.stderr!r}")
+    for data_in, says in ((b"", "too short"), (b"SIMPLE  = T" + b" " * 3000, "")):
+        r = piped("-t", "tiff", "-o", "-", "-", data=data_in)
+        check(r.returncode == 1 and says in r.stderr.decode() and b"<stdin>" in r.stderr and r.stdout == b"",
+              f"stdio: a standard input that is no file: {r.stderr!r}")
+    r = piped("--verify", "-", data=data[:-100])
+    check(r.returncode == 1 and r.stdout.startswith(b"<stdin>: FAILED"), f"stdio: a cut-off file fails to verify: {r.stdout!r}")
+    r = piped("--asdf-tree-json", "-", data=open(os.path.join(d, "c.asdf"), "rb").read())
+    check(r.returncode == 1 and b"needs a file" in r.stderr, "stdio: --asdf-tree-json reads a file")
+    # a file named "-" is ./-, and a directory too: "-" is the standard input
+    shutil.copy(os.path.join(d, "a.xisf"), os.path.join(d, "-"))
+    r = subprocess.run([EXE, "-I", "./-"], cwd=d, capture_output=True)
+    check(r.returncode == 0 and b"./-: XISF" in r.stdout, "stdio: a file named - is ./-")
+    os.remove(os.path.join(d, "-"))
+    os.makedirs(os.path.join(d, "-"))
+    for args in (["--verify", "-"], ["-t", "fits", "-o", "-", "-"]):
+        r = subprocess.run([EXE, *args], cwd=d, input=data, capture_output=True)
+        check(r.returncode == 0 and r.stdout.startswith(b"<stdin>: OK" if args[0] == "--verify" else b"SIMPLE  ="),
+              f"stdio: with a directory named -, {args} reads the standard input: {r.stdout[:80]!r} {r.stderr!r}")
+    # a pattern that names one file: nothing but the file on the standard output
+    r = piped("-t", "fits", "-o", "-", os.path.join(d, "a.xis?"))
+    check(r.returncode == 0 and r.stdout == open(os.path.join(d, "a2.fits"), "rb").read(),
+          f"stdio: a pattern to the standard output gives the file alone: {r.stdout[-80:]!r}")
+
+
 def test_pieces():
     """Images are read and written a piece at a time (0.20): what comes out does not depend on the size of the pieces
     or on the memory a conversion may take (XISFCONV_PIECE_BYTES, XISFCONV_MEMORY_LIMIT), large TIFF output is BigTIFF,
@@ -7676,7 +7783,7 @@ if __name__ == "__main__":
               test_asdf_python_files, test_asdf_roundtrips, test_export_from_fits_and_asdf, test_xisf_rewrite,
               test_verify, test_fits_tile_compressed, test_fits_tile_writing, test_property_round_trip,
               test_downsampling_and_thumbnailer, test_distributed_units, test_directories_and_patterns, test_dng, test_debayer,
-              test_compression_level_and_shuffling, test_pieces,
+              test_compression_level_and_shuffling, test_pieces, test_standard_input_and_output,
               test_documents):
         try:
             t()
