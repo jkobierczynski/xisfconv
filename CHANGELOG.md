@@ -9,7 +9,18 @@ in [`DEVELOPMENT.md`](DEVELOPMENT.md).
 Under "changed" stands what makes the same command, or the same call, do something else than
 before.
 
-## Unreleased
+## 0.21.0 (12 October 2026)
+
+**Fixes found by checking the documents against the program, and by CI on macOS and Windows.**
+
+Changed
+- By default (`--external-files header-dir`) a `..` behind a symbolic link in a path that a
+  header names is refused, also behind a link that stays in the directory: going out through a
+  link and back in would tell what the link leads to. `--external-files anywhere` allows it.
+- A path in a header that goes through a name that is not there and back (`missing/../name`)
+  is the file its words spell, `name`, on every system (as on Windows before); it was "not
+  there" on Linux and macOS.
+- A FITS file that ends inside the header of an HDU converts with a warning (below).
 
 Fixed
 - A process forked while the library wrote a file (in Python, `os.fork()` while another thread
@@ -23,8 +34,10 @@ Fixed
   depending on whether there was a file where it led: "behind a symbolic link" when there was,
   "not there" when there was not. It now reads the same both times, as `MANUAL.md` says. A path
   out through a symbolic link and back in by `..` was followed or refused depending on what
-  the link led to; a `..` behind a link is now refused by default (`--external-files anywhere`
-  allows it), also behind a link that stays in the directory.
+  the link led to (see "Changed").
+- A long path in a header that stays in its directory (`a/../a/../name`, beyond 1024
+  characters on macOS, 260 on Windows) was "not there": the system was asked about the path as
+  it is written. It is now asked about the path as its words reduce.
 - A FITS file that ends inside the header of an HDU (one that was not copied whole) converted
   without what that HDU held, and without a word: a table of XISF properties cut off there was
   lost silently. The remains are now skipped with a warning, as a table is, that names the

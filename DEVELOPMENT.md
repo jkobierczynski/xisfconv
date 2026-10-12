@@ -404,6 +404,7 @@ brought are in the sections below.
 | | 0.18.1 | `--debayer`: colour pictures of a mosaic, for TIFF and PNG |
 | 9 October | 0.19.0 | `--level` and `--no-shuffle`: the compression level and byte shuffling for conversions to XISF and rewrites |
 | | 0.20.0 | Images read and written a piece at a time; BigTIFF; Ctrl-C within one image |
+| 12 October | 0.21.0 | Fixes: the digest of the WCS as written, cut-off FITS remains told, refusals through symbolic links, files written safely across fork() |
 
 ## Purpose and scope
 
@@ -795,7 +796,7 @@ them. The choices:
   name only when there was nothing there, as its words reduce. `link/../name` (the link leading
   out) is `name` to the words but beside the link's target to the system, so a file there was
   refused as behind a link and its absence reported as "not there" (found when the documents
-  were checked against the program, 0.20.x). Going through the path as written instead let a
+  were checked against the program, 0.21.0). Going through the path as written instead let a
   long path hide the link (a name longer than the system takes is no link to `lstat`), and a
   path out through a link and back in by `..` was followed if the link's target was a
   directory and refused if not. So the path is now gone through name by name first, as it is
@@ -1742,7 +1743,7 @@ library with one line changed.
   Python. What they print is held against what they must print for those files (most lines word
   for word, numbers that depend on the arithmetic of the machine by their form and range), and
   what they write is read back.
-- `tests/run_tests.py` drives the built program (about 6830 checks at 0.20.0 when run as root with rawpy and imagecodecs installed, 13 more with OpenXISF beside it). The Python packages it
+- `tests/run_tests.py` drives the built program (about 6870 checks at 0.21.0 when run as root with rawpy and imagecodecs installed, 13 more with OpenXISF beside it). The Python packages it
   needs are listed at its top; the `asdf` packages and the external tools (`tiffcp`, `fitsverify`,
   `pngcheck`, `fpack`/`funpack`) are used when installed and their checks skipped when not.
 - Every format is checked against an implementation that shares no code with xisfconv: astropy
