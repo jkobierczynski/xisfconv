@@ -4035,6 +4035,49 @@ def test_property_round_trip():
           "Observatory:Name (String) = Dark Sky & Co" in listing and "M:F64 (F64Matrix) [data block]" in listing and
           "table" not in listing, "--info lists the properties a FITS file carries (and not their tables as skipped HDUs)")
     check(run(f, "--verify").returncode == 0, "--verify accepts the FITS file with its tables")
+    import re
+    # A file that was not copied whole: a table of properties cut off inside its header is passed over, and said.
+    whole = open(f, "rb").read()
+    tables = [m.start() for m in re.finditer(rb"XTENSION= 'BINTABLE'", whole)]
+    for label, cut, said in (
+            ("the table of the file, after its name", tables[-1] + 2500, "skipped HDU 5: the XISF properties of the file, cut off"),
+            ("the table of image 2, after its name", tables[-2] + 2500, "skipped HDU 4: the XISF properties of image 2, cut off"),
+            ("the table of image 2, before its name", tables[-2] + 500,
+             "skipped HDU 4: 500 bytes at the end of the file that are not padding: what is left of a table behind image 2, "
+             "cut off or damaged: XISF properties it held are not restored"),
+            ("its first card", tables[-2] + 1, "skipped HDU 4: 1 byte at the end of the file that is not padding")):
+        cut_file = os.path.join(d, "cut.fits")
+        open(cut_file, "wb").write(whole[:cut])
+        r = subprocess.run([EXE, cut_file, "-o", X, "-f"], capture_output=True, text=True, encoding="utf-8", errors="replace")
+        listing = info(X) if r.returncode == 0 else ""
+        restored = re.findall(r"info: image (\d+): (\d+) XISF properties restored", r.stderr)
+        check(r.returncode == 0 and said in r.stderr and r.stderr.count("skipped") == 1 and "Dark Sky" not in listing and
+              restored == [("0", str(len(original[0])))] + ([] if "HDU 4" in said else [("2", "2")]),
+              f"a FITS file cut inside {label}: converted with a warning, the properties before the cut restored: "
+              f"{r.returncode} {r.stderr.strip()[-400:]} {restored}")
+        if label == "the table of image 2, after its name":
+            check("Skipped HDU 4: the XISF properties of image 2, cut off" in info(cut_file), "... and --info lists it")
+            r = run(cut_file, "--verify", expect_ok=False)
+            check(r.returncode == 1 and "after HDU 3 are not padding" in r.stdout, f"... and --verify reports it: {r.stdout.strip()}")
+    # ... also where its header takes more than one block and the cut is in a later one
+    from astropy.io import fits as afits
+    table = afits.BinTableHDU.from_columns([afits.Column(name="ID", format="8A", array=np.array([b"A:B"]))], name="XISF_PROPERTIES")
+    for k in range(60):
+        table.header[f"NOTE{k:04d}"] = "a card"
+    long_header = os.path.join(d, "long_header.fits")
+    afits.HDUList([afits.PrimaryHDU(np.zeros((4, 5), np.uint16)), table]).writeto(long_header, overwrite=True)
+    data = open(long_header, "rb").read()
+    open(cut_file, "wb").write(data[:2880 * 3 + 300])   # (the image takes two blocks, the header of the table two more)
+    r = subprocess.run([EXE, cut_file, "-o", X, "-f"], capture_output=True, text=True)
+    check(r.returncode == 0 and "skipped HDU 1: the XISF properties of image 0, cut off at the end of the file (3180 bytes of the table)" in r.stderr,
+          f"a table cut off in a later block of its header is passed over as well: {r.returncode} {r.stderr.strip()[-300:]}")
+    open(cut_file, "wb").write(data[:2000])
+    r = subprocess.run([EXE, cut_file, "--info"], capture_output=True, text=True)
+    check("Skipped" not in r.stdout + r.stderr, f"a primary HDU that is cut off is no remains of an extension: {r.stdout.strip()[-200:]} {r.stderr.strip()[-200:]}")
+    open(os.path.join(d, "padded.fits"), "wb").write(whole + b"\0" * 2880 + b" " * 2880)
+    r = subprocess.run([EXE, os.path.join(d, "padded.fits"), "-o", X, "-f"], capture_output=True, text=True)
+    check(r.returncode == 0 and "skipped" not in r.stderr and "warning" not in r.stderr,
+          f"blocks of zeros or blanks after the last HDU are no remains of anything: {r.stderr.strip()[-300:]}")
     a = os.path.join(d, "a.asdf")
     run(src, "-o", a, "-f", "-q")
     listing = info(a)

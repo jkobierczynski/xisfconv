@@ -138,7 +138,9 @@ void addCard(Header& hdr, const std::string& raw) {
 }
 
 // Reads one header (a whole number of 2880-byte blocks). Returns false at a clean end of file.
-bool readHeader(std::ifstream& in, uint64_t fileSize, uint64_t& pos, Header& hdr, bool primary) {
+// `cutOff`: set instead of throwing for the header of an extension that the end of the file cuts
+// off before its END card.
+bool readHeader(std::ifstream& in, uint64_t fileSize, uint64_t& pos, Header& hdr, bool primary, bool* cutOff = nullptr) {
     if (pos >= fileSize) return false;
     std::string block(kBlock, ' ');
     bool end = false, first = true;
@@ -146,6 +148,10 @@ bool readHeader(std::ifstream& in, uint64_t fileSize, uint64_t& pos, Header& hdr
         if (pos + kBlock > fileSize) {
             if (first) {
                 // Trailing junk shorter than a block after the last HDU is tolerated.
+                return false;
+            }
+            if (cutOff && !primary) {
+                *cutOff = true;
                 return false;
             }
             throw Error("FITS header is truncated (no END card)");
@@ -171,6 +177,59 @@ bool readHeader(std::ifstream& in, uint64_t fileSize, uint64_t& pos, Header& hdr
         }
     }
     return true;
+}
+
+// True if [from, to) of the file holds nothing but padding (zeros or blanks), as what follows the
+// last HDU may. `count`: the bytes that are not, all of them counted (else it stops at the first).
+bool onlyPadding(std::ifstream& in, uint64_t from, uint64_t to, uint64_t* count = nullptr) {
+    in.clear();
+    in.seekg(static_cast<std::streamoff>(from));
+    std::vector<char> buf(65536);
+    uint64_t stray = 0;
+    for (uint64_t left = to - from; left > 0;) {
+        const size_t n = static_cast<size_t>(std::min<uint64_t>(left, buf.size()));
+        if (!in.read(buf.data(), static_cast<std::streamsize>(n))) throw Error("read error", ErrorKind::Io);
+        for (size_t i = 0; i < n; ++i) {
+            if (buf[i] == 0 || buf[i] == ' ') continue;
+            ++stray;
+            if (!count) return false;
+        }
+        left -= n;
+    }
+    if (count) *count = stray;
+    return stray == 0;
+}
+
+// What the skipped HDUs of a file say of the remains of HDU `hduIndex`, [from, to) of the file:
+// that of a table of XISF properties is named, since what was carried is not restored.
+std::string remainsOfHdu(std::ifstream& in, uint64_t from, uint64_t to, size_t hduIndex, std::optional<size_t> imageBefore) {
+    // (the name of a table may stand in a later block of its header than the first)
+    std::string start(static_cast<size_t>(std::min<uint64_t>(to - from, 16 * kBlock)), ' ');
+    in.clear();
+    in.seekg(static_cast<std::streamoff>(from));
+    if (!in.read(&start[0], static_cast<std::streamsize>(start.size()))) throw Error("read error", ErrorKind::Io);
+    std::replace(start.begin(), start.end(), '\0', ' ');
+    Header hdr;
+    if (start.compare(0, 8, "XTENSION") == 0)
+        for (size_t off = 0; off + 80 <= start.size(); off += 80) {
+            const std::string raw = start.substr(off, 80);
+            if (rtrim(raw.substr(0, 8)) == "END" && rtrim(raw.substr(8)).empty()) break;
+            addCard(hdr, raw);
+        }
+    const std::string name = hdr.getString("EXTNAME");
+    const std::string bytes = std::to_string(to - from) + (to - from == 1 ? " byte" : " bytes");
+    const std::string label = "HDU " + std::to_string(hduIndex) + ": ";
+    if (name == kPropertyTable && imageBefore)
+        return label + "the XISF properties of image " + std::to_string(*imageBefore) + ", cut off at the end of the file (" +
+               bytes + " of the table): they are not restored";
+    if (name == kMetadataTable)
+        return label + "the XISF properties of the file, cut off at the end of the file (" + bytes + " of the table): they are not restored";
+    const std::string notPadding = label + bytes + " at the end of the file that " + (to - from == 1 ? "is" : "are") + " not padding: ";
+    // (a table behind an image, which the cards so far do not name, may be that of its properties)
+    if (imageBefore && toUpper(hdr.getString("XTENSION")) == "BINTABLE")
+        return notPadding + "what is left of a table behind image " + std::to_string(*imageBefore) +
+               ", cut off or damaged: XISF properties it held are not restored";
+    return notPadding + "what is left of a cut-off or damaged extension, or records that are no HDU";
 }
 
 // The keywords of an image among the cards of its header: what the reader leaves to the header
@@ -701,17 +760,7 @@ VerifyReport verifyFits(const std::string& path) {
             // HDU: a cut-off header, or one whose first card is damaged.
             pos = headerPos;
             uint64_t stray = 0;
-            in.clear();
-            in.seekg(static_cast<std::streamoff>(pos));
-            std::vector<char> buf(65536);
-            for (uint64_t left = fileSize - pos; left > 0;) {
-                const size_t n = static_cast<size_t>(std::min<uint64_t>(left, buf.size()));
-                if (!in.read(buf.data(), static_cast<std::streamsize>(n))) throw Error("read error", ErrorKind::Io);
-                for (size_t i = 0; i < n; ++i)
-                    if (buf[i] != 0 && buf[i] != ' ') ++stray;
-                left -= n;
-            }
-            if (stray) {
+            if (pos < fileSize && !onlyPadding(in, pos, fileSize, &stray)) {
                 report.problems.push_back(std::to_string(fileSize - pos) + " bytes after HDU " + std::to_string(hduIndex - 1) +
                                           " are not padding: a truncated or damaged extension");
             }
@@ -821,7 +870,18 @@ FitsFile readFits(const std::string& path, bool headersOnly, std::optional<size_
     uint64_t budget = propertyBudget(file.fileSize);   // what the XISF properties of the file may hold together
     for (size_t hduIndex = 0;; ++hduIndex) {
         Header hdr;
-        if (!readHeader(in, file.fileSize, pos, hdr, hduIndex == 0)) break;
+        const uint64_t headerPos = pos;
+        bool cutOff = false;
+        if (!readHeader(in, file.fileSize, pos, hdr, hduIndex == 0, &cutOff)) {
+            // What follows the last HDU should be padding. Anything else is what is left of an
+            // HDU that was cut off (a file that was not copied whole) or damaged: it is passed
+            // over, and said, as an HDU that is not an image is. (An HDU begins on a block, so
+            // its first block tells; --verify looks at all of it.)
+            if (hduIndex > 0 && headerPos < file.fileSize &&
+                (cutOff || !onlyPadding(in, headerPos, std::min(file.fileSize, headerPos + kBlock))))
+                file.skipped.push_back(remainsOfHdu(in, headerPos, file.fileSize, hduIndex, imageBefore));
+            break;
+        }
         const std::optional<size_t> owner = imageBefore;
         imageBefore.reset();
 

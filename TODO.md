@@ -74,9 +74,6 @@ Smaller items, each closing a limitation listed in `MANUAL.md`:
 
 Found when the documents were checked against the program (October 2026), and not changed yet:
 
-- [ ] A FITS file that ends inside the header of an `XISF_PROPERTIES` table converts without the
-      properties and without a warning (what is behind the last whole HDU counts as something
-      that does not belong to the file). `--verify` reports it; a conversion should warn.
 - [ ] `MANUAL.md` says a refusal does not tell whether there is something where a symbolic link
       leads. For a path that goes through a link and back (`link/../name`, the link leading to a
       directory outside) the message differs between a file that is there and one that is not.

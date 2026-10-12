@@ -287,6 +287,11 @@ A FITS input is converted to XISF automatically.
 
 - Reads the primary HDU and IMAGE extensions: BITPIX 8/16/32/64/-32/-64, 2-D images and 3-D cubes
   (channels). Each image HDU becomes an XISF image; tables are skipped with a warning.
+- What follows the last HDU is passed over if it is padding (zeros or blanks). Anything else is
+  what is left of an HDU that was cut off, as in a file that was not copied whole, or damaged: it
+  is skipped with a warning as well, which names the table of XISF properties it was when its
+  header says so (those properties are not restored). `--verify` reports such a file as failed.
+  An HDU that is cut off inside its data is an error.
 - Reads **tile-compressed images** (`.fits.fz`, as written by fpack, CFITSIO and astropy) directly,
   without funpack: see below.
 - Sample mapping: the standard unsigned conventions (BZERO = 32768, 2^31, 2^63) become UInt16/32/64

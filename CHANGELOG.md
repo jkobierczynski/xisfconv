@@ -12,6 +12,12 @@ before.
 ## Unreleased
 
 Fixed
+- A FITS file that ends inside the header of an HDU (one that was not copied whole) converted
+  without what that HDU held, and without a word: a table of XISF properties cut off there was
+  lost silently. The remains are now skipped with a warning, as a table is, that names the
+  properties when the header says whose they are; `--info` lists them with the skipped HDUs, and
+  the library and the Python package among their skipped HDUs (`xisfconv_skipped_text`,
+  `skipped`). Zeros and blanks after the last HDU are padding, as before.
 - The digest of the WCS that goes with the XISF properties in FITS and ASDF output (`WCSDIGST`,
   `wcs_digest`) is taken from the keywords as they are written. A WCS keyword that a FITS card
   cannot hold as it is (a text outside ASCII or with a tab, a number too long for a card or too
