@@ -53,7 +53,7 @@
 #include <stdint.h>
 
 #define XISFCONV_VERSION_MAJOR 0
-#define XISFCONV_VERSION_MINOR 21
+#define XISFCONV_VERSION_MINOR 22
 #define XISFCONV_VERSION_PATCH 0
 
 #if defined(XISFCONV_STATIC)
@@ -464,7 +464,8 @@ typedef struct xisfconv_image_info {
      * ASDF: both depend on the data (signed integers without negative values become unsigned,
      * with negative values floating point; the range is 0:1 when the data fits, else 0:65535
      * when it fits, else minimum and maximum), so they are known once the pixels have been
-     * loaded: data_known is 0 before that. xisfconv_load_pixels loads them. DNG: unsigned
+     * loaded: data_known is 0 before that. xisfconv_load_pixels loads them, and so does
+     * xisfconv_read_rows (since 0.22; with rows = 0 it does nothing else). DNG: unsigned
      * integers, known from the header (16-bit, or 32-bit for samples of more than 16 bits). */
     xisfconv_sample_format sample_format;
     int32_t data_known;
@@ -676,6 +677,28 @@ XISFCONV_API xisfconv_status xisfconv_pixels_size(xisfconv_file *file, size_t im
 XISFCONV_API xisfconv_status xisfconv_read_pixels(xisfconv_file *file, size_t image,
                                                   const xisfconv_read_options *options, void *buffer,
                                                   uint64_t buffer_size);
+
+/* (Since 0.22.) Reads a band of rows of an image: rows [first_row, first_row + rows), counted in
+ * the row order options->row_order asks for, of all channels. The band is planar as the buffer of
+ * xisfconv_read_pixels is: channel 0 (rows x width samples), then channel 1, ... in host byte
+ * order, and holds what that buffer holds in those rows, with the same options. So a program
+ * reads an image of any size in bands of rows that fit its memory, and the library holds no
+ * more than a band either: the image is read where it is in the file. What has to be decoded
+ * first (a compressed XISF block, a tile-compressed FITS image, the raw image of a DNG file) is
+ * decoded once, when the first band of the image is read, and kept with the file handle (in
+ * memory up to XISFCONV_MEMORY_LIMIT, beyond that in a temporary file in the system's
+ * temporary directory) until the file is closed, also when bands of several images are read by
+ * turns. Decoding is a step of its own, reported as "reading" to the progress handler and
+ * stopped there as other calls are (XISFCONV_ERR_CANCELLED; the next call begins again). A checksum
+ * that is verified is verified then, once, over the whole block. That first band is also when
+ * a FITS or ASDF image gets its final sample format (whether a signed integer image becomes
+ * unsigned depends on its data) and its range: xisfconv_image_info_get reports them from then
+ * on (data_known = 1).
+ * rows = 0 does only that and reads nothing (buffer may then be NULL). XISFCONV_ERR_ARGUMENT
+ * for rows beyond the last; XISFCONV_ERR_BUFFER if buffer_size is less than
+ * rows x width x channels x the size of a sample. */
+XISFCONV_API xisfconv_status xisfconv_read_rows(xisfconv_file *file, size_t image, const xisfconv_read_options *options,
+                                                uint64_t first_row, uint64_t rows, void *buffer, uint64_t buffer_size);
 
 /* ICC profile of an image (XISF). Call with buffer = NULL to learn the size.
  * XISFCONV_ERR_NOT_FOUND if the image has none. */
@@ -1143,6 +1166,20 @@ typedef struct xisfconv_writer xisfconv_writer;
 XISFCONV_API xisfconv_status xisfconv_writer_new(xisfconv_context *ctx, const char *path,
                                                  const xisfconv_write_options *options, xisfconv_writer **out);
 XISFCONV_API xisfconv_status xisfconv_writer_add_image(xisfconv_writer *writer, const xisfconv_image *image);
+/* (Since 0.22.) An image given a band of rows at a time, for a program that does not hold it
+ * whole: xisfconv_writer_begin_image takes what xisfconv_writer_add_image takes, with pixels
+ * NULL, and xisfconv_writer_add_rows the rows, in the order of image->row_order, from the
+ * first: a band is planar as the buffer of xisfconv_writer_add_image is (channel 0, rows x
+ * width samples, then channel 1, ...), in host byte order, and `size` is its size in bytes
+ * (at least rows x width x channels x the size of a sample). The rows are kept until
+ * xisfconv_writer_finish writes the file, in memory up to XISFCONV_MEMORY_LIMIT and beyond that
+ * in a temporary file beside the output, and the file is the one xisfconv_writer_add_image
+ * would write of the whole buffer, byte for byte. An image is complete when all of its rows have
+ * been given: until then XISFCONV_ERR_ARGUMENT for another image and for finishing, and for
+ * rows beyond the last. */
+XISFCONV_API xisfconv_status xisfconv_writer_begin_image(xisfconv_writer *writer, const xisfconv_image *image);
+XISFCONV_API xisfconv_status xisfconv_writer_add_rows(xisfconv_writer *writer, const void *rows_data, uint64_t rows,
+                                                      uint64_t size);
 /* Writes "<path>.part", renames it, and frees the writer whether or not it succeeds. */
 XISFCONV_API xisfconv_status xisfconv_writer_finish(xisfconv_writer *writer);
 /* Drops a writer without writing anything. NULL is allowed. */

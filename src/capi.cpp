@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <memory>
 #include <new>
 #include <optional>
@@ -127,6 +128,16 @@ struct xisfconv_file {
     bool propertyHeld = false;        // xisfconv_property_read: the property that was asked for last
     size_t propertyImage = 0, propertyIndex = 0;
     Property property;
+    // xisfconv_read_rows: of each image whose rows are read, a source of them (kept until the file
+    // is closed: what has to be decoded first is decoded once, also when bands of several images
+    // are read by turns).
+    struct Bands {
+        bool verified = false;
+        Source source;
+        bool topDown = true;          // the rows as the source has them
+        double lower = 0, upper = 1;  // the range of floating point samples (for a conversion to integers)
+    };
+    std::map<size_t, Bands> bands;
 };
 
 struct xisfconv_properties {
@@ -146,6 +157,10 @@ struct xisfconv_writer {
     ConvertOptions options;
     xisfconv_row_order rowOrder = XISFCONV_ROWS_DEFAULT;
     FitsFile images;
+    // xisfconv_writer_begin_image: the image whose rows are being given (the last of `images`),
+    // where they are kept, and how many have come.
+    std::shared_ptr<Store> rows;
+    uint64_t rowsGiven = 0;
 };
 
 namespace {
@@ -1655,6 +1670,105 @@ xisfconv_status xisfconv_read_pixels(xisfconv_file* file, size_t image, const xi
     });
 }
 
+namespace {
+// The rows of an image as xisfconv_read_rows reads them: set up when the first band of it is
+// asked for, and kept until another image is.
+xisfconv_file::Bands& bandsOf(xisfconv_file* f, size_t image, bool verify) {
+    // (rows that were set up without verifying the checksum do not serve a caller who wants it verified)
+    const auto found = f->bands.find(image);
+    if (found != f->bands.end() && (found->second.verified || !verify)) return found->second;
+    if (found != f->bands.end()) f->bands.erase(found);
+    // What is decoded first is a step of its own, which can be stopped and is reported on.
+    progress("reading", 0, 0);
+    xisfconv_file::Bands b;
+    b.verified = verify;
+    if (isXisf(f)) {
+        const XisfImage& img = f->xisf->images()[image];
+        b.source = f->xisf->pixelSource(image, verify);
+        b.topDown = true;
+        b.lower = img.lowerBound;
+        b.upper = img.upperBound;
+    } else {
+        FitsFile all = f->format == XISFCONV_FORMAT_ASDF ? readAsdf(f->readPath, false, verify, image, true)
+                       : f->format == XISFCONV_FORMAT_DNG ? readDng(f->readPath, false, true)
+                                                          : readFits(f->readPath, false, image, true);
+        if (image >= all.images.size() || !all.images[image].hasData) {
+            fail(XISFCONV_ERR_FORMAT, "image " + std::to_string(image) + " cannot be read (has the file changed since it was opened?)");
+        }
+        FitsImage& img = all.images[image];
+        const PixelBuffer& then = f->fits.images[image].pixels;
+        if (img.pixels.width != then.width || img.pixels.height != then.height || img.pixels.channels != then.channels) {
+            fail(XISFCONV_ERR_FORMAT, "image " + std::to_string(image) + " is not the image it was when the file was opened: "
+                                      "the file has changed");
+        }
+        b.source = img.pieces ? img.pieces : bufferSource(std::make_shared<const PixelBuffer>(std::move(img.pixels)));
+        b.topDown = img.topDown;
+        Known& k = f->known[image];
+        k.known = true;
+        k.format = b.source->format;
+        k.mapping = img.note;
+        k.lower = 0;
+        k.upper = 1;
+        if (isFloat(k.format)) {
+            const auto bounds = automaticBounds(img);
+            k.lower = bounds.first;
+            k.upper = bounds.second;
+        }
+        b.lower = k.lower;
+        b.upper = k.upper;
+    }
+    return f->bands[image] = std::move(b);
+}
+}  // namespace
+
+xisfconv_status xisfconv_read_rows(xisfconv_file* file, size_t image, const xisfconv_read_options* options,
+                                   uint64_t first_row, uint64_t rows, void* buffer, uint64_t buffer_size) {
+    if (!file) return XISFCONV_ERR_ARGUMENT;
+    return guarded(file->state, file->path.c_str(), [&] {
+        if (!buffer && rows) fail(XISFCONV_ERR_ARGUMENT, "xisfconv_read_rows: buffer is NULL");
+        checkImage(file, image);
+        const xisfconv_read_options o = optionsFrom(options, xisfconv_read_options_init);
+        checkRowOrder(o.row_order);
+        const std::optional<SampleFormat> wanted = wantedFormat(o.sample_format);
+        if (o.use_bounds && !(o.upper_bound > o.lower_bound)) fail(XISFCONV_ERR_ARGUMENT, "the upper bound must be above the lower bound");
+        uint64_t width, height, channels;
+        if (isXisf(file)) {
+            const XisfImage& img = file->xisf->images()[image];
+            width = img.width, height = img.height, channels = img.channels;
+        } else {
+            const PixelBuffer& px = file->fits.images[image].pixels;
+            width = px.width, height = px.height, channels = px.channels;
+        }
+        if (first_row > height || rows > height - first_row) {
+            fail(XISFCONV_ERR_ARGUMENT, "rows " + std::to_string(first_row) + " to " + std::to_string(first_row + rows) +
+                                            " of an image of " + std::to_string(height) + " rows");
+        }
+        // (a buffer too small for the band is said before the work of reading, where the sample
+        // format is known before it)
+        const auto needed = [&](SampleFormat format) {
+            return checkedMul(checkedMul(checkedMul(rows, width, "band size"), channels, "band size"), sampleBytes(format), "band size");
+        };
+        if (rows && wanted && buffer_size < needed(*wanted)) {
+            fail(XISFCONV_ERR_BUFFER, "the band needs " + std::to_string(needed(*wanted)) + " bytes, the buffer has " + std::to_string(buffer_size));
+        }
+        xisfconv_file::Bands& b = bandsOf(file, image, o.verify_checksums != 0);
+        if (!rows) return;
+        Source px = b.source;
+        if (wanted && *wanted != px->format) {
+            px = convertedSource(px, *wanted, o.use_bounds ? o.lower_bound : b.lower, o.use_bounds ? o.upper_bound : b.upper);
+        }
+        const bool wantTopDown = o.row_order == XISFCONV_ROWS_DEFAULT ? b.topDown : o.row_order == XISFCONV_ROWS_TOP_DOWN;
+        if (wantTopDown != b.topDown) px = flippedSource(px);
+        const uint64_t bytes = needed(px->format);
+        if (buffer_size < bytes) {
+            fail(XISFCONV_ERR_BUFFER, "the band needs " + std::to_string(bytes) + " bytes, the buffer has " + std::to_string(buffer_size));
+        }
+        const uint64_t plane = bytes / channels;
+        uint8_t* out = static_cast<uint8_t*>(buffer);
+        for (uint64_t c = 0; c < channels; ++c) px->readRows(c, first_row, rows, out + c * plane);
+    });
+}
+
 xisfconv_status xisfconv_read_icc_profile(xisfconv_file* file, size_t image, void* buffer, size_t buffer_size,
                                           size_t* size) {
     if (!file) return XISFCONV_ERR_ARGUMENT;
@@ -2094,6 +2208,13 @@ xisfconv_status xisfconv_writer_new(xisfconv_context* ctx, const char* path, con
         w->options.subblockSize = o.subblock_size;
         w->options.wcs = o.wcs != 0;
         w->options.force = o.overwrite != 0;
+        // (said now, before a program gives the images, which may be given in bands for an hour;
+        // the file is looked at again when it is written)
+        // (a file: what is not one, a directory say, is said for what it is then)
+        std::error_code there;
+        if (!w->options.force && std::filesystem::is_regular_file(std::filesystem::status(toPath(path), there))) {
+            throw Error(std::string(path) + " already exists (use --force to overwrite)", ErrorKind::Exists);
+        }
         checkRowOrder(o.row_order);
         w->rowOrder = o.row_order;
         // What only an XISF file has is checked for an XISF file, and means nothing to the others.
@@ -2122,45 +2243,135 @@ xisfconv_status xisfconv_writer_new(xisfconv_context* ctx, const char* path, con
     });
 }
 
+namespace {
+// What xisfconv_writer_add_image and xisfconv_writer_begin_image take of an image but its pixels.
+void describeImage(const xisfconv_image& in, FitsImage& img, size_t index) {
+    checkRowOrder(in.row_order);
+    img.hduIndex = index;
+    img.hasData = true;
+    img.hasRowOrder = true;
+    img.topDown = in.row_order != XISFCONV_ROWS_BOTTOM_UP;
+    if (in.name) img.name = in.name;
+    if (in.keywords) {
+        // The cards that describe how a FITS file stores its data say nothing about a buffer
+        // (a header taken over from a FITS file brings them along): the writer sets its own.
+        for (const auto& card : in.keywords->cards)
+            if (!isReservedFitsKeyword(card.name)) img.keywords.push_back(card);
+    }
+    checkRowOrder(in.wcs_row_order);
+    if (in.wcs_row_order != XISFCONV_ROWS_DEFAULT && (in.wcs_row_order == XISFCONV_ROWS_TOP_DOWN) != img.topDown) {
+        // The WCS keywords count rows from the other end than the buffer does. They are turned
+        // to the order of the file when it is written, and only if that is another one.
+        img.wcsTopDown = in.wcs_row_order == XISFCONV_ROWS_TOP_DOWN;
+    }
+    if (in.icc_profile && in.icc_profile_size) {
+        const uint8_t* icc = static_cast<const uint8_t*>(in.icc_profile);
+        img.iccProfile.assign(icc, icc + in.icc_profile_size);
+    }
+    if (in.use_bounds) {
+        if (!(in.upper_bound > in.lower_bound)) fail(XISFCONV_ERR_ARGUMENT, "the upper bound must be above the lower bound");
+        img.bounds = std::make_pair(in.lower_bound, in.upper_bound);
+    }
+    if (in.properties && !in.properties->items.empty()) {
+        img.properties = in.properties->items;
+        img.propertiesGiven = true;
+    }
+}
+
+// An image whose rows are still being given stops everything else.
+void noImageInRows(const xisfconv_writer* writer) {
+    if (!writer->rows) return;
+    const FitsImage& img = writer->images.images.back();
+    fail(XISFCONV_ERR_ARGUMENT, "image " + std::to_string(writer->images.images.size() - 1) + " has been given " +
+                                    std::to_string(writer->rowsGiven) + " of its " + std::to_string(img.pixels.height) +
+                                    " rows (xisfconv_writer_add_rows)");
+}
+
+// The directory a file is written to: where the temporary files for it go.
+std::string directoryOfOutput(const std::string& path) {
+    const std::filesystem::path parent = toPath(path).parent_path();
+    return parent.empty() ? std::string(".") : fromPath(parent);
+}
+}  // namespace
+
 xisfconv_status xisfconv_writer_add_image(xisfconv_writer* writer, const xisfconv_image* image) {
     if (!writer) return XISFCONV_ERR_ARGUMENT;
     return guarded(writer->state, writer->path.c_str(), [&] {
         if (!image) fail(XISFCONV_ERR_ARGUMENT, "xisfconv_writer_add_image: image is NULL");
+        noImageInRows(writer);
         const xisfconv_image in = optionsFrom(image, xisfconv_image_init);
         checkRowOrder(in.row_order);
         FitsImage img;
         img.pixels = bufferFrom(in.pixels, in.width, in.height, in.channels, in.sample_format);
-        img.hduIndex = writer->images.images.size();
-        img.hasData = true;
-        img.hasRowOrder = true;
-        img.topDown = in.row_order != XISFCONV_ROWS_BOTTOM_UP;
-        if (in.name) img.name = in.name;
-        if (in.keywords) {
-            // The cards that describe how a FITS file stores its data say nothing about a buffer
-            // (a header taken over from a FITS file brings them along): the writer sets its own.
-            for (const auto& card : in.keywords->cards)
-                if (!isReservedFitsKeyword(card.name)) img.keywords.push_back(card);
-        }
-        checkRowOrder(in.wcs_row_order);
-        if (in.wcs_row_order != XISFCONV_ROWS_DEFAULT && (in.wcs_row_order == XISFCONV_ROWS_TOP_DOWN) != img.topDown) {
-            // The WCS keywords count rows from the other end than the buffer does. They are turned
-            // to the order of the file when it is written, and only if that is another one.
-            img.wcsTopDown = in.wcs_row_order == XISFCONV_ROWS_TOP_DOWN;
-        }
-        if (in.icc_profile && in.icc_profile_size) {
-            const uint8_t* icc = static_cast<const uint8_t*>(in.icc_profile);
-            img.iccProfile.assign(icc, icc + in.icc_profile_size);
-        }
-        if (in.use_bounds) {
-            if (!(in.upper_bound > in.lower_bound)) fail(XISFCONV_ERR_ARGUMENT, "the upper bound must be above the lower bound");
-            img.bounds = std::make_pair(in.lower_bound, in.upper_bound);
-        }
-        if (in.properties && !in.properties->items.empty()) {
-            img.properties = in.properties->items;
-            img.propertiesGiven = true;
-        }
+        describeImage(in, img, writer->images.images.size());
         updateFloatRange(img);
         writer->images.images.push_back(std::move(img));
+    });
+}
+
+xisfconv_status xisfconv_writer_begin_image(xisfconv_writer* writer, const xisfconv_image* image) {
+    if (!writer) return XISFCONV_ERR_ARGUMENT;
+    return guarded(writer->state, writer->path.c_str(), [&] {
+        if (!image) fail(XISFCONV_ERR_ARGUMENT, "xisfconv_writer_begin_image: image is NULL");
+        noImageInRows(writer);
+        const xisfconv_image in = optionsFrom(image, xisfconv_image_init);
+        if (in.pixels) fail(XISFCONV_ERR_ARGUMENT, "xisfconv_writer_begin_image: pixels is not NULL (the rows come by xisfconv_writer_add_rows)");
+        FitsImage img;
+        if (!fromApi(in.sample_format, img.pixels.format)) fail(XISFCONV_ERR_ARGUMENT, "unknown sample format " + std::to_string(in.sample_format));
+        if (in.width == 0 || in.height == 0 || in.channels == 0) fail(XISFCONV_ERR_ARGUMENT, "an image needs a width, a height and at least one channel");
+        uint64_t bytes = 0;
+        try {
+            bytes = checkedMul(checkedMul(checkedMul(in.width, in.height, "image size"), in.channels, "image size"),
+                               sampleBytes(img.pixels.format), "image size");
+        } catch (const Error& e) {
+            fail(XISFCONV_ERR_ARGUMENT, e.what());
+        }
+        img.pixels.width = in.width;
+        img.pixels.height = in.height;
+        img.pixels.channels = in.channels;
+        describeImage(in, img, writer->images.images.size());
+        // The rows are kept as the whole buffer of xisfconv_writer_add_image would hold them.
+        const TempDirectoryScope temporaries(directoryOfOutput(writer->path));
+        auto rows = std::make_shared<Store>(bytes);
+        img.pieces = storedSource(rows, in.width, in.height, in.channels, img.pixels.format, StoredLayout());
+        writer->images.images.push_back(std::move(img));
+        writer->rows = std::move(rows);
+        writer->rowsGiven = 0;
+    });
+}
+
+xisfconv_status xisfconv_writer_add_rows(xisfconv_writer* writer, const void* rows_data, uint64_t rows, uint64_t size) {
+    if (!writer) return XISFCONV_ERR_ARGUMENT;
+    return guarded(writer->state, writer->path.c_str(), [&] {
+        if (!writer->rows) fail(XISFCONV_ERR_ARGUMENT, "xisfconv_writer_add_rows: no image is begun (xisfconv_writer_begin_image)");
+        FitsImage& img = writer->images.images.back();
+        const uint64_t height = img.pixels.height, given = writer->rowsGiven;
+        if (rows > height - given) {
+            fail(XISFCONV_ERR_ARGUMENT, std::to_string(rows) + " rows more for image " + std::to_string(writer->images.images.size() - 1) +
+                                            ", which has " + std::to_string(height - given) + " of its " + std::to_string(height) + " to come");
+        }
+        if (!rows) return;
+        if (!rows_data) fail(XISFCONV_ERR_ARGUMENT, "xisfconv_writer_add_rows: rows_data is NULL");
+        const uint64_t rowBytes = img.pixels.width * sampleBytes(img.pixels.format);
+        const uint64_t plane = rows * rowBytes;   // (no overflow: within the image, whose size was checked)
+        if (size < plane * img.pixels.channels) {
+            fail(XISFCONV_ERR_BUFFER, "a band of " + std::to_string(rows) + " rows has " + std::to_string(plane * img.pixels.channels) +
+                                          " bytes, the buffer " + std::to_string(size));
+        }
+        const TempDirectoryScope temporaries(directoryOfOutput(writer->path));
+        const uint8_t* in = static_cast<const uint8_t*>(rows_data);
+        const uint64_t channelBytes = height * rowBytes;
+        for (uint64_t c = 0; c < img.pixels.channels; ++c) {
+            writer->rows->write(c * channelBytes + given * rowBytes, in + c * plane, static_cast<size_t>(plane));
+            progressTick(plane);
+        }
+        writer->rowsGiven += rows;
+        if (writer->rowsGiven == height) {
+            // complete: what the writer needs to know of the samples is found as for a buffer
+            updateFloatRange(img);
+            writer->rows.reset();
+            writer->rowsGiven = 0;
+        }
     });
 }
 
@@ -2168,6 +2379,7 @@ xisfconv_status xisfconv_writer_finish(xisfconv_writer* writer) {
     if (!writer) return XISFCONV_ERR_ARGUMENT;
     const std::unique_ptr<xisfconv_writer> owned(writer);
     return guarded(writer->state, writer->path.c_str(), [&] {
+        noImageInRows(writer);
         if (writer->images.images.empty()) fail(XISFCONV_ERR_ARGUMENT, "no images to write");
         if (writer->format == Format::Fits || writer->format == Format::Asdf) {
             // FITS and ASDF keep the rows as they are handed over: put them in the order asked for.
@@ -2177,7 +2389,8 @@ xisfconv_status xisfconv_writer_finish(xisfconv_writer* writer) {
                 // WCS keywords if they describe another order than the stored one.
                 const bool wcsTopDown = img.wcsTopDown ? *img.wcsTopDown : img.topDown;
                 if (img.topDown != storeTopDown) {
-                    flipVertical(img.pixels);
+                    if (img.pieces) img.pieces = flippedSource(img.pieces);
+                    else flipVertical(img.pixels);
                     flipBayerRows(img.keywords, img.pixels.height);
                     img.topDown = storeTopDown;
                     img.hasRowOrder = true;

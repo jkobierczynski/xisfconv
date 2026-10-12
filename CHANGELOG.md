@@ -9,6 +9,30 @@ in [`DEVELOPMENT.md`](DEVELOPMENT.md).
 Under "changed" stands what makes the same command, or the same call, do something else than
 before.
 
+## 0.22.0 (12 October 2026)
+
+**Images in bands of rows, for programs that use the library.**
+
+Added
+- `xisfconv_read_rows` reads a band of rows of an image: what `xisfconv_read_pixels` gives in
+  those rows, with the same options, laid out the same way. The rows are read where they are in
+  the file; what has to be decoded first (a compressed XISF block, a tile-compressed FITS image,
+  the raw image of a DNG file) is decoded once, when the first band is read, and kept with the
+  open file. Reading no rows readies the image, after which `xisfconv_image_info_get` reports the
+  final sample format of a FITS or ASDF image.
+- `xisfconv_writer_begin_image` and `xisfconv_writer_add_rows`: a writer given an image a band
+  of rows at a time. The rows are kept until the file is written, in memory up to
+  `XISFCONV_MEMORY_LIMIT` and in a temporary file beside the output beyond, and the file is the
+  one the image given whole makes, byte for byte.
+- Python: `FileImage.bands(rows)`, a generator of `(first_row, array)`, and
+  `FileImage.read_rows(first, count)`, with the options of `read`; `xisfconv.Writer`, which takes
+  images whole (`add`) or in bands (`begin_image`, `add_rows`) and writes the file at the end of
+  its `with` block (an exception there writes nothing).
+- The tour of the manual has a chapter "Images in bands" in C, C++ and Python.
+
+Changed
+- `xisfconv.write` is a `Writer` given whole images: the same files, the same messages.
+
 ## 0.21.0 (12 October 2026)
 
 **Fixes found by checking the documents against the program, and by CI on macOS and Windows.**

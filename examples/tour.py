@@ -159,6 +159,30 @@ def write_crop(path):
 # [/write]
 
 
+# [bands]
+def bands(path):
+    # An image of any size, a band of rows at a time: the program holds one band. The library reads
+    # the rows where they are in the file, and keeps what it has to (the rows it is given for a
+    # file, a block it decompressed) in memory up to a limit, beyond that in a temporary file.
+    rows = 256
+    low, high, total, count, done = np.inf, -np.inf, 0.0, 0, 0
+    with xisfconv.open(path) as f, xisfconv.Writer(out_path("bands.fits"), overwrite=True) as writer:
+        image = f[0]
+        # The writer takes the image without its pixels, and then its rows, from the first.
+        writer.begin_image(image.width, image.height, "float32", channels=image.channels, name="bands")
+        for y, band in image.bands(rows, sample_format="float32"):    # [rows, width(, channels)]
+            low, high = min(low, band.min()), max(high, band.max())
+            total += band.sum(dtype=np.float64)
+            count += band.size
+            writer.add_rows(band)
+            done += 1
+    # the numbers of the chapter "pixels", which read the image whole
+    print("%d samples: minimum %.6f, maximum %.6f, mean %.6f" % (count, low, high, total / count))
+    print("wrote bands.fits from %d bands of up to %d rows" % (done, rows))
+    return 0
+# [/bands]
+
+
 # [convert]
 def convert(path):
     # To FITS, with everything the tool does: rows turned bottom-up, keywords, properties.
@@ -350,7 +374,7 @@ def like_the_xisf_package(path):
 
 # [main]
 CHAPTERS = [("inspect", inspect), ("pixels", pixels), ("stretch", stretch), ("write", write_crop),
-            ("convert", convert), ("rewrite", rewrite_and_verify), ("units", units), ("wcs", wcs),
+            ("bands", bands), ("convert", convert), ("rewrite", rewrite_and_verify), ("units", units), ("wcs", wcs),
             ("progress", progress_and_errors), ("astropy", with_astropy), ("compat", like_the_xisf_package)]
 
 

@@ -20,7 +20,7 @@ import xisfconv
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
 EXAMPLES = os.path.join(ROOT, "examples")
-CHAPTERS = ["inspect", "pixels", "stretch", "write", "convert", "rewrite", "units", "wcs", "progress"]
+CHAPTERS = ["inspect", "pixels", "stretch", "write", "bands", "convert", "rewrite", "units", "wcs", "progress"]
 PYTHON_ONLY = ["astropy", "compat"]
 
 pytestmark = pytest.mark.skipif(not os.path.exists(os.path.join(EXAMPLES, "tour.py")),
@@ -109,6 +109,8 @@ def test_tour(work):
     assert re.fullmatch(r"shadows [\d.]+, midtones [\d.]+, highlights [\d.]+", found["stretch"][0])
     assert found["stretch"][1] == "wrote stretched.png, 96 x 64, 8 bits"
     assert found["write"] == ["wrote crop.xisf: 64 x 64 pixels, compressed with zlib, SHA-256 checksum"]
+    assert found["bands"] == [found["pixels"][0], "wrote bands.fits from 1 bands of up to 256 rows"]
+    assert np.array_equal(xisfconv.read(str(work / "out" / "bands.fits")), xisfconv.read(str(work / "small.xisf")))
     assert found["convert"] == ["wrote frame.fits", "wrote preview.png"]
     assert re.fullmatch(r"\d+ -> \d+ bytes: 2 block\(s\) compressed, 0 kept, 2 checksum\(s\), read back: yes", found["rewrite"][0])
     assert found["rewrite"][1:] == ["smaller.xisf is stored as asked: yes", "verdict OK: 1 image, 2 data blocks; 2 checksum(s) verified"]
@@ -121,7 +123,7 @@ def test_tour(work):
     assert len(notes) == 3 and "taken along" in notes[0] and "32-bit float" in notes[1] and "restored" in notes[2]
     assert found["progress"][-3:] == ["  rewriting 0 of 2", "  rewriting 1 of 2", "stopped: by the handler; a file is left: no"]
 
-    written = ["back.xisf", "crop.xisf", "frame.fits", "packed.xisf", "preview.png", "smaller.xisf", "stretched.png",
+    written = ["back.xisf", "bands.fits", "crop.xisf", "frame.fits", "packed.xisf", "preview.png", "smaller.xisf", "stretched.png",
                "there.fits", "unit.xisb", "unit.xish"]
     try:
         import astropy  # noqa: F401
@@ -194,6 +196,7 @@ def test_tour_on_other_frames(tmp_path):
         found = chapters_of(out)
         assert list(found) == CHAPTERS + PYTHON_ONLY
         crop = xisfconv.read_image(str(tmp_path / name / "crop.xisf"))
+        assert found["bands"][0] == found["pixels"][0], name     # (the image in bands is the image)
         if name == "rgb16":
             assert 'image 0 "rgb16": 21 x 12 pixels, 3 channel(s), uint16, range 0 to 65535' in found["inspect"]
             assert "the object is not named" in found["inspect"]

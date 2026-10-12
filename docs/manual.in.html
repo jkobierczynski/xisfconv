@@ -416,9 +416,10 @@ constants, and flags are 0 or 1.</p>
 <code>sample_format="float32"</code>, <code>codec="zstd"</code>, <code>row_order="bottom-up"</code>.</p>
 
 <h3 id="pixel-layout">Pixels</h3>
-<p>An image that a program reads or writes is a whole, in memory. The table says how it lies there. (A conversion and a
-rewrite read and write an image a piece at a time, and hold none whole: since 0.20 they take little memory whatever the
-size of the image.)</p>
+<p>An image that a program reads or writes is a whole in memory, or a band of its rows (since 0.22, see
+<a href="#bands">Images in bands</a>). The table says how it lies there; a band lies the same way, with fewer rows. (A
+conversion and a rewrite read and write an image a piece at a time, and hold none whole: since 0.20 they take little memory
+whatever the size of the image.)</p>
 <table class="grid">
   <thead><tr><th></th><th>C and C++</th><th>Python</th></tr></thead>
   <tbody>
@@ -519,6 +520,25 @@ that fails leaves no half-written file under the final name. An existing file is
 <p>In C and C++ a <em>writer</em> collects images and writes them when it is finished: one image here, several for an XISF file
 with several images or a FITS file with several HDUs. The writer copies what it is given, so the program may free its buffers
 as soon as the image is added. In Python, <code>xisfconv.write</code> takes one array, one <code>Image</code>, or a list of them.</p>
+
+<h3 id="bands">Images in bands</h3>
+<p>A mosaic or a drizzled stack can be larger than the memory of the program that makes or reads it. Such an image is read a
+band of rows at a time, and written that way: the program holds one band, and the library little more. This chapter reads the frame
+in bands of 256 rows, computes what the chapter on reading pixels computed of the whole, and writes the bands as they come into
+a new FITS file.</p>
+<!--@tabs bands-->
+<p>A band lies as a whole image does, with fewer rows: planar in C and C++, an array of <code>[rows, width]</code> or
+<code>[rows, width, channels]</code> in Python. Its rows are counted in the row order the call asks for, and the options of
+reading are those of reading the whole: another sample format, bounds, either row order.</p>
+<p>Reading takes the rows from where they are in the file. What has to be decoded first, a compressed XISF block or a
+tile-compressed FITS image, is decoded once, when the first band of the image is read, and kept with the open file until it is
+closed: in memory up to <code>XISFCONV_MEMORY_LIMIT</code> (256 MiB by default), beyond that in a temporary file. A checksum is
+verified then, over the whole block. That first band is a step that is reported to the progress handler and can be stopped.</p>
+<p>Writing keeps the rows it is given until the file is written, in memory up to the same limit and beyond it in a temporary
+file beside the output, and writes the file that the image given whole would have made, byte for byte. An image is complete
+when its last row has come; until then the writer takes no other image and does not finish. In Python,
+<code>xisfconv.Writer</code> does both kinds: <code>add</code> for an image given whole, <code>begin_image</code> and
+<code>add_rows</code> for one given in bands, and <code>xisfconv.write</code> is a writer that is given its images whole.</p>
 
 <h3 id="convert">Converting files</h3>
 <p>One call does what the command line tool does with a file: it reads every image, turns the rows as the output format

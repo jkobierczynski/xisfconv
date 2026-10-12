@@ -331,6 +331,64 @@ void write_crop(const xisf::Context& ctx, const std::string& path) {
 }
 // [/write]
 
+// [bands]
+// An image of any size, a band of rows at a time: the program holds one band. The library reads
+// the rows where they are in the file, and keeps what it has to (the rows it is given for a file,
+// a block it decompressed) in memory up to a limit, beyond that in a temporary file.
+void bands(const xisf::Context& ctx, const std::string& path) {
+    constexpr uint64_t kRows = 256;
+    const xisf::File file = xisf::open(ctx, path);
+    auto options = xisf::defaults(xisfconv_read_options_init);
+    options.sample_format = XISFCONV_SAMPLE_FLOAT32;
+    options.row_order = XISFCONV_ROWS_TOP_DOWN;
+    // Reading no rows readies the image: from then on its description is final, also that of a
+    // FITS or ASDF image, whose sample format may depend on its data.
+    xisf::check(ctx, xisfconv_read_rows(file.get(), 0, &options, 0, 0, nullptr, 0));
+    auto info = xisf::defaults(xisfconv_image_info_init);
+    xisf::check(ctx, xisfconv_image_info_get(file.get(), 0, &info));
+
+    // The writer takes the image without its pixels, and then its rows, from the first.
+    auto image = xisf::defaults(xisfconv_image_init);
+    image.width = info.width;
+    image.height = info.height;
+    image.channels = info.channels;
+    image.sample_format = XISFCONV_SAMPLE_FLOAT32;
+    image.row_order = XISFCONV_ROWS_TOP_DOWN;
+    image.name = "bands";
+    auto write_options = xisf::defaults(xisfconv_write_options_init);
+    write_options.overwrite = 1;
+    xisfconv_writer* raw = nullptr;
+    xisf::check(ctx, xisfconv_writer_new(ctx.get(), out_path("bands.fits").c_str(), &write_options, &raw));
+    xisf::Handle<xisfconv_writer> writer(raw);
+    xisf::check(ctx, xisfconv_writer_begin_image(writer.get(), &image));
+
+    std::vector<float> band(static_cast<size_t>(kRows * info.width * info.channels));
+    float low = 0, high = 0;
+    double sum = 0;
+    uint64_t count = 0, done = 0;
+    for (uint64_t y = 0; y < info.height; y += kRows) {
+        const uint64_t rows = std::min(kRows, info.height - y);
+        const size_t samples = static_cast<size_t>(rows * info.width * info.channels);
+        // A band is planar as a whole image is: channel 0 (rows x width), then channel 1, ...
+        xisf::check(ctx, xisfconv_read_rows(file.get(), 0, &options, y, rows, band.data(), sizeof(float) * samples));
+        if (y == 0) low = high = band[0];
+        for (size_t i = 0; i < samples; ++i) {
+            low = std::min(low, band[i]);
+            high = std::max(high, band[i]);
+            sum += band[i];
+        }
+        count += samples;
+        xisf::check(ctx, xisfconv_writer_add_rows(writer.get(), band.data(), rows, sizeof(float) * samples));
+        ++done;
+    }
+    xisf::check(ctx, xisfconv_writer_finish(writer.release()));  // writes the file, frees the writer
+    // the numbers of the chapter "pixels", which read the image whole
+    std::printf("%llu samples: minimum %.6f, maximum %.6f, mean %.6f\n", ull(count), low, high,
+                sum / static_cast<double>(count));
+    std::printf("wrote bands.fits from %llu bands of up to %llu rows\n", ull(done), ull(kRows));
+}
+// [/bands]
+
 // ---------------------------------------------------------------------------------------------
 
 // [convert]
@@ -537,7 +595,7 @@ void progress_and_errors(const xisf::Context& ctx, const std::string& path) {
 int main(int argc, char** argv) {
     static const std::pair<const char*, void (*)(const xisf::Context&, const std::string&)> chapters[] = {
         {"inspect", inspect},  {"pixels", pixels},   {"stretch", stretch},
-        {"write", write_crop}, {"convert", convert}, {"rewrite", rewrite_and_verify},
+        {"write", write_crop}, {"bands", bands}, {"convert", convert}, {"rewrite", rewrite_and_verify},
         {"units", units},      {"wcs", wcs},         {"progress", progress_and_errors}};
     if (argc < 3) {
         std::fprintf(stderr, "usage: %s <image.xisf> <output directory> [chapter]\n", argv[0]);

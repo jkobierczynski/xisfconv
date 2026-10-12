@@ -66,7 +66,8 @@ xisfconv --info light_0001.xisf               # geometry, codecs, FITS keywords,
   gigabytes converts on a machine with far less memory: what has to wait between reading and
   writing is kept in memory up to 256 MB and in temporary files beside the output beyond. TIFF
   output beyond 4 GiB is BigTIFF, and Ctrl-C stops a conversion within one image without leaving
-  a half-written file.
+  a half-written file. Programs that use the library read and write such images in bands of
+  rows, in C and in Python.
 - **Careful with files**: output is written under another name and renamed when it is complete,
   nothing is overwritten unless asked, no file is written twice in a run or over a file the run
   reads, a rewrite is read back and compared before it replaces anything, and the header of a

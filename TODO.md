@@ -100,32 +100,38 @@ Open checks of the Python package:
       of them (Linux x86_64 and arm64, macOS arm64, Windows x64) and the source distribution.
 - [ ] Register the project on PyPI and switch publishing on (see "Releasing" in `DEVELOPMENT.md`).
 
-Later, each when it is needed:
+Done since:
 
 - [x] Conversions and rewrites read and write an image a piece at a time, with temporary files
       for what does not fit the memory limit; Ctrl-C stops one large image (0.20.0)
-- [ ] Library and Python: read and write an array in pieces (a band of rows at a time), for
-      callers whose images do not fit their memory; wheels for musllinux and Intel macOS; type
-      stubs.
 - [x] A compression level and byte shuffling off for conversions and rewrites, and for the tool
       (`--level`, `--no-shuffle`) (0.19.0)
-- [ ] `xisfconv.xisf`: the resolution, the ICC profile and the thumbnail of an image, which the
-      `xisf` package leaves out as well; table properties.
-- [ ] Write LZ4 blocks to ASDF (its own layout of chunks, which is read).
-- [ ] Hand a data block of a property type without a name over the API as its bytes, so that
-      `read_image` and `write` carry it as a conversion does; and tables.
-- [ ] XML attribute values as XML normalizes them (a line break written as such inside an
-      attribute is a blank), and a header text with both literal and referenced carriage returns
-      written back as it was.
 
-- [ ] A CMake package for the static library (the dependencies have to be described to the consumer).
-- [ ] Library messages without the tool's option names.
-- [ ] Check in PixInsight that it accepts the inline ICC profile the writer stores in XISF.
-- [ ] Reading from and writing to memory instead of files, and input that cannot be rewound
-      (a pipe).
-- [ ] Reading one image of a FITS or ASDF file without going through the headers before it again
-      (a file with a thousand HDUs is read image by image in half a minute).
-- [ ] Rust and Perl bindings.
+Next, in this order (what 0.20 made cheap comes first):
+
+1. [x] **Reading and writing in bands of rows**, in the C API and the Python package, for callers
+   whose images do not fit their memory: `xisfconv_read_rows` and `FileImage.bands()`; a writer
+   that takes an image a band at a time (`xisfconv_writer_begin_image`,
+   `xisfconv_writer_add_rows`; `xisfconv.Writer`). (0.22.0)
+2. [ ] Reading from and writing to memory instead of files, and input that cannot be rewound
+   (a pipe). The readers take their bytes through one interface already and the writers write
+   to a stream: what is left is the API.
+3. [ ] Reading one image of a FITS or ASDF file without going through the headers before it again
+   (a file with a thousand HDUs is read image by image in half a minute): the place of each
+   image, kept with the open file.
+4. [ ] Hand a data block of a property type without a name over the API as its bytes, so that
+   `read_image` and `write` carry it as a conversion does; and tables.
+5. [ ] Write LZ4 blocks to ASDF (its own layout of chunks, which is read).
+6. [ ] Library messages without the tool's option names.
+7. [ ] A CMake package for the static library (the dependencies have to be described to the consumer).
+8. [ ] Python: type stubs; wheels for musllinux and Intel macOS.
+9. [ ] `xisfconv.xisf`: the resolution, the ICC profile and the thumbnail of an image, which the
+   `xisf` package leaves out as well; table properties.
+10. [ ] XML attribute values as XML normalizes them (a line break written as such inside an
+    attribute is a blank), and a header text with both literal and referenced carriage returns
+    written back as it was.
+11. [ ] Rust and Perl bindings (on the band API).
+12. [ ] Check in PixInsight that it accepts the inline ICC profile the writer stores in XISF.
 
 Open check:
 

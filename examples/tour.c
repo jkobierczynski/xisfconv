@@ -429,6 +429,85 @@ static int write_crop(xisfconv_context *ctx, const char *path) {
 
 /* ------------------------------------------------------------------------------------------ */
 
+/* [bands] */
+/* An image of any size, a band of rows at a time: the program holds one band. The library reads
+   the rows where they are in the file, and keeps what it has to (the rows it is given for a file,
+   a block it decompressed) in memory up to a limit, beyond that in a temporary file. */
+static int bands(xisfconv_context *ctx, const char *path) {
+    enum { ROWS = 256 };
+    xisfconv_file *file = NULL;
+    xisfconv_writer *writer = NULL;
+    xisfconv_image_info info;
+    xisfconv_read_options options;
+    xisfconv_write_options write_options;
+    xisfconv_image image;
+    xisfconv_status status;
+    float *band = NULL, low = 0, high = 0;
+    double sum = 0;
+    uint64_t y, i, count = 0, done = 0;
+
+    status = xisfconv_open(ctx, path, &file);
+    if (status != XISFCONV_OK) return failed(ctx, "open");
+    xisfconv_read_options_init(&options, sizeof options);
+    options.sample_format = XISFCONV_SAMPLE_FLOAT32;
+    options.row_order = XISFCONV_ROWS_TOP_DOWN;
+    xisfconv_image_info_init(&info, sizeof info);
+    /* Reading no rows readies the image: from then on its description is final, also that of a
+       FITS or ASDF image, whose sample format may depend on its data. */
+    status = xisfconv_read_rows(file, 0, &options, 0, 0, NULL, 0);
+    if (status == XISFCONV_OK) status = xisfconv_image_info_get(file, 0, &info);
+
+    /* The writer takes the image without its pixels, and then its rows, from the first. */
+    xisfconv_image_init(&image, sizeof image);
+    image.width = info.width;
+    image.height = info.height;
+    image.channels = info.channels;
+    image.sample_format = XISFCONV_SAMPLE_FLOAT32;
+    image.row_order = XISFCONV_ROWS_TOP_DOWN;
+    image.name = "bands";
+    xisfconv_write_options_init(&write_options, sizeof write_options);
+    write_options.overwrite = 1;
+    if (status == XISFCONV_OK) status = xisfconv_writer_new(ctx, out_path("bands.fits"), &write_options, &writer);
+    if (status == XISFCONV_OK) status = xisfconv_writer_begin_image(writer, &image);
+    if (status == XISFCONV_OK) {
+        band = (float *)malloc(sizeof(float) * ROWS * info.width * info.channels);
+        if (!band) status = XISFCONV_ERR_MEMORY;
+    }
+    for (y = 0; status == XISFCONV_OK && y < info.height; y += ROWS) {
+        const uint64_t rows = info.height - y < ROWS ? info.height - y : ROWS;
+        const uint64_t samples = rows * info.width * info.channels;
+        /* A band is planar as a whole image is: channel 0 (rows x width), then channel 1, ... */
+        status = xisfconv_read_rows(file, 0, &options, y, rows, band, sizeof(float) * samples);
+        if (status != XISFCONV_OK) break;
+        if (y == 0) low = high = band[0];
+        for (i = 0; i < samples; ++i) {
+            if (band[i] < low) low = band[i];
+            if (band[i] > high) high = band[i];
+            sum += band[i];
+        }
+        count += samples;
+        status = xisfconv_writer_add_rows(writer, band, rows, sizeof(float) * samples);
+        ++done;
+    }
+    if (status == XISFCONV_OK) {
+        status = xisfconv_writer_finish(writer); /* writes the file and frees the writer */
+    } else {
+        xisfconv_writer_discard(writer);
+    }
+    free(band);
+    xisfconv_close(file);
+    if (status == XISFCONV_ERR_MEMORY) return no_memory();
+    if (status != XISFCONV_OK) return failed(ctx, "bands");
+    /* the numbers of the chapter "pixels", which read the image whole */
+    printf("%llu samples: minimum %.6f, maximum %.6f, mean %.6f\n", (unsigned long long)count, low, high,
+           sum / (double)count);
+    printf("wrote bands.fits from %llu bands of up to %d rows\n", (unsigned long long)done, ROWS);
+    return 0;
+}
+/* [/bands] */
+
+/* ------------------------------------------------------------------------------------------ */
+
 /* [convert] */
 static int convert(xisfconv_context *ctx, const char *path) {
     xisfconv_convert_options options;
@@ -663,8 +742,9 @@ int main(int argc, char **argv) {
         const char *name;
         int (*run)(xisfconv_context *, const char *);
     } chapters[] = {{"inspect", inspect},  {"pixels", pixels},   {"stretch", stretch},
-                    {"write", write_crop}, {"convert", convert}, {"rewrite", rewrite_and_verify},
-                    {"units", units},      {"wcs", wcs},         {"progress", progress_and_errors}};
+                    {"write", write_crop}, {"bands", bands},     {"convert", convert},
+                    {"rewrite", rewrite_and_verify},             {"units", units},
+                    {"wcs", wcs},          {"progress", progress_and_errors}};
     xisfconv_context *ctx;
     xisfconv_format format = XISFCONV_FORMAT_AUTO;
     size_t i;

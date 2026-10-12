@@ -31,6 +31,7 @@ The decisions:
 - [Care with files](#care-with-files)
 - [Structure of the code](#structure-of-the-code)
 - [Images in pieces (0.20.0)](#images-in-pieces-0200)
+- [Images in bands (0.22.0)](#images-in-bands-0220)
 - [The library (libxisfconv)](#the-library-libxisfconv)
 - [The Python package](#the-python-package)
 - [The manual (`docs/manual.html`)](#the-manual-docsmanualhtml)
@@ -405,6 +406,7 @@ brought are in the sections below.
 | 9 October | 0.19.0 | `--level` and `--no-shuffle`: the compression level and byte shuffling for conversions to XISF and rewrites |
 | | 0.20.0 | Images read and written a piece at a time; BigTIFF; Ctrl-C within one image |
 | 12 October | 0.21.0 | Fixes: the digest of the WCS as written, cut-off FITS remains told, refusals through symbolic links, files written safely across fork() |
+| | 0.22.0 | Images in bands of rows for programs: `xisfconv_read_rows`, a writer given an image in bands; `FileImage.bands()`, `xisfconv.Writer` |
 
 ## Purpose and scope
 
@@ -1204,6 +1206,56 @@ reads an image a piece at a time and writes it as it reads it.
   769 / 223 MB, slightly faster. A 46400 x 46400 image (4.3 GB) of a compressed XISF file became a
   BigTIFF file in 10 MB.
 
+## Images in bands (0.22.0)
+
+0.20 made the conversions take an image a piece at a time; a program that used the library still
+handed over and got back whole arrays. 0.22 gives it the pieces too, on what 0.20 built.
+
+- **Reading: `xisfconv_read_rows(file, image, options, first_row, rows, buffer, size)`.** A band
+  is what `xisfconv_read_pixels` gives in those rows, with the same options, and lies the same
+  way (planar: channel 0, rows x width, then channel 1), its rows counted in the order asked for.
+  That makes the definition one sentence and the test one comparison: every band of every image,
+  in every format, under every option, is held against the slice of the whole (`tests/capi_test.c`
+  `test_bands`, `python/tests/test_bands.py`). Underneath it is the source of rows a conversion
+  reads (`XisfFile::pixelSource`, the readers with `inPieces`), with the sample conversion and the
+  turn of the rows as sources on top.
+- **The source of each image is kept with the open file** until it is closed (the first version
+  kept the source of one image, and bands of two images read by turns decoded each block again
+  for every band, as a reviewer found): what has
+  to be decoded first (a compressed block, a tile-compressed image, the raw image of a DNG file)
+  is decoded once, and a checksum is verified once, over the whole block, when the first band is
+  read. Reading no rows does only that, so that the sample format of a FITS or ASDF image, which
+  depends on its data, is known before a buffer is sized; `xisfconv_image_info_get` reports it
+  from then on, as after `xisfconv_load_pixels`.
+- **Writing: `xisfconv_writer_begin_image` (the image without pixels), then
+  `xisfconv_writer_add_rows`.** The rows go into a store laid out as the whole buffer of
+  `xisfconv_writer_add_image` would be, in memory up to the memory limit and in a temporary file
+  beside the output beyond, and `xisfconv_writer_finish` writes from it through the same code as
+  for a buffer. So the file is the one the whole image would make, byte for byte (tested for every
+  format), the writer keeps its one-step `finish` (an XISF header needs the size of every block,
+  and a file of several images is written in one go), and a band may come in any size. The price
+  is one more copy of the image on disk when it does not fit the limit, in exchange for a writer
+  that does not have to know, while it is given rows, where they will end up in the file.
+- **An image is complete when its last row has come.** Until then the writer refuses another
+  image and refuses to finish (and then writes nothing, as `finish` always frees the writer):
+  half an image is a mistake of the program, and a file with zeros where the rows were missing
+  would hide it.
+- **Python: `FileImage.bands()`, `FileImage.read_rows()`, `xisfconv.Writer`.** `bands()` is a
+  generator of `(first_row, array)` with bands of about 4 MiB unless told; each array is new, so
+  that a program may keep one. `Writer` holds the writer of the library, freed by the collector
+  if the program forgets it (nothing is written then), and `write` is now a `Writer` given whole
+  images, so the two cannot drift apart: the hundred tests of `write` test `Writer` too. The calls
+  on an open file have no steps (a progress handler is not installed for them); the first band of
+  an image does work that may take long (decompressing a block), so that call may be stopped by
+  Ctrl-C (`stoppable` in `_Context.call`).
+- **The tour has a chapter for it** (`examples/tour.*`, `bands`): it reads the frame in bands of
+  256 rows, prints what the chapter on pixels prints of the whole image, and writes the bands into
+  a FITS file. The tests hold the two lines against each other.
+- Measured: a 128 MB image (8192 x 4096, float32) written and read back in bands of 256 rows with
+  `XISFCONV_MEMORY_LIMIT=0` takes 41 MiB of a Python process that takes 31 MiB with NumPy and the
+  package loaded; reading it whole takes 288 MiB (`python/tests/test_bands.py` holds it below
+  100 MiB).
+
 ## The library (libxisfconv)
 
 Planned in a separate brief with a draft header (not part of the repository), decided as follows
@@ -1743,7 +1795,7 @@ library with one line changed.
   Python. What they print is held against what they must print for those files (most lines word
   for word, numbers that depend on the arithmetic of the machine by their form and range), and
   what they write is read back.
-- `tests/run_tests.py` drives the built program (about 6870 checks at 0.21.0 when run as root with rawpy and imagecodecs installed, 13 more with OpenXISF beside it). The Python packages it
+- `tests/run_tests.py` drives the built program (about 6870 checks at 0.22.0 when run as root with rawpy and imagecodecs installed, 13 more with OpenXISF beside it). The Python packages it
   needs are listed at its top; the `asdf` packages and the external tools (`tiffcp`, `fitsverify`,
   `pngcheck`, `fpack`/`funpack`) are used when installed and their checks skipped when not.
 - Every format is checked against an implementation that shares no code with xisfconv: astropy

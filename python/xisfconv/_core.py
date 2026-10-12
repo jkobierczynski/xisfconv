@@ -6,6 +6,7 @@ Everything public here is re-exported by the package; see the package documentat
 """
 
 import atexit
+import contextlib
 import ctypes
 import datetime
 import logging
@@ -537,14 +538,14 @@ class _Context:
         _library.xisfconv_context_clear_messages(pointer)
         return out
 
-    def _ask(self, progress):
+    def _ask(self, progress, stoppable=False):
         """Tells the library what to call between its steps during the next call. Returns
         True if it will call the reporter."""
         pointer = self.pointer
         # what a call that was torn off left behind is not this call's
         if _library.xisfconv_context_message_count(pointer):
             _library.xisfconv_context_clear_messages(pointer)
-        if (not self._steps or _exiting or
+        if (not (self._steps or stoppable) or _exiting or
                 (progress is None and threading.current_thread() is not threading.main_thread())):
             # the call has no steps; or there is nothing to report to and no signal handler runs
             # in this thread; or Python is ending, and the library must not come back into it
@@ -581,7 +582,7 @@ class _Context:
         self._emit(messages, quiet=True)
         raise failure
 
-    def call(self, function, *arguments, progress=None, undo=None, unstarted=None):
+    def call(self, function, *arguments, progress=None, undo=None, unstarted=None, stoppable=False):
         """Calls a function of the library that returns a status.
 
         `progress(stage, done, total)` is called between the steps of the work; an exception
@@ -590,7 +591,9 @@ class _Context:
         thread. `undo` frees what the call made if this raises although the call succeeded (a
         warning turned into an error, an interrupt after the last step); it must be harmless
         if the call made nothing. `unstarted` is called if this raises before the function was
-        called at all (for a function that frees what it is given).
+        called at all (for a function that frees what it is given). `stoppable`: this call has
+        steps although the calls of the context have none (the first rows of an image of an open
+        file, which decode it).
         """
         started = False
         try:
@@ -612,7 +615,7 @@ class _Context:
                 state = self._state
                 try:
                     _active.add(self)         # (before `_ask` looks whether Python is ending: see _stop_at_exit)
-                    if self._ask(progress):
+                    if self._ask(progress, stoppable):
                         state = self._state
                     _local.depth = depth + 1
                     if self._gone():          # (here once more: a handler may have closed the file since)
@@ -2100,6 +2103,25 @@ class Properties(Mapping):
         return "<xisfconv.Properties: %d>" % len(self)
 
 
+def _read_options(sample_format, row_order, verify, bounds):
+    options = _lib.struct(_lib.ReadOptions, _library.xisfconv_read_options_init)
+    options.sample_format = _sample_format(sample_format)
+    options.row_order = _rows(row_order)
+    options.verify_checksums = int(bool(verify))
+    options.use_bounds, options.lower_bound, options.upper_bound = _bounds(bounds)
+    return options
+
+
+def _row_index(value, what):
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+        raise TypeError("%s is a number of rows, not %s" % (what, type(value).__name__))
+    if value < 0:
+        raise ValueError("%s is not negative" % what)
+    if value >= 1 << 64:
+        raise ValueError("%s is beyond what the library counts (64 bits)" % what)
+    return int(value)
+
+
 class FileImage:
     """One image of an open :class:`File`. The attributes describe it; :meth:`read` gives the
     pixels, :meth:`read_image` the pixels with their keywords."""
@@ -2162,7 +2184,8 @@ class FileImage:
     @property
     def dtype(self):
         """NumPy dtype of the samples :meth:`read` returns by default. For FITS and ASDF it
-        depends on the data and is None until the image has been read once."""
+        depends on the data and is None until the image has been read once (whole, or rows of
+        it)."""
         info = self._info()
         if not info.data_known or not info.convertible:
             return None
@@ -2171,7 +2194,7 @@ class FileImage:
     @property
     def bounds(self):
         """``(lower, upper)``: the range of floating point samples; None for integers, and for
-        FITS and ASDF until the image has been read once."""
+        FITS and ASDF until the image has been read once (whole, or rows of it)."""
         info = self._info()
         if not info.data_known or info.sample_format not in (_lib.SAMPLE_FLOAT32, _lib.SAMPLE_FLOAT64):
             return None
@@ -2369,11 +2392,7 @@ class FileImage:
         ``verify=False`` skips the checksums of the file.
         """
         file = self._file
-        options = _lib.struct(_lib.ReadOptions, _library.xisfconv_read_options_init)
-        options.sample_format = _sample_format(sample_format)
-        options.row_order = _rows(row_order)
-        options.verify_checksums = int(bool(verify))
-        options.use_bounds, options.lower_bound, options.upper_bound = _bounds(bounds)
+        options = _read_options(sample_format, row_order, verify, bounds)
         _channels_last(channels)
         context = file._context
         with context.lock:
@@ -2390,6 +2409,75 @@ class FileImage:
                 raise InternalError("the library asks for %d bytes for an image of %d" % (size.value, planar.nbytes))
             context.call(_library.xisfconv_read_pixels, pointer, self.index, byref(options),
                          planar.ctypes.data_as(c_void_p), planar.nbytes)
+        return _arranged(planar, channels)
+
+    def read_rows(self, first, count, sample_format=None, *, row_order="top-down", channels="last", verify=True,
+                  bounds=None):
+        """Reads ``count`` rows from row ``first`` on: what :meth:`read` gives in those rows,
+        ``[count, width]`` or ``[count, width, channels]`` (``[channels, count, width]`` with
+        ``channels="first"``), with the same options. Rows are counted in the order
+        ``row_order`` gives them.
+
+        The library reads the rows where they are in the file and holds no more than them, so an
+        image of any size is read in parts that fit the memory of the program. What has to be
+        decoded first (a compressed XISF block, a tile-compressed FITS image, the raw image of a
+        DNG file) is decoded when the first rows of the image are read, once, and kept with the
+        open file (in memory up to ``XISFCONV_MEMORY_LIMIT``, else in a temporary file) until the
+        file is closed; Ctrl-C stops that as it stops other work. A checksum is verified then, over the
+        whole block.
+        """
+        first, count = _row_index(first, "first"), _row_index(count, "count")
+        _channels_last(channels)
+        return self._read_rows(_read_options(sample_format, row_order, verify, bounds), first, count, channels)
+
+    def bands(self, rows=None, sample_format=None, *, row_order="top-down", channels="last", verify=True,
+              bounds=None):
+        """Reads the image a band of rows at a time: yields ``(first_row, array)`` for bands of
+        ``rows`` rows (None: about 4 MiB each; the last band may be smaller), from the first row
+        in ``row_order`` to the last. The arrays are those of :meth:`read_rows`, with the same
+        options; each is new, and may be kept::
+
+            with xisfconv.open("mosaic.xisf") as f:
+                total = 0.0
+                for y, band in f[0].bands(sample_format="float64"):
+                    total += band.sum()
+        """
+        options = _read_options(sample_format, row_order, verify, bounds)
+        _channels_last(channels)
+        if rows is not None:
+            rows = _row_index(rows, "rows")
+            if rows < 1:
+                raise ValueError("a band has at least one row")
+        return self._bands(options, rows, channels)
+
+    def _bands(self, options, rows, channels):
+        info = self._prepare_rows(options)
+        if rows is None:
+            sample = np.dtype(_dtype(options.sample_format or info.sample_format)).itemsize
+            rows = max(1, (4 << 20) // max(1, int(info.width) * int(info.channels) * sample))
+        height = int(info.height)
+        for first in range(0, height, rows):
+            yield first, self._read_rows(options, first, min(rows, height - first), channels)
+
+    def _prepare_rows(self, options):
+        """Sets up the rows of the image in the library (the sample format of a FITS or ASDF image
+        is known from then on) and returns its description."""
+        file = self._file
+        with file._context.lock:
+            file._context.call(_library.xisfconv_read_rows, file._pointer(), self.index, byref(options), 0, 0, None, 0,
+                               stoppable=True)
+            return self._info()
+
+    def _read_rows(self, options, first, count, channels):
+        file = self._file
+        context = file._context
+        with context.lock:
+            info = self._prepare_rows(options)
+            sample = options.sample_format or info.sample_format
+            planar = np.empty((int(info.channels), count, int(info.width)), _dtype(sample))
+            if count:
+                context.call(_library.xisfconv_read_rows, file._pointer(), self.index, byref(options), first, count,
+                             planar.ctypes.data_as(c_void_p), planar.nbytes, stoppable=True)
         return _arranged(planar, channels)
 
     def read_image(self, sample_format=None, *, row_order="top-down", channels="last", verify=True, bounds=None,
@@ -2823,89 +2911,280 @@ def write(path, images, *, format=None, codec=None, checksum=None, stored_row_or
             item = Image(item, keywords=keywords, name=name, bounds=bounds, icc_profile=icc_profile,
                          row_order=row_order, channels=channels, wcs_row_order=wcs_row_order, properties=properties)
         prepared.append(item)
+    with Writer(path, format=format, codec=codec, checksum=checksum, stored_row_order=stored_row_order,
+                subblock_size=subblock_size, wcs=wcs, overwrite=overwrite, file_properties=file_properties,
+                shuffle=shuffle, level=level, creator=creator, progress=progress) as writer:
+        writer._several = len(prepared) > 1
+        for item in prepared:
+            writer.add(item)
 
-    options = _lib.struct(_lib.WriteOptions, _library.xisfconv_write_options_init)
-    options.format = _output_format(format)
-    options.codec = _codec(codec)
-    options.checksum = _checksum(checksum)
-    options.row_order = _rows(stored_row_order)
-    options.subblock_size = _subblock(subblock_size, options.subblock_size)
-    options.wcs = int(bool(wcs))
-    options.overwrite = int(bool(overwrite))
-    options.shuffle = _shuffle(shuffle)
-    options.compression_level = _level(level)
-    if creator is not None:
-        if not isinstance(creator, str):
-            raise TypeError("creator is the name of a program, a string")
-        options.creator_application = _bytes(creator, "creator")
 
-    context = _Context.borrow()
-    with context.lock:
-        context.about(path, reading=False)
-        writer = c_void_p()
-        whole = _properties_handle(context, file_properties, "the properties of the file")
-        try:
-            options.properties = whole
-            context.call(_library.xisfconv_writer_new, context.pointer, _path(path), byref(options), byref(writer),
-                         undo=lambda: _library.xisfconv_writer_discard(writer))
-        finally:
-            if whole is not None:
-                _library.xisfconv_properties_free(whole)
-        kind = _written_format(format, path)
-        try:
-            for number, item in enumerate(prepared):
-                planar, count = _planar(item.data, item.channels)
-                image = _lib.struct(_lib.Image, _library.xisfconv_image_init)
-                image.pixels = planar.ctypes.data
-                image.width = planar.shape[2]
-                image.height = planar.shape[1]
-                image.channels = count
-                image.sample_format = _SAMPLES[planar.dtype.name]
-                image.row_order = _choice(item.row_order, _ROWS, "row order")
-                image.use_bounds, image.lower_bound, image.upper_bound = _bounds(item.bounds)
-                image.name = _bytes(item.name, "the image name") if item.name else None
-                image.wcs_row_order = _rows(item.wcs_row_order)
-                profile = None
-                if item.icc_profile is not None:
-                    if not isinstance(item.icc_profile, (bytes, bytearray, memoryview)):
-                        raise TypeError("an ICC profile is given as bytes, not as %s" % type(item.icc_profile).__name__)
-                    profile = bytes(item.icc_profile)
-                if profile:
-                    image.icc_profile = ctypes.cast(ctypes.c_char_p(profile), c_void_p)
-                    image.icc_profile_size = len(profile)
-                handle = own = None
+_INTERRUPTED = ["interrupted"]   # (Writer._rows after an add_rows that was interrupted)
+
+
+class Writer:
+    """Writes images to an XISF, FITS, ASDF, TIFF or PNG file, one after the other: each given
+    whole (:meth:`add`), or a band of rows at a time (:meth:`begin_image`, then
+    :meth:`add_rows`), for an image that the program does not hold whole::
+
+        with xisfconv.Writer("mosaic.xisf", codec="zstd") as writer:
+            writer.begin_image(40000, 30000, "float32", name="mosaic")
+            for y in range(0, 30000, 500):
+                writer.add_rows(render(y, 500))           # [500, 40000] float32
+
+    The options are those of :func:`write` about the file. The file is written when the writer
+    is closed (by :meth:`close`, or at the end of the ``with`` block), under the name
+    ``path + ".part"``, and renamed when it is complete; until then the images are kept, an
+    image given in bands in memory up to ``XISFCONV_MEMORY_LIMIT`` (256 MiB by default) and
+    beyond that in a temporary file beside the output. The file is the one :func:`write` makes
+    of the same images given whole, byte for byte. A ``with`` block that ends in an exception
+    writes nothing (:meth:`discard`).
+    """
+
+    _handle = None
+    _resource = None
+    _context = None
+
+    def __init__(self, path, *, format=None, codec=None, checksum=None, stored_row_order=None,   # noqa: A002
+                 subblock_size=None, wcs=True, overwrite=False, file_properties=None, shuffle=True, level=None,
+                 creator=None, progress=None):
+        options = _lib.struct(_lib.WriteOptions, _library.xisfconv_write_options_init)
+        options.format = _output_format(format)
+        options.codec = _codec(codec)
+        options.checksum = _checksum(checksum)
+        options.row_order = _rows(stored_row_order)
+        options.subblock_size = _subblock(subblock_size, options.subblock_size)
+        options.wcs = int(bool(wcs))
+        options.overwrite = int(bool(overwrite))
+        options.shuffle = _shuffle(shuffle)
+        options.compression_level = _level(level)
+        if creator is not None:
+            if not isinstance(creator, str):
+                raise TypeError("creator is the name of a program, a string")
+            options.creator_application = _bytes(creator, "creator")
+        #: the name of the file that is written
+        self.path = path
+        self._progress = progress
+        self._kind = _written_format(format, path)
+        self._wcs = wcs
+        self._count = 0              # images given
+        self._rows = None            # of the image given in bands: [height, rows given, width, channels, dtype]
+        self._several = None         # (write(): whether a message names the image by its number)
+        self._context = context = _Context(path, reading=False)
+        self._resource = resource = _own(self, _library.xisfconv_writer_discard, None)
+        handle = c_void_p()
+        with context.lock:
+            whole = _properties_handle(context, file_properties, "the properties of the file")
+            try:
+                options.properties = whole
                 try:
-                    if item.keywords is not None and len(item.keywords):
-                        handle = Keywords(item.keywords)._to_handle(context)
-                        image.keywords = handle
-                    given = item.properties
-                    if isinstance(given, Properties):      # those of an open file
-                        given = PropertyDict(given)
-                    if isinstance(given, PropertyDict) and kind not in ("tiff", "png"):
-                        # A solution that was read from a file describes the WCS keywords and the
-                        # size it was read with. With others it is left out. (TIFF and PNG have
-                        # no place for properties at all.)
-                        stale, set_since = _stale_solution(context, given, item.keywords, planar.shape[2],
-                                                           planar.shape[1], item.wcs_row_order or item.row_order)
-                        if stale:
-                            given = given._without(stale)
-                            _solution_left_out(context._name() + (" (image %d)" % number if len(prepared) > 1 else ""),
-                                               set_since, item.keywords, wcs, kind)
-                    own = _properties_handle(context, given, "the properties of an image")
-                    image.properties = own
-                    context.call(_library.xisfconv_writer_add_image, writer, byref(image))
-                finally:
-                    if handle is not None:
-                        _library.xisfconv_keywords_free(handle)
-                    if own is not None:
-                        _library.xisfconv_properties_free(own)
-                del planar, profile
-        except BaseException:
-            _library.xisfconv_writer_discard(writer)
-            raise
-        # finish frees the writer whether or not it succeeds
-        context.call(_library.xisfconv_writer_finish, writer, progress=progress,
-                     unstarted=lambda: _library.xisfconv_writer_discard(writer))
+                    context.call(_library.xisfconv_writer_new, context.pointer, _path(path), byref(options), byref(handle))
+                    resource._as_parameter_ = handle.value
+                except BaseException:
+                    if resource._as_parameter_ is None and handle.value:   # nobody owns the writer yet
+                        _library.xisfconv_writer_discard(handle)
+                    raise
+            finally:
+                if whole is not None:
+                    _library.xisfconv_properties_free(whole)
+        self._handle = handle.value
+
+    def _pointer(self):
+        if self._handle is None or self._resource is None or self._resource() is None:
+            raise ValueError("the writer is closed")
+        return self._handle
+
+    @property
+    def closed(self):
+        return self._handle is None
+
+    def __enter__(self):
+        self._pointer()
+        return self
+
+    def __exit__(self, kind, value, traceback):
+        if kind is None:
+            self.close()
+        else:
+            self.discard()
+        return False
+
+    def __repr__(self):
+        return "<xisfconv.Writer %r, %d image(s)%s>" % (self.path, self._count, ", closed" if self.closed else "")
+
+    def add(self, image, *, keywords=None, name=None, bounds=None, icc_profile=None, row_order="top-down",
+            channels="last", wcs_row_order=None, properties=None):
+        """Adds an image given whole: a NumPy array, with the options :func:`write` has for one,
+        or an :class:`Image`."""
+        item = image if isinstance(image, Image) else Image(
+            image, keywords=keywords, name=name, bounds=bounds, icc_profile=icc_profile, row_order=row_order,
+            channels=channels, wcs_row_order=wcs_row_order, properties=properties)
+        self._pointer()
+        self._no_rows_to_come()
+        planar, count = _planar(item.data, item.channels)
+        with self._context.lock:
+            pointer = self._pointer()
+            with self._described(item, planar.shape[2], planar.shape[1], count, _SAMPLES[planar.dtype.name]) as described:
+                described.pixels = planar.ctypes.data
+                self._context.call(_library.xisfconv_writer_add_image, pointer, byref(described))
+            del planar
+            self._count += 1
+
+    def begin_image(self, width, height, sample_format, *, channels=1, keywords=None, name=None, bounds=None,
+                    icc_profile=None, row_order="top-down", wcs_row_order=None, properties=None):
+        """Begins an image whose rows :meth:`add_rows` gives, from the first in ``row_order`` on.
+
+        ``sample_format``: "uint8", "uint16", "uint32", "uint64", "float32" or "float64" (or a
+        NumPy dtype): the samples of the bands, which are not converted. The other options are
+        those of :class:`Image`. The image is complete when its last row has come; the writer
+        takes no other image before that, and is not closed.
+        """
+        self._pointer()
+        self._no_rows_to_come()
+        width, height, channels = (_row_index(width, "width"), _row_index(height, "height"),
+                                   _row_index(channels, "channels"))
+        sample = _sample_format(sample_format)
+        if sample == _lib.SAMPLE_AS_STORED:
+            raise ValueError("the sample format of the image is needed: uint8, uint16, uint32, uint64, float32 or float64")
+        item = Image(None, keywords=keywords, name=name, bounds=bounds, icc_profile=icc_profile, row_order=row_order,
+                     wcs_row_order=wcs_row_order, properties=properties)
+        with self._context.lock:
+            pointer = self._pointer()
+            with self._described(item, width, height, channels, sample) as described:
+                self._context.call(_library.xisfconv_writer_begin_image, pointer, byref(described))
+            self._count += 1
+            self._rows = [height, 0, width, channels, np.dtype(_dtype(sample))]
+
+    def add_rows(self, rows, *, channels="last"):
+        """Gives the next rows of the image begun by :meth:`begin_image`: ``[rows, width]`` for
+        one channel, else ``[rows, width, channels]`` (or ``[channels, rows, width]`` with
+        ``channels="first"``), in its sample format."""
+        with self._context.lock:
+            self._pointer()
+            if self._rows is _INTERRUPTED:
+                raise ValueError("an earlier add_rows was interrupted: whether its rows were taken is not known, and "
+                                 "the writer can only be discarded")
+            if self._rows is None:
+                raise ValueError("no image is begun (Writer.begin_image), or its last row has come")
+            height, given, width, count, dtype = self._rows
+            array = np.asanyarray(rows)
+            if isinstance(array, np.ma.MaskedArray):
+                raise TypeError("a masked array cannot be written; fill it first (array.filled(value))")
+            if count == 1 and array.ndim == 2:
+                planar = array[np.newaxis]
+            elif array.ndim == 3:
+                planar = np.moveaxis(array, -1, 0) if _channels_last(channels) else array
+            else:
+                raise ValueError("the rows of an image of %d channel(s) are a %s array; these have %d dimension(s)" %
+                                 (count, "2-D or 3-D" if count == 1 else "3-D", array.ndim))
+            if array.dtype.newbyteorder("=") != dtype.newbyteorder("="):
+                raise TypeError("the image is %s, these rows are %s: convert them first" % (dtype.name, array.dtype.name))
+            if planar.shape[0] != count or planar.shape[2] != width:
+                raise ValueError("rows of %d channel(s) of %d samples are wanted; these are %d of %d" %
+                                 (count, width, planar.shape[0], planar.shape[2]))
+            n = planar.shape[1]
+            if n > height - given:
+                raise ValueError("%d rows more for an image of %d rows, of which %d have come" % (n, height, given))
+            planar = np.ascontiguousarray(planar, dtype=planar.dtype.newbyteorder("="))
+            try:
+                self._context.call(_library.xisfconv_writer_add_rows, self._pointer(), planar.ctypes.data_as(c_void_p),
+                                   n, planar.nbytes)
+            except BaseException:
+                # (a Ctrl-C may come when the library has taken the rows, or before: which, is not known)
+                self._rows = _INTERRUPTED
+                raise
+            given += n
+            self._rows = None if given == height else [height, given, width, count, dtype]
+
+    def close(self):
+        """Writes the file, and frees the writer whether or not that succeeds. An image whose
+        rows have not all come is an error: nothing is written then."""
+        if self._handle is None:
+            return
+        with self._context.lock:
+            if self._handle is None:
+                return
+            self._pointer()
+            # finish frees the writer whether or not it succeeds: nothing else may free it
+            resource, handle = self._resource, self._handle
+            try:
+                _resources.remove(resource)
+            except KeyError:
+                pass
+            resource._as_parameter_ = None
+            self._handle = None
+            self._rows = None
+            self._context.call(_library.xisfconv_writer_finish, handle, progress=self._progress,
+                               unstarted=lambda: _library.xisfconv_writer_discard(handle))
+
+    def discard(self):
+        """Frees the writer without writing anything."""
+        if self._handle is None:
+            return
+        with self._context.lock:
+            self._handle = None
+            self._rows = None
+            _release(self._resource)
+
+    def _no_rows_to_come(self):
+        if self._rows is _INTERRUPTED:
+            raise ValueError("an earlier add_rows was interrupted: whether its rows were taken is not known, and the "
+                             "writer can only be discarded")
+        if self._rows is not None:
+            height, given = self._rows[:2]
+            raise ValueError("the image begun last has had %d of its %d rows (Writer.add_rows)" % (given, height))
+
+    @contextlib.contextmanager
+    def _described(self, item, width, height, channels, sample):
+        """The image as the library takes it, but its pixels; the handles it needs live as long
+        as the block."""
+        context = self._context
+        image = _lib.struct(_lib.Image, _library.xisfconv_image_init)
+        image.width = width
+        image.height = height
+        image.channels = channels
+        image.sample_format = sample
+        image.row_order = _choice(item.row_order, _ROWS, "row order")
+        image.use_bounds, image.lower_bound, image.upper_bound = _bounds(item.bounds)
+        image.name = _bytes(item.name, "the image name") if item.name else None
+        image.wcs_row_order = _rows(item.wcs_row_order)
+        profile = None
+        if item.icc_profile is not None:
+            if not isinstance(item.icc_profile, (bytes, bytearray, memoryview)):
+                raise TypeError("an ICC profile is given as bytes, not as %s" % type(item.icc_profile).__name__)
+            profile = bytes(item.icc_profile)
+        if profile:
+            image.icc_profile = ctypes.cast(ctypes.c_char_p(profile), c_void_p)
+            image.icc_profile_size = len(profile)
+        handle = own = None
+        try:
+            if item.keywords is not None and len(item.keywords):
+                handle = Keywords(item.keywords)._to_handle(context)
+                image.keywords = handle
+            given = item.properties
+            if isinstance(given, Properties):      # those of an open file
+                given = PropertyDict(given)
+            if isinstance(given, PropertyDict) and self._kind not in ("tiff", "png"):
+                # A solution that was read from a file describes the WCS keywords and the size it
+                # was read with. With others it is left out. (TIFF and PNG have no place for
+                # properties at all.)
+                stale, set_since = _stale_solution(context, given, item.keywords, width, height,
+                                                   item.wcs_row_order or item.row_order)
+                if stale:
+                    given = given._without(stale)
+                    number = self._count
+                    several = self._several if self._several is not None else number > 0
+                    _solution_left_out(context._name() + (" (image %d)" % number if several else ""),
+                                       set_since, item.keywords, self._wcs, self._kind)
+            own = _properties_handle(context, given, "the properties of an image")
+            image.properties = own
+            yield image
+        finally:
+            if handle is not None:
+                _library.xisfconv_keywords_free(handle)
+            if own is not None:
+                _library.xisfconv_properties_free(own)
+            del profile
 
 
 # ------------------------------------------------------------------------------------------

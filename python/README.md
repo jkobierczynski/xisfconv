@@ -131,6 +131,38 @@ An image read with `read_image` and written again has its pixels, its keywords, 
 bounds and its ICC profile. It does not have everything an XISF file may hold: see "Good to
 know". To copy an XISF file with everything in it, use `rewrite`.
 
+## Images in bands
+
+An image that does not fit the memory of the program (a mosaic, a drizzled stack) is read and
+written a band of rows at a time (since 0.22). The program holds one band, and the library
+little more (what it has to keep, it keeps in memory up to a limit and beyond that in a temporary
+file):
+
+```python
+with xisfconv.open("mosaic.xisf") as f:
+    image = f[0]
+    total = 0.0
+    for y, band in image.bands(512, sample_format="float32"):   # [512, width(, channels)]
+        total += band.sum(dtype=np.float64)
+    middle = image.read_rows(image.height // 2, 10)           # ten rows from the middle
+
+with xisfconv.Writer("stack.fits", overwrite=True) as writer:
+    writer.begin_image(40000, 30000, "float32", name="stack", keywords=cards)
+    for y in range(0, 30000, 500):
+        writer.add_rows(make_rows(y, 500))                    # [500, 40000] float32
+```
+
+A band has the options of `read` (another sample format, bounds, either row order, the
+channels first) and is what `read` gives in those rows. What has to be decoded first, a
+compressed XISF block or a tile-compressed FITS image, is decoded when the first band is read and
+kept with the open file until it is closed (Ctrl-C stops that first band, as it stops other work).
+
+`Writer` writes what `write` writes, byte for byte: `add` takes an image whole, `begin_image`
+and `add_rows` one in bands, from its first row in `row_order`. The rows are kept until the file
+is written, when the `with` block ends (or by `close()`), in memory up to 256 MiB and beyond that
+in a temporary file beside the output (`XISFCONV_MEMORY_LIMIT` sets the amount). A block that
+ends in an exception writes nothing, and neither does an image whose last row has not come.
+
 ## Whole files
 
 What the command line tool does, with the same options:
@@ -326,10 +358,11 @@ that a signal handler raises there (an alarm's time limit) can be lost. `Keyboar
 - FITS and ASDF are supported as far as images need them: signed integers are read as unsigned
   if none is negative and as floating point otherwise, and tables are left alone. For
   everything else in those formats use astropy or the asdf package.
-- An array is read and written as a whole, in memory. Reading takes about twice the size of the
+- An array that is read or written whole is in memory. Reading takes about twice the size of the
   image for a moment. Writing takes once the size of the image on top of the array, twice for a
   colour image with the channels last, and for a compressed XISF file at most 256 MiB more
-  (beyond that, temporary files beside it; see "Large images" in the manual of the tool).
+  (beyond that, temporary files beside it; see "Large images" in the manual of the tool). An
+  image that does not fit is read and written in bands of rows (see "Images in bands" above).
   `convert` and `rewrite` hold no image whole: they read and write it a piece at a time.
 - Not everything of an XISF file is carried by `read_image` and `write`: the saved screen
   stretch, the resolution and the thumbnail are not. The XISF properties are (since 0.15; up to

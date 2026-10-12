@@ -15,7 +15,7 @@ from ctypes import (CFUNCTYPE, POINTER, Structure, c_char, c_char_p, c_double, c
 
 # The library version this module was written for. In 0.x every release may change the layout
 # of the structures, so another library is refused.
-API_VERSION = (0, 21)
+API_VERSION = (0, 22)
 
 # ------------------------------------------------------------------------------------------
 # Constants of xisfconv.h
@@ -366,6 +366,7 @@ _FUNCTIONS = {
     "xisfconv_load_pixels": (_status, [_p, c_size_t, c_int32]),
     "xisfconv_pixels_size": (_status, [_p, c_size_t, POINTER(ReadOptions), POINTER(c_uint64)]),
     "xisfconv_read_pixels": (_status, [_p, c_size_t, POINTER(ReadOptions), c_void_p, c_uint64]),
+    "xisfconv_read_rows": (_status, [_p, c_size_t, POINTER(ReadOptions), c_uint64, c_uint64, c_void_p, c_uint64]),
     "xisfconv_read_icc_profile": (_status, [_p, c_size_t, c_void_p, c_size_t, POINTER(c_size_t)]),
     "xisfconv_stored_stretch": (_status, [_p, c_size_t, POINTER(StretchParams), c_size_t, POINTER(c_size_t)]),
     "xisfconv_auto_stretch": (_status, [_p, c_void_p, c_uint64, c_uint64, c_uint64, c_int32, c_double, c_double,
@@ -398,6 +399,8 @@ _FUNCTIONS = {
     "xisfconv_write_options_init": (None, [POINTER(WriteOptions), c_size_t]),
     "xisfconv_writer_new": (_status, [_p, _str, POINTER(WriteOptions), _pp]),
     "xisfconv_writer_add_image": (_status, [_p, POINTER(Image)]),
+    "xisfconv_writer_begin_image": (_status, [_p, POINTER(Image)]),
+    "xisfconv_writer_add_rows": (_status, [_p, c_void_p, c_uint64, c_uint64]),
     "xisfconv_writer_finish": (_status, [_p]),
     "xisfconv_writer_discard": (None, [_p]),
 }

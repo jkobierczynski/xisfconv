@@ -26,8 +26,8 @@ if len(sys.argv) < 2:
     sys.exit(__doc__)
 WHERE = os.path.abspath(sys.argv[1])
 TMP = tempfile.mkdtemp(prefix="xisfconv-examples-")
-CHAPTERS = ["inspect", "pixels", "stretch", "write", "convert", "rewrite", "units", "wcs", "progress"]
-WRITTEN = ["back.xisf", "crop.xisf", "frame.fits", "packed.xisf", "preview.png", "smaller.xisf", "stretched.png",
+CHAPTERS = ["inspect", "pixels", "stretch", "write", "bands", "convert", "rewrite", "units", "wcs", "progress"]
+WRITTEN = ["back.xisf", "bands.fits", "crop.xisf", "frame.fits", "packed.xisf", "preview.png", "smaller.xisf", "stretched.png",
            "there.fits", "unit.xisb", "unit.xish"]
 
 passed = 0
@@ -197,6 +197,8 @@ def test_tour(frame, width, height):
               found["stretch"][1] == "wrote stretched.png, %d x %d, 8 bits" % (width, height), "tour.%s, stretch: %s" % (lang, found["stretch"]))
         check(found["write"] == ["wrote crop.xisf: %d x %d pixels, compressed with zlib, SHA-256 checksum" % (side, side)],
               "tour.%s, write: %s" % (lang, found["write"]))
+        check(found["bands"] == [found["pixels"][0], "wrote bands.fits from %d bands of up to 256 rows" % ((height + 255) // 256)],
+              "tour.%s, bands: the numbers of the image read whole: %s" % (lang, found["bands"]))
         check(found["convert"] == ["wrote frame.fits", "wrote preview.png"], "tour.%s, convert: %s" % (lang, found["convert"]))
         check(re.match(r"\d+ -> \d+ bytes: 2 block\(s\) compressed, 0 kept, 2 checksum\(s\), read back: yes$", found["rewrite"][0]) is not None
               and found["rewrite"][1] == "smaller.xisf is stored as asked: yes"

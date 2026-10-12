@@ -1075,6 +1075,258 @@ static void test_pieces(xisfconv_context *ctx) {
     free(pixels);
 }
 
+/* (0.22) Reading and writing an image a band of rows at a time. */
+static int bytes_equal_files(const char *a, const char *b) {
+    FILE *fa = fopen(a, "rb"), *fb = fopen(b, "rb");
+    int same = fa && fb, ca, cb;
+    while (same) {
+        ca = getc(fa);
+        cb = getc(fb);
+        if (ca != cb) same = 0;
+        if (ca == EOF || cb == EOF) break;
+    }
+    if (fa) fclose(fa);
+    if (fb) fclose(fb);
+    return same;
+}
+
+/* Every band of `rows` rows of an image is what xisfconv_read_pixels gives in those rows, with these options. */
+static int bands_match(xisfconv_file *f, size_t image, const xisfconv_read_options *o, uint64_t band) {
+    xisfconv_image_info info;
+    uint64_t size = 0, y, c;
+    unsigned char *whole, *part;
+    size_t sample, row, plane;
+    int ok = 1;
+    xisfconv_image_info_init(&info, sizeof info);
+    if (xisfconv_read_rows(f, image, o, 0, 0, NULL, 0) != XISFCONV_OK) return 0;   /* (the sample format is known then) */
+    if (xisfconv_pixels_size(f, image, o, &size) != XISFCONV_OK || xisfconv_image_info_get(f, image, &info) != XISFCONV_OK) return 0;
+    whole = (unsigned char *)malloc((size_t)size);
+    part = (unsigned char *)malloc((size_t)size);
+    if (!whole || !part || xisfconv_read_pixels(f, image, o, whole, size) != XISFCONV_OK) ok = 0;
+    sample = (size_t)(size / (info.width * info.height * info.channels));
+    row = (size_t)info.width * sample;
+    plane = row * (size_t)info.height;
+    for (y = 0; ok && y < info.height; y += band) {
+        const uint64_t n = y + band <= info.height ? band : info.height - y;
+        if (xisfconv_read_rows(f, image, o, y, n, part, n * row * info.channels) != XISFCONV_OK) ok = 0;
+        for (c = 0; ok && c < info.channels; ++c)
+            if (memcmp(part + c * n * row, whole + c * plane + y * row, (size_t)(n * row)) != 0) ok = 0;
+    }
+    free(whole);
+    free(part);
+    return ok;
+}
+
+static void test_bands(xisfconv_context *ctx) {
+    enum { W = 37, H = 29, C = 3 };
+    static const char *names[] = {"bands.xisf", "bands-zlib.xisf", "bands.fits", "bands.fits.fz", "bands.asdf"};
+    static const char *outputs[] = {"w.xisf", "w.fits", "w.fits.fz", "w.asdf", "w.tif", "w.png"};
+    float *f32 = (float *)malloc(sizeof(float) * W * H * C);
+    uint16_t *u16 = (uint16_t *)malloc(sizeof(uint16_t) * W * H * C);
+    xisfconv_image img;
+    xisfconv_write_options wo;
+    xisfconv_read_options o;
+    xisfconv_writer *w = NULL;
+    xisfconv_file *f = NULL;
+    size_t n, i, x, y, c;
+    if (!f32 || !u16) {
+        CHECK(0, "memory for the band tests");
+        return;
+    }
+    for (c = 0; c < C; ++c)
+        for (y = 0; y < H; ++y)
+            for (x = 0; x < W; ++x) {
+                f32[(c * H + y) * W + x] = (float)((x * 0.7 + y * 1.3 + c * 5.0) / 40.0 - 0.2);   /* (beyond 0:1 both ways) */
+                u16[(c * H + y) * W + x] = (uint16_t)((x * 977 + y * 3011 + c * 17) % 65536);
+            }
+
+    /* reading: a band is the rows of the whole image, whatever the format and the options */
+    for (n = 0; n < sizeof names / sizeof names[0]; ++n) {
+        int all = 1;
+        xisfconv_write_options_init(&wo, sizeof wo);
+        wo.overwrite = 1;
+        if (n == 1) {
+            wo.codec = XISFCONV_CODEC_ZLIB;
+            wo.checksum = XISFCONV_CHECKSUM_SHA1;
+        }
+        if (n == 3) wo.codec = XISFCONV_CODEC_DEFAULT;
+        xisfconv_image_init(&img, sizeof img);
+        img.width = W;
+        img.height = H;
+        img.channels = C;
+        img.pixels = f32;
+        img.sample_format = XISFCONV_SAMPLE_FLOAT32;
+        CHECK(xisfconv_writer_new(ctx, path_of(names[n]), &wo, &w) == XISFCONV_OK && xisfconv_writer_add_image(w, &img) == XISFCONV_OK,
+              "an image for the band tests");
+        img.channels = 1;
+        img.pixels = u16;
+        img.sample_format = XISFCONV_SAMPLE_UINT16;
+        CHECK(xisfconv_writer_add_image(w, &img) == XISFCONV_OK && xisfconv_writer_finish(w) == XISFCONV_OK, "... and another");
+        if (xisfconv_open(ctx, path_of(names[n]), &f) != XISFCONV_OK) {
+            CHECK(0, names[n]);
+            continue;
+        }
+        for (i = 0; i < 2; ++i) {
+            int variant;
+            for (variant = 0; variant < 5; ++variant) {
+                uint64_t band;
+                xisfconv_read_options_init(&o, sizeof o);
+                if (variant == 1) o.sample_format = XISFCONV_SAMPLE_UINT8;
+                if (variant == 2) o.row_order = XISFCONV_ROWS_TOP_DOWN;
+                if (variant == 3) o.row_order = XISFCONV_ROWS_BOTTOM_UP;
+                if (variant == 4) {
+                    o.sample_format = i == 0 ? XISFCONV_SAMPLE_UINT16 : XISFCONV_SAMPLE_FLOAT64;
+                    o.use_bounds = 1;
+                    o.lower_bound = -1;
+                    o.upper_bound = 2;
+                    o.row_order = XISFCONV_ROWS_BOTTOM_UP;
+                }
+                for (band = 1; band <= H; band = band == 1 ? 7 : band == 7 ? H : H + 1)
+                    if (!bands_match(f, i, &o, band)) {
+                        fprintf(stderr, "  %s, image %u, variant %d, bands of %u rows\n", names[n], (unsigned)i, variant, (unsigned)band);
+                        all = 0;
+                    }
+            }
+        }
+        CHECK(all, "xisfconv_read_rows: every band is the rows of xisfconv_read_pixels (XISF, compressed with a checksum, FITS, "
+                   "tile-compressed FITS, ASDF; another sample format, either row order, bounds)");
+        {
+            unsigned char band[W * 4 * C * 8];
+            xisfconv_read_options_init(&o, sizeof o);
+            CHECK(xisfconv_read_rows(f, 0, &o, H - 3, 4, band, sizeof band) == XISFCONV_ERR_ARGUMENT &&
+                      xisfconv_read_rows(f, 0, &o, H + 1, 0, NULL, 0) == XISFCONV_ERR_ARGUMENT &&
+                      xisfconv_read_rows(f, 0, &o, 0, 4, band, 4 * W * C * 4 - 1) == XISFCONV_ERR_BUFFER &&
+                      xisfconv_read_rows(f, 0, &o, 0, 4, NULL, 0) == XISFCONV_ERR_ARGUMENT &&
+                      xisfconv_read_rows(f, 2, &o, 0, 0, NULL, 0) == XISFCONV_ERR_INDEX &&
+                      xisfconv_read_rows(f, 0, &o, H, 0, NULL, 0) == XISFCONV_OK,
+                  "xisfconv_read_rows: rows beyond the last, a small buffer, none, another image");
+        }
+        xisfconv_close(f);
+        f = NULL;
+    }
+
+    /* the first band of a compressed image is a step of its own: it is reported, and may be stopped;
+       bands of two images read by turns decode each of them once */
+    {
+        progress steps;
+        unsigned char band[37 * 3 * 4 * 2];
+        int ok = 1;
+        memset(&steps, 0, sizeof steps);
+        steps.cancel_at = 1;
+        xisfconv_context_set_progress_handler(ctx, on_progress, &steps);
+        if (xisfconv_open(ctx, path_of("bands-zlib.xisf"), &f) == XISFCONV_OK) {
+            xisfconv_read_options_init(&o, sizeof o);
+            CHECK(xisfconv_read_rows(f, 0, &o, 0, 2, band, sizeof band) == XISFCONV_ERR_CANCELLED && steps.calls == 1,
+                  "the first band of a compressed image is reported, and can be stopped there");
+            steps.cancel_at = 0;
+            steps.calls = 0;
+            for (i = 0; i < 6; ++i) ok = ok && xisfconv_read_rows(f, i % 2, &o, i, 1, band, sizeof band) == XISFCONV_OK;
+            CHECK(ok && steps.calls == 2, "bands of two images read by turns: each image is decoded once");
+            xisfconv_close(f);
+            f = NULL;
+        }
+        xisfconv_context_set_progress_handler(ctx, NULL, NULL);
+    }
+    xisfconv_write_options_init(&wo, sizeof wo);
+    w = NULL;
+    CHECK(xisfconv_writer_new(ctx, path_of(names[0]), &wo, &w) == XISFCONV_ERR_EXISTS && w == NULL,
+          "a writer is not made for a file that is there, unless it may be written over");
+
+    /* writing: an image given in bands is the file of the image given whole */
+    for (n = 0; n < sizeof outputs / sizeof outputs[0]; ++n) {
+        char banded[64];
+        int k;
+        const uint64_t bands[] = {4, 1, 10, H - 15};
+        sprintf(banded, "banded-%s", outputs[n]);
+        for (k = 0; k < 2; ++k) {
+            xisfconv_write_options_init(&wo, sizeof wo);
+            wo.overwrite = 1;
+            if (n == 2) wo.codec = XISFCONV_CODEC_DEFAULT;
+            if (n == 0) {
+                wo.codec = XISFCONV_CODEC_ZLIB;
+                wo.checksum = XISFCONV_CHECKSUM_SHA256;
+                wo.creator_application = "band test";
+            }
+            xisfconv_image_init(&img, sizeof img);
+            img.width = W;
+            img.height = H;
+            img.channels = C;
+            img.sample_format = XISFCONV_SAMPLE_UINT16;
+            img.row_order = XISFCONV_ROWS_BOTTOM_UP;   /* (turned for every format but FITS and ASDF) */
+            img.name = "banded";
+            if (xisfconv_writer_new(ctx, path_of(k ? banded : outputs[n]), &wo, &w) != XISFCONV_OK) {
+                CHECK(0, "a writer for the band tests");
+                continue;
+            }
+            if (k == 0) {
+                img.pixels = u16;
+                CHECK(xisfconv_writer_add_image(w, &img) == XISFCONV_OK, "the image given whole");
+            } else {
+                size_t b;
+                uint64_t at = 0;
+                uint16_t *band = (uint16_t *)malloc(sizeof(uint16_t) * W * H * C);
+                int ok = band && xisfconv_writer_begin_image(w, &img) == XISFCONV_OK;
+                for (b = 0; ok && b < sizeof bands / sizeof bands[0]; ++b) {
+                    for (c = 0; c < C; ++c)
+                        memcpy(band + c * bands[b] * W, u16 + (c * H + at) * W, sizeof(uint16_t) * W * bands[b]);
+                    ok = xisfconv_writer_add_rows(w, band, bands[b], sizeof(uint16_t) * W * bands[b] * C) == XISFCONV_OK;
+                    at += bands[b];
+                }
+                CHECK(ok && at == H, "the image given in bands of 4, 1, 10 and 14 rows");
+                free(band);
+            }
+            CHECK(xisfconv_writer_finish(w) == XISFCONV_OK, "written");
+        }
+        if (n == 0) {
+            /* (XISF names the time it was written: the rest is the same, and so are the pixels) */
+            uint16_t *a = (uint16_t *)malloc(sizeof(uint16_t) * W * H * C), *b = (uint16_t *)malloc(sizeof(uint16_t) * W * H * C);
+            xisfconv_file *fa = NULL, *fb = NULL;
+            int same = a && b && xisfconv_open(ctx, path_of(outputs[n]), &fa) == XISFCONV_OK &&
+                       xisfconv_open(ctx, path_of(banded), &fb) == XISFCONV_OK &&
+                       xisfconv_read_pixels(fa, 0, NULL, a, sizeof(uint16_t) * W * H * C) == XISFCONV_OK &&
+                       xisfconv_read_pixels(fb, 0, NULL, b, sizeof(uint16_t) * W * H * C) == XISFCONV_OK &&
+                       memcmp(a, b, sizeof(uint16_t) * W * H * C) == 0 && file_size(path_of(outputs[n])) == file_size(path_of(banded));
+            CHECK(same, "XISF written in bands: the pixels and the size of the file given whole");
+            xisfconv_close(fa);
+            xisfconv_close(fb);
+            free(a);
+            free(b);
+        } else {
+            CHECK(bytes_equal_files(path_of(outputs[n]), path_of(banded)), outputs[n]);
+        }
+        remove(path_of(outputs[n]));
+        remove(path_of(banded));
+    }
+
+    /* what a writer with an image in bands refuses */
+    xisfconv_write_options_init(&wo, sizeof wo);
+    wo.overwrite = 1;
+    xisfconv_image_init(&img, sizeof img);
+    img.width = W;
+    img.height = H;
+    img.channels = 1;
+    img.sample_format = XISFCONV_SAMPLE_UINT16;
+    if (xisfconv_writer_new(ctx, path_of("refused.fits"), &wo, &w) == XISFCONV_OK) {
+        CHECK(xisfconv_writer_add_rows(w, u16, 1, sizeof(uint16_t) * W) == XISFCONV_ERR_ARGUMENT, "rows before an image is begun");
+        img.pixels = u16;
+        CHECK(xisfconv_writer_begin_image(w, &img) == XISFCONV_ERR_ARGUMENT, "an image begun with pixels");
+        img.pixels = NULL;
+        CHECK(xisfconv_writer_begin_image(w, &img) == XISFCONV_OK &&
+                  xisfconv_writer_add_rows(w, u16, 2, sizeof(uint16_t) * W * 2 - 1) == XISFCONV_ERR_BUFFER &&
+                  xisfconv_writer_add_rows(w, u16, H - 1, sizeof(uint16_t) * W * (H - 1)) == XISFCONV_OK &&
+                  xisfconv_writer_add_rows(w, u16, 2, sizeof(uint16_t) * W * 2) == XISFCONV_ERR_ARGUMENT,
+              "a band too small, rows beyond the last");
+        img.pixels = u16;
+        CHECK(xisfconv_writer_add_image(w, &img) == XISFCONV_ERR_ARGUMENT, "another image before the last row");
+        CHECK(xisfconv_writer_finish(w) == XISFCONV_ERR_ARGUMENT && strstr(xisfconv_error_message(ctx), "28 of its 29 rows") &&
+                  !file_exists(path_of("refused.fits")) && !file_exists(path_of("refused.fits.part")),
+              "finishing before the last row: nothing is written");
+    }
+    for (n = 0; n < sizeof names / sizeof names[0]; ++n) remove(path_of(names[n]));
+    free(f32);
+    free(u16);
+}
+
 /* A host's progress handler, as an interpreter would give it. */
 typedef struct {
     int reports, answer_at;
@@ -2762,6 +3014,7 @@ int main(int argc, char **argv) {
     test_callbacks(ctx);
     test_kept_messages_and_cancel(ctx);
     test_pieces(ctx);
+    test_bands(ctx);
     test_host_progress(ctx);
     test_stretch_and_wcs(ctx);
     test_fits_header(ctx);

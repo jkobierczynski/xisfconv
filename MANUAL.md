@@ -918,6 +918,15 @@ and nothing kept in memory as with the defaults (which the tests check). They ar
 bytes of the same data (a fraction of a percent more or less) than compressing a whole block at
 once did.
 
+A program that uses the library reads and writes such an image a band of rows at a time too
+(since 0.22): `xisfconv_read_rows` and a writer given an image in bands
+(`xisfconv_writer_begin_image`, `xisfconv_writer_add_rows`) in C, `FileImage.bands()`,
+`FileImage.read_rows()` and `xisfconv.Writer` in Python. The rows it is given are kept until
+the file is written, in memory up to the limit below and in a temporary file beside the output
+beyond it, and what has to be decoded of a file it reads (a compressed block) is kept with the
+open file, in memory up to the limit and beyond it in the system's directory for temporary files.
+See "Images in bands" in [the manual of the library](docs/manual.html).
+
 TIFF output whose pages could take more than 4 GiB is written as BigTIFF, which has offsets of 8
 bytes instead of 4 (libtiff 4, tifffile and the programs built on them read it; a program that
 knows classic TIFF only does not). Whether a file needs it is judged before it is written, from
@@ -1143,11 +1152,14 @@ Good to know:
   elsewhere, and a monolithic `.xisf` file that names any other file, raises
   `xisfconv.NotAllowedError` (a `PermissionError`) unless the call says
   `external_files="anywhere"`. Each call says it for itself: there is no setting that stays.
-- An array is read and written as a whole: reading takes about twice the size of the image for a
-  moment (a compressed block is decompressed once, into memory up to the limit of
-  [Large images](#large-images), into a temporary file beyond). Writing takes once its size on
-  top of the array, twice for a colour image with the channels last, and for compressed XISF
-  output at most the memory limit more. `convert` and `rewrite` hold no image whole.
+- An array that is read or written as a whole takes memory: reading about twice the size of the
+  image for a moment (a compressed block is decompressed once, into memory up to the limit of
+  [Large images](#large-images), into a temporary file beyond); writing once its size on top of
+  the array, twice for a colour image with the channels last, and for compressed XISF output at
+  most the memory limit more. An image that does not fit is read and written in bands of rows
+  (since 0.22): `FileImage.bands()` and `FileImage.read_rows()`, and `xisfconv.Writer` with
+  `begin_image` and `add_rows`, which hold no more than a band and the memory limit. `convert`
+  and `rewrite` hold no image whole.
 - `CCDData.read` hands the image to astropy's own FITS reader as a FITS file in memory, so that
   units, mask and uncertainty behave exactly as with FITS; that takes about four times the size
   of the image in memory.
