@@ -3376,6 +3376,170 @@ static void test_memory_and_streams(xisfconv_context *ctx) {
     sink_reset(&sink);
 }
 
+/* ---- tables and data blocks of types without a name (0.25) ---- */
+
+static void test_tables_and_bytes(xisfconv_context *ctx) {
+    static const char *const ids[] = {"name", "mag", "seen"};
+    static const char *const types[] = {"String", "Float32", "TimePoint"};
+    static const char *const headers[] = {"Star", NULL, NULL};
+    static const char *const formats[] = {NULL, "%.2f", NULL};
+    static const char *const cells[] = {"Vega", "0.03", "2026-10-12T20:00:00Z", "line\r\nbreak", "1.25", "2026-10-13"};
+    static const char *const bad_cells[] = {"Vega", "bright", "2026-10-12"};
+    static const char *const vector_type[] = {"F64Vector"};
+    static const char *const twice[] = {"a", "a"};
+    static const char *const ints[] = {"Int32", "Int32"};
+    static const unsigned char raw[12] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+    unsigned char back[12];
+    xisfconv_properties *list = NULL, *whole = NULL;
+    xisfconv_write_options wo;
+    xisfconv_writer *w = NULL;
+    xisfconv_image img;
+    xisfconv_file *f = NULL;
+    size_t fields = 0, rows = 0, size = 0;
+    uint64_t r = 0, c = 0;
+    int32_t big = -1;
+    const char *caption = NULL, *id = NULL, *type = NULL, *header = NULL, *format = NULL, *value = NULL;
+    int64_t at;
+
+    CHECK(xisfconv_properties_new(ctx, &list) == XISFCONV_OK && xisfconv_properties_new(ctx, &whole) == XISFCONV_OK,
+          "property lists for tables");
+    CHECK(xisfconv_properties_set_table(list, "Cat:Stars", "Bright stars", "a comment", 3, ids, types, headers, formats, 2,
+                                        cells) == XISFCONV_OK,
+          "a table is given");
+    CHECK(xisfconv_properties_set_table(list, "Bad", NULL, NULL, 3, ids, types, NULL, NULL, 1, bad_cells) == XISFCONV_ERR_ARGUMENT &&
+              strstr(xisfconv_error_message(ctx), "row 0, field mag"),
+          "a cell that is not of its field's type");
+    CHECK(xisfconv_properties_set_table(list, "Bad", NULL, NULL, 1, ids, vector_type, NULL, NULL, 0, NULL) == XISFCONV_ERR_ARGUMENT,
+          "a field of a vector type");
+    CHECK(xisfconv_properties_set_table(list, "Bad", NULL, NULL, 2, twice, ints, NULL, NULL, 0, NULL) == XISFCONV_ERR_ARGUMENT,
+          "two fields of one id");
+    CHECK(xisfconv_properties_set_table(list, "Bad", NULL, NULL, 0, NULL, NULL, NULL, NULL, 0, NULL) == XISFCONV_ERR_ARGUMENT,
+          "a table without fields");
+    CHECK(xisfconv_properties_set_bytes(list, "Odd:Quad", "Float128Vector", raw, sizeof raw, 3, 0, 0, NULL, NULL) == XISFCONV_OK,
+          "a data block of a type without a name");
+    CHECK(xisfconv_properties_set_bytes(list, "Odd:Matrix", "Q32Matrix", raw, sizeof raw, 2, 3, 1, NULL, NULL) == XISFCONV_OK,
+          "... a matrix of big-endian bytes");
+    CHECK(xisfconv_properties_set_bytes(list, "Bad", "Int32", raw, 4, 0, 0, 0, NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set_bytes(list, "Bad", "F64Vector", raw, 8, 1, 0, 0, NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set_bytes(list, "Bad", "Table", raw, 1, 0, 0, 0, NULL, NULL) == XISFCONV_ERR_ARGUMENT &&
+              xisfconv_properties_set_bytes(list, "Bad", "QVector", raw, 1, 1, 2, 0, NULL, NULL) == XISFCONV_ERR_ARGUMENT,
+          "types with a name here are not given as bytes, and a vector has no columns");
+    CHECK(xisfconv_properties_count(list) == 3, "three properties");
+    CHECK(xisfconv_properties_set_table(whole, "File:Table", NULL, NULL, 1, ids, types, NULL, NULL, 1, cells) == XISFCONV_OK,
+          "a table of the file");
+    {
+        static const char *const odd[] = {"1.0", "x\001y"};
+        CHECK(xisfconv_properties_set_table(whole, "File:Odd", NULL, NULL, 2, twice, ints, NULL, NULL, 1, odd) ==
+                      XISFCONV_ERR_ARGUMENT &&
+                  xisfconv_properties_set_table_as_read(whole, "File:Odd", "cap\001tion", NULL, 2, twice, ints, NULL, NULL, 1,
+                                                        odd) == XISFCONV_OK,
+              "a table as it was read: fields of one id, cells that are not of their type");
+        CHECK(xisfconv_properties_set_table_as_read(whole, "Bad", NULL, NULL, 0, NULL, NULL, NULL, NULL, 0, NULL) ==
+                      XISFCONV_ERR_ARGUMENT &&
+                  xisfconv_properties_set_table_as_read(whole, "Bad", NULL, NULL, 1, ids, vector_type, NULL, NULL, 0, NULL) ==
+                      XISFCONV_ERR_ARGUMENT &&
+                  xisfconv_properties_set_table_as_read(whole, "Bad", NULL, NULL, 1, ids, types, NULL, NULL, 1, NULL) ==
+                      XISFCONV_ERR_ARGUMENT,
+              "... but a table: fields of types of values, and cells");
+    }
+
+    xisfconv_write_options_init(&wo, sizeof wo);
+    wo.overwrite = 1;
+    wo.properties = whole;
+    xisfconv_image_init(&img, sizeof img);
+    img.width = W;
+    img.height = H;
+    img.pixels = g_gray;
+    img.sample_format = XISFCONV_SAMPLE_UINT16;
+    img.properties = list;
+    CHECK(xisfconv_writer_new(ctx, path_of("tables.xisf"), &wo, &w) == XISFCONV_OK && xisfconv_writer_add_image(w, &img) == XISFCONV_OK &&
+              xisfconv_writer_finish(w) == XISFCONV_OK,
+          "an XISF file with tables");
+    if (xisfconv_open(ctx, path_of("tables.xisf"), &f) != XISFCONV_OK) {
+        CHECK(0, "tables.xisf");
+    } else {
+        at = xisfconv_property_find(f, 0, "Cat:Stars");
+        CHECK(at == 0 && xisfconv_property_stored(f, 0, 0) == XISFCONV_PROPERTY_TABLE, "the table is a table");
+        CHECK(xisfconv_property_get(f, 0, 0, &id, &type, &value, &header, NULL) == XISFCONV_OK && strcmp(type, "Table") == 0 &&
+                  strcmp(header, "a comment") == 0,
+              "... of the type Table, with its comment");
+        CHECK(xisfconv_property_table(f, 0, 0, &fields, &rows, &caption) == XISFCONV_OK && fields == 3 && rows == 2 &&
+                  strcmp(caption, "Bright stars") == 0,
+              "... its shape and caption");
+        CHECK(xisfconv_property_table_field(f, 0, 0, 1, &id, &type, &header, &format) == XISFCONV_OK && strcmp(id, "mag") == 0 &&
+                  strcmp(type, "Float32") == 0 && strcmp(header, "") == 0 && strcmp(format, "%.2f") == 0,
+              "... a field");
+        CHECK(xisfconv_property_table_field(f, 0, 0, 0, &id, NULL, &header, NULL) == XISFCONV_OK && strcmp(header, "Star") == 0,
+              "... a header");
+        CHECK(xisfconv_property_table_cell(f, 0, 0, 1, 0, &value) == XISFCONV_OK && strcmp(value, "line\r\nbreak") == 0,
+              "... a String with its line break");
+        CHECK(xisfconv_property_table_cell(f, 0, 0, 1, 2, &value) == XISFCONV_OK && strcmp(value, "2026-10-13") == 0, "... a time point");
+        CHECK(xisfconv_property_table_cell(f, 0, 0, 2, 0, &value) == XISFCONV_ERR_INDEX &&
+                  xisfconv_property_table_field(f, 0, 0, 3, &id, NULL, NULL, NULL) == XISFCONV_ERR_INDEX,
+              "... and nothing beyond");
+        CHECK(xisfconv_property_stored(f, 0, 1) == XISFCONV_PROPERTY_BYTES &&
+                  xisfconv_property_read_bytes(f, 0, 1, NULL, 0, &size, &r, &c, &big) == XISFCONV_OK && size == sizeof raw &&
+                  r == 3 && c == 0 && big == 0,
+              "a data block of a type without a name: its size and shape");
+        memset(back, 0, sizeof back);
+        CHECK(xisfconv_property_read_bytes(f, 0, 1, back, 4, &size, NULL, NULL, NULL) == XISFCONV_ERR_BUFFER &&
+                  xisfconv_property_read_bytes(f, 0, 1, back, sizeof back, &size, NULL, NULL, NULL) == XISFCONV_OK &&
+                  memcmp(back, raw, sizeof raw) == 0,
+              "... its bytes");
+        CHECK(xisfconv_property_read_bytes(f, 0, 2, NULL, 0, &size, &r, &c, &big) == XISFCONV_OK && r == 2 && c == 3 && big == 1,
+              "... a matrix of big-endian bytes");
+        CHECK(xisfconv_property_read(f, 0, 1, NULL, 0, &size, NULL, NULL) == XISFCONV_ERR_NOT_FOUND &&
+                  xisfconv_property_read_bytes(f, 0, 0, NULL, 0, &size, NULL, NULL, NULL) == XISFCONV_ERR_NOT_FOUND &&
+                  xisfconv_property_table(f, 0, 1, &fields, &rows, NULL) == XISFCONV_ERR_NOT_FOUND &&
+                  xisfconv_property_table(f, 0, 9, &fields, &rows, NULL) == XISFCONV_ERR_INDEX,
+              "each is read by its own functions");
+        at = xisfconv_property_find(f, XISFCONV_FILE_PROPERTIES, "File:Table");
+        CHECK(at >= 0 && xisfconv_property_stored(f, XISFCONV_FILE_PROPERTIES, (size_t)at) == XISFCONV_PROPERTY_TABLE &&
+                  xisfconv_property_table(f, XISFCONV_FILE_PROPERTIES, (size_t)at, &fields, &rows, NULL) == XISFCONV_OK &&
+                  fields == 1 && rows == 1,
+              "the table of the file");
+        at = xisfconv_property_find(f, XISFCONV_FILE_PROPERTIES, "File:Odd");
+        CHECK(at >= 0 && xisfconv_property_table(f, XISFCONV_FILE_PROPERTIES, (size_t)at, &fields, &rows, &caption) == XISFCONV_OK &&
+                  fields == 2 && rows == 1 && strcmp(caption, "cap tion") == 0 &&
+                  xisfconv_property_table_cell(f, XISFCONV_FILE_PROPERTIES, (size_t)at, 0, 0, &value) == XISFCONV_OK &&
+                  strcmp(value, "1.0") == 0 &&
+                  xisfconv_property_table_cell(f, XISFCONV_FILE_PROPERTIES, (size_t)at, 0, 1, &value) == XISFCONV_OK &&
+                  strcmp(value, "x y") == 0,
+              "... written as it was read, with blanks for what XML cannot hold");
+        xisfconv_close(f);
+        f = NULL;
+    }
+    /* FITS does not carry tables: a warning says so */
+    xisfconv_context_keep_messages(ctx, 1);
+    xisfconv_context_clear_messages(ctx);
+    {
+        xisfconv_convert_options co;
+        size_t m, told = 0;
+        xisfconv_convert_options_init(&co, sizeof co);
+        co.overwrite = 1;
+        CHECK(xisfconv_convert(ctx, path_of("tables.xisf"), path_of("tables.fits"), &co) == XISFCONV_OK, "tables to FITS");
+        for (m = 0; m < xisfconv_context_message_count(ctx); ++m) {
+            xisfconv_message_level level;
+            const char *path = NULL, *text = NULL;
+            if (xisfconv_context_message(ctx, m, &level, &path, &text) == XISFCONV_OK && strstr(text, "is not carried to FITS")) ++told;
+        }
+        CHECK(told == 4, "... three tables and the big-endian block are not carried, and that is said");
+        if (xisfconv_open(ctx, path_of("tables.fits"), &f) == XISFCONV_OK) {
+            CHECK(xisfconv_property_count(f, 0) == 1 && xisfconv_property_stored(f, 0, 0) == XISFCONV_PROPERTY_BYTES &&
+                      xisfconv_property_read_bytes(f, 0, 0, back, sizeof back, &size, &r, NULL, &big) == XISFCONV_OK &&
+                      size == sizeof raw && memcmp(back, raw, sizeof raw) == 0 && r == 3 && big == 0,
+                  "... the data block of a type without a name is, as its bytes");
+            xisfconv_close(f);
+        } else {
+            CHECK(0, "tables.fits");
+        }
+    }
+    xisfconv_context_clear_messages(ctx);
+    xisfconv_context_keep_messages(ctx, 0);
+    xisfconv_properties_free(list);
+    xisfconv_properties_free(whole);
+}
+
 static void test_lifetime(void) {
     xisfconv_context *ctx = xisfconv_context_new();
     xisfconv_file *f = NULL;
@@ -3457,6 +3621,7 @@ int main(int argc, char **argv) {
     test_given_properties(ctx);
     test_distributed_units(ctx);
     test_memory_and_streams(ctx);
+    test_tables_and_bytes(ctx);
     xisfconv_context_free(ctx);
     test_lifetime();
 

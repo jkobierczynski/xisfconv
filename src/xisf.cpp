@@ -185,6 +185,18 @@ XisfFile::XisfFile(const Input& input, const XisfBlocksRedirect* redirect, bool 
              (externalFiles_.size() > 1 ? ", ..." : "") + "), which the specification has for a header file (.xish) only");
     }
 
+    // Elements at the root may be shared: an image refers to one by its uid (<Reference ref=.../>),
+    // and a table to the structure of its rows. A table at the root that no image refers to is
+    // one of the file.
+    for (const auto& child : root_->children) {
+        if (const std::string* uid = child->attr("uid")) uids_.emplace(*uid, child.get());
+    }
+    for (const xml::Node* image : root_->childrenNamed("Image")) {
+        for (const xml::Node* reference : image->childrenNamed("Reference")) {
+            const auto found = uids_.find(attrOr(*reference, "ref"));
+            if (found != uids_.end()) referenced_.insert(found->second);
+        }
+    }
     for (const auto& child : root_->children) {
         if (child->name == "Image") {
             parseImage(*child);
@@ -192,8 +204,76 @@ XisfFile::XisfFile(const Input& input, const XisfBlocksRedirect* redirect, bool 
             for (const xml::Node* p : child->childrenNamed("Property")) fileProperties_.push_back(parseProperty(*p));
         } else if (child->name == "Property") {
             fileProperties_.push_back(parseProperty(*child));
+        } else if (child->name == "Table" && !referenced_.count(child.get())) {
+            fileProperties_.push_back(parseTable(*child));
         }
     }
+}
+
+// A <Table>: its fields (of its own <Structure>, or of the one at the root it refers to) and
+// its rows. One that is not a table of values, or does not hold together, is listed and not read.
+XisfProperty XisfFile::parseTable(const xml::Node& node) {
+    // (once for each element: what an image refers to again and again is the same table, shared)
+    const auto known = tables_.find(&node);
+    if (known != tables_.end()) return known->second;
+    XisfProperty x;
+    x.id = attrOr(node, "id");
+    x.type = "Table";
+    x.comment = attrOr(node, "comment");
+    x.node = &node;
+    auto table = std::make_shared<PropertyTable>();
+    table->caption = attrOr(node, "caption");
+    try {
+        const xml::Node* structure = node.child("Structure");
+        if (!structure) {
+            if (const xml::Node* reference = node.child("Reference")) {
+                const auto found = uids_.find(attrOr(*reference, "ref"));
+                if (found != uids_.end() && found->second->name == "Structure") structure = found->second;
+            }
+        }
+        if (!structure) throw Error("it has no <Structure>");
+        for (const xml::Node* f : structure->childrenNamed("Field")) {
+            table->fields.push_back({attrOr(*f, "id"), attrOr(*f, "type"), attrOr(*f, "header"), attrOr(*f, "format")});
+        }
+        if (table->fields.empty()) throw Error("its structure has no fields");
+        for (const PropertyTable::Field& f : table->fields) {
+            if (!isScalarPropertyType(f.type)) {
+                throw Error("its field " + f.id + " is a " + f.type + ", and a table is read with values only (scalars, "
+                            "complex numbers, Strings, time points)");
+            }
+        }
+        size_t rows = 0;
+        for (const xml::Node* row : node.childrenNamed("Row")) {
+            const std::vector<const xml::Node*> cells = row->childrenNamed("Cell");
+            if (cells.size() != table->fields.size()) {
+                throw Error("row " + std::to_string(rows) + " has " + std::to_string(cells.size()) + " cells for " +
+                            std::to_string(table->fields.size()) + " fields");
+            }
+            for (size_t i = 0; i < cells.size(); ++i) {
+                const xml::Node& cell = *cells[i];
+                if (cell.attr("location")) throw Error("a cell of row " + std::to_string(rows) + " is in a data block");
+                // (a String is the text of its cell; tables of PixInsight's first examples gave it a value attribute)
+                const std::string* value = cell.attr("value");
+                const bool text = table->fields[i].type == "String" ? !value || !cell.text.empty() : !value;
+                table->cells.push_back(text ? cell.text : *value);
+            }
+            ++rows;
+        }
+        uint64_t declared = 0;
+        if (const std::string* r = node.attr("rows")) {
+            if (!parseUInt64(*r, declared) || declared != rows) throw Error("its rows attribute says " + *r + ", and it has " + std::to_string(rows));
+        }
+        if (const std::string* c = node.attr("columns")) {
+            if (!parseUInt64(*c, declared) || declared != table->fields.size()) {
+                throw Error("its columns attribute says " + *c + ", and it has " + std::to_string(table->fields.size()) + " fields");
+            }
+        }
+        x.table = std::move(table);
+    } catch (const Error& e) {
+        x.unread = e.what();
+    }
+    tables_.emplace(&node, x);
+    return x;
 }
 
 namespace {
@@ -378,6 +458,11 @@ void XisfFile::parseImage(const xml::Node& node) {
             img.keywords.push_back({attrOr(c, "name"), attrOr(c, "value"), attrOr(c, "comment")});
         } else if (c.name == "Property") {
             img.properties.push_back(parseProperty(c));
+        } else if (c.name == "Table") {
+            img.properties.push_back(parseTable(c));
+        } else if (c.name == "Reference") {
+            const auto found = uids_.find(attrOr(c, "ref"));
+            if (found != uids_.end() && found->second->name == "Table") img.properties.push_back(parseTable(*found->second));
         } else if (c.name == "ColorFilterArray") {
             img.cfa.present = true;
             img.cfa.pattern = attrOr(c, "pattern");
@@ -666,6 +751,11 @@ Property XisfFile::loadProperty(const XisfProperty& x, bool verify) {
     p.format = x.format;
     PropertyElement element;
     const bool known = propertyElement(x.type, element);
+    if (x.node && x.node->name == "Table") {
+        if (!x.table) throw Error("it is a table that is not read: " + x.unread);
+        p.table = x.table;
+        return p;
+    }
     // A property is a value, or a data block. One that is built of other elements (the tables
     // and structures of the specification) is neither, and is not something this form can hold.
     if (x.node) {
@@ -708,6 +798,9 @@ Property XisfFile::loadProperty(const XisfProperty& x, bool verify) {
     } else {
         number("length", p.rows);
     }
+    // (of a type without a name here nothing is known of its elements: the block says how its
+    // bytes are, and is written so again)
+    if (!known) p.bigEndian = attrOr(*x.node, "byteOrder", "little") == "big";
     if (known) {
         // XISF blocks are little-endian unless they say otherwise; a complex number is two numbers
         const size_t part = element.kind == 'c' ? element.size / 2 : element.size;
@@ -779,6 +872,7 @@ uint64_t XisfFile::declaredBlockSize(const xml::Node& element) const {
 }
 
 XisfFile::PropertyStorage XisfFile::propertyStorage(const XisfProperty& x) const {
+    if (x.node && x.node->name == "Table") return x.table ? PropertyStorage::Table : PropertyStorage::Unread;
     if (x.node) {
         for (const auto& child : x.node->children)
             if (child->name != "Data") return PropertyStorage::Unread;
@@ -789,6 +883,7 @@ XisfFile::PropertyStorage XisfFile::propertyStorage(const XisfProperty& x) const
         return x.hasBlockData ? PropertyStorage::Unread : PropertyStorage::TextBlock;   // (unread: the block could not be read)
     }
     if (!x.hasBlockData) return known ? PropertyStorage::Unread : x.exactText ? PropertyStorage::TextBlock : PropertyStorage::Header;
+    if (x.node && isUnnamedBlockType(x.type) && x.type != "String") return PropertyStorage::Bytes;
     return known && x.node ? PropertyStorage::Array : PropertyStorage::Unread;
 }
 

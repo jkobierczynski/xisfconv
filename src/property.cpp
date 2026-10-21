@@ -183,6 +183,46 @@ bool isTimePointText(const std::string& s) {
 
 }  // namespace
 
+bool isScalarPropertyType(const std::string& type) {
+    static const char* const names[] = {"Boolean", "Int8",  "UInt8",   "Byte",   "Int16",   "Short",     "UInt16",
+                                        "UShort",  "Int32", "Int",     "UInt32", "UInt",    "Int64",     "UInt64",
+                                        "Float32", "Float", "Float64", "Double", "Complex32", "Complex64", "String",
+                                        "TimePoint"};
+    for (const char* name : names)
+        if (type == name) return true;
+    return false;
+}
+
+bool isUnnamedBlockType(const std::string& type) {
+    PropertyElement element;
+    return !type.empty() && !isScalarPropertyType(type) && !propertyElement(type, element) && type != "Table";
+}
+
+std::string tableProblem(const PropertyTable& table) {
+    if (!isXmlText(table.caption)) return "its caption is not text that XML can hold";
+    if (table.fields.empty()) return "a table has at least one field";
+    for (size_t i = 0; i < table.fields.size(); ++i) {
+        const PropertyTable::Field& f = table.fields[i];
+        if (f.id.empty() || !isXmlText(f.id)) return "field " + std::to_string(i) + ": its id is empty or not text that XML can hold";
+        for (size_t k = 0; k < i; ++k)
+            if (table.fields[k].id == f.id) return "two fields have the id " + f.id;
+        if (!isScalarPropertyType(f.type)) {
+            return "field " + f.id + ": " + (isXmlText(f.type) && !f.type.empty() ? f.type : std::string("its type")) +
+                   " is not a type of value (a scalar, a complex number, a String or a TimePoint)";
+        }
+        if (!isXmlText(f.header) || !isXmlText(f.format)) return "field " + f.id + ": its header or format is not text that XML can hold";
+    }
+    if (table.cells.size() % table.fields.size() != 0) return "the cells are not a whole number of rows";
+    for (size_t i = 0; i < table.cells.size(); ++i) {
+        const PropertyTable::Field& f = table.fields[i % table.fields.size()];
+        const std::string where = "row " + std::to_string(i / table.fields.size()) + ", field " + f.id + ": ";
+        const std::string problem = scalarPropertyProblem(f.type, table.cells[i]);
+        if (!problem.empty()) return where + problem;
+        if (!isXmlText(table.cells[i])) return where + "the value is not text that XML can hold";
+    }
+    return {};
+}
+
 std::string scalarPropertyProblem(const std::string& type, const std::string& text) {
     struct Whole { const char* name; int bits; bool isSigned; };
     static const Whole wholes[] = {{"Int8", 8, true},    {"UInt8", 8, false},   {"Byte", 8, false},   {"Int16", 16, true},

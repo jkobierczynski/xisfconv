@@ -57,7 +57,8 @@ Not carried: the properties of the file that describe that one XISF file and wou
 the next (`XISF:CreationTime`, `XISF:CreatorApplication`, `XISF:CreatorModule`, `XISF:CreatorOS`,
 `XISF:BlockAlignmentSize`, `XISF:MaxInlineBlockSize`, `XISF:CompressionCodecs`,
 `XISF:CompressionLevel`), a property that is built of other elements (the tables and structures
-of the specification), and what is not a property at all: the saved screen stretch, the
+of the specification: the conversion says so), a data block of a type without a name whose bytes
+are big-endian (its byte order has no place in the layout below), and what is not a property at all: the saved screen stretch, the
 resolution, the ICC profile, the thumbnail.
 
 ## In a FITS file

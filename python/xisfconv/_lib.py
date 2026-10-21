@@ -15,7 +15,7 @@ from ctypes import (CFUNCTYPE, POINTER, Structure, c_char, c_char_p, c_double, c
 
 # The library version this module was written for. In 0.x every release may change the layout
 # of the structures, so another library is refused.
-API_VERSION = (0, 24)
+API_VERSION = (0, 25)
 
 # ------------------------------------------------------------------------------------------
 # Constants of xisfconv.h
@@ -107,7 +107,7 @@ ELEMENT_COMPLEX64 = 12
 EXTERNAL_HEADER_DIRECTORY, EXTERNAL_ANYWHERE, EXTERNAL_NONE = range(3)
 
 # xisfconv_property_storage
-PROPERTY_NONE, PROPERTY_VALUE, PROPERTY_TEXT_BLOCK, PROPERTY_ARRAY, PROPERTY_UNREAD = range(5)
+PROPERTY_NONE, PROPERTY_VALUE, PROPERTY_TEXT_BLOCK, PROPERTY_ARRAY, PROPERTY_UNREAD, PROPERTY_BYTES, PROPERTY_TABLE = range(7)
 
 ALL_IMAGES = c_size_t(-1).value
 FILE_PROPERTIES = c_size_t(-1).value
@@ -417,6 +417,18 @@ _FUNCTIONS = {
     "xisfconv_write_options_init": (None, [POINTER(WriteOptions), c_size_t]),
     "xisfconv_writer_new": (_status, [_p, _str, POINTER(WriteOptions), _pp]),
     "xisfconv_io_init": (None, [POINTER(Io), c_size_t]),
+    "xisfconv_property_read_bytes": (_status, [_p, c_size_t, c_size_t, c_void_p, c_size_t, POINTER(c_size_t),
+                                               POINTER(c_uint64), POINTER(c_uint64), POINTER(c_int32)]),
+    "xisfconv_property_table": (_status, [_p, c_size_t, c_size_t, POINTER(c_size_t), POINTER(c_size_t), _strp]),
+    "xisfconv_property_table_field": (_status, [_p, c_size_t, c_size_t, c_size_t, _strp, _strp, _strp, _strp]),
+    "xisfconv_property_table_cell": (_status, [_p, c_size_t, c_size_t, c_size_t, c_size_t, _strp]),
+    "xisfconv_properties_set_bytes": (_status, [_p, _str, _str, c_void_p, c_size_t, c_uint64, c_uint64, c_int32, _str,
+                                                _str]),
+    "xisfconv_properties_set_table": (_status, [_p, _str, _str, _str, c_size_t, POINTER(c_char_p), POINTER(c_char_p),
+                                                POINTER(c_char_p), POINTER(c_char_p), c_size_t, POINTER(c_char_p)]),
+    "xisfconv_properties_set_table_as_read": (_status, [_p, _str, _str, _str, c_size_t, POINTER(c_char_p),
+                                                        POINTER(c_char_p), POINTER(c_char_p), POINTER(c_char_p),
+                                                        c_size_t, POINTER(c_char_p)]),
     "xisfconv_detect_format_io": (_status, [_p, POINTER(Io), POINTER(c_int32)]),
     "xisfconv_open_io": (_status, [_p, POINTER(Io), _pp]),
     "xisfconv_convert_io": (_status, [_p, POINTER(Io), POINTER(Io), POINTER(ConvertOptions)]),

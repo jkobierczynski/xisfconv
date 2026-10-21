@@ -263,6 +263,19 @@ class XISF:
                 raise NotXisfError("%s: not an XISF file (it is %s)" % (file._name, file.format.upper()))
             self._path = fname
             self._root = self._tree(file)       # the header, as ElementTree has it
+            # Tables are listed with the properties, as the library lists them: those of an image
+            # in it or referred to from it (by the uid of a Table at the root), those of the file
+            # at the root where no image refers to them.
+            # (The first element with a uid is the one it names, and a Reference without a ref
+            # refers to the uid "", as for the library.)
+            self._uids = {}
+            for child in self._root:
+                if child.get("uid") is not None:
+                    self._uids.setdefault(child.get("uid"), child)
+            self._referred = {id(self._uids[reference.get("ref", "")])
+                              for image in self._root if _local(image.tag) == "Image"
+                              for reference in image if _local(reference.tag) == "Reference"
+                              and reference.get("ref", "") in self._uids}
             # The images of the library are the Image elements of the root, in their order.
             elements = [child for child in self._root if _local(child.tag) == "Image"]
             if len(elements) != len(file):
@@ -274,7 +287,7 @@ class XISF:
                 name = _local(child.tag)
                 if name == "Metadata":
                     elements.extend(grandchild for grandchild in child if _local(grandchild.tag) == "Property")
-                elif name == "Property":
+                elif name == "Property" or (name == "Table" and id(child) not in self._referred):
                     elements.append(child)
             self._about_file = self._properties(file, file.properties, elements)
 
@@ -319,8 +332,7 @@ class XISF:
         about["location"] = _location(about.get("location", ""))
         about["dtype"] = entry.dtype
         about["FITSKeywords"] = keywords
-        about["XISFProperties"] = found = self._properties(entry._file, entry.properties,
-                                                           [child for child in element if _local(child.tag) == "Property"])
+        about["XISFProperties"] = found = self._properties(entry._file, entry.properties, self._listed(element))
         solved = [found[key] for key in found if key.startswith(_core._SOLUTION)]
         if solved:
             # What the solution was read with: write() leaves it out of an image that has not
@@ -333,6 +345,19 @@ class XISF:
         if "compression" in about:
             about["compression"] = _compression(about["compression"])
         return about
+
+    def _listed(self, image):
+        """The elements of an image that the library lists as its properties, in their order."""
+        out = []
+        for child in image:
+            name = _local(child.tag)
+            if name in ("Property", "Table"):
+                out.append(child)
+            elif name == "Reference":
+                target = self._uids.get(child.get("ref", ""))
+                if target is not None and _local(target.tag) == "Table":
+                    out.append(target)
+        return out
 
     def _properties(self, file, properties, elements):
         if properties._count() != len(elements):
@@ -358,7 +383,9 @@ class XISF:
         if not identifier or "id" not in found:
             return left_out("it has no id")
         try:
-            if stored == _lib.PROPERTY_UNREAD:
+            if _local(element.tag) == "Table" or stored == _lib.PROPERTY_TABLE:
+                return left_out("it is a table, which the xisf package does not read")
+            if stored in (_lib.PROPERTY_UNREAD, _lib.PROPERTY_BYTES):
                 if kind == "String":   # (the library says why when the file is opened)
                     return left_out("its text cannot be read")
                 return left_out("the type %s is not read" % (kind or "(none)"))

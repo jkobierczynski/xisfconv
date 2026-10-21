@@ -95,7 +95,10 @@ std::vector<FitsKeyword> xisfImageFitsKeywords(XisfFile& file, size_t index, boo
 // it is converted to FITS or ASDF: all of them with their values, but for the properties of
 // the file that describe how that one XISF file was made and stored. A property that cannot be
 // read is left out with a warning.
-std::vector<Property> carriedProperties(XisfFile& file, size_t index, bool verify);
+std::vector<Property> carriedProperties(XisfFile& file, size_t index, bool verify, Format format);
+// What FITS and ASDF do not carry of XISF properties, left out with a warning: tables, and a data
+// block of a type without a name here whose bytes are big-endian.
+void notCarriedToFitsOrAsdf(std::vector<Property>& properties, const std::string& label, Format format);
 
 // The range given to floating point data from FITS and ASDF when nothing else is said: 0:1 if
 // the data fits, else 0:65535 if it fits, else its minimum and maximum.

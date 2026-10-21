@@ -321,8 +321,10 @@ def test_a_file_that_could_not_be_opened(tmp_path):
 # --- properties -------------------------------------------------------------------------------
 
 def test_a_property_that_is_not_read(tmp_path):
-    """A vector of a type the library has no reader for (elements nobody knows): its value is
-    None, the image is read all the same, and writing it leaves the property out and says so."""
+    """A data block of a scalar type (an Int32 is a value, not a block): its value is None, the
+    image is read all the same, and writing it leaves the property out and says so. A vector of a
+    type the library has no name for (elements nobody knows) is the bytes it holds (since 0.25),
+    which are written again as they were."""
     header = fits.Header()
     header["CTYPE1"], header["CTYPE2"], header["CRVAL1"], header["CRVAL2"] = "RA---TAN", "DEC--TAN", 10.0, 20.0
     header["CRPIX1"], header["CRPIX2"], header["CD1_1"], header["CD1_2"] = 3.0, 3.0, -1e-4, 0.0
@@ -331,18 +333,28 @@ def test_a_property_that_is_not_read(tmp_path):
     name = b"PCL:AstrometricSolution:ReferenceCelestialCoordinates"
     raw = (tmp_path / "solved.xisf").read_bytes()
     at = raw.index(b'type="F64Vector"', raw.index(name))
-    (tmp_path / "odd.xisf").write_bytes(raw[:at] + b'type="Q64Vector"' + raw[at + 16:])
+    (tmp_path / "odd.xisf").write_bytes(raw[:at] + b'type="Int32"    ' + raw[at + 16:])
     with xisfconv.open(tmp_path / "odd.xisf") as file:
         properties = file[0].properties
-        assert properties.type(name.decode()) == "Q64Vector" and properties[name.decode()] is None
+        assert properties.type(name.decode()) == "Int32" and properties[name.decode()] is None
         assert properties["PCL:AstrometricSolution:ReferenceImageCoordinates"].shape == (2,)
     image = xisfconv.read_image(tmp_path / "odd.xisf")
     assert image.properties[name.decode()] is None and image.data.shape == (6, 6)
-    assert image.properties.type(name.decode()) == "Q64Vector"
+    assert image.properties.type(name.decode()) == "Int32"
     with pytest.warns(xisfconv.XisfconvWarning, match="has no value and is not written"):
         xisfconv.write(tmp_path / "again.xisf", image)
     with xisfconv.open(tmp_path / "again.xisf") as file:
         assert name.decode() not in file[0].properties and len(file[0].properties) == len(image.properties) - 1
+    # elements nobody knows: the bytes, carried
+    (tmp_path / "unknown.xisf").write_bytes(raw[:at] + b'type="Q64Vector"' + raw[at + 16:])
+    with xisfconv.open(tmp_path / "unknown.xisf") as file:
+        block = file[0].properties[name.decode()]
+        assert isinstance(block, xisfconv.DataBlock) and block.type == "Q64Vector" and len(block.data) == 16
+        assert block.rows == 2 and not block.big_endian
+    image = xisfconv.read_image(tmp_path / "unknown.xisf")
+    xisfconv.write(tmp_path / "unknown-again.xisf", image)
+    with xisfconv.open(tmp_path / "unknown-again.xisf") as file:
+        assert file[0].properties[name.decode()] == block
     # the same elements as complex numbers are read, since 0.15
     (tmp_path / "complex.xisf").write_bytes(raw[:at] + b'type="C32Vector"' + raw[at + 16:])
     with xisfconv.open(tmp_path / "complex.xisf") as file:

@@ -119,8 +119,10 @@ Next, in this order (what 0.20 made cheap comes first):
 3. [x] **Reading one image of a FITS or ASDF file from its place**, kept with the open file,
    without going through the headers before it again (a thousand HDUs read one by one: 7 s for
    FITS, 12 s for ASDF before, a fifth of a second at most now). (0.24.0)
-4. [ ] Hand a data block of a property type without a name over the API as its bytes, so that
-   `read_image` and `write` carry it as a conversion does; and tables.
+4. [x] **Tables and data blocks of types without a name through the API**: tables of values read
+   and written (C, Python), conversions say they do not carry them; a block of a type without a
+   name handed over as its bytes. (0.25.0) Left: tables with vectors or matrices in their cells,
+   and tables carried to FITS and ASDF.
 5. [ ] Write LZ4 blocks to ASDF (its own layout of chunks, which is read).
 6. [ ] Library messages without the tool's option names.
 7. [ ] A CMake package for the static library (the dependencies have to be described to the consumer).

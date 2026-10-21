@@ -454,6 +454,11 @@ them off. In Python a value is a <code>str</code>, a <code>bool</code>, an <code
 strings, time points, vectors and matrices. An image has them, and so has the file. PixInsight keeps the processing history
 and its astrometric solution there. Converted to FITS or ASDF, a file takes its properties along, and gives them back when it
 is converted to XISF again.</p>
+<p>A <strong>table</strong> is a property too: rows of cells, each of the type its field names. The library reads and writes
+tables of values (numbers, strings, time points), in C through <code>xisfconv_property_table</code> and
+<code>xisfconv_properties_set_table</code>, in Python as a <code>xisfconv.Table</code>; FITS and ASDF do not carry them. A data
+block of a type the library has no name for, some other program's, is handed over as the bytes it holds and written again as
+they were (<code>xisfconv.DataBlock</code>).</p>
 <p>WCS keywords need one more thought, because they describe pixel positions and so depend on the row order. In an XISF
 file they count rows from the bottom, as PixInsight writes them, while the pixels are stored from the top.
 <a href="#wcs">Astrometry</a> shows the call that gives them for either order.</p>

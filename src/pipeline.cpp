@@ -845,13 +845,35 @@ std::vector<FitsKeyword> xisfImageFitsKeywords(XisfFile& file, size_t idx, bool 
     return keywords;
 }
 
-std::vector<Property> carriedProperties(XisfFile& file, size_t index, bool verify) {
+void notCarriedToFitsOrAsdf(std::vector<Property>& properties, const std::string& label, Format format) {
+    const char* name = format == Format::Asdf ? "ASDF" : "FITS";
+    properties.erase(std::remove_if(properties.begin(), properties.end(),
+                                    [&](const Property& p) {
+                                        if (p.table) {
+                                            warn(label + ": the table " + p.id + " is not carried to " + name +
+                                                 ": tables go to XISF only");
+                                            return true;
+                                        }
+                                        if (p.array && p.bigEndian) {
+                                            warn(label + ": property " + p.id + " (a " + p.type + " in a data block of "
+                                                 "big-endian bytes) is not carried to " + name + ", whose layout keeps "
+                                                 "no byte order for a type without a name here");
+                                            return true;
+                                        }
+                                        return false;
+                                    }),
+                     properties.end());
+}
+
+std::vector<Property> carriedProperties(XisfFile& file, size_t index, bool verify, Format format) {
     std::vector<Property> properties = file.loadProperties(index, verify);
     if (index == XisfFile::kFileProperties) {
         properties.erase(std::remove_if(properties.begin(), properties.end(),
                                         [](const Property& p) { return isFileStorageProperty(p.id); }),
                          properties.end());
     }
+    notCarriedToFitsOrAsdf(properties, index == XisfFile::kFileProperties ? std::string("the file") : "image " + std::to_string(index),
+                           format);
     return properties;
 }
 
@@ -1022,7 +1044,7 @@ void convertXisfFile(const std::string& input, const std::string& outPath, Forma
                 hdu.keywords.push_back({"HISTORY", "", std::string("Converted from XISF by xisfconv ") + kVersion});
                 if (n < stretchNotes.size()) hdu.keywords.push_back({"HISTORY", "", stretchNotes[n]});
                 if (opt.properties) {
-                    hdu.properties = carriedProperties(file, idx, opt.verify);
+                    hdu.properties = carriedProperties(file, idx, opt.verify, format);
                     if (!hdu.properties.empty()) {
                         hdu.wcsCurrent = true;   // (the writer takes the digest from what it writes)
                         info("image " + std::to_string(idx) + ": " + countOf(hdu.properties.size(), "XISF property", "XISF properties") +
@@ -1032,7 +1054,7 @@ void convertXisfFile(const std::string& input, const std::string& outPath, Forma
                 hdus.push_back(std::move(hdu));
             }
             std::vector<Property> metadata;
-            if (opt.properties) metadata = carriedProperties(file, XisfFile::kFileProperties, opt.verify);
+            if (opt.properties) metadata = carriedProperties(file, XisfFile::kFileProperties, opt.verify, format);
             if (format == Format::Asdf) {
                 AsdfWriteOptions aopt;
                 aopt.codec = asdfCodec(opt);
@@ -1364,6 +1386,7 @@ void writeImageSet(FitsFile& fits, const ImageSetOrigin& source, const std::stri
                 hdu.wcsCurrent = !img.properties.empty() && topDown == img.topDown &&
                                  wcsDigest(img.keywords, px->width, px->height, !img.topDown) == img.wcsDigest;
                 hdu.properties = std::move(img.properties);
+                notCarriedToFitsOrAsdf(hdu.properties, label, format);
                 hdu.wcsDigest = img.wcsDigest;
             }
             if (source.notes) {
@@ -1380,10 +1403,12 @@ void writeImageSet(FitsFile& fits, const ImageSetOrigin& source, const std::stri
                 AsdfWriteOptions aopt;
                 aopt.codec = asdfCodec(opt);
                 if (opt.properties) aopt.metadata = std::move(fits.properties);
+                notCarriedToFitsOrAsdf(aopt.metadata, "the file", format);
                 writeAsdf(tmpPath, hdus, aopt);
             } else {
                 FitsWriteOptions fopt = fitsOptions;
                 if (opt.properties) fopt.metadata = std::move(fits.properties);
+                notCarriedToFitsOrAsdf(fopt.metadata, "the file", format);
                 writeFits(tmpPath, hdus, fopt);
             }
             replaceFile(tmpPath, outPath);
