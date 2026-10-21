@@ -1938,6 +1938,26 @@ def test_asdf_output():
     compare("--stretch for ASDF output equals FITS output", hdus[0][0], np.array(fits.getdata(ref)))
 
 
+def asdf_node_has_strides(path, key):
+    """Whether the top-level ndarray `key` of an ASDF file is stored with strides (a view into
+    another array's block), read from the file's YAML tree."""
+    with open(path, "rb") as f:
+        head = f.read()
+    end = head.find(b"\n...")
+    lines = head[:end if end >= 0 else len(head)].decode("utf-8", "replace").splitlines()
+    inside = False
+    for line in lines:
+        if line.startswith(key + ":"):
+            inside = True
+            continue
+        if inside:
+            if line and not line[0].isspace():
+                return False
+            if line.strip().startswith("strides:"):
+                return True
+    return False
+
+
 def test_asdf_python_files():
     """Files written by Python's asdf library and by asdf-astropy."""
     if not HAVE_ASDF:
@@ -1979,17 +1999,23 @@ def test_asdf_python_files():
     for name, kw in variants:
         p = os.path.join(d, f"gen_{name}.asdf")
         asdf.AsdfFile(tree).write_to(p, **kw)
+        # asdf < 6 writes the view as strides into its base array's block, which is skipped;
+        # asdf 6 writes every view as a contiguous block of its own, which is an ordinary image
+        view_strided = asdf_node_has_strides(p, "view")
+        want = dict(expected)
+        if not view_strided:
+            want["view"] = skips["view"]
         r = run(p, "-o", out, "-f")
         with fits.open(out) as h:
             names = [x.header["EXTNAME"] for x in h]
-            check(sorted(names) == sorted(expected), f"asdf-written file ({name}): images {names}")
+            check(sorted(names) == sorted(want), f"asdf-written file ({name}): images {names}")
             for x in h:
-                exp = expected.get(x.header["EXTNAME"])
+                exp = want.get(x.header["EXTNAME"])
                 if exp is not None:
                     got = np.array(x.data)
                     check(got.shape == exp.shape and np.array_equal(got.astype(np.float64), exp.astype(np.float64)),
                           f"asdf-written file ({name}): array {x.header['EXTNAME']} ({exp.dtype} -> {got.dtype})")
-        for key in ("bool", "cplx", "cube4", "view", "fortran"):
+        for key in ("bool", "cplx", "cube4", "fortran") + (("view",) if view_strided else ()):
             check(f"skipped {key}: " in r.stderr, f"asdf-written file ({name}): {key} is reported as skipped")
         check("skipped vec" not in r.stderr and "skipped meta" not in r.stderr, "arrays that are no images are passed over")
     info = run(os.path.join(d, "gen_zlib.asdf"), "--info").stdout
