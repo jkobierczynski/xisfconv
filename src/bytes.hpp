@@ -77,6 +77,9 @@ public:
     // All of the bytes, if they are in memory one after the other (valid while nothing is
     // written to them); nullptr otherwise.
     virtual const uint8_t* contiguous() const { return nullptr; }
+    // True if several threads may read the bytes at once (each its own part, or the same):
+    // bytes in memory, and a file read at a place of its own (RawFile).
+    virtual bool readableByThreads() const { return false; }
 };
 
 // Bytes in memory that somebody else keeps (`keep` keeps them, if given).
@@ -88,6 +91,7 @@ public:
     void read(uint64_t position, size_t n, uint8_t* out) override;
     const uint8_t* data() const { return data_; }
     const uint8_t* contiguous() const override { return data_; }
+    bool readableByThreads() const override { return true; }
 
 private:
     const uint8_t* data_;
@@ -103,6 +107,7 @@ public:
         : file_(std::move(file)), offset_(offset), size_(size), failure_(std::move(failure)) {}
     uint64_t size() const override { return size_; }
     void read(uint64_t position, size_t n, uint8_t* out) override;
+    bool readableByThreads() const override { return true; }
 
 private:
     std::shared_ptr<RawFile> file_;
@@ -147,6 +152,7 @@ public:
     // The bytes, if they are in memory (nullptr if they are in a file).
     const uint8_t* memory() const { return file_ ? nullptr : memory_.data(); }
     const uint8_t* contiguous() const override { return memory(); }
+    bool readableByThreads() const override { return !file_; }   // (a file it writes when it is read)
     bool inFile() const { return file_ != nullptr; }
     // True if `size` more bytes would be held in memory now (as far as the limit tells).
     static bool fitsInMemory(uint64_t size);

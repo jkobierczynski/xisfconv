@@ -429,6 +429,13 @@ that a signal handler raises there (an alarm's time limit) can be lost. `Keyboar
   written as `?`. An XISF file keeps them.
 - A `File` and the images read from it belong to one thread at a time; separate files, and the
   functions that take file names, can be used from several threads at once.
+- A call spreads its work over the cores of the machine (since 0.26: tiles, strips and
+  subblocks compressed side by side, checksums beside decompression, samples converted a piece
+  per core); the GIL is not held meanwhile. `xisfconv.set_threads(n)` sets how many threads a call
+  uses (0, the default: as many as `xisfconv.hardware_threads()`; 1: the calling thread alone).
+  What is written and read is the same with any number. `subblock_size=16 << 20` in `write`,
+  `convert` and `rewrite` stores compressed XISF blocks in subblocks that are compressed and read
+  side by side as well.
 - Signal handlers run between the steps of a call only in the main thread, as everywhere in
   Python. Reading one image is one step: Ctrl-C during `read` takes effect when the image has
   been read.

@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 Jurgen Kobierczynski
 #include "xisfrewrite.hpp"
+#include "parallel.hpp"
 
 #include <algorithm>
+#include <functional>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -209,12 +211,32 @@ std::string checksumAlgorithm(const std::string& attribute) {
     return algo;
 }
 
-// True if the block is already stored the way the options ask (so it is copied as it is).
-bool storedAsRequested(const XisfRewriteOptions& opt, bool compressed, const XisfCompression& comp, size_t itemSize) {
+// True if the block is already stored the way the options ask (so it is copied as it is). A
+// subblock size other than the usual 1 GiB asks for the subblocks a writer makes of it as well:
+// `subblocks` is the attribute the block has.
+bool storedAsRequested(const XisfRewriteOptions& opt, bool compressed, const XisfCompression& comp, size_t itemSize,
+                       const std::string& subblocks) {
     if (opt.codec.empty()) return true;
     if (opt.codec == "none") return !compressed;
     if (opt.level != 0) return false;   // (no file says the level a block was compressed with)
-    return compressed && comp.codec == opt.codec && (itemSize <= 1 || comp.shuffled == opt.shuffle);
+    if (!(compressed && comp.codec == opt.codec && (itemSize <= 1 || comp.shuffled == opt.shuffle))) return false;
+    if (opt.subblockSize == (uint64_t(1) << 30)) return true;
+    // the uncompressed sizes of the subblocks, as written and as asked for
+    const uint64_t chunk = xisfSubblockSize(opt.codec, opt.subblockSize), size = comp.uncompressedSize;
+    std::vector<uint64_t> wanted, there;
+    if (size > chunk) {
+        for (uint64_t off = 0; off < size; off += chunk) wanted.push_back(std::min(chunk, size - off));
+    }
+    if (!subblocks.empty()) {
+        for (const auto& pair : split(subblocks, ':')) {
+            const auto cu = split(pair, ',');
+            uint64_t cs = 0, us = 0;
+            if (cu.size() != 2 || !parseUInt64(cu[0], cs) || !parseUInt64(cu[1], us)) return false;
+            there.push_back(us);
+        }
+        if (there.size() == 1) there.clear();   // (one subblock is the block)
+    }
+    return wanted == there;
 }
 
 // A level and byte shuffling are of a codec that compresses: they need one, and the level must
@@ -273,13 +295,40 @@ Packed compressBlock(const std::shared_ptr<RandomBytes>& raw, size_t itemSize, c
     size_t chunks = 0;
     p.bytes = std::make_shared<Store>();
     StoreSink sink(*p.bytes);
-    for (uint64_t off = 0; off < size; off += chunk, ++chunks) {
-        const uint64_t n = std::min<uint64_t>(chunk, size - off);
-        const uint64_t before = p.bytes->size();
-        compressBytes(opt.codec, opt.level, *src, off, n, sink);
-        if (!subblocks.empty()) subblocks += ':';
-        subblocks += std::to_string(p.bytes->size() - before) + "," + std::to_string(n);
-        if (p.bytes->size() >= size) return Packed();  // no gain: stop early
+    // Subblocks side by side where threads can read the input together, as the writer does
+    // (xisfwrite.cpp): the same bytes as one after the other.
+    const uint64_t count = (size + chunk - 1) / chunk;
+    const unsigned threads = threadLimit();
+    const bool together = threads > 1 && count > 1 && src->readableByThreads();
+    for (uint64_t first = 0; first < count;) {
+        uint64_t end = first + 1;
+        if (together) {
+            while (end < count && end - first < 2 * uint64_t(threads) && (end + 1 - first) * chunk <= (uint64_t(256) << 20)) ++end;
+        }
+        std::vector<std::vector<uint8_t>> pieces;
+        if (end - first > 1) {
+            pieces.resize(static_cast<size_t>(end - first));
+            parallelFor(pieces.size(), [&](size_t k, unsigned) {
+                const uint64_t off = (first + k) * chunk;
+                VectorSink piece(pieces[k]);
+                compressBytes(opt.codec, opt.level, *src, off, std::min<uint64_t>(chunk, size - off), piece);
+            });
+        }
+        for (uint64_t k = first; k < end; ++k, ++chunks) {
+            const uint64_t off = k * chunk, n = std::min<uint64_t>(chunk, size - off);
+            const uint64_t before = p.bytes->size();
+            if (pieces.empty()) {
+                compressBytes(opt.codec, opt.level, *src, off, n, sink);
+            } else {
+                std::vector<uint8_t>& piece = pieces[static_cast<size_t>(k - first)];
+                sink.write(piece.data(), piece.size());
+                std::vector<uint8_t>().swap(piece);
+            }
+            if (!subblocks.empty()) subblocks += ':';
+            subblocks += std::to_string(p.bytes->size() - before) + "," + std::to_string(n);
+            if (p.bytes->size() >= size) return Packed();  // no gain: stop early
+        }
+        first = end;
     }
     p.compression = opt.codec + (shuffle ? "+sh" : "") + ":" + std::to_string(size) +
                     (shuffle ? ":" + std::to_string(itemSize) : "");
@@ -341,9 +390,25 @@ void readBack(const std::string& path, const std::vector<Fingerprint>& expected,
         progress("comparing", i, blocks.size());
         const std::string& what = expected[i].what;
         const XisfBlockView sb = out.openStoredBlock(*blocks[i].node, what);
-        XisfFile::verifyBlockChecksum(*sb.bytes, sb.checksum, what);
-        const std::shared_ptr<RandomBytes> bytes = expected[i].stored ? sb.bytes : XisfFile::decodedBlock(sb, what);
-        if (digestHex("sha1", *bytes, 0, bytes->size()) != expected[i].sha1) {
+        std::string fingerprint;
+        if (expected[i].stored) {
+            // its checksum and its fingerprint, two digests of the same bytes, side by side
+            std::string digest;
+            XisfChecksumState state;
+            const std::string algorithm = XisfFile::checksumToVerify(sb.checksum, what, digest, state);
+            const auto print = [&] { fingerprint = digestHex("sha1", *sb.bytes, 0, sb.bytes->size()); };
+            if (algorithm.empty()) print();
+            else if (!sb.bytes->readableByThreads()) {
+                XisfFile::compareDigest(*sb.bytes, algorithm, digest, what);
+                print();
+            } else {
+                runBeside(print, [&] { XisfFile::compareDigest(*sb.bytes, algorithm, digest, what); });
+            }
+        } else {
+            const std::shared_ptr<RandomBytes> bytes = XisfFile::verifiedDecodedBlock(sb, what, 0, true);
+            fingerprint = digestHex("sha1", *bytes, 0, bytes->size());
+        }
+        if (fingerprint != expected[i].sha1) {
             throw Error("read-back: " + what + " differs from the input");
         }
     }
@@ -440,8 +505,17 @@ XisfRewriteResult rewriteXisf(const std::string& input, const std::string& outpu
         // and write it. What is made of it on the way is held in memory, or in temporary files
         // beside the output where it is large.
         const XisfBlockView sb = in.openStoredBlock(node, b.what);
-        const bool unverifiable =
-            opt.verifyInput && XisfFile::verifyBlockChecksum(*sb.bytes, sb.checksum, b.what) == XisfChecksumState::Unsupported;
+        // (the checksum is looked at here; its digest is computed below, beside the decompression
+        // where there is one)
+        std::string expectedDigest;
+        XisfChecksumState inputState = XisfChecksumState::None;
+        const std::string inputAlgorithm =
+            opt.verifyInput ? XisfFile::checksumToVerify(sb.checksum, b.what, expectedDigest, inputState) : std::string();
+        const bool unverifiable = inputState == XisfChecksumState::Unsupported;
+        bool inputChecked = inputAlgorithm.empty();
+        const auto checkInput = [&] {
+            XisfFile::compareDigest(*sb.bytes, inputAlgorithm, expectedDigest, b.what);
+        };
 
         const bool wasCompressed = !sb.compression.empty();
         XisfCompression comp;
@@ -449,24 +523,41 @@ XisfRewriteResult rewriteXisf(const std::string& input, const std::string& outpu
         const size_t itemSize = wasCompressed && comp.shuffled ? static_cast<size_t>(comp.itemSize) : guessItemSize(node);
 
         // Blocks already in the requested form are copied as they are.
-        bool verbatim = storedAsRequested(opt, wasCompressed, comp, itemSize);
+        bool verbatim = storedAsRequested(opt, wasCompressed, comp, itemSize, sb.subblocks);
         if (unverifiable && (!verbatim || !opt.checksum.empty())) {
             // Storing the block differently would drop the one thing that can tell whether it is intact.
             throw Unsupported(b.what + " has a checksum of a kind this program cannot verify (" +
                               sb.checksum.substr(0, sb.checksum.find(':')) + "); it is not stored differently or given "
                               "another checksum without that check (--no-verify overrides)");
         }
+        if (!inputChecked && !(wasCompressed && sb.bytes->readableByThreads())) {
+            checkInput();
+            inputChecked = true;
+        }
+        // (the decompression, with the digest of the input beside it if that is still to come)
+        const auto withInputChecked = [&](const std::function<void()>& decode) {
+            if (inputChecked) {
+                decode();
+            } else {
+                runBeside(decode, checkInput);
+                inputChecked = true;
+            }
+        };
         std::shared_ptr<RandomBytes> raw = sb.bytes;   // the block decoded
         std::shared_ptr<Store> stillShuffled;          // ... as it decompresses, if it was shuffled
         if (wasCompressed && !verbatim) {
             auto decompressed = std::make_shared<Store>();
             if (comp.uncompressedSize / (1u << 20) <= sb.bytes->size() + 1) decompressed->reserve(comp.uncompressedSize);
             StoreSink sink(*decompressed);
-            XisfFile::decodeBlockTo(sb, b.what, imageBytes(b), sink);
+            withInputChecked([&] { XisfFile::decodeBlockTo(sb, b.what, imageBytes(b), sink); });
             raw = comp.shuffled ? unshuffledBytes(decompressed, comp.itemSize) : decompressed;
             if (comp.shuffled && comp.itemSize == itemSize) stillShuffled = decompressed;
         } else if (wasCompressed && opt.verifyInput) {
-            decodedSize(sb, b.what, imageBytes(b));   // (it decodes, and is copied)
+            withInputChecked([&] { decodedSize(sb, b.what, imageBytes(b)); });   // (it decodes, and is copied)
+        }
+        if (!inputChecked) {
+            checkInput();
+            inputChecked = true;
         }
         if (opt.verifyInput && !wasCompressed) checkImageSize(b, raw->size());
 
@@ -498,10 +589,22 @@ XisfRewriteResult rewriteXisf(const std::string& input, const std::string& outpu
         if (verbatim) ++result.kept;
 
         std::string checksum = sb.checksum;
+        // The fingerprint the read-back compares with (of the block as it was read, decoded unless
+        // it is copied): made beside the new checksum where there is one.
+        std::string fingerprint;
+        RandomBytes& printed = verbatim ? *sb.bytes : *raw;
+        const auto print = [&] { fingerprint = digestHex("sha1", printed, 0, printed.size()); };
         const auto digest = [&](const std::string& algorithm) {
             const std::string a = toLower(trim(algorithm));
             if (a == "md5" || !Hasher::known(a)) return false;
-            checksum = algorithm + ":" + digestHex(a, *stored, 0, stored->size());
+            std::string hex;
+            const auto sum = [&] { hex = digestHex(a, *stored, 0, stored->size()); };
+            if (opt.readBack && fingerprint.empty() && stored->readableByThreads() && printed.readableByThreads()) {
+                runBeside(sum, print);
+            } else {
+                sum();
+            }
+            checksum = algorithm + ":" + hex;
             ++result.checksums;
             return true;
         };
@@ -549,8 +652,8 @@ XisfRewriteResult rewriteXisf(const std::string& input, const std::string& outpu
             Fingerprint f;
             f.stored = verbatim;
             f.what = b.what;
-            RandomBytes& bytes = verbatim ? *sb.bytes : *raw;
-            f.sha1 = digestHex("sha1", bytes, 0, bytes.size());
+            if (fingerprint.empty()) print();
+            f.sha1 = fingerprint;
             fingerprints.push_back(std::move(f));
         }
     }
@@ -645,7 +748,8 @@ bool xisfStoredAsRequested(const std::string& path, const XisfRewriteOptions& op
         const std::string* sum = node.attr("checksum");
         XisfCompression comp;
         if (c) comp = parseXisfCompression(*c);
-        if (!storedAsRequested(opt, c != nullptr, comp, c && comp.shuffled ? static_cast<size_t>(comp.itemSize) : guessItemSize(node))) {
+        if (!storedAsRequested(opt, c != nullptr, comp, c && comp.shuffled ? static_cast<size_t>(comp.itemSize) : guessItemSize(node),
+                               node.attr("subblocks") ? *node.attr("subblocks") : std::string())) {
             return false;
         }
         if (opt.checksum == "none" ? sum != nullptr
@@ -665,11 +769,41 @@ VerifyReport verifyXisf(const std::string& path, const XisfBlocksRedirect* redir
         progress("verifying", done++, blocks.size());
         try {
             const XisfBlockView sb = file.openStoredBlock(*b.node, b.what);
-            const XisfChecksumState state = XisfFile::verifyBlockChecksum(*sb.bytes, sb.checksum, b.what);
-            if (state == XisfChecksumState::Verified) ++report.verified;
-            else if (state == XisfChecksumState::None) ++report.unchecked;
-            else report.notChecked.push_back(b.what + ": checksum of an unknown kind (" + sb.checksum.substr(0, sb.checksum.find(':')) + ")");
-            checkImageSize(b, decodedSize(sb, b.what));
+            std::string digest;
+            XisfChecksumState state;
+            const std::string algorithm = XisfFile::checksumToVerify(sb.checksum, b.what, digest, state);
+            const auto count = [&] {
+                if (state == XisfChecksumState::Verified) ++report.verified;
+                else if (state == XisfChecksumState::None) ++report.unchecked;
+                else report.notChecked.push_back(b.what + ": checksum of an unknown kind (" + sb.checksum.substr(0, sb.checksum.find(':')) + ")");
+            };
+            // The checksum and the decompression side by side where both can read the block at once.
+            // (A block whose checksum is right is counted, also where it then fails to decode.)
+            bool compared = algorithm.empty(), counted = false;
+            uint64_t decoded = 0;
+            const auto countOnce = [&] {
+                if (!counted) count();
+                counted = true;
+            };
+            const auto compare = [&] {
+                XisfFile::compareDigest(*sb.bytes, algorithm, digest, b.what);
+                compared = true;
+            };
+            const auto decode = [&] { decoded = decodedSize(sb, b.what); };
+            try {
+                if (!compared && !sb.compression.empty() && sb.bytes->readableByThreads()) {
+                    runBeside(decode, compare);
+                } else {
+                    if (!compared) compare();
+                    countOnce();
+                    decode();
+                }
+            } catch (...) {
+                if (compared) countOnce();
+                throw;
+            }
+            countOnce();
+            checkImageSize(b, decoded);
             if (sb.indexed) {
                 // What the index of the data blocks file says of the block is what the header says.
                 const uint64_t declared = sb.compression.empty() ? 0 : parseXisfCompression(sb.compression).uncompressedSize;

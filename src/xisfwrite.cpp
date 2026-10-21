@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 Jurgen Kobierczynski
 #include "xisfwrite.hpp"
+#include "parallel.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -211,12 +212,42 @@ void prepareImageBlock(const Source& source, const XisfWriteOptions& opt, Block&
         size_t chunks = 0;
         bool gain = true;
         try {
-            for (uint64_t off = 0; off < rawSize; off += chunk, ++chunks) {
-                const uint64_t n = std::min<uint64_t>(chunk, rawSize - off);
-                const uint64_t before = packed->size();
-                compressBytes(opt.codec, opt.level, *input, off, n, sink);
-                if (!subblocks.empty()) subblocks += ':';
-                subblocks += std::to_string(packed->size() - before) + "," + std::to_string(n);
+            // Subblocks are compressed side by side where threads can read the input together:
+            // each into memory of its own, then put after the others in their order (some 256 MiB
+            // of input at a time at most). Each is the same bytes as when compressed alone.
+            const uint64_t count = (rawSize + chunk - 1) / chunk;
+            const unsigned threads = threadLimit();
+            const bool together = threads > 1 && count > 1 && input->readableByThreads();
+            for (uint64_t first = 0; first < count;) {
+                uint64_t end = first + 1;
+                if (together) {
+                    while (end < count && end - first < 2 * uint64_t(threads) && (end + 1 - first) * chunk <= (uint64_t(256) << 20)) ++end;
+                }
+                if (end - first == 1) {
+                    const uint64_t off = first * chunk, n = std::min<uint64_t>(chunk, rawSize - off);
+                    const uint64_t before = packed->size();
+                    compressBytes(opt.codec, opt.level, *input, off, n, sink);
+                    if (!subblocks.empty()) subblocks += ':';
+                    subblocks += std::to_string(packed->size() - before) + "," + std::to_string(n);
+                    ++chunks;
+                    first = end;
+                    continue;
+                }
+                std::vector<std::vector<uint8_t>> pieces(static_cast<size_t>(end - first));
+                parallelFor(pieces.size(), [&](size_t k, unsigned) {
+                    const uint64_t off = (first + k) * chunk, n = std::min<uint64_t>(chunk, rawSize - off);
+                    VectorSink piece(pieces[k]);
+                    compressBytes(opt.codec, opt.level, *input, off, n, piece);
+                });
+                for (size_t k = 0; k < pieces.size(); ++k) {
+                    const uint64_t off = (first + k) * chunk, n = std::min<uint64_t>(chunk, rawSize - off);
+                    sink.write(pieces[k].data(), pieces[k].size());
+                    if (!subblocks.empty()) subblocks += ':';
+                    subblocks += std::to_string(pieces[k].size()) + "," + std::to_string(n);
+                    ++chunks;
+                    std::vector<uint8_t>().swap(pieces[k]);
+                }
+                first = end;
             }
         } catch (const NoGain&) {
             gain = false;

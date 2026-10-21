@@ -35,6 +35,7 @@ The decisions:
 - [Files in memory and streams (0.23.0)](#files-in-memory-and-streams-0230)
 - [Images read from their place (0.24.0)](#images-read-from-their-place-0240)
 - [Tables and data blocks of other types (0.25.0)](#tables-and-data-blocks-of-other-types-0250)
+- [Threads (0.26.0)](#threads-0260)
 - [The library (libxisfconv)](#the-library-libxisfconv)
 - [The Python package](#the-python-package)
 - [The manual (`docs/manual.html`)](#the-manual-docsmanualhtml)
@@ -413,6 +414,7 @@ brought are in the sections below.
 | | 0.23.0 | Files in memory and streams: the `_io` functions of the C API, data and file objects in Python, `-` for the standard input and output of the tool |
 | | 0.24.0 | The images of an open FITS or ASDF file read from their place, without the headers before them |
 | | 0.25.0 | XISF tables of values read and written through the API; data blocks of types without a name handed over as their bytes |
+| 21 October | 0.26.0 | The work on a file spread over the cores; `--threads`, `--jobs`, `--subblocks` |
 
 ## Purpose and scope
 
@@ -1402,6 +1404,82 @@ which the library did not list at all.
   values, a caption; equal when all of that is) and `xisfconv.DataBlock` (type, bytes, shape, byte
   order). `xisfconv.xisf` lists the elements of a file in the order the library does, tables
   included, and leaves tables out with a warning: the `xisf` package has none.
+
+## Threads (0.26.0)
+
+Where the time goes was measured first (callgrind, the 16-megapixel Float32 master of the tests,
+65 MB): a rewrite with zstd and SHA-1 spent 77 % in SHA-1 (one block is hashed four to five times:
+its checksum, the fingerprints of the read-back, the verification after it); reading a
+zlib+SHA-256 XISF file 57 % in SHA-256 and 18 % unshuffling; an ASDF file 50 % in zlib and 36 % in
+MD5; tile compression to FITS 75 % in zlib; reading Rice tiles 74 % decoding them; PNG output 34 %
+in the row filters and 45 % in zlib; a stretched TIFF 80 % in the stretch and the conversion.
+
+- **Scope, as decided with the user: the same bytes, threads optional.** Nothing that is written
+  changes with the number of threads, and a damaged file fails with the same message. So the
+  work that one stream or one digest is (zlib in PNG and ASDF, a digest from the first byte to
+  the last) stays on one thread; what is parallel is what is already in pieces (tiles, strips,
+  subblocks, bands of samples) and two things that read the same bytes (a checksum and the
+  decompression). Pieces that would change the bytes are asked for: `--subblocks` writes XISF
+  blocks that can be compressed side by side, PixInsight's 1 GiB staying the default. Parallel
+  deflate of one stream (pigz) was offered; with no preference given, the bytes were kept.
+- **One pool for the library** (`src/parallel.cpp`), not threads per call: helpers are made as
+  they are needed and wait for work until the process ends (a library that joined them at unload
+  would hang on Windows, where the threads are gone by then). `parallelFor(n, fn(index, slot))`
+  queues a batch; the calling thread takes indices too, so a call never waits for a helper that is
+  not there, and calls from several contexts (and the tool's `--jobs`) share the helpers instead of
+  starting their own. Work inside a task does not spread further (the limit is 1 there), which
+  rules out nested waits. `slot` gives a task state of its own (a z_stream).
+- **Deterministic failures.** When tasks throw, the indices not begun are left and the exception
+  of the lowest index that threw is rethrown: every index below a failed one was taken before it,
+  so that is the one a single thread would have met first. What is read before (the stored bytes
+  of a tile) keeps its own error for the place where it is decoded. `runBeside(here, beside)` runs
+  a checksum beside a decompression; a mismatch wins over a decompression error, as when the
+  checksum came first.
+- **What runs on the pool computes.** Warnings, progress and cancellation belong to the calling
+  thread (they are thread-local); a checksum is checked for being one this program knows (with its
+  warning) before its digest goes to a helper. Reading the same bytes from two threads needs
+  bytes that allow it (`RandomBytes::readableByThreads`: memory, a file read with `pread`, and on
+  Windows `ReadFile` at a place of its own instead of a seek and a read); a temporary file being
+  written does not, and is read by one thread.
+- **Stopping.** A helper does not report progress, so a checksum computed beside a decompression
+  would not see a stop: the caller, once its own part is done, gives the last report again every
+  250 ms while it waits, and a stop (or a stop that ended its own part) sets a flag at which the
+  helper's digest gives up at its next 8 MiB (`AbandonScope`, checked by `progressTick`). A tile or
+  subblock that a helper has begun is finished.
+- **fork()**: a child of a process with helpers has none, and the lock may have been held: it gets
+  a pool of its own (`pthread_atfork`).
+- **`--jobs`** converts files in threads of the tool, each with a context of its own. The checks
+  before a conversion (two inputs with one output, an output that is an input) stay one after
+  another; an output is counted as written when its job starts, so the second of two inputs with
+  one output is refused also where the first fails; and the directories made for a job that
+  failed are taken away (if empty) only when all jobs are done, since a later job may write there. What a job says is kept (`Captured`, the
+  standard output and error in their order) and written when the files before it are done. The
+  default is one file at a time: each file uses all cores already, and memory grows with every
+  file in flight.
+- **Measured** on the 2 cores of the development machine, best of three (0.25, then 0.26 with one
+  thread and with two):
+
+  | Seconds | 0.25 | 0.26, 1 thread | 0.26, 2 threads |
+  |---|---|---|---|
+  | XISF → tile-compressed FITS (GZIP) | 1.73 | 1.57 | 0.94 |
+  | XISF → tile-compressed FITS, `-b u16` (Rice) | 0.50 | 0.53 | 0.37 |
+  | Rice `.fits.fz` → XISF | 0.45 | 0.43 | 0.29 |
+  | GZIP `.fits.fz` → XISF | 0.59 | 0.55 | 0.44 |
+  | XISF zlib + SHA-256 → FITS | 0.72 | 0.69 | 0.50 |
+  | XISF zstd + SHA-1 → FITS | 0.81 | 0.66 | 0.56 |
+  | ASDF zlib → XISF | 0.73 | 0.82 | 0.55 |
+  | XISF → TIFF `-c -s` | 1.79 | 1.98 | 1.17 |
+  | XISF → PNG `-s` (the row filter was made faster) | 3.17 | 2.09 | 2.18 |
+  | Rewrite zstd + SHA-1, read back | 3.10 | 2.89 | 2.30 |
+  | `--verify` of the zlib + SHA-256 file | 0.44 | 0.46 | 0.31 |
+  | Rewrite zstd + SHA-1, `--subblocks 8M` | | 2.84 | 2.31 |
+  | Rewrite lz4hc, `--subblocks 8M` | | 4.64 | 3.21 |
+  | XISF zstd in 8 MiB subblocks → FITS | | 0.64 | 0.52 |
+
+  (The 65 MB Float32 master, input and output on a memory file system; times on this machine
+  vary by some 15 % from run to run, and the instructions one thread executes are those of 0.25,
+  less where the unshuffling, the byte swap and the PNG filter were rewritten. More cores take the
+  parts in pieces further; one digest and one zlib stream stay where they are.)
 
 ## The library (libxisfconv)
 

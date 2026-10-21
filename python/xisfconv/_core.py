@@ -576,8 +576,15 @@ class _Context:
         self.pointer = _library.xisfconv_context_new()
         if not self.pointer:
             raise MemoryError("xisfconv: cannot create a context")
+        self._threads = 0   # (what the context was told: see _spread)
         _library.xisfconv_context_keep_messages(self.pointer, 1)
         self._resource = _own(self, _library.xisfconv_context_free, self.pointer)
+
+    def _spread(self):
+        """The number of threads of set_threads, for the calls of this context (under its lock)."""
+        if self._threads != _THREADS[0]:
+            self._threads = _THREADS[0]
+            _library.xisfconv_context_set_threads(self.pointer, self._threads)
 
     def follow(self, external_files):
         """Which files the header of an XISF unit may name for its data: "header-dir" (None),
@@ -745,6 +752,7 @@ class _Context:
                 if _library.xisfconv_context_running(self.pointer):
                     raise RuntimeError("xisfconv: this file is in use by a call that has not returned yet "
                                        "(is it used from a signal handler or from a progress function?)")
+                self._spread()
                 # A handler or progress function that uses the package runs inside the call
                 # that is at work, each time deeper on the stack of C. That must end before
                 # the stack does.
@@ -797,6 +805,7 @@ class _Context:
             if _library.xisfconv_context_running(self.pointer):
                 raise RuntimeError("xisfconv: this file is in use by a call that has not returned yet "
                                    "(is it used from a signal handler or from a progress function?)")
+            self._spread()
             status = function(*arguments)
             if status != _lib.OK:
                 raise self.error(status)
@@ -3105,6 +3114,36 @@ class File:
         if self.closed:
             return "<xisfconv.File %r, closed>" % (self.path,)
         return "<xisfconv.File %r: %s, %d image(s)>" % (self.path, self.format, self._count)
+
+
+#: set_threads: the threads a call of the library spreads its work over (0: the cores)
+_THREADS = [0]
+
+
+def set_threads(threads=0):
+    """The threads a call of the library spreads its work over, the calling thread among them
+    (since 0.26): compressing and decompressing (FITS tiles, TIFF strips, XISF subblocks),
+    checksums beside decompression, converting and stretching samples. 0 (the default) is as
+    many as the machine has cores (:func:`hardware_threads`), 1 the calling thread alone. What is
+    written and read is the same with any number. The setting is the package's, for the calls
+    made after it in every thread; the threads are those of one pool of the library, made as
+    they are needed. The work of the library runs without the GIL: Python threads that use the
+    package at the same time each have their own calls, which share that pool."""
+    if isinstance(threads, bool) or not isinstance(threads, numbers.Integral):
+        raise TypeError("the number of threads is an int, not %s" % threads.__class__.__name__)
+    if not 0 <= threads <= 256:
+        raise ValueError("the number of threads is 0 (the cores of the machine) or from 1 to 256, not %d" % threads)
+    _THREADS[0] = int(threads)
+
+
+def threads():
+    """What :func:`set_threads` set: 0 for as many as the machine has cores."""
+    return _THREADS[0]
+
+
+def hardware_threads():
+    """The cores of the machine, as the system tells them (since 0.26)."""
+    return int(_library.xisfconv_hardware_threads())
 
 
 def open(path, *, external_files=None):   # noqa: A001 - the name is the point, as in gzip.open

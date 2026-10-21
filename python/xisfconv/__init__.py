@@ -45,8 +45,8 @@ from ._core import (ArgumentError, Cancelled, Card, ChecksumError, Error, File, 
                     NotFoundError, OutputExistsError, Properties, PropertyDict, Report, RewriteResult, StretchParams, UnsupportedError,
                     DataBlock, Table, TableField,
                     Writer, XisfconvWarning, apply_stretch, auto_stretch, codec_available, convert, detect_format,
-                    library_path, library_version, open, read, read_image, rewrite, rewrite_in_place,
-                    stored_as_requested, verify, wcs_flip_rows, write)
+                    hardware_threads, library_path, library_version, open, read, read_image, rewrite, rewrite_in_place,
+                    set_threads, stored_as_requested, threads, verify, wcs_flip_rows, write)
 
 try:
     from importlib.metadata import PackageNotFoundError, version as _version
@@ -65,6 +65,6 @@ __all__ = [
     "OutputExistsError", "Properties", "PropertyDict", "Report", "RewriteResult", "StretchParams", "Table", "TableField",
     "UnsupportedError",
     "Writer", "XisfconvWarning", "apply_stretch", "auto_stretch", "codec_available", "convert", "detect_format",
-    "library_path", "library_version", "open", "read", "read_image", "rewrite", "rewrite_in_place",
-    "stored_as_requested", "verify", "wcs_flip_rows", "write",
+    "hardware_threads", "library_path", "library_version", "open", "read", "read_image", "rewrite", "rewrite_in_place",
+    "set_threads", "stored_as_requested", "threads", "verify", "wcs_flip_rows", "write",
 ]

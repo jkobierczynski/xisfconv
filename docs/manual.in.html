@@ -404,6 +404,13 @@ threads gives each its own, and different contexts are independent.</p>
 <p>The messages are those of the command line tool, and some name its options (<code>--force</code>,
 <code>--bounds</code>): the option names say which setting is meant. In Python the same messages name the arguments
 (<code>overwrite=True</code>).</p>
+<p>A call spreads its work over the cores of the machine (since 0.26): tiles, strips and subblocks are compressed and
+decompressed side by side, a checksum is computed while its block is decompressed, samples are converted a piece per
+core. <code>xisfconv_context_set_threads</code> sets how many threads the calls of a context use, the calling one among
+them (0, the default: as many as there are cores; 1: the calling thread alone), and in Python
+<code>xisfconv.set_threads</code> does for every call. What is written and read is the same with any number. The threads
+belong to one pool of the library, which all contexts share; the handlers of a context are only ever called from the
+thread that made the call.</p>
 
 <h3 id="options">Options</h3>
 <p>In C and C++, the options of a call are a struct. Each struct starts with its own size and is filled with its defaults

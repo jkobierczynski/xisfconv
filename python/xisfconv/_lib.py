@@ -11,11 +11,11 @@ import ctypes.util
 import os
 import sys
 from ctypes import (CFUNCTYPE, POINTER, Structure, c_char, c_char_p, c_double, c_float, c_int32, c_int64, c_size_t,
-                    c_uint64, c_void_p)
+                    c_uint32, c_uint64, c_void_p)
 
 # The library version this module was written for. In 0.x every release may change the layout
 # of the structures, so another library is refused.
-API_VERSION = (0, 25)
+API_VERSION = (0, 26)
 
 # ------------------------------------------------------------------------------------------
 # Constants of xisfconv.h
@@ -325,6 +325,9 @@ _FUNCTIONS = {
     "xisfconv_error_message": (_str, [_p]),
     "xisfconv_context_keep_messages": (None, [_p, c_int32]),
     "xisfconv_context_set_external_files": (_status, [_p, c_int32]),
+    "xisfconv_context_set_threads": (_status, [_p, c_uint32]),
+    "xisfconv_context_threads": (c_uint32, [_p]),
+    "xisfconv_hardware_threads": (c_uint32, []),
     "xisfconv_context_external_files": (c_int32, [_p]),
     "xisfconv_context_message_count": (c_size_t, [_p]),
     "xisfconv_context_message": (_status, [_p, c_size_t, POINTER(c_int32), _strp, _strp]),

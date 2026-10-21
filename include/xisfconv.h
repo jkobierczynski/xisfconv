@@ -53,7 +53,7 @@
 #include <stdint.h>
 
 #define XISFCONV_VERSION_MAJOR 0
-#define XISFCONV_VERSION_MINOR 25
+#define XISFCONV_VERSION_MINOR 26
 #define XISFCONV_VERSION_PATCH 0
 
 #if defined(XISFCONV_STATIC)
@@ -217,6 +217,19 @@ enum {
 };
 XISFCONV_API xisfconv_status xisfconv_context_set_external_files(xisfconv_context *ctx, xisfconv_external_files which);
 XISFCONV_API xisfconv_external_files xisfconv_context_external_files(const xisfconv_context *ctx);
+
+/* (Since 0.26.) The threads a call in the context spreads its work over, the calling thread
+ * among them: compressing and decompressing (FITS tiles, TIFF strips, XISF subblocks), checksums
+ * beside decompression, converting and stretching samples. 0 (the default) is as many as the
+ * machine has cores (xisfconv_hardware_threads), 1 is the calling thread alone. What a call
+ * writes and returns is the same at every number of threads. The threads are those of one pool
+ * of the library, which the calls of all contexts share: made as they are needed, and kept
+ * waiting for work until the process ends; a program that unloads the library while it runs
+ * (dlclose, FreeLibrary) sets 1 for every context, so that none are made. The handlers of the
+ * context are only ever called from the calling thread. A number above 256 is taken as 256. */
+XISFCONV_API xisfconv_status xisfconv_context_set_threads(xisfconv_context *ctx, uint32_t threads);
+XISFCONV_API uint32_t xisfconv_context_threads(const xisfconv_context *ctx);   /* as set: 0 is the default */
+XISFCONV_API uint32_t xisfconv_hardware_threads(void);                         /* the cores of the machine */
 
 /* Asks the call that is running in this context to stop: at its next step it returns
  * XISFCONV_ERR_CANCELLED and leaves no partly written file, as when the progress handler asks.
@@ -1071,7 +1084,9 @@ typedef struct xisfconv_rewrite_options {
     size_t image;               /* default XISFCONV_ALL_IMAGES; else keep only this one */
     int32_t verify_input;       /* default 1 */
     int32_t read_back;          /* default 1: read the output back and compare every block */
-    uint64_t subblock_size;     /* default 1 GiB */
+    uint64_t subblock_size;     /* default 1 GiB. (Since 0.26) Another size is asked for of the
+                                   blocks that are in the requested codec already, too: one in
+                                   other subblocks is compressed again */
     int32_t overwrite;          /* default 0. In place it only decides whether a leftover
                                    "<path>.part" file from an interrupted run may be overwritten */
     int32_t reserved;           /* not used (where the layout of 0.18 had padding on 64-bit systems) */

@@ -37,6 +37,7 @@ say what to know before reading those.
 - [Previews in the file manager](#previews-in-the-file-manager)
 - [Sample conversion](#sample-conversion)
 - [Large images](#large-images)
+- [Threads and several files at once](#threads-and-several-files-at-once)
 - [Pipes: standard input and output](#pipes-standard-input-and-output)
 - [The library (libxisfconv)](#the-library-libxisfconv)
 - [Python](#python)
@@ -121,6 +122,8 @@ xisfconv [options] <file or directory>...   # any of XISF, FITS, ASDF -> any oth
       --level <n>             XISF output: the codec's compression level (implies -c): zlib 1-9,
                               lz4hc 1-12, zstd 1-22; XISF -> XISF: every block compressed again
       --no-shuffle            XISF output: no byte shuffling before compression (implies -c)
+      --subblocks <size>      XISF output: compressed blocks in subblocks of at most this size (16M),
+                              compressed and read on all cores at once (default 1G)
       --checksum <sha1|sha256|sha512|sha3-256|sha3-512|none>
                               XISF output: checksum of the pixel data;
                               XISF -> XISF: of every attached block (none removes them)
@@ -130,6 +133,8 @@ xisfconv [options] <file or directory>...   # any of XISF, FITS, ASDF -> any oth
                               converts nothing; exit status 1 if a file is damaged
   -I, --info                  print image geometry, keywords and properties; no conversion
       --dump-header           print the raw XML header (XISF), all keywords (FITS, DNG) or the YAML tree (ASDF)
+      --threads <n>           threads the work on a file is spread over (default: the cores; 1: one)
+  -j, --jobs <n>              convert n files at once (default 1)
   -q, --quiet                 suppress warnings
 ```
 
@@ -946,6 +951,35 @@ What is still held whole: an image that the library or the Python package reads 
 the properties of a file (see [Limitations](#limitations)); and a DNG file's raw image, which is
 decoded once (into memory or a temporary file, as above).
 
+## Threads and several files at once
+
+Since 0.26 the work on a file is spread over the cores of the machine: the tiles of a
+tile-compressed FITS file are compressed and decompressed side by side, and so are the strips of a
+compressed TIFF file and the subblocks of an XISF block; the checksum of an XISF block (and the MD5
+of an ASDF block) is computed while the block is decompressed; samples are converted, stretched,
+byte-swapped and unshuffled, and PNG rows filtered, a piece per core. What is written is the same,
+byte for byte, with one thread and with many, and a damaged file fails with the same message.
+`--threads <n>` sets the number (1: the work of one thread, as before 0.26).
+
+What stays the work of one thread: one zlib stream (a PNG file, an ASDF block, an XISF block that
+is not in subblocks) and one checksum (a digest is computed from the first byte to the last). An
+XISF block is one stream unless it is larger than its subblock size, 1 GiB by default, as PixInsight
+writes it. `--subblocks 16M` writes compressed blocks in subblocks of at most 16 MiB, which are
+compressed and decompressed on all cores at once, here and by any reader that does so; PixInsight
+reads them, and so do other readers of XISF 1.0 (subblocks are part of the specification). The size
+of the file changes little (each subblock is compressed by itself: with 8 MiB subblocks the 65 MB master
+of the tests came out 14 kB smaller with zstd, 1 kB smaller with LZ4 and 1 kB larger with zlib),
+and its bytes are other than without the option.
+
+`-j <n>` (`--jobs`) converts n files of a run at once, each with a context of its own; the threads
+of the library are shared among them. What a file says is written when it and the files before it
+are done, so that a run says the same with `-j` as without it. Two inputs of a run that would have
+the same output are refused as before; with `-j` the second is refused also where the first then
+fails. `-j` is for conversions; `--info`, `--dump-header`, `--verify` and `--in-place` take one
+file after another.
+
+In the library the number is `xisfconv_context_set_threads`, in Python `xisfconv.set_threads`.
+
 ## Pipes: standard input and output
 
 Since 0.23 an input of `-` is the standard input, and `-o -` writes the output to the standard
@@ -1106,6 +1140,13 @@ What to know:
   program) is handed over as its bytes, `xisfconv_property_read_bytes` and
   `xisfconv_properties_set_bytes`, as a conversion carries it. FITS and ASDF carry no tables: a
   conversion says so, and a rewrite to XISF keeps them as they are.
+- **Threads** (since 0.26). A call spreads its work over the cores of the machine (see [Threads
+  and several files at once](#threads-and-several-files-at-once)); `xisfconv_context_set_threads`
+  sets how many threads a call of the context uses, the calling one among them (1: the calling
+  thread alone), `xisfconv_hardware_threads` says how many cores there are. The threads are those
+  of one pool of the library, which all contexts share: they are made as they are needed and wait
+  for work until the process ends. The handlers of a context are called from the calling thread
+  only. What a call writes and returns is the same with any number of threads.
 - **Images of an open file are read from where they are** (since 0.24): an open FITS or ASDF
   file keeps the place of each image, so the pixels of one are read without going through the
   headers before it (or the tree of an ASDF file) again. The images of a file of a thousand HDUs
@@ -1143,6 +1184,7 @@ xisfconv.convert("m31.xisf", "m31.fits")            # what the command line tool
 print(xisfconv.verify("m31.xisf").verdict)
 xisfconv.write("m31.xish", data)                    # a distributed unit: m31.xish and m31.xisb
 xisfconv.rewrite("m31.xish", "packed.xisf")         # ... packed into one file (and the reverse)
+xisfconv.set_threads(4)                             # the threads a call uses (default 0: the cores)
 
 import xisfconv.astropy                             # CCDData.read("m31.xisf"), ccd.write("x.xisf"),
 from astropy.nddata import CCDData                  # and astropy.io.fits HDU lists

@@ -9,6 +9,35 @@ in [`DEVELOPMENT.md`](DEVELOPMENT.md).
 Under "changed" stands what makes the same command, or the same call, do something else than
 before.
 
+## 0.26.0 (21 October 2026)
+
+**The work on a file spread over the cores of the machine.**
+
+Added
+- A call of the library spreads its work over threads, the calling one among them: the tiles of
+  a tile-compressed FITS file are compressed and decompressed side by side (GZIP and Rice), the
+  strips of a compressed TIFF file compressed, the subblocks of an XISF block compressed and
+  decompressed; the checksum of an XISF block, and the MD5 of an ASDF block, is computed while the
+  block is decompressed (also by `--verify` and by the read-back of a rewrite); samples are
+  converted, stretched, byte-swapped and unshuffled, and PNG rows filtered, a piece per core.
+  What is written is the same, byte for byte, with one thread and with many, and a damaged file
+  fails with the same message.
+- `xisfconv_context_set_threads`, `xisfconv_context_threads` and `xisfconv_hardware_threads` in
+  C; `xisfconv.set_threads`, `xisfconv.threads` and `xisfconv.hardware_threads` in Python;
+  `--threads <n>` for the tool. The default is as many threads as the machine has cores.
+- `--subblocks <size>` (`16M`): XISF output in subblocks of at most that size, which are compressed
+  and decompressed on all cores at once (the option that was there for the tests, in bytes, is
+  now one for everybody). In C and Python this was `subblock_size` already.
+- `-j <n>` / `--jobs <n>`: the tool converts n files at once. What each file says is written when
+  it and the files before it are done, in their order.
+- Reading a file from several threads at once (the checksum beside the decompression) reads it
+  at a place of its own on Windows too, as `pread` does elsewhere.
+
+Changed
+- The library starts threads of its own, which wait for work until the process ends. A program
+  that wants none sets one thread (`xisfconv_context_set_threads(ctx, 1)`, `set_threads(1)`,
+  `--threads 1`).
+
 ## 0.25.0 (12 October 2026)
 
 **XISF tables, and data blocks of types without a name, through the API.**

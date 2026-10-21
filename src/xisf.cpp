@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 Jurgen Kobierczynski
 #include "xisf.hpp"
+#include "parallel.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -78,24 +79,58 @@ XisfChecksumState XisfFile::verifyBlockChecksum(const XisfStoredBlock& block, co
     return verifyBlockChecksum(bytes, block.checksum, what);
 }
 
-XisfChecksumState XisfFile::verifyBlockChecksum(RandomBytes& bytes, const std::string& checksum, const std::string& what) {
-    if (checksum.empty()) return XisfChecksumState::None;
+std::string XisfFile::checksumToVerify(const std::string& checksum, const std::string& what, std::string& expected,
+                                      XisfChecksumState& state) {
+    expected.clear();
+    state = XisfChecksumState::None;
+    if (checksum.empty()) return {};
     const size_t colon = checksum.find(':');
     if (colon == std::string::npos) {
         warn("malformed checksum attribute on " + what + "; not verified");
-        return XisfChecksumState::Unsupported;
+        state = XisfChecksumState::Unsupported;
+        return {};
     }
     const std::string algo = toLower(trim(checksum.substr(0, colon)));
-    const std::string expected = toLower(trim(checksum.substr(colon + 1)));
     if (algo == "md5" || !Hasher::known(algo)) {
         warn("checksum algorithm '" + algo + "' on " + what + " is not supported; not verified");
-        return XisfChecksumState::Unsupported;
+        state = XisfChecksumState::Unsupported;
+        return {};
     }
+    expected = toLower(trim(checksum.substr(colon + 1)));
+    state = XisfChecksumState::Verified;
+    return algo;
+}
+
+void XisfFile::compareDigest(RandomBytes& bytes, const std::string& algo, const std::string& expected, const std::string& what) {
     if (digestHex(algo, bytes, 0, bytes.size()) != expected) {
         throw Error("checksum mismatch on " + what + " (" + algo + "): file is corrupt "
                     "(use --no-verify to convert anyway)", ErrorKind::Checksum);
     }
-    return XisfChecksumState::Verified;
+}
+
+XisfChecksumState XisfFile::verifyBlockChecksum(RandomBytes& bytes, const std::string& checksum, const std::string& what) {
+    std::string expected;
+    XisfChecksumState state;
+    const std::string algo = checksumToVerify(checksum, what, expected, state);
+    if (!algo.empty()) compareDigest(bytes, algo, expected, what);
+    return state;
+}
+
+std::shared_ptr<RandomBytes> XisfFile::verifiedDecodedBlock(const XisfBlockView& block, const std::string& what,
+                                                            uint64_t expectedSize, bool verify, XisfChecksumState* state) {
+    std::string expected;
+    XisfChecksumState checked = XisfChecksumState::None;
+    const std::string algo = verify ? checksumToVerify(block.checksum, what, expected, checked) : std::string();
+    if (state) *state = checked;
+    if (algo.empty()) return decodedBlock(block, what, expectedSize);
+    if (block.compression.empty() || !block.bytes->readableByThreads()) {
+        compareDigest(*block.bytes, algo, expected, what);
+        return decodedBlock(block, what, expectedSize);
+    }
+    std::shared_ptr<RandomBytes> decoded;
+    runBeside([&] { decoded = decodedBlock(block, what, expectedSize); },
+              [&] { compareDigest(*block.bytes, algo, expected, what); });
+    return decoded;
 }
 
 XisfFile::XisfFile(const Input& input, const XisfBlocksRedirect* redirect, bool verifying) : path_(input.name) {
@@ -629,23 +664,69 @@ void XisfFile::decodeBlockTo(const XisfBlockView& block, const std::string& what
     }
     if (block.subblocks.empty()) {
         decompressBytes(c.codec, stored, 0, storedSize, c.uncompressedSize, sink);
-    } else {
-        uint64_t offset = 0, made = 0;
-        for (const auto& pair : split(block.subblocks, ':')) {
-            const auto cu = split(pair, ',');
-            uint64_t cs = 0, us = 0;
-            if (cu.size() != 2 || !parseUInt64(cu[0], cs) || !parseUInt64(cu[1], us)) {
-                throw Error("malformed subblocks attribute in " + what);
-            }
-            if (cs > storedSize - offset || us > c.uncompressedSize - made) {
-                throw Error("subblock sizes exceed the data block in " + what);
-            }
-            decompressBytes(c.codec, stored, offset, cs, us, sink);
-            offset += cs;
-            made += us;
-        }
-        if (made != c.uncompressedSize) throw Error("subblocks do not add up to the declared size in " + what);
+        return;
     }
+    // The subblocks as the attribute lists them, up to the first that it does not describe well
+    // (which fails where it is reached, after those before it).
+    struct Part {
+        uint64_t offset, stored, size;
+    };
+    std::vector<Part> parts;
+    std::string wrong;
+    uint64_t offset = 0, made = 0;
+    for (const auto& pair : split(block.subblocks, ':')) {
+        const auto cu = split(pair, ',');
+        uint64_t cs = 0, us = 0;
+        if (cu.size() != 2 || !parseUInt64(cu[0], cs) || !parseUInt64(cu[1], us)) {
+            wrong = "malformed subblocks attribute in " + what;
+            break;
+        }
+        if (cs > storedSize - offset || us > c.uncompressedSize - made) {
+            wrong = "subblock sizes exceed the data block in " + what;
+            break;
+        }
+        parts.push_back({offset, cs, us});
+        offset += cs;
+        made += us;
+    }
+    if (wrong.empty() && made != c.uncompressedSize) wrong = "subblocks do not add up to the declared size in " + what;
+    // Several subblocks at once where threads can read the stored bytes together: each into
+    // memory of its own, given to the sink in their order; some 256 MiB at a time at most.
+    const unsigned threads = threadLimit();
+    const bool together = threads > 1 && parts.size() > 1 && stored.readableByThreads();
+    for (size_t first = 0; first < parts.size();) {
+        if (!together) {
+            decompressBytes(c.codec, stored, parts[first].offset, parts[first].stored, parts[first].size, sink);
+            ++first;
+            continue;
+        }
+        size_t end = first;
+        uint64_t bytes = 0;
+        while (end < parts.size() && end - first < 2 * size_t(threads) &&
+               (end == first || bytes + parts[end].size <= (uint64_t(256) << 20))) {
+            bytes += parts[end].size;
+            ++end;
+        }
+        if (end - first == 1) {
+            decompressBytes(c.codec, stored, parts[first].offset, parts[first].stored, parts[first].size, sink);
+            ++first;
+            continue;
+        }
+        std::vector<std::vector<uint8_t>> pieces(end - first);
+        parallelFor(end - first, [&](size_t k, unsigned) {
+            const Part& part = parts[first + k];
+            if (part.size > std::numeric_limits<size_t>::max()) throw Error("data block too large for this platform");
+            pieces[k].reserve(static_cast<size_t>(part.size));
+            VectorSink piece(pieces[k]);
+            decompressBytes(c.codec, stored, part.offset, part.stored, part.size, piece);
+        });
+        for (std::vector<uint8_t>& piece : pieces) {
+            sink.write(piece.data(), piece.size());
+            std::vector<uint8_t>().swap(piece);
+        }
+        first = end;
+    }
+    if (!wrong.empty()) throw Error(wrong);
 }
 
 std::vector<uint8_t> XisfFile::decodeBlock(const XisfStoredBlock& block, const std::string& what, uint64_t expectedSize) {
@@ -719,8 +800,7 @@ Source XisfFile::pixelSource(size_t index, bool verify) {
         }
     }
     const XisfBlockView block = openStoredBlock(*img.node, what);
-    if (verify) verifyBlockChecksum(*block.bytes, block.checksum, what);
-    const std::shared_ptr<RandomBytes> data = decodedBlock(block, what, expected);
+    const std::shared_ptr<RandomBytes> data = verifiedDecodedBlock(block, what, expected, verify);
     if (data->size() != expected) {
         throw Error(what + ": pixel data is " + std::to_string(data->size()) + " bytes, geometry requires " + std::to_string(expected));
     }

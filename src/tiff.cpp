@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 Jurgen Kobierczynski
 #include "tiff.hpp"
+#include "parallel.hpp"
 
 #include <zlib.h>
 
@@ -163,50 +164,67 @@ void writePage(Output& out, const TiffPage& page, bool deflate, uint64_t& prevNe
     const uint16_t predictor = !deflate ? 1 : floatData ? 3 : (sb <= 4 ? 2 : 1);
 
     std::vector<uint64_t> offsets_, counts;
-    std::vector<uint8_t> strip, compressed, tmp, channel;
-    for (size_t y0 = 0; y0 < height; y0 += rowsPerStrip) {
-        const size_t rows = std::min(rowsPerStrip, height - y0);
-        strip.resize(rows * rowBytes);
+    // Strips a few at a time: read together, then each made ready (predictor, byte order,
+    // Deflate) side by side, and written in their order. One at a time with one thread.
+    const unsigned threads = threadLimit();
+    const size_t group = threads > 1 ? std::max<size_t>(1, std::min<size_t>(4 * size_t(threads), (size_t(32) << 20) / (rowsPerStrip * std::max<size_t>(rowBytes, 1)))) : 1;
+    std::vector<uint8_t> strips, channel;
+    std::vector<std::vector<uint8_t>> tmps(threads), compressed(group);
+    std::vector<uLongf> compressedSize(group);
+    for (size_t y0 = 0; y0 < height; y0 += rowsPerStrip * group) {
+        const size_t groupRows = std::min(rowsPerStrip * group, height - y0);
+        const size_t stripCount = (groupRows + rowsPerStrip - 1) / rowsPerStrip;
+        strips.resize(groupRows * rowBytes);
         // Interleave planar channels into chunky rows (host byte order).
         if (spp == 1) {
-            px.readRows(0, y0, rows, strip.data());
+            px.readRows(0, y0, groupRows, strips.data());
         } else {
-            channel.resize(rows * width * sb);
+            channel.resize(groupRows * width * sb);
             for (size_t c = 0; c < spp; ++c) {
-                px.readRows(c, y0, rows, channel.data());
-                for (size_t r = 0; r < rows; ++r) {
-                    uint8_t* dst = strip.data() + r * rowBytes;
+                px.readRows(c, y0, groupRows, channel.data());
+                for (size_t r = 0; r < groupRows; ++r) {
+                    uint8_t* dst = strips.data() + r * rowBytes;
                     const uint8_t* src = channel.data() + r * width * sb;
                     for (size_t x = 0; x < width; ++x) std::memcpy(dst + (x * spp + c) * sb, src + x * sb, sb);
                 }
             }
         }
-        progressTick(rows * rowBytes);
-        if (predictor != 1) {
-            for (size_t r = 0; r < rows; ++r) {
-                uint8_t* row = strip.data() + r * rowBytes;
-                if (predictor == 3) floatingPointDiff(row, rowSamples, spp, sb, tmp);
-                else if (sb == 1) horizontalDiff<uint8_t>(row, rowSamples, spp);
-                else if (sb == 2) horizontalDiff<uint16_t>(row, rowSamples, spp);
-                else horizontalDiff<uint32_t>(row, rowSamples, spp);
+        progressTick(groupRows * rowBytes);
+        parallelFor(stripCount, [&](size_t k, unsigned slot) {
+            const size_t rows = std::min(rowsPerStrip, groupRows - k * rowsPerStrip);
+            uint8_t* strip = strips.data() + k * rowsPerStrip * rowBytes;
+            const size_t size = rows * rowBytes;
+            if (predictor != 1) {
+                for (size_t r = 0; r < rows; ++r) {
+                    uint8_t* row = strip + r * rowBytes;
+                    if (predictor == 3) floatingPointDiff(row, rowSamples, spp, sb, tmps[slot]);
+                    else if (sb == 1) horizontalDiff<uint8_t>(row, rowSamples, spp);
+                    else if (sb == 2) horizontalDiff<uint16_t>(row, rowSamples, spp);
+                    else horizontalDiff<uint32_t>(row, rowSamples, spp);
+                }
             }
-        }
-        // File is little-endian; the floating point predictor output is already a byte stream.
-        if (!little && sb > 1 && predictor != 3) byteSwapInPlace(strip.data(), strip.size() / sb, sb);
-
-        out.align2();
-        offsets_.push_back(out.pos());
-        if (deflate) {
-            uLongf destLen = compressBound(static_cast<uLong>(strip.size()));
-            compressed.resize(destLen);
-            if (compress2(compressed.data(), &destLen, strip.data(), static_cast<uLong>(strip.size()), 6) != Z_OK) {
-                throw Error("deflate compression failed");
+            // File is little-endian; the floating point predictor output is already a byte stream.
+            if (!little && sb > 1 && predictor != 3) byteSwapInPlace(strip, size / sb, sb);
+            if (deflate) {
+                uLongf destLen = compressBound(static_cast<uLong>(size));
+                compressed[k].resize(destLen);
+                if (compress2(compressed[k].data(), &destLen, strip, static_cast<uLong>(size), 6) != Z_OK) {
+                    throw Error("deflate compression failed");
+                }
+                compressedSize[k] = destLen;
             }
-            out.write(compressed.data(), destLen);
-            counts.push_back(destLen);
-        } else {
-            out.write(strip.data(), strip.size());
-            counts.push_back(strip.size());
+        });
+        for (size_t k = 0; k < stripCount; ++k) {
+            const size_t rows = std::min(rowsPerStrip, groupRows - k * rowsPerStrip);
+            out.align2();
+            offsets_.push_back(out.pos());
+            if (deflate) {
+                out.write(compressed[k].data(), compressedSize[k]);
+                counts.push_back(compressedSize[k]);
+            } else {
+                out.write(strips.data() + k * rowsPerStrip * rowBytes, rows * rowBytes);
+                counts.push_back(rows * rowBytes);
+            }
         }
     }
 

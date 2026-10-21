@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 Jurgen Kobierczynski
 #include "fits.hpp"
+#include "parallel.hpp"
 
 #include <algorithm>
 #include <cstdio>
 #include <fstream>
 #include <limits>
+#include <memory>
 
 #include "fitsread.hpp"
 #include "fitstile.hpp"
@@ -559,20 +561,37 @@ std::string writeTiledImage(std::ostream& out, const std::string& path, const Fi
     writeZeros(out, tableBytes);
 
     std::vector<uint8_t> table(static_cast<size_t>(tableBytes));
-    std::vector<uint8_t> tile(static_cast<size_t>(tileSamples) * sb);
-    TileGzip gzip;
+    // A compressor and a tile of its own for each thread: the tiles of a band are compressed side
+    // by side (each to the same bytes as one after the other), and written in their order.
+    const unsigned threads = threadLimit();
+    std::vector<std::vector<uint8_t>> tileBuffers(threads, std::vector<uint8_t>(static_cast<size_t>(tileSamples) * sb));
+    std::vector<std::unique_ptr<TileGzip>> gzips(threads);
+    std::vector<std::vector<uint8_t>> packedRows;
     uint64_t heap = 0, longest = 0;
     const size_t count = static_cast<size_t>(tileSamples);
     // a sign of life (and a chance to stop) every 8 MiB of pixels or so
     const uint64_t reportEvery = std::max<uint64_t>(1, (uint64_t(8) << 20) / (tileSamples * sb));
     // The rows of the image one after the other, channel by channel: the order of the tiles.
     uint64_t row = 0;
+    // (a few tiles at a time, while they are in the cache: 8 for each thread)
+    const uint64_t step = uint64_t(threads) * 8;
+    packedRows.resize(static_cast<size_t>(step));
     forEachBand(px, [&](uint64_t, uint64_t, uint64_t rows, const uint8_t* data) {
-        for (uint64_t r = 0; r < rows; ++r, ++row) {
+      for (uint64_t first = 0; first < rows; first += step) {
+        const size_t some = static_cast<size_t>(std::min(step, rows - first));
+        parallelFor(some, [&](size_t k, unsigned slot) {
+            std::vector<uint8_t>& tile = tileBuffers[slot];
+            storedSamples(px.format, data + (first + k) * count * sb, count, tile.data());
+            if (rice) {
+                packedRows[k] = riceEncode(tile.data(), count, static_cast<int>(sb));
+            } else {
+                if (!gzips[slot]) gzips[slot].reset(new TileGzip);
+                packedRows[k] = gzips[slot]->compress(tile.data(), count, sb, true);
+            }
+        });
+        for (size_t k = 0; k < some; ++k, ++row) {
             if (row % reportEvery == 0) progress("compressing", row, ntiles);
-            storedSamples(px.format, data + r * count * sb, count, tile.data());
-            const std::vector<uint8_t> packed = rice ? riceEncode(tile.data(), count, static_cast<int>(sb))
-                                                     : gzip.compress(tile.data(), count, sb, true);
+            std::vector<uint8_t> packed = std::move(packedRows[k]);
             if (!wide && heap + packed.size() > narrowLimit) throw Error("the compressed tiles do not fit the table (internal error)");
             uint8_t* descriptor = table.data() + static_cast<size_t>(row) * rowBytes;
             if (wide) {
@@ -587,6 +606,7 @@ std::string writeTiledImage(std::ostream& out, const std::string& path, const Fi
             heap += packed.size();
             longest = std::max<uint64_t>(longest, packed.size());
         }
+      }
     });
     padBlock(out, tableBytes + heap);
     const std::ostream::pos_type endAt = out.tellp();

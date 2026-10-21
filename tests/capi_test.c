@@ -3587,6 +3587,104 @@ static void test_lifetime(void) {
     xisfconv_close(f);
 }
 
+/* Time stamps (2026-10-21T13:13:34Z) as zeros: what differs between two files written a second apart. */
+static void unstamp(unsigned char *d, size_t n) {
+    size_t i, k;
+    static const char shape[] = "dddd-dd-ddTdd:dd:dd";
+    for (i = 0; i + sizeof shape - 1 <= n; ++i) {
+        for (k = 0; k < sizeof shape - 1; ++k) {
+            const unsigned char c = d[i + k];
+            if (shape[k] == 'd' ? !(c >= '0' && c <= '9') : c != (unsigned char)shape[k]) break;
+        }
+        if (k == sizeof shape - 1)
+            for (k = 0; k < sizeof shape - 1; ++k)
+                if (shape[k] == 'd') d[i + k] = '0';
+    }
+}
+
+static int same_but_stamps(const char *a, const char *b) {
+    size_t na = 0, nb = 0;
+    unsigned char *da = read_whole(a, &na), *db = read_whole(b, &nb);
+    int same = da && db && na == nb;
+    if (same) {
+        unstamp(da, na);
+        unstamp(db, nb);
+        same = memcmp(da, db, na) == 0;
+    }
+    free(da);
+    free(db);
+    return same;
+}
+
+/* (0.26) The threads of a context: what is written and read is the same with one and with many. */
+static void test_threads(xisfconv_context *ctx) {
+    static const char *const xisf[2] = {"threads1.xisf", "threads9.xisf"};
+    static const char *const fz[2] = {"threads1.fits.fz", "threads9.fits.fz"};
+    static const char *const back[2] = {"threads1.fits", "threads9.fits"};
+    enum { TW = 613, TH = 401 };
+    static uint16_t big[TW * TH], got[TW * TH];
+    xisfconv_write_options wo;
+    xisfconv_image img;
+    xisfconv_writer *w = NULL;
+    xisfconv_convert_options co;
+    char first[512];
+    int k;
+    for (k = 0; k < TW * TH; ++k) big[k] = (uint16_t)(1000 + (k % TW) * 3 + (k / TW) * 7 + (k * 7919) % 5);
+    CHECK(xisfconv_hardware_threads() >= 1, "the cores of the machine");
+    CHECK(xisfconv_context_threads(ctx) == 0, "a context spreads its work over all cores by default");
+    CHECK(xisfconv_context_set_threads(NULL, 2) == XISFCONV_ERR_ARGUMENT && xisfconv_context_threads(NULL) == 0, "NULL context");
+    for (k = 0; k < 2; ++k) {
+        xisfconv_file *f = NULL;
+        CHECK(xisfconv_context_set_threads(ctx, k ? 9 : 1) == XISFCONV_OK && xisfconv_context_threads(ctx) == (k ? 9u : 1u),
+              "the threads of a context");
+        xisfconv_write_options_init(&wo, sizeof wo);
+        wo.overwrite = 1;
+        wo.codec = XISFCONV_CODEC_ZLIB;   /* (every build has it) */
+        wo.checksum = XISFCONV_CHECKSUM_SHA256;
+        wo.subblock_size = 8192;   /* many subblocks, compressed side by side */
+        xisfconv_image_init(&img, sizeof img);
+        img.width = TW;
+        img.height = TH;
+        img.name = "threads";
+        img.pixels = big;
+        img.sample_format = XISFCONV_SAMPLE_UINT16;
+        CHECK(xisfconv_writer_new(ctx, path_of(xisf[k]), &wo, &w) == XISFCONV_OK && xisfconv_writer_add_image(w, &img) == XISFCONV_OK &&
+                  xisfconv_writer_finish(w) == XISFCONV_OK,
+              "XISF in subblocks");
+        xisfconv_convert_options_init(&co, sizeof co);
+        co.overwrite = 1;
+        co.codec = XISFCONV_CODEC_DEFAULT;
+        CHECK(xisfconv_convert(ctx, path_of(xisf[k]), path_of(fz[k]), &co) == XISFCONV_OK, "... to tile-compressed FITS");
+        co.codec = XISFCONV_CODEC_NONE;
+        CHECK(xisfconv_convert(ctx, path_of(fz[k]), path_of(back[k]), &co) == XISFCONV_OK, "... and back to FITS");
+        if (xisfconv_open(ctx, path_of(xisf[k]), &f) == XISFCONV_OK) {
+            xisfconv_read_options ro;
+            xisfconv_read_options_init(&ro, sizeof ro);
+            CHECK(xisfconv_read_pixels(f, 0, &ro, got, sizeof got) == XISFCONV_OK && memcmp(got, big, sizeof big) == 0,
+                  "the pixels of subblocks, decompressed side by side");
+            xisfconv_close(f);
+        } else {
+            CHECK(0, "open threads.xisf");
+        }
+    }
+    CHECK(same_but_stamps(path_of(xisf[0]), path_of(xisf[1])) && same_but_stamps(path_of(fz[0]), path_of(fz[1])) &&
+              same_but_stamps(path_of(back[0]), path_of(back[1])),
+          "the same files with 1 and 9 threads");
+    /* a damaged subblock fails the same way */
+    for (k = 0; k < 2; ++k) {
+        xisfconv_context_set_threads(ctx, k ? 9 : 1);
+        CHECK(copy_damaged(path_of(xisf[0]), path_of("threads-bad.xisf"), file_size(path_of(xisf[0])) / 3) == 1, "a damaged copy");
+        CHECK(xisfconv_convert(ctx, path_of("threads-bad.xisf"), path_of("threads-bad.fits"), &co) != XISFCONV_OK, "... fails");
+        if (k == 0) {
+            strncpy(first, xisfconv_error_message(ctx), sizeof first - 1);
+            first[sizeof first - 1] = 0;
+        } else {
+            CHECK(strcmp(first, xisfconv_error_message(ctx)) == 0, "... saying the same with 9 threads");
+        }
+    }
+    xisfconv_context_set_threads(ctx, 0);
+}
+
 int main(int argc, char **argv) {
     xisfconv_context *ctx;
     xisfconv_keywords *kw;
@@ -3622,6 +3720,7 @@ int main(int argc, char **argv) {
     test_distributed_units(ctx);
     test_memory_and_streams(ctx);
     test_tables_and_bytes(ctx);
+    test_threads(ctx);
     xisfconv_context_free(ctx);
     test_lifetime();
 

@@ -8,6 +8,12 @@
 #include <csignal>
 #include <cstdio>
 #include <cstring>
+#include <thread>
+#include <mutex>
+#include <memory>
+#include <functional>
+#include <deque>
+#include <condition_variable>
 #include <filesystem>
 #include <iostream>
 #include <limits>
@@ -37,6 +43,13 @@
 namespace fs = std::filesystem;
 
 namespace {
+
+// Where the run writes what it says: the standard output and error, or, for a file converted
+// beside others (--jobs), what is kept for it and written in its turn.
+thread_local std::ostream* t_out = nullptr;
+thread_local std::ostream* t_err = nullptr;
+std::ostream& stdOut() { return t_out ? *t_out : std::cout; }
+std::ostream& stdErr() { return t_err ? *t_err : std::cerr; }
 
 struct Error : std::runtime_error {
     using std::runtime_error::runtime_error;
@@ -154,6 +167,9 @@ struct Options {
     bool verifyMode = false;     // --verify: check the files, convert nothing
     std::optional<std::pair<double, double>> bounds;  // FITS/ASDF input: range of floating point data
     uint64_t subblockSize = 1u << 30;
+    bool subblocksGiven = false; // --subblocks
+    unsigned threads = 0;        // --threads: 0, the cores of the machine
+    unsigned jobs = 1;           // --jobs: files converted at once
     bool propertyKeywords = true;
     bool properties = true;      // take XISF properties along to FITS and ASDF, and use those such a file carries
     uint64_t bin = 1;            // TIFF and PNG output: n x n pixels become one
@@ -276,11 +292,19 @@ void usage(std::ostream& os) {
           "                              smaller and slower to write, as fast to read. XISF -> XISF: every\n"
           "                              block is compressed again (a file does not say its level)\n"
           "      --no-shuffle            XISF: no byte shuffling before compression (implies --compress)\n"
+          "      --subblocks <size>      XISF: compressed blocks in subblocks of at most this size (4M, 16M, 1G;\n"
+          "                              default 1G), which are compressed and decompressed on all cores at\n"
+          "                              once. The size of the file changes little; PixInsight reads them\n"
           "      --checksum <sha1|sha256|sha512|sha3-256|sha3-512|none>\n"
           "                              XISF: store a checksum of the pixel data block; XISF -> XISF: of every\n"
           "                              attached block (none removes them). ASDF blocks always carry MD5.\n"
           "                              PixInsight opens files with sha1, sha256 and sha512 checksums only\n\n"
 
+          "Speed:\n"
+          "      --threads <n>           the threads the work on a file is spread over (default: as many as the\n"
+          "                              machine has cores; 1: one). What is written is the same with any number\n"
+          "  -j, --jobs <n>              convert n files at once (default 1); the threads are shared among them.\n"
+          "                              What each file says is written once it is done, in the order of the files\n\n"
           "Inspection:\n"
           "      --verify                check the integrity of the files (and of the XISF, FITS, ASDF and DNG\n"
           "                              files in the directories) given: checksums are verified, compressed\n"
@@ -341,17 +365,19 @@ std::string megabytes(uint64_t bytes) {
 // Ctrl-C (and a request to terminate): the call that is running stops at its next step, within an
 // image too, and leaves no partly written file; then the run ends. A second Ctrl-C ends the program
 // at once.
-std::atomic<xisfconv_context*> g_context{nullptr};
+// The contexts of the run: that of the run itself (0), and those of the threads of --jobs.
+std::atomic<xisfconv_context*> g_contexts[65];
 volatile std::sig_atomic_t g_interrupted = 0;
 
 extern "C" void onInterrupt(int signal) {
     g_interrupted = 1;
-    if (xisfconv_context* ctx = g_context.load()) xisfconv_context_cancel(ctx);
+    for (auto& slot : g_contexts)
+        if (xisfconv_context* ctx = slot.load()) xisfconv_context_cancel(ctx);
     std::signal(signal, SIG_DFL);
 }
 
 void catchInterrupts(xisfconv_context* ctx) {
-    g_context.store(ctx);
+    g_contexts[0].store(ctx);
 #ifdef _WIN32
     std::signal(SIGINT, onInterrupt);
     std::signal(SIGTERM, onInterrupt);
@@ -367,7 +393,7 @@ void catchInterrupts(xisfconv_context* ctx) {
 
 // What the run says and returns when it was interrupted.
 int interrupted(const std::string& input) {
-    std::cerr << "xisfconv: interrupted" << (input.empty() ? std::string() : "; " + input + " is not converted") << "\n";
+    stdErr() << "xisfconv: interrupted" << (input.empty() ? std::string() : "; " + input + " is not converted") << "\n";
     return 130;
 }
 
@@ -389,11 +415,11 @@ struct Library {
         const Library* self = static_cast<const Library*>(user);
         if (self->quiet) return;
         if (level == XISFCONV_MESSAGE_WARNING) {
-            std::cerr << "warning: ";
-            if (path && *path) std::cerr << path << ": ";
-            std::cerr << message << '\n';
+            stdErr() << "warning: ";
+            if (path && *path) stdErr() << path << ": ";
+            stdErr() << message << '\n';
         } else {
-            std::cerr << "info: " << message << '\n';
+            stdErr() << "info: " << message << '\n';
         }
     }
 
@@ -543,11 +569,11 @@ void printCards(const xisfconv_keywords* kw) {
         const char *name = "", *value = "", *comment = "";
         xisfconv_keywords_get(kw, k, &name, &value, &comment);
         const size_t length = std::strlen(name);
-        std::cout << "    " << name;
-        if (length < 8) std::cout << std::string(8 - length, ' ');
-        if (*value) std::cout << "= " << value;
-        if (*comment) std::cout << (*value ? " / " : " ") << comment;
-        std::cout << "\n";
+        stdOut() << "    " << name;
+        if (length < 8) stdOut() << std::string(8 - length, ' ');
+        if (*value) stdOut() << "= " << value;
+        if (*comment) stdOut() << (*value ? " / " : " ") << comment;
+        stdOut() << "\n";
     }
 }
 
@@ -572,7 +598,7 @@ void printProperties(const Library& lib, xisfconv_file* f, size_t image, const c
         const char *pid = "", *type = "", *value = "";
         int32_t block = 0;
         lib.check(xisfconv_property_get(f, image, p, &pid, &type, &value, nullptr, &block));
-        std::cout << indent << pid << " (" << type << ")";
+        stdOut() << indent << pid << " (" << type << ")";
         const xisfconv_property_storage stored = xisfconv_property_stored(f, image, p);
         if (stored == XISFCONV_PROPERTY_TABLE) {
             size_t fields = 0, rows = 0;
@@ -597,11 +623,11 @@ void printProperties(const Library& lib, xisfconv_file* f, size_t image, const c
                 }
                 shown = plain;
             }
-            std::cout << " [table: " << rows << (rows == 1 ? " row" : " rows") << " of " << fields << (fields == 1 ? " field" : " fields")
+            stdOut() << " [table: " << rows << (rows == 1 ? " row" : " rows") << " of " << fields << (fields == 1 ? " field" : " fields")
                       << (shown.empty() ? std::string() : ", \"" + shown + "\"") << "]";
         } else if (stored == XISFCONV_PROPERTY_UNREAD && std::string(type) == "Table") {
-            std::cout << " [table, not read]";
-        } else if (block) std::cout << " [data block]";
+            stdOut() << " [table, not read]";
+        } else if (block) stdOut() << " [data block]";
         else {
             std::string v = value;
             if (image != XISFCONV_FILE_PROPERTIES) {
@@ -609,9 +635,9 @@ void printProperties(const Library& lib, xisfconv_file* f, size_t image, const c
                 for (auto& c : v)
                     if (c == '\n' || c == '\r') c = ' ';
             }
-            std::cout << " = " << v;
+            stdOut() << " = " << v;
         }
-        std::cout << "\n";
+        stdOut() << "\n";
     }
 }
 
@@ -625,16 +651,16 @@ void printXisfInfo(const Library& lib, const std::string& path, xisfconv_file* f
     for (size_t k = 0; k < others; ++k) there += xisfconv_external_status(f, k) == XISFCONV_OK;
     if (std::string(xisfconv_file_detail(f, "unit")) == "distributed") {
         // a header file: the unit is that file and those its header names
-        std::cout << path << ": XISF " << xisfconv_file_detail(f, "version") << ", distributed unit, " << xisfconv_unit_size(f)
+        stdOut() << path << ": XISF " << xisfconv_file_detail(f, "version") << ", distributed unit, " << xisfconv_unit_size(f)
                   << " bytes in " << there + 1 << (there ? " files" : " file") << ", header " << headerSize << " bytes, "
                   << images << " image(s)\n";
     } else {
-        std::cout << path << ": XISF " << xisfconv_file_detail(f, "version") << ", " << xisfconv_file_size(f) << " bytes, header "
+        stdOut() << path << ": XISF " << xisfconv_file_detail(f, "version") << ", " << xisfconv_file_size(f) << " bytes, header "
                   << headerSize << " bytes, " << images << " image(s)\n";
     }
     for (size_t k = 0; k < others; ++k) {
         const xisfconv_status status = xisfconv_external_status(f, k);
-        std::cout << "  data in:     " << xisfconv_external_file(f, k)
+        stdOut() << "  data in:     " << xisfconv_external_file(f, k)
                   << (status == XISFCONV_OK ? ""
                       : status == XISFCONV_ERR_NOT_ALLOWED ? "  (not read: the header is not followed there, see --external-files)"
                       : status == XISFCONV_ERR_UNSUPPORTED ? "  (not read: nothing is fetched from a network)"
@@ -645,46 +671,46 @@ void printXisfInfo(const Library& lib, const std::string& path, xisfconv_file* f
         const xisfconv_image_info img = infoOf(lib, f, i);
         auto detail = [&](const char* name) { return std::string(xisfconv_image_detail(f, i, name)); };
         const std::string id = xisfconv_image_name(f, i);
-        std::cout << "\nImage " << i;
-        if (!id.empty()) std::cout << " \"" << id << "\"";
-        std::cout << ": " << img.width << " x " << img.height << " x " << img.channels << ", "
+        stdOut() << "\nImage " << i;
+        if (!id.empty()) stdOut() << " \"" << id << "\"";
+        stdOut() << ": " << img.width << " x " << img.height << " x " << img.channels << ", "
                   << detail("sampleFormat") << ", " << detail("colorSpace") << ", " << detail("pixelStorage")
                   << ", " << detail("byteOrder") << "-endian\n";
-        if (isFloat(img.sample_format)) std::cout << "  bounds:      " << img.lower_bound << " : " << img.upper_bound << "\n";
-        std::cout << "  location:    " << detail("location") << "\n";
-        if (!detail("compression").empty()) std::cout << "  compression: " << detail("compression") << "\n";
-        if (!detail("subblocks").empty()) std::cout << "  subblocks:   " << detail("subblocks") << "\n";
-        if (!detail("checksum").empty()) std::cout << "  checksum:    " << detail("checksum") << "\n";
-        if (!detail("imageType").empty()) std::cout << "  imageType:   " << detail("imageType") << "\n";
-        if (!detail("orientation").empty()) std::cout << "  orientation: " << detail("orientation") << "\n";
+        if (isFloat(img.sample_format)) stdOut() << "  bounds:      " << img.lower_bound << " : " << img.upper_bound << "\n";
+        stdOut() << "  location:    " << detail("location") << "\n";
+        if (!detail("compression").empty()) stdOut() << "  compression: " << detail("compression") << "\n";
+        if (!detail("subblocks").empty()) stdOut() << "  subblocks:   " << detail("subblocks") << "\n";
+        if (!detail("checksum").empty()) stdOut() << "  checksum:    " << detail("checksum") << "\n";
+        if (!detail("imageType").empty()) stdOut() << "  imageType:   " << detail("imageType") << "\n";
+        if (!detail("orientation").empty()) stdOut() << "  orientation: " << detail("orientation") << "\n";
         if (img.has_cfa)
-            std::cout << "  CFA:         " << detail("cfaPattern") << " (" << img.cfa_width << "x" << img.cfa_height << ")"
+            stdOut() << "  CFA:         " << detail("cfaPattern") << " (" << img.cfa_width << "x" << img.cfa_height << ")"
                       << (detail("cfaName").empty() ? "" : " " + detail("cfaName")) << "\n";
         if (img.resolution_unit)
-            std::cout << "  resolution:  " << img.resolution_x << " x " << img.resolution_y << " per "
+            stdOut() << "  resolution:  " << img.resolution_x << " x " << img.resolution_y << " per "
                       << detail("resolutionUnit") << "\n";
-        if (img.has_icc_profile) std::cout << "  ICC profile: yes\n";
+        if (img.has_icc_profile) stdOut() << "  ICC profile: yes\n";
         if (img.has_display_function) {
-            std::cout << "  STF:         " << (img.has_stored_stretch ? "" : "identity (no stretch)");
+            stdOut() << "  STF:         " << (img.has_stored_stretch ? "" : "identity (no stretch)");
             if (img.has_stored_stretch) {
                 xisfconv_stretch_params stf[3];
                 size_t count = 0;
                 lib.check(xisfconv_stored_stretch(f, i, stf, 3, &count));
                 for (size_t k = 0; k < count; ++k)
-                    std::cout << (k ? "; " : "") << "s=" << stf[k].shadows << " m=" << stf[k].midtones << " h=" << stf[k].highlights;
+                    stdOut() << (k ? "; " : "") << "s=" << stf[k].shadows << " m=" << stf[k].midtones << " h=" << stf[k].highlights;
             }
-            std::cout << "\n";
+            stdOut() << "\n";
         }
-        if (!img.convertible) std::cout << "  NOT CONVERTIBLE: " << xisfconv_image_unsupported_reason(f, i) << "\n";
+        if (!img.convertible) stdOut() << "  NOT CONVERTIBLE: " << xisfconv_image_unsupported_reason(f, i) << "\n";
         const xisfconv_keywords* kw = cardsOf(lib, f, i);
-        std::cout << "  FITS keywords (" << xisfconv_keywords_count(kw) << "):\n";
+        stdOut() << "  FITS keywords (" << xisfconv_keywords_count(kw) << "):\n";
         printCards(kw);
-        std::cout << "  Properties (" << xisfconv_property_count(f, i) << "):\n";
+        stdOut() << "  Properties (" << xisfconv_property_count(f, i) << "):\n";
         printProperties(lib, f, i, "    ");
     }
     const size_t metadata = xisfconv_property_count(f, XISFCONV_FILE_PROPERTIES);
     if (metadata) {
-        std::cout << "\nFile metadata (" << metadata << "):\n";
+        stdOut() << "\nFile metadata (" << metadata << "):\n";
         printProperties(lib, f, XISFCONV_FILE_PROPERTIES, "  ");
     }
 }
@@ -693,13 +719,13 @@ void printXisfInfo(const Library& lib, const std::string& path, xisfconv_file* f
 void printCarriedProperties(const Library& lib, xisfconv_file* f, size_t image) {
     const size_t count = xisfconv_property_count(f, image);
     if (!count) return;
-    if (image == XISFCONV_FILE_PROPERTIES) std::cout << "\nXISF file metadata (" << count << "):\n";
-    else std::cout << "  XISF properties (" << count << "):\n";
+    if (image == XISFCONV_FILE_PROPERTIES) stdOut() << "\nXISF file metadata (" << count << "):\n";
+    else stdOut() << "  XISF properties (" << count << "):\n";
     printProperties(lib, f, image, image == XISFCONV_FILE_PROPERTIES ? "  " : "    ");
 }
 
 void printKeywords(const xisfconv_keywords* kw) {
-    std::cout << "  Keywords (" << xisfconv_keywords_count(kw) << "):\n";
+    stdOut() << "  Keywords (" << xisfconv_keywords_count(kw) << "):\n";
     printCards(kw);
 }
 
@@ -710,58 +736,58 @@ const char* rowsText(const xisfconv_image_info& img, const char* undeclared) {
 
 void printFitsInfo(const Library& lib, const std::string& path, xisfconv_file* f) {
     const size_t images = xisfconv_image_count(f);
-    std::cout << path << ": FITS, " << xisfconv_file_size(f) << " bytes, " << images << " image HDU(s)\n";
+    stdOut() << path << ": FITS, " << xisfconv_file_size(f) << " bytes, " << images << " image HDU(s)\n";
     for (size_t i = 0; i < images; ++i) {
         const xisfconv_image_info img = infoOf(lib, f, i);
         const std::string name = xisfconv_image_name(f, i);
         const std::string tiles = xisfconv_image_detail(f, i, "tileCompression");
-        std::cout << "\nHDU " << img.source_index;
-        if (!name.empty()) std::cout << " \"" << name << "\"";
-        std::cout << ": " << img.width << " x " << img.height << " x " << img.channels << ", BITPIX " << img.bitpix;
-        if (!tiles.empty()) std::cout << ", tile-compressed (" << tiles << ")";
-        if (img.bscale != 1 || img.bzero != 0) std::cout << ", BZERO " << img.bzero << ", BSCALE " << img.bscale;
-        std::cout << ", rows " << rowsText(img, "bottom-up (FITS default, no ROWORDER)") << "\n";
+        stdOut() << "\nHDU " << img.source_index;
+        if (!name.empty()) stdOut() << " \"" << name << "\"";
+        stdOut() << ": " << img.width << " x " << img.height << " x " << img.channels << ", BITPIX " << img.bitpix;
+        if (!tiles.empty()) stdOut() << ", tile-compressed (" << tiles << ")";
+        if (img.bscale != 1 || img.bzero != 0) stdOut() << ", BZERO " << img.bzero << ", BSCALE " << img.bscale;
+        stdOut() << ", rows " << rowsText(img, "bottom-up (FITS default, no ROWORDER)") << "\n";
         printKeywords(cardsOf(lib, f, i));
         printCarriedProperties(lib, f, i);
     }
     printCarriedProperties(lib, f, XISFCONV_FILE_PROPERTIES);
-    for (size_t s = 0; s < xisfconv_skipped_count(f); ++s) std::cout << "\nSkipped " << xisfconv_skipped_text(f, s) << "\n";
+    for (size_t s = 0; s < xisfconv_skipped_count(f); ++s) stdOut() << "\nSkipped " << xisfconv_skipped_text(f, s) << "\n";
 }
 
 void printAsdfInfo(const Library& lib, const std::string& path, xisfconv_file* f) {
     const size_t images = xisfconv_image_count(f);
-    std::cout << path << ": " << xisfconv_file_detail(f, "format") << ", " << xisfconv_file_size(f) << " bytes, " << images
+    stdOut() << path << ": " << xisfconv_file_detail(f, "format") << ", " << xisfconv_file_size(f) << " bytes, " << images
               << " image(s)\n";
     for (size_t i = 0; i < images; ++i) {
         const xisfconv_image_info img = infoOf(lib, f, i);
         const std::string name = xisfconv_image_name(f, i);
-        std::cout << "\nImage " << img.source_index << " at " << xisfconv_image_detail(f, i, "source");
-        if (!img.plain_array && !name.empty()) std::cout << " \"" << name << "\"";
-        std::cout << ": " << img.width << " x " << img.height << " x " << img.channels << ", "
+        stdOut() << "\nImage " << img.source_index << " at " << xisfconv_image_detail(f, i, "source");
+        if (!img.plain_array && !name.empty()) stdOut() << " \"" << name << "\"";
+        stdOut() << ": " << img.width << " x " << img.height << " x " << img.channels << ", "
                   << xisfconv_image_detail(f, i, "storage") << "\n";
-        std::cout << "  rows:        "
+        stdOut() << "  rows:        "
                   << rowsText(img, img.plain_array ? "assumed bottom-up (plain array)" : "bottom-up (FITS default, no ROWORDER)")
                   << "\n";
         if (!img.plain_array) printKeywords(cardsOf(lib, f, i));
         printCarriedProperties(lib, f, i);
     }
     printCarriedProperties(lib, f, XISFCONV_FILE_PROPERTIES);
-    for (size_t s = 0; s < xisfconv_skipped_count(f); ++s) std::cout << "\nSkipped " << xisfconv_skipped_text(f, s) << "\n";
+    for (size_t s = 0; s < xisfconv_skipped_count(f); ++s) stdOut() << "\nSkipped " << xisfconv_skipped_text(f, s) << "\n";
 }
 
 // DNG: the raw image, and what the other images of the file are.
 void printDngInfo(const Library& lib, const std::string& path, xisfconv_file* f) {
-    std::cout << path << ": " << xisfconv_file_detail(f, "format") << ", " << xisfconv_file_size(f) << " bytes\n";
+    stdOut() << path << ": " << xisfconv_file_detail(f, "format") << ", " << xisfconv_file_size(f) << " bytes\n";
     const xisfconv_image_info img = infoOf(lib, f, 0);
-    std::cout << "\nRaw image at " << xisfconv_image_detail(f, 0, "source") << ": " << img.width << " x " << img.height << " x "
+    stdOut() << "\nRaw image at " << xisfconv_image_detail(f, 0, "source") << ": " << img.width << " x " << img.height << " x "
               << img.channels << ", " << xisfconv_image_detail(f, 0, "storage") << "\n";
-    std::cout << "  rows:        top-down\n";
+    stdOut() << "  rows:        top-down\n";
     if (img.has_cfa) {
-        std::cout << "  CFA:         " << xisfconv_image_detail(f, 0, "cfaPattern") << " (" << img.cfa_width << "x" << img.cfa_height
+        stdOut() << "  CFA:         " << xisfconv_image_detail(f, 0, "cfaPattern") << " (" << img.cfa_width << "x" << img.cfa_height
                   << ")\n";
     }
     printKeywords(cardsOf(lib, f, 0));
-    for (size_t s = 0; s < xisfconv_skipped_count(f); ++s) std::cout << "\nSkipped " << xisfconv_skipped_text(f, s) << "\n";
+    for (size_t s = 0; s < xisfconv_skipped_count(f); ++s) stdOut() << "\nSkipped " << xisfconv_skipped_text(f, s) << "\n";
 }
 
 // ---------------------------------------------------------------- converting
@@ -822,7 +848,7 @@ void rewriteXisfInput(const Library& lib, const std::string& input, const Option
     }
     if (opt.quiet) return;
     if (opt.inPlace && !done.changed) {
-        std::cout << input << ": already stored as requested; left unchanged\n";
+        stdOut() << input << ": already stored as requested; left unchanged\n";
         return;
     }
     std::string what;
@@ -840,7 +866,7 @@ void rewriteXisfInput(const Library& lib, const std::string& input, const Option
     char percent[32];
     std::snprintf(percent, sizeof percent, "%.1f%%",
                   done.input_size ? 100.0 * static_cast<double>(done.output_size) / static_cast<double>(done.input_size) : 100.0);
-    std::cout << shown(input) << " -> " << output << ": " << megabytes(done.input_size) << " -> " << megabytes(done.output_size)
+    stdOut() << shown(input) << " -> " << output << ": " << megabytes(done.input_size) << " -> " << megabytes(done.output_size)
               << " (" << percent << "); " << what << (done.read_back ? "; read back and compared with the input" : "") << "\n";
 }
 
@@ -850,7 +876,7 @@ void convertTo(const Library& lib, const std::string& input, const std::string& 
     const xisfconv_io in = inputIo(input), out = outputIo(outPath);
     lib.check(xisfconv_convert_io(lib.ctx, &in, &out, &c));
     if (isStdio(outPath)) flushStdout();   // (and nothing else goes there)
-    else if (!opt.quiet) std::cout << shown(input) << " -> " << outPath << "\n";
+    else if (!opt.quiet) stdOut() << shown(input) << " -> " << outPath << "\n";
 }
 
 void convertXisfInput(const Library& lib, const std::string& input, const Options& opt) {
@@ -870,8 +896,8 @@ void convertXisfInput(const Library& lib, const std::string& input, const Option
             const char* header = "";
             size_t size = 0;
             lib.check(xisfconv_header_text(file.file, &header, &size));
-            std::cout.write(header, static_cast<std::streamsize>(size));   // all of it, whatever bytes it holds
-            std::cout << "\n";
+            stdOut().write(header, static_cast<std::streamsize>(size));   // all of it, whatever bytes it holds
+            stdOut() << "\n";
         } else if (opt.info) {
             printXisfInfo(lib, shown(input), file.file);
         } else {
@@ -893,9 +919,9 @@ void convertFitsOrAsdfInput(const Library& lib, const std::string& input, xisfco
         const char* tree = "";
         size_t size = 0;
         lib.check(xisfconv_header_text(file.file, &tree, &size));
-        std::cout.flush();
+        stdOut().flush();
         binaryMode(stdout);
-        std::cout.write(tree, static_cast<std::streamsize>(size));
+        stdOut().write(tree, static_cast<std::streamsize>(size));
         return;
     }
     if (asdfInput && opt.treeJson) {
@@ -903,7 +929,7 @@ void convertFitsOrAsdfInput(const Library& lib, const std::string& input, xisfco
         lib.check(xisfconv_asdf_tree_json(lib.ctx, input.c_str(), nullptr, 0, &size));
         std::string json(size, '\0');
         lib.check(xisfconv_asdf_tree_json(lib.ctx, input.c_str(), &json[0], json.size(), &size));
-        std::cout << json << "\n";
+        stdOut() << json << "\n";
         return;
     }
     if (opt.treeJson) throw Error("--asdf-tree-json needs an ASDF file");
@@ -914,10 +940,10 @@ void convertFitsOrAsdfInput(const Library& lib, const std::string& input, xisfco
         lib.check(xisfconv_asdf_tree_text(lib.ctx, input.c_str(), &tree[0], tree.size(), &size));
 #ifdef _WIN32
         // The tree is printed byte for byte; text mode would turn its CR LF into CR CR LF.
-        std::cout.flush();
+        stdOut().flush();
         _setmode(_fileno(stdout), _O_BINARY);
 #endif
-        std::cout << tree;
+        stdOut() << tree;
         return;
     }
     if (opt.info || opt.dumpHeader) {
@@ -951,7 +977,7 @@ bool parseArgs(int argc, char** argv, Options& opt, int& exitCode) {
         // "/?" asks a Windows program what it does. (As a pattern it would be every name of one
         // letter in the root of the drive.)
         if (!endOfOptions && a == "/?") {
-            usage(std::cout);
+            usage(stdOut());
             exitCode = 0;
             return false;
         }
@@ -961,9 +987,9 @@ bool parseArgs(int argc, char** argv, Options& opt, int& exitCode) {
             continue;
         }
         if (a == "--") endOfOptions = true;
-        else if (a == "-h" || a == "--help") { usage(std::cout); exitCode = 0; return false; }
+        else if (a == "-h" || a == "--help") { usage(stdOut()); exitCode = 0; return false; }
         else if (a == "-V" || a == "--version") {
-            std::cout << "xisfconv " << kVersion << "\ncodecs: zlib lz4 lz4hc" << (zstdAvailable() ? " zstd" : "")
+            stdOut() << "xisfconv " << kVersion << "\ncodecs: zlib lz4 lz4hc" << (zstdAvailable() ? " zstd" : "")
                       << " (+byte shuffling)\n";
             exitCode = 0;
             return false;
@@ -1043,11 +1069,37 @@ bool parseArgs(int argc, char** argv, Options& opt, int& exitCode) {
                 throw Error("--bounds expects lo:hi with hi > lo, e.g. 0:65535");
             }
             opt.bounds = std::make_pair(lo, hi);
-        } else if (a == "--xisf-subblock-size") {  // undocumented: for testing subblock output
+        } else if (a == "--xisf-subblock-size") {  // undocumented: for testing subblock output (in bytes)
             uint64_t n;
             const std::string v = need(i, a);
             if (!parseUInt64(v, n) || n == 0) throw Error("invalid subblock size");
             opt.subblockSize = n;
+        } else if (a == "--subblocks") {
+            const std::string v = need(i, a);
+            uint64_t n = 0, unit = 1;
+            std::string digits = v;
+            if (!digits.empty()) {
+                const char last = static_cast<char>(std::toupper(static_cast<unsigned char>(digits.back())));
+                if (last == 'K' || last == 'M' || last == 'G') {
+                    unit = last == 'K' ? 1u << 10 : last == 'M' ? 1u << 20 : 1u << 30;
+                    digits.pop_back();
+                }
+            }
+            if (!parseUInt64(digits, n) || n == 0 || n > (uint64_t(4) << 30) / unit || n * unit < 4096) {
+                throw Error("--subblocks expects a size from 4K to 4G: a number of bytes, or with K, M or G (16M)");
+            }
+            opt.subblockSize = n * unit;
+            opt.subblocksGiven = true;
+        } else if (a == "--threads") {
+            uint64_t n;
+            const std::string v = need(i, a);
+            if (!parseUInt64(v, n) || n == 0 || n > 256) throw Error("--threads expects a number from 1 to 256");
+            opt.threads = static_cast<unsigned>(n);
+        } else if (a == "-j" || a == "--jobs") {
+            uint64_t n;
+            const std::string v = need(i, a);
+            if (!parseUInt64(v, n) || n == 0 || n > 64) throw Error("--jobs expects a number of files from 1 to 64");
+            opt.jobs = static_cast<unsigned>(n);
         }
         else if (a == "--debayer") opt.debayer = true;
         else if (a == "--bin") {
@@ -1098,7 +1150,7 @@ bool parseArgs(int argc, char** argv, Options& opt, int& exitCode) {
         else throw Error("unknown option '" + a + "' (see --help)");
     }
     if (opt.inputs.empty()) {
-        usage(std::cerr);
+        usage(stdErr());
         exitCode = 2;
         return false;
     }
@@ -1489,7 +1541,7 @@ void planDirectory(const std::string& directory, const Options& opt, Plan& plan)
     findImageFiles(toPath(directory), search, found, plan.errors);
     std::sort(found.begin(), found.end());
     if (found.empty()) {
-        if (!opt.quiet) std::cerr << "warning: " << directory << ": no XISF, FITS, ASDF or DNG files found\n";
+        if (!opt.quiet) stdErr() << "warning: " << directory << ": no XISF, FITS, ASDF or DNG files found\n";
         return;
     }
     size_t xisf = 0;
@@ -1523,7 +1575,7 @@ void planDirectory(const std::string& directory, const Options& opt, Plan& plan)
     for (const auto& entry : passed) {
         plan.passedOver += entry.second;
         if (!opt.quiet) {
-            std::cerr << "info: " << directory << ": " << countOfKind(entry.second, entry.first) << " passed over ("
+            stdErr() << "info: " << directory << ": " << countOfKind(entry.second, entry.first) << " passed over ("
                       << (opt.inPlace ? "--in-place rewrites XISF files" : "that is what is written") << ")\n";
         }
     }
@@ -1581,7 +1633,7 @@ Plan planInputs(const std::vector<Name>& names, const Options& opt) {
         plan.many = true;
         // A pattern that also matches the directory of the outputs ("*" with "-d out") does not mean it.
         if (name.matched && !opt.outdir.empty() && fs::equivalent(toPath(name.path), toPath(opt.outdir), ec)) {
-            if (!opt.quiet) std::cerr << "info: " << name.path << ": the directory of the outputs (-d) is not searched\n";
+            if (!opt.quiet) stdErr() << "info: " << name.path << ": the directory of the outputs (-d) is not searched\n";
             continue;
         }
         planDirectory(name.path, opt, plan);
@@ -1623,7 +1675,7 @@ int verifyFiles(const Library& lib, const Options& opt, const std::vector<Name>&
         std::vector<std::string> found;
         findImageFiles(toPath(input), Search(), found, errors);
         std::sort(found.begin(), found.end());
-        if (found.empty() && !opt.quiet) std::cerr << "warning: " << input << ": no XISF, FITS, ASDF or DNG files found\n";
+        if (found.empty() && !opt.quiet) stdErr() << "warning: " << input << ": no XISF, FITS, ASDF or DNG files found\n";
         files.insert(files.end(), found.begin(), found.end());
     }
 
@@ -1636,7 +1688,7 @@ int verifyFiles(const Library& lib, const Options& opt, const std::vector<Name>&
         const xisfconv_status status = xisfconv_verify_io(lib.ctx, &in, &report);
         if (g_interrupted) {
             xisfconv_report_free(report);
-            std::cerr << "xisfconv: interrupted\n";
+            stdErr() << "xisfconv: interrupted\n";
             return 130;
         }
         if (status != XISFCONV_OK) {
@@ -1646,14 +1698,14 @@ int verifyFiles(const Library& lib, const Options& opt, const std::vector<Name>&
         }
         if (!problems.empty()) {
             ++failed;
-            std::cout << shown(f) << ": FAILED\n";
+            stdOut() << shown(f) << ": FAILED\n";
             for (std::string p : problems) {
                 // Hints meant for conversions do not apply here.
                 for (const char* hint : {" (use --no-verify to convert anyway)", " (the file is damaged; --no-verify skips this check)"}) {
                     const size_t at = p.find(hint);
                     if (at != std::string::npos) p.erase(at, std::strlen(hint));
                 }
-                std::cout << "  " << p << "\n";
+                stdOut() << "  " << p << "\n";
             }
             xisfconv_report_free(report);
             continue;
@@ -1667,22 +1719,22 @@ int verifyFiles(const Library& lib, const Options& opt, const std::vector<Name>&
         const bool complete = notChecked == 0;
         ++(complete ? ok : partly);
         if (!(opt.quiet && complete)) {
-            std::cout << shown(f) << ": " << (complete ? "OK" : "NOT FULLY CHECKED") << " (" << kind << ", " << xisfconv_report_summary(report)
+            stdOut() << shown(f) << ": " << (complete ? "OK" : "NOT FULLY CHECKED") << " (" << kind << ", " << xisfconv_report_summary(report)
                       << "; ";
-            if (verified) std::cout << plural(verified, "checksum") << " verified";
-            else std::cout << "no checksums " << (complete ? "in the file" : "verified");
-            if (verified && unchecked) std::cout << ", " << unchecked << " without checksum";
-            std::cout << ")\n";
-            for (size_t i = 0; i < notChecked; ++i) std::cout << "  not checked: " << xisfconv_report_not_checked(report, i) << "\n";
+            if (verified) stdOut() << plural(verified, "checksum") << " verified";
+            else stdOut() << "no checksums " << (complete ? "in the file" : "verified");
+            if (verified && unchecked) stdOut() << ", " << unchecked << " without checksum";
+            stdOut() << ")\n";
+            for (size_t i = 0; i < notChecked; ++i) stdOut() << "  not checked: " << xisfconv_report_not_checked(report, i) << "\n";
         }
         xisfconv_report_free(report);
     }
-    for (const auto& e : errors) std::cout << e << ": FAILED (cannot be read)\n";
+    for (const auto& e : errors) stdOut() << e << ": FAILED (cannot be read)\n";
     failed += errors.size() + unmatched;
     if ((files.size() + errors.size() + unmatched > 1) && !opt.quiet) {
-        std::cout << "\n" << plural(ok, "file") << " OK, ";
-        if (partly) std::cout << partly << " not fully checked, ";
-        std::cout << failed << " failed\n";
+        stdOut() << "\n" << plural(ok, "file") << " OK, ";
+        if (partly) stdOut() << partly << " not fully checked, ";
+        stdOut() << failed << " failed\n";
     }
     return failed ? 1 : 0;
 }
@@ -1696,19 +1748,182 @@ void removeEmpty(const std::vector<fs::path>& made) {
     }
 }
 
+// ---------------------------------------------------------------- --jobs
+
+// What a file converted beside others writes to the standard output and error, in its order:
+// kept, and written out in its turn (replay).
+class Captured {
+public:
+    Captured() : outBuf_(this, 0), errBuf_(this, 1), out(&outBuf_), err(&errBuf_) {}
+    Captured(const Captured&) = delete;
+    Captured& operator=(const Captured&) = delete;
+    void replay() {
+        for (const auto& part : parts_) {
+            std::ostream& to = part.first ? std::cerr : std::cout;
+            to << part.second;
+            to.flush();
+        }
+        parts_.clear();
+    }
+
+private:
+    struct Buffer : std::streambuf {
+        Captured* owner;
+        int which;
+        Buffer(Captured* o, int w) : owner(o), which(w) {}
+        int overflow(int c) override {
+            if (c != EOF) {
+                const char ch = static_cast<char>(c);
+                owner->add(which, &ch, 1);
+            }
+            return c == EOF ? 0 : c;
+        }
+        std::streamsize xsputn(const char* s, std::streamsize n) override {
+            owner->add(which, s, static_cast<size_t>(n));
+            return n;
+        }
+    };
+    void add(int which, const char* s, size_t n) {
+        if (parts_.empty() || parts_.back().first != which) parts_.push_back({which, std::string()});
+        parts_.back().second.append(s, n);
+    }
+    std::vector<std::pair<int, std::string>> parts_;
+    Buffer outBuf_, errBuf_;
+
+public:
+    std::ostream out, err;
+};
+
+// What came of a conversion that ran as a job.
+struct JobResult {
+    enum Outcome { Done, Failed, Interrupted };
+    Outcome outcome = Failed;
+    bool finished() {
+        std::lock_guard<std::mutex> guard(lock);
+        return over;
+    }
+    void wait() {
+        std::unique_lock<std::mutex> guard(lock);
+        ended.wait(guard, [&] { return over; });
+    }
+    void end(Outcome o) {
+        {
+            std::lock_guard<std::mutex> guard(lock);
+            outcome = o;
+            over = true;
+        }
+        ended.notify_all();
+    }
+    std::mutex lock;
+    std::condition_variable ended;
+    bool over = false;
+};
+
+// The threads of --jobs: each converts one file after another, with a context of its own (set
+// as the run's is), saying what it says into the file's Captured.
+class Jobs {
+public:
+    using Work = std::function<void(const Library&)>;
+    Jobs(size_t threads, const Options& opt) : opt_(opt) {
+        try {
+            for (size_t k = 0; k < threads; ++k) threads_.emplace_back([this, k] { run(k + 1); });
+        } catch (...) {
+            if (threads_.empty()) throw;   // (no thread at all: the run cannot go on this way)
+            // fewer threads, then: those that are there do the jobs
+        }
+    }
+    ~Jobs() { finish(); }
+    Jobs(const Jobs&) = delete;
+    Jobs& operator=(const Jobs&) = delete;
+
+    std::shared_ptr<JobResult> add(Captured* log, const std::string& input, Work work) {
+        auto result = std::make_shared<JobResult>();
+        {
+            std::lock_guard<std::mutex> guard(lock_);
+            queue_.push_back({log, input, std::move(work), result});
+        }
+        wake_.notify_one();
+        return result;
+    }
+    // (the jobs that are queued are done first)
+    void finish() {
+        {
+            std::lock_guard<std::mutex> guard(lock_);
+            closing_ = true;
+        }
+        wake_.notify_all();
+        for (auto& t : threads_)
+            if (t.joinable()) t.join();
+    }
+
+private:
+    struct Job {
+        Captured* log;
+        std::string input;
+        Work work;
+        std::shared_ptr<JobResult> result;
+    };
+    void run(size_t slot) {
+        std::unique_ptr<Library> lib;
+        try {
+            lib.reset(new Library);
+            lib->quiet = opt_.quiet;
+            xisfconv_context_set_external_files(lib->ctx, opt_.externalFiles);
+            xisfconv_context_set_threads(lib->ctx, opt_.threads);
+            g_contexts[slot].store(lib->ctx);
+            if (g_interrupted) xisfconv_context_cancel(lib->ctx);
+        } catch (...) {
+            lib.reset();   // (the jobs of this thread fail, saying so)
+        }
+        for (;;) {
+            Job job;
+            {
+                std::unique_lock<std::mutex> guard(lock_);
+                wake_.wait(guard, [&] { return closing_ || !queue_.empty(); });
+                if (queue_.empty()) break;
+                job = std::move(queue_.front());
+                queue_.pop_front();
+            }
+            t_out = &job.log->out;
+            t_err = &job.log->err;
+            JobResult::Outcome outcome = JobResult::Failed;
+            try {
+                if (!lib) throw std::bad_alloc();
+                if (g_interrupted) throw Cancelled("cancelled");
+                job.work(*lib);
+                outcome = JobResult::Done;
+            } catch (const std::bad_alloc&) {
+                stdErr() << "error: " << shown(job.input) << ": out of memory\n";
+            } catch (const std::exception& e) {
+                if (g_interrupted && dynamic_cast<const Cancelled*>(&e)) outcome = JobResult::Interrupted;
+                else stdErr() << "error: " << shown(job.input) << ": " << e.what() << "\n";
+            }
+            t_out = t_err = nullptr;
+            job.result->end(outcome);
+        }
+        if (lib) g_contexts[slot].store(nullptr);
+    }
+    const Options& opt_;
+    std::mutex lock_;
+    std::condition_variable wake_;
+    std::deque<Job> queue_;
+    bool closing_ = false;
+    std::vector<std::thread> threads_;
+};
+
 int convertFiles(const Library& lib, Options& opt) {
     // What the arguments stand for: patterns first, then the files of the directories.
     std::vector<std::string> unmatched, unreadable;
     bool expanded = false;
     const std::vector<Name> names = expandPatterns(opt.inputs, unmatched, unreadable, expanded);
     opt.inputs.clear();
-    for (const auto& e : unreadable) std::cerr << "error: " << e << "\n";
-    for (const auto& pattern : unmatched) std::cerr << "error: " << pattern << ": no file matches this pattern\n";
+    for (const auto& e : unreadable) stdErr() << "error: " << e << "\n";
+    for (const auto& pattern : unmatched) stdErr() << "error: " << pattern << ": no file matches this pattern\n";
     if (names.size() == 1 && isStdio(names[0].path)) {
         try {
             readStdin();
         } catch (const Error& e) {
-            std::cerr << "error: " << e.what() << "\n";
+            stdErr() << "error: " << e.what() << "\n";
             return 1;
         }
     }
@@ -1717,10 +1932,10 @@ int convertFiles(const Library& lib, Options& opt) {
     try {
         plan = planInputs(names, opt);
     } catch (const Error& e) {   // (nothing has been read or written yet)
-        std::cerr << "xisfconv: " << e.what() << "\n";
+        stdErr() << "xisfconv: " << e.what() << "\n";
         return 2;
     }
-    for (const auto& e : plan.errors) std::cerr << "error: " << e << "\n";
+    for (const auto& e : plan.errors) stdErr() << "error: " << e << "\n";
     size_t failures = unmatched.size() + unreadable.size() + plan.errors.size(), done = 0, passedOver = plan.passedOver, inTheWay = 0;
 
     // A run that writes files under names of their own does not write a file twice, and not over
@@ -1743,9 +1958,58 @@ int convertFiles(const Library& lib, Options& opt) {
             if (const auto id = isStdio(in.path) ? std::nullopt : fileId(in.path)) inputIds.insert(*id);
         }
     }
+    // With --jobs, files are converted by threads of their own, each with a context of its own:
+    // what a file says (its warnings, its errors) is kept, and written when it and the files
+    // before it are done, so that the run says what it says in the order of the files.
+    const bool jobs = opt.jobs > 1 && converts && !opt.inPlace && plan.inputs.size() > 1 && !isStdio(opt.output);
+    struct Entry {
+        Captured log;
+        std::shared_ptr<JobResult> result;   // a conversion that runs as a job
+        std::string input;
+        std::vector<fs::path> made;
+        bool failed = false;                 // ... or what the checks before it said
+    };
+    std::deque<std::unique_ptr<Entry>> pending;
+    // (after the entries: should this function be left by an exception, the jobs end before the
+    // entries they write into are gone)
+    Jobs pool(jobs ? std::min<size_t>(opt.jobs, plan.inputs.size()) : 0, opt);
+    std::string stopped;   // the first file of a job that the interrupt stopped
+    // The directories made for jobs that failed: taken away when all jobs are done, since a job
+    // after it may write into them.
+    std::vector<std::vector<fs::path>> unused;
+    // The entries that are done, in their order: what they said, and what came of them.
+    auto settle = [&](bool all) {
+        while (!pending.empty()) {
+            Entry& e = *pending.front();
+            if (e.result && !e.result->finished()) {
+                if (!all) break;
+                e.result->wait();
+            }
+            e.log.replay();
+            if (e.failed) ++failures;
+            if (e.result) {
+                if (e.result->outcome == JobResult::Done) ++done;
+                else {
+                    unused.push_back(e.made);
+                    if (e.result->outcome == JobResult::Interrupted) {
+                        if (stopped.empty()) stopped = shown(e.input);
+                    }
+                    else ++failures;
+                }
+            }
+            pending.pop_front();
+        }
+    };
     for (const auto& in : plan.inputs) {
         const std::string& input = in.path;
         std::vector<fs::path> made;   // directories made for this output
+        std::unique_ptr<Entry> entry;
+        if (jobs) {
+            entry.reset(new Entry);
+            entry->input = input;
+            t_out = &entry->log.out;
+            t_err = &entry->log.err;
+        }
         try {
             Options own = opt;
             if (!in.below.empty() && !opt.outdir.empty()) own.outdir = fromPath(toPath(opt.outdir) / toPath(in.below));
@@ -1774,8 +2038,11 @@ int convertFiles(const Library& lib, Options& opt) {
                 std::error_code ec;
                 const bool there = !nameItself && !toStdout && fs::exists(fs::symlink_status(toPath(planned), ec));
                 if (opt.skipExisting && there) {
-                    if (!opt.quiet) std::cout << input << ": " << planned << " exists; passed over\n";
+                    if (!opt.quiet) stdOut() << input << ": " << planned << " exists; passed over\n";
                     ++passedOver;
+                    if (entry) pending.push_back(std::move(entry));
+                    t_out = t_err = nullptr;
+                    settle(false);
                     continue;
                 }
                 if (!itself && (inputKeys.count(key) || (id && inputIds.count(*id)))) {
@@ -1795,6 +2062,25 @@ int convertFiles(const Library& lib, Options& opt) {
                     if (ec) throw Error("the directory " + own.outdir + " could not be made (" + ec.message() + ")");
                 }
             }
+            if (entry) {
+                // A job: the output counts as written from now on (a second input with the same
+                // output is refused also where this one fails).
+                if (converts && in.image) {
+                    written[key] = input;
+                    if (const auto id = fileId(planned)) writtenIds[*id] = key;
+                }
+                entry->made = made;
+                const xisfconv_format format = in.format;
+                entry->result = pool.add(&entry->log, input, [input, own, format](const Library& jobLib) {
+                    if (format == XISFCONV_FORMAT_XISF) convertXisfInput(jobLib, input, own);
+                    else convertFitsOrAsdfInput(jobLib, input, format, own);
+                });
+                pending.push_back(std::move(entry));
+                t_out = t_err = nullptr;
+                settle(false);
+                if (g_interrupted) break;
+                continue;
+            }
             if (in.format == XISFCONV_FORMAT_XISF) convertXisfInput(lib, input, own);
             else convertFitsOrAsdfInput(lib, input, in.format, own);
             if (converts && in.image) {
@@ -1803,23 +2089,36 @@ int convertFiles(const Library& lib, Options& opt) {
             }
             ++done;
         } catch (const std::bad_alloc&) {
-            std::cerr << "error: " << shown(input) << ": out of memory\n";
-            ++failures;
+            stdErr() << "error: " << shown(input) << ": out of memory\n";
             removeEmpty(made);
+            if (entry) entry->failed = true;
+            else ++failures;
         } catch (const std::exception& e) {
             removeEmpty(made);
             // (a file that failed for another reason before the interrupt came says so)
-            if (g_interrupted && dynamic_cast<const Cancelled*>(&e)) return interrupted(shown(input));
-            std::cerr << "error: " << shown(input) << ": " << e.what() << "\n";
-            ++failures;
+            if (!entry && g_interrupted && dynamic_cast<const Cancelled*>(&e)) return interrupted(shown(input));
+            stdErr() << "error: " << shown(input) << ": " << e.what() << "\n";
+            if (entry) entry->failed = true;
+            else ++failures;
         }
-        if (g_interrupted) return interrupted(std::string());
+        if (entry) {
+            pending.push_back(std::move(entry));
+            t_out = t_err = nullptr;
+            settle(false);
+        }
+        if (g_interrupted) break;
     }
+    if (jobs) {
+        settle(true);
+        pool.finish();
+        for (auto it = unused.rbegin(); it != unused.rend(); ++it) removeEmpty(*it);
+    }
+    if (g_interrupted) return interrupted(stopped);
     if ((plan.many || expanded) && !opt.quiet && !(opt.info || opt.dumpHeader || opt.treeJson) && !isStdio(opt.output)) {
-        std::cout << "\n" << done << (done == 1 ? " file " : " files ") << (opt.inPlace ? "done" : "converted") << ", " << passedOver
+        stdOut() << "\n" << done << (done == 1 ? " file " : " files ") << (opt.inPlace ? "done" : "converted") << ", " << passedOver
                   << " passed over, " << failures << " failed\n";
         if (inTheWay) {
-            std::cout << "(" << inTheWay << (inTheWay == 1 ? " output was" : " outputs were") << " there already and not written over: "
+            stdOut() << "(" << inTheWay << (inTheWay == 1 ? " output was" : " outputs were") << " there already and not written over: "
                       << "--skip-existing passes such inputs over, --force replaces the outputs)\n";
         }
     }
@@ -1832,23 +2131,24 @@ int run(int argc, char** argv) {
         int exitCode = 0;
         if (!parseArgs(argc, argv, opt, exitCode)) return exitCode;
     } catch (const std::exception& e) {
-        std::cerr << "xisfconv: " << e.what() << "\n";
+        stdErr() << "xisfconv: " << e.what() << "\n";
         return 2;
     }
     try {
         Library lib;
         lib.quiet = opt.quiet;
         xisfconv_context_set_external_files(lib.ctx, opt.externalFiles);
+        xisfconv_context_set_threads(lib.ctx, opt.threads);
         catchInterrupts(lib.ctx);
         struct Release {
-            ~Release() { g_context.store(nullptr); }   // (before the context is freed)
+            ~Release() { g_contexts[0].store(nullptr); }   // (before the context is freed)
         } release;
         return convertFiles(lib, opt);
     } catch (const std::bad_alloc&) {
-        std::cerr << "xisfconv: out of memory\n";
+        stdErr() << "xisfconv: out of memory\n";
         return 1;
     } catch (const std::exception& e) {   // (a name the system has and this program cannot write down, where none is expected)
-        std::cerr << "xisfconv: " << e.what() << "\n";
+        stdErr() << "xisfconv: " << e.what() << "\n";
         return 1;
     }
 }
@@ -1880,8 +2180,8 @@ int wmain(int argc, wchar_t** wargv) {
     const UINT codePage = GetConsoleOutputCP();
     SetConsoleOutputCP(CP_UTF8);
     const int status = run(argc, argv.data());
-    std::cout.flush();
-    std::cerr.flush();
+    stdOut().flush();
+    stdErr().flush();
     if (codePage) SetConsoleOutputCP(codePage);
     return status;
 }

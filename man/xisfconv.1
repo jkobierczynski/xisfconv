@@ -2,7 +2,7 @@
 .\" Copyright (C) 2026 Jurgen Kobierczynski
 .\" The manual page of the command line tool. Its options are those of "xisfconv --help", and its
 .\" version that of include/xisfconv.h: tests/run_tests.py holds both against the program.
-.TH XISFCONV 1 "2026-10-12" "xisfconv 0.25.0" "User Commands"
+.TH XISFCONV 1 "2026-10-21" "xisfconv 0.26.0" "User Commands"
 .SH NAME
 xisfconv \- convert between PixInsight XISF, FITS and ASDF images; read DNG; export TIFF and PNG
 .SH SYNOPSIS
@@ -354,6 +354,18 @@ XISF output: store the compressed blocks without byte shuffling (implies
 .BR \-\-compress ).
 Shuffling almost always makes them smaller.
 .TP
+.BI \-\-subblocks " size"
+XISF output: write compressed blocks in subblocks of at most
+.I size
+bytes (a number, or with
+.BR K ,
+.B M
+or
+.BR G :
+.BR 16M ;
+from 4K to 4G, default 1G). Subblocks are compressed and decompressed on all cores at once; the
+size of the file changes little. PixInsight reads them.
+.TP
 .BI \-\-checksum " algorithm"
 XISF: store a checksum of the pixel data block; XISF to XISF: of every attached block.
 .I algorithm
@@ -371,6 +383,21 @@ or
 and
 .B sha512
 checksums only. ASDF blocks always carry an MD5 checksum.
+.SS Speed
+.TP
+.BI \-\-threads " n"
+The threads the work on a file is spread over: tiles, strips and subblocks compressed side by
+side, checksums computed beside decompression, samples converted a piece per core. The default is
+as many as the machine has cores;
+.B 1
+is one. What is written is the same with any number.
+.TP
+.BR \-j ", " \-\-jobs " \fIn\fP"
+Convert
+.I n
+files at once (default 1); the threads are shared among them. What each file says is written
+once it is done, in the order of the files. Two inputs with one output are refused also where the
+first one fails.
 .SS Inspection
 .TP
 .B \-\-verify

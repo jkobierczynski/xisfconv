@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 Jurgen Kobierczynski
 #include "common.hpp"
+#include "parallel.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -8,6 +9,7 @@
 #include <clocale>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <limits>
 #include <sstream>
@@ -73,7 +75,23 @@ void progress(const char* stage, uint64_t done, uint64_t total) {
     if (!(*handler)(stage, done, total)) throw Error("cancelled", ErrorKind::Cancelled);
 }
 
+namespace {
+thread_local const AbandonScope* t_abandon = nullptr;   // the innermost; each names the one around it
+}  // namespace
+
+AbandonScope::AbandonScope(const std::atomic<bool>* abandon) : flag_(abandon), previous_(t_abandon) { t_abandon = this; }
+AbandonScope::~AbandonScope() { t_abandon = previous_; }
+
+void progressAgain() {
+    const ProgressHandler* handler = t_progress;
+    if (!t_stage || !handler || !*handler) return;
+    if (!(*handler)(t_stage, t_done, t_total)) throw Error("cancelled", ErrorKind::Cancelled);
+}
+
 void progressTick(uint64_t bytes) {
+    for (const AbandonScope* scope = t_abandon; scope; scope = scope->previous_) {
+        if (scope->flag_ && scope->flag_->load(std::memory_order_relaxed)) throw Error("cancelled", ErrorKind::Cancelled);
+    }
     if (!t_stage) return;   // (a call that reports no steps has none to repeat: reading the pixels of an open file)
     t_since += bytes;
     if (t_since < kTickBytes) return;
@@ -161,8 +179,36 @@ bool hostIsLittleEndian() {
 
 void byteSwapInPlace(uint8_t* data, size_t count, size_t itemSize) {
     if (itemSize <= 1) return;
-    for (size_t i = 0; i < count; ++i) {
-        std::reverse(data + i * itemSize, data + (i + 1) * itemSize);
+    if (pieceCount(count, size_t(1) << 17) > 1) {
+        parallelPieces(count, size_t(1) << 17, [&](size_t begin, size_t end) {
+            byteSwapInPlace(data + begin * itemSize, end - begin, itemSize);
+        });
+        return;
+    }
+    switch (itemSize) {
+        case 2:
+            for (size_t i = 0; i < count; ++i, data += 2) std::swap(data[0], data[1]);
+            return;
+        case 4:
+            for (size_t i = 0; i < count; ++i, data += 4) {
+                uint32_t v;
+                std::memcpy(&v, data, 4);
+                v = (v >> 24) | ((v >> 8) & 0xFF00u) | ((v << 8) & 0xFF0000u) | (v << 24);
+                std::memcpy(data, &v, 4);
+            }
+            return;
+        case 8:
+            for (size_t i = 0; i < count; ++i, data += 8) {
+                uint64_t v;
+                std::memcpy(&v, data, 8);
+                v = ((v & 0x00000000FFFFFFFFull) << 32) | ((v & 0xFFFFFFFF00000000ull) >> 32);
+                v = ((v & 0x0000FFFF0000FFFFull) << 16) | ((v & 0xFFFF0000FFFF0000ull) >> 16);
+                v = ((v & 0x00FF00FF00FF00FFull) << 8) | ((v & 0xFF00FF00FF00FF00ull) >> 8);
+                std::memcpy(data, &v, 8);
+            }
+            return;
+        default:
+            for (size_t i = 0; i < count; ++i) std::reverse(data + i * itemSize, data + (i + 1) * itemSize);
     }
 }
 

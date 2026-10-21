@@ -28,6 +28,7 @@
 #include "dng.hpp"
 #include "fits.hpp"
 #include "fitsread.hpp"
+#include "parallel.hpp"
 #include "pipeline.hpp"
 #include "wcs.hpp"
 #include "xisf.hpp"
@@ -64,6 +65,7 @@ struct ContextState {
     xisfconv_host_progress_fn hostProgress = nullptr;  // xisfconv_context_set_host_progress
     void* hostProgressUser = nullptr;
     bool hostProgressFailed = false;
+    uint32_t threads = 0;             // xisfconv_context_set_threads: 0, the cores of the machine
 };
 
 // Counts a call in a context for as long as it runs.
@@ -228,6 +230,7 @@ xisfconv_status guarded(const StatePtr& state, const char* path, Body&& body) no
         const Running running(s);
         const VirtualFileFrame ownFiles;   // (the files in memory of a call this one is made from are not its own)
         const ExternalFilesScope followed(s->externalFiles);
+        const ThreadScope threads(s->threads);
         const ProgressScope reports([s](const char* stage, uint64_t done, uint64_t total) {
             if (s->cancel.exchange(false)) return false;
             if (!hostAllows(s, stage, done, total)) return false;
@@ -733,6 +736,19 @@ xisfconv_status xisfconv_context_set_external_files(xisfconv_context* ctx, xisfc
     }
     return XISFCONV_OK;
 }
+
+xisfconv_status xisfconv_context_set_threads(xisfconv_context* ctx, uint32_t threads) {
+    if (!ctx) return XISFCONV_ERR_ARGUMENT;
+    ctx->state->threads = threads;
+    return XISFCONV_OK;
+}
+
+uint32_t xisfconv_context_threads(const xisfconv_context* ctx) {
+    if (!ctx) return 0;
+    return ctx->state->threads;
+}
+
+uint32_t xisfconv_hardware_threads(void) { return hardwareThreads(); }
 
 xisfconv_external_files xisfconv_context_external_files(const xisfconv_context* ctx) {
     if (!ctx) return XISFCONV_EXTERNAL_HEADER_DIRECTORY;

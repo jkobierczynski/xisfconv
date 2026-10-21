@@ -71,6 +71,7 @@ add_library(xisfconv_core
   src/fits.cpp
   src/fitsread.cpp
   src/fitstile.cpp
+  src/parallel.cpp
   src/pipeline.cpp
   src/property.cpp
   src/tiff.cpp
@@ -90,6 +91,10 @@ if(NOT BUILD_SHARED_LIBS)
   target_compile_definitions(xisfconv_core PUBLIC XISFCONV_STATIC)
 endif()
 target_link_libraries(xisfconv_core PRIVATE ZLIB::ZLIB)
+# Work is spread over the cores of the machine (src/parallel.cpp).
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
+target_link_libraries(xisfconv_core PRIVATE Threads::Threads)
 # The code is compiled with hidden visibility: of its own functions, only those of xisfconv.h are
 # visible from outside. The version of the shared library changes with every 0.x release: there
 # is no ABI promise yet.
@@ -310,7 +315,7 @@ endif()
 if(APPLE)
   string(APPEND XISFCONV_PC_LIBS_PRIVATE " -lc++")
 elseif(NOT MSVC)
-  string(APPEND XISFCONV_PC_LIBS_PRIVATE " -lstdc++ -lm")
+  string(APPEND XISFCONV_PC_LIBS_PRIVATE " -lstdc++ -lm -pthread")
 endif()
 set(XISFCONV_PC_CFLAGS "")
 if(NOT BUILD_SHARED_LIBS)

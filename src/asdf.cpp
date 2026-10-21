@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 Jurgen Kobierczynski
 #include "asdf.hpp"
+#include "parallel.hpp"
 
 #include <algorithm>
+#include <exception>
 #include <cmath>
 #include <chrono>
 #include <filesystem>
@@ -1048,7 +1050,11 @@ private:
         // The checksum of a compressed block covers the stored bytes (the standard, and the
         // asdf library since 3.0) or the uncompressed data (asdf 2.x); both are accepted.
         const bool check = verify_ && b.hasChecksum;
-        const bool storedOk = check && matches(digestOf(*stored));
+        // The digest of the stored bytes is computed beside the decompression where the data is
+        // kept and threads can read the stored bytes together (what is decompressed is then looked
+        // at again only for a checksum of the uncompressed data); else before it.
+        const bool beside = check && keep && threadLimit() > 1 && stored->readableByThreads();
+        bool storedOk = check && !beside && matches(digestOf(*stored));
         // A header that declares more data than the stored bytes can expand to is damaged.
         uint64_t limit = std::numeric_limits<uint64_t>::max();
         if (b.compression == "zlib") limit = b.used * 1032 + 1024;
@@ -1080,17 +1086,39 @@ private:
             Out(Store* s, Hasher* h) : store(s), hasher(h) {}
         };
         Hasher decoded("md5");
-        Out out(data.get(), check && !storedOk ? &decoded : nullptr);
+        Out out(data.get(), check && !storedOk && !beside ? &decoded : nullptr);
         try {
-            if (b.compression == "lz4") lz4Chunks(*stored, b.dataSize, out);
-            else decompressBytes(b.compression, *stored, 0, b.used, b.dataSize, out);
+            const auto decompress = [&] {
+                if (b.compression == "lz4") lz4Chunks(*stored, b.dataSize, out);
+                else decompressBytes(b.compression, *stored, 0, b.used, b.dataSize, out);
+            };
+            if (beside) {
+                std::exception_ptr failed;
+                runBeside([&] {
+                    try {
+                        decompress();
+                    } catch (...) {
+                        failed = std::current_exception();
+                    }
+                }, [&] { storedOk = matches(digestOf(*stored)); });
+                if (failed) std::rethrow_exception(failed);
+            } else {
+                decompress();
+            }
         } catch (const Error& e) {
             // (what goes wrong with the file being read, or with a temporary file, is no damage of the data)
             if (e.kind == ErrorKind::Cancelled || e.kind == ErrorKind::Io) throw;
             if (check && !storedOk) checksumError(index);  // damaged data rarely decompresses
             throw Error(where + ": " + e.what(), e.kind);
         }
-        if (check && !storedOk && !matches(decoded.finish())) checksumError(index);
+        if (check && !storedOk) {
+            if (beside) {
+                // (a checksum of the uncompressed data, as asdf 2.x wrote it)
+                if (!matches(digestOf(*data))) checksumError(index);
+            } else if (!matches(decoded.finish())) {
+                checksumError(index);
+            }
+        }
         if (!keep) return nullptr;
         return sliceBytes(data, offset, count);
     }

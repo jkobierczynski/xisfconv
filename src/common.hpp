@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstddef>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -103,6 +104,23 @@ void progress(const char* stage, uint64_t done, uint64_t total);
 // step had begun once more), and may stop the work there as it may at any report. A call that has
 // reported nothing is not reported on.
 void progressTick(uint64_t bytes);
+// The last report of the call given to the handler again, as a sign of life does (for a thread
+// that waits for work of the call done elsewhere); nothing if the call reported nothing.
+void progressAgain();
+// Work done for a call on another thread (parallel.cpp) stops at its next sign of life once
+// `*abandon` is true, as if the handler had asked: progressTick throws Error (Cancelled) there.
+class AbandonScope {
+public:
+    explicit AbandonScope(const std::atomic<bool>* abandon);
+    ~AbandonScope();
+    AbandonScope(const AbandonScope&) = delete;
+    AbandonScope& operator=(const AbandonScope&) = delete;
+
+private:
+    const std::atomic<bool>* flag_;
+    const AbandonScope* previous_;
+    friend void progressTick(uint64_t bytes);
+};
 
 enum class SampleFormat { UInt8, UInt16, UInt32, UInt64, Float32, Float64 };
 

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 Jurgen Kobierczynski
 #include "imagesource.hpp"
+#include "parallel.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -109,6 +110,8 @@ public:
     UnshuffledBytes(std::shared_ptr<RandomBytes> shuffled, uint64_t itemSize)
         : in_(std::move(shuffled)), item_(itemSize), size_(in_->size()), items_(itemSize ? size_ / itemSize : 0) {}
     uint64_t size() const override { return size_; }
+    // (from memory it is read without a buffer of its own)
+    bool readableByThreads() const override { return in_->contiguous() && in_->readableByThreads(); }
     void read(uint64_t position, size_t n, uint8_t* out) override {
         if (position > size_ || n > size_ - position) throw Error("read beyond the end of the data (internal error)");
         if (item_ <= 1 || size_ < item_) {
@@ -126,6 +129,33 @@ public:
         // the items that [position, last) touches, and of each byte of them the run in its plane
         const uint64_t first = position / item_, beyond = (last + item_ - 1) / item_;
         const size_t count = static_cast<size_t>(beyond - first);
+        if (const uint8_t* planes = in_->contiguous()) {
+            // In memory: the items put together straight from the planes, a piece of them for each
+            // thread, a plane at a time. (Only the first and the last item may lie partly outside
+            // [position, last).)
+            const uint64_t item = item_, items = items_;
+            parallelPieces(count, size_t(1) << 16, [&](size_t from, size_t to) {
+                const uint64_t i0 = first + from, i1 = first + to;   // the items of this piece
+                // those wholly inside: [whole0, whole1)
+                const uint64_t whole0 = std::max<uint64_t>(i0, (position + item - 1) / item), whole1 = std::max(whole0, std::min<uint64_t>(i1, last / item));
+                for (uint64_t k = 0; k < item; ++k) {
+                    const uint8_t* plane = planes + k * items;
+                    uint8_t* o = out + (whole0 * item + k - position);
+                    for (uint64_t i = whole0; i < whole1; ++i, o += item) *o = plane[i];
+                }
+                for (uint64_t i = i0; i < i1; ++i) {
+                    if (i >= whole0 && i < whole1) {
+                        i = whole1 - 1;
+                        continue;
+                    }
+                    for (uint64_t k = 0; k < item; ++k) {
+                        const uint64_t at = i * item + k;
+                        if (at >= position && at < last) out[at - position] = planes[k * items + i];
+                    }
+                }
+            });
+            return;
+        }
         run_.resize(count);
         for (uint64_t k = 0; k < item_; ++k) {
             in_->read(k * items_ + first, count, run_.data());

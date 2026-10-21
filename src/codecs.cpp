@@ -9,6 +9,7 @@
 #include <climits>
 
 #include "common.hpp"
+#include "parallel.hpp"
 
 #ifdef XISFCONV_HAVE_ZSTD
 #include <zstd.h>
@@ -947,11 +948,13 @@ std::vector<uint8_t> shuffled(const uint8_t* data, size_t size, size_t itemSize)
         return out;
     }
     const size_t n = size / itemSize;
-    for (size_t b = 0; b < itemSize; ++b) {
-        uint8_t* d = out.data() + b * n;
-        const uint8_t* s = data + b;
-        for (size_t i = 0; i < n; ++i, s += itemSize) d[i] = *s;
-    }
+    parallelPieces(n, size_t(1) << 16, [&](size_t from, size_t to) {
+        for (size_t b = 0; b < itemSize; ++b) {
+            uint8_t* d = out.data() + b * n;
+            const uint8_t* s = data + b + from * itemSize;
+            for (size_t i = from; i < to; ++i, s += itemSize) d[i] = *s;
+        }
+    });
     const size_t tail = n * itemSize;
     std::copy(data + tail, data + size, out.begin() + static_cast<std::ptrdiff_t>(tail));
     return out;
@@ -961,11 +964,13 @@ void unshuffle(std::vector<uint8_t>& data, size_t itemSize) {
     if (itemSize <= 1 || data.size() < itemSize) return;
     const size_t n = data.size() / itemSize;
     std::vector<uint8_t> out(data.size());
-    for (size_t b = 0; b < itemSize; ++b) {
-        const uint8_t* s = data.data() + b * n;
-        uint8_t* d = out.data() + b;
-        for (size_t i = 0; i < n; ++i, d += itemSize) *d = s[i];
-    }
+    parallelPieces(n, size_t(1) << 16, [&](size_t from, size_t to) {
+        for (size_t b = 0; b < itemSize; ++b) {
+            const uint8_t* s = data.data() + b * n;
+            uint8_t* d = out.data() + b + from * itemSize;
+            for (size_t i = from; i < to; ++i, d += itemSize) *d = s[i];
+        }
+    });
     const size_t tail = n * itemSize;
     std::copy(data.begin() + static_cast<std::ptrdiff_t>(tail), data.end(),
               out.begin() + static_cast<std::ptrdiff_t>(tail));

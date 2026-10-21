@@ -26,6 +26,7 @@ import base64
 import hashlib
 import io
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -7551,6 +7552,104 @@ def test_tables():
           odd.encode() in open(os.path.join(d, "packed.xisf"), "rb").read(), "tables: a rewrite keeps them as they are")
 
 
+def test_threads():
+    """Work spread over threads (0.26): what is written, and what fails, is the same with one
+    thread and with several (--threads); several files at once (--jobs) say what they say in the
+    order of the files; compressed XISF blocks in small subblocks (--subblocks)."""
+    d = os.path.join(TMP, "threads")
+    os.makedirs(d)
+    Z = "zstd" if ZSTD_BUILD else "zlib"
+    stamp = re.compile(rb"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z?")
+
+    def content(path):
+        return stamp.sub(b"T", open(path, "rb").read())
+
+    write_xisf(os.path.join(d, "rgb.xisf"), [image_entry(test_image(np.uint16, 301, 257, 3, 1))])
+    write_xisf(os.path.join(d, "gray.xisf"), [image_entry(test_image(np.float32, 263, 389, 1, 2))])
+    # inputs of each kind, made with one thread
+    makes = [("zstd.xisf", "rgb.xisf", ["-t", "xisf", "--codec", Z, "--checksum", "sha1", "--subblocks", "16K"]),
+             ("zlib.xisf", "gray.xisf", ["-t", "xisf", "--codec", "zlib", "--checksum", "sha256", "--subblocks", "64K"]),
+             ("lz4.xisf", "rgb.xisf", ["-t", "xisf", "--codec", "lz4hc", "--subblocks", "32K"]),
+             ("whole.xisf", "gray.xisf", ["-t", "xisf", "--codec", Z, "--checksum", "sha512"]),
+             ("rice.fits.fz", "rgb.xisf", ["-t", "fits", "-c"]), ("gzip.fits.fz", "gray.xisf", ["-t", "fits", "-c"]),
+             ("z.asdf", "gray.xisf", ["-t", "asdf", "--codec", "zlib"])]
+    for name, source, args in makes:
+        run(os.path.join(d, source), *args, "-o", os.path.join(d, name), "-q", "--threads", "1")
+    check(b"subblocks=" in open(os.path.join(d, "zstd.xisf"), "rb").read() and
+          b"subblocks=" not in open(os.path.join(d, "whole.xisf"), "rb").read(), "threads: --subblocks writes subblocks")
+    conversions = [(src, args, ending) for src in ("zstd.xisf", "zlib.xisf", "lz4.xisf", "whole.xisf")
+                   for args, ending in ((["-t", "fits"], ".fits"), (["-t", "fits", "-c"], ".fits.fz"), (["-t", "asdf", "-c"], ".asdf"),
+                                        (["-t", "tiff", "-c", "-s"], ".tif"), (["-t", "png", "-s"], ".png"),
+                                        (["-t", "xisf", "--codec", Z, "--subblocks", "8K", "--checksum", "sha3-256"], ".x.xisf"),
+                                        (["-t", "xisf", "--codec", "none"], ".n.xisf"))]
+    conversions += [(src, ["-t", "xisf"], ".xisf") for src in ("rice.fits.fz", "gzip.fits.fz", "z.asdf")]
+    conversions += [("gray.xisf", ["-t", "png", "--resize", "50%", "-s"], ".png"), ("gray.xisf", ["-t", "tiff", "-b", "u8"], ".tif")]
+    for src, args, ending in conversions:
+        outputs = []
+        for threads in ("1", "3", "16"):
+            o = os.path.join(d, f"{src}-{threads}{ending}")
+            r = run(os.path.join(d, src), *args, "-o", o, "-f", "--threads", threads, expect_ok=False)
+            outputs.append((r.returncode, content(o) if os.path.exists(o) else None))
+        check(outputs[0][0] == 0 and outputs[0] == outputs[1] == outputs[2],
+              f"threads: {src} {' '.join(args)}: the same output with 1, 3 and 16 threads")
+    # a rewrite read back, and --verify
+    for src in ("zstd.xisf", "zlib.xisf", "z.asdf", "rice.fits.fz"):
+        said = [run("--verify", os.path.join(d, src), "--threads", t).stdout for t in ("1", "4")]
+        check(said[0] == said[1] and ": OK" in said[0], f"threads: --verify {src}: {said}")
+
+    # What fails, fails the same way
+    def damaged(name, at_text, offset_from):
+        data = bytearray(open(os.path.join(d, name), "rb").read())
+        k = offset_from(data)
+        data[k] ^= 0xFF
+        bad = os.path.join(d, "bad-" + name)
+        open(bad, "wb").write(bytes(data))
+        return bad
+    bad = [damaged("zstd.xisf", None, lambda b: len(b) - 5000), damaged("zlib.xisf", None, lambda b: len(b) // 2 + 4096),
+           damaged("rice.fits.fz", None, lambda b: len(b) - 20000), damaged("z.asdf", None, lambda b: len(b) // 2)]
+    short = os.path.join(d, "short.fits.fz")   # tiles beyond the end of the file
+    open(short, "wb").write(open(os.path.join(d, "gzip.fits.fz"), "rb").read()[:-30000])
+    bad.append(short)
+    for path in bad:
+        for args in (["-t", "fits"], ["-t", "xisf"], ["--no-verify", "-t", "tiff"]):
+            if path.endswith(".xisf") and args == ["-t", "xisf"]:
+                args = ["-t", "xisf", "--codec", "lz4"]
+            said = []
+            for threads in ("1", "4"):
+                o = os.path.join(d, "bad-out" + threads)
+                r = run(path, *args, "-o", o, "-f", "--threads", threads, expect_ok=False)
+                said.append((r.returncode, r.stderr.replace(o, "OUT")))
+            check(said[0] == said[1], f"threads: {os.path.basename(path)} {' '.join(args)}: fails the same way: {said}")
+        said = [run("--verify", path, "--threads", t, expect_ok=False) for t in ("1", "4")]
+        # (a Rice tile with a byte changed may still decode: FITS has no checksum here)
+        check(said[0].returncode == said[1].returncode == (0 if path.endswith("rice.fits.fz") else 1) and said[0].stdout == said[1].stdout,
+              f"threads: --verify {os.path.basename(path)}: {[r.stdout for r in said]}")
+
+    # --jobs: the outputs of one file at a time, and what is said in the order of the files
+    batch = os.path.join(d, "batch")
+    os.makedirs(batch)
+    for k, (name, _, _) in enumerate(makes[:4]):
+        shutil.copy(os.path.join(d, name), os.path.join(batch, f"f{k}.xisf"))
+    shutil.copy(bad[0], os.path.join(batch, "f4.xisf"))
+    open(os.path.join(batch, "f5.xisf"), "wb").write(b"XISF0100garbage")
+    results = []
+    for jobs in ("1", "3"):
+        o = os.path.join(d, "jobs" + jobs)
+        os.makedirs(o)
+        r = run(batch, "-t", "fits", "-c", "-d", o, "-j", jobs, expect_ok=False)
+        files = {n: content(os.path.join(o, n)) for n in sorted(os.listdir(o))}
+        results.append((r.returncode, r.stdout.replace(o, "OUT"), r.stderr.replace(o, "OUT"), files))
+    check(results[0][0] == 1 and results[0] == results[1] and len(results[0][3]) == 4,
+          f"threads: --jobs 3 says and writes what one at a time does: {results[1][:3]} {results[0][:3]}")
+    # the same with --skip-existing, files that are there
+    r = run(batch, "-t", "fits", "-c", "-d", os.path.join(d, "jobs3"), "-j", "4", "--skip-existing", expect_ok=False)
+    check(r.stdout.count("passed over") == 5 and "4 passed over, 2 failed" in r.stdout, f"threads: --jobs with --skip-existing: {r.stdout}")
+    for args in (["--threads", "0"], ["--threads", "257"], ["--jobs", "0"], ["-j", "65"], ["--subblocks", "1K"],
+                 ["--subblocks", "5G"], ["--subblocks", "x"]):
+        r = run(os.path.join(d, "gray.xisf"), "-t", "fits", "-o", os.path.join(d, "never.fits"), *args, expect_ok=False)
+        check(r.returncode == 2 and not os.path.exists(os.path.join(d, "never.fits")), f"threads: {' '.join(args)} is refused")
+
+
 def test_standard_input_and_output():
     """"-" as the input reads the standard input, "-o -" writes to the standard output (0.23): the bytes of the file
     that would be written, and nothing else there; a failed run writes nothing."""
@@ -7835,7 +7934,7 @@ if __name__ == "__main__":
               test_asdf_python_files, test_asdf_roundtrips, test_export_from_fits_and_asdf, test_xisf_rewrite,
               test_verify, test_fits_tile_compressed, test_fits_tile_writing, test_property_round_trip,
               test_downsampling_and_thumbnailer, test_distributed_units, test_directories_and_patterns, test_dng, test_debayer,
-              test_compression_level_and_shuffling, test_pieces, test_standard_input_and_output, test_tables,
+              test_compression_level_and_shuffling, test_pieces, test_standard_input_and_output, test_tables, test_threads,
               test_documents):
         try:
             t()

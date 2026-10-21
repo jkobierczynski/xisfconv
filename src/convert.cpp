@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 Jurgen Kobierczynski
 #include "convert.hpp"
+#include "parallel.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -69,8 +70,20 @@ void dispatchTarget(const uint8_t* src, uint8_t* dst, size_t n, SampleFormat tar
 
 }  // namespace
 
+namespace {
+// Pieces of this many samples or more are converted side by side.
+constexpr size_t kSamplesPerPiece = size_t(1) << 16;
+}  // namespace
+
 void convertSamples(const uint8_t* src, SampleFormat from, uint8_t* dst, SampleFormat target, size_t n, double lower, double upper) {
     if (!(upper > lower)) { lower = 0; upper = 1; }
+    if (pieceCount(n, kSamplesPerPiece) > 1) {
+        const size_t sf = sampleBytes(from), st = sampleBytes(target);
+        parallelPieces(n, kSamplesPerPiece, [&](size_t begin, size_t end) {
+            convertSamples(src + begin * sf, from, dst + begin * st, target, end - begin, lower, upper);
+        });
+        return;
+    }
     if (from == target) {
         std::memcpy(dst, src, n * sampleBytes(from));
         return;
@@ -215,6 +228,13 @@ std::vector<StretchParams> autoStretch(const PixelBuffer& px, double lower, doub
 
 void stretchSamples(const uint8_t* src, SampleFormat format, size_t n, const StretchParams* params, double lower, double upper,
                     float* dst) {
+    if (pieceCount(n, kSamplesPerPiece) > 1) {
+        const size_t sb = sampleBytes(format);
+        parallelPieces(n, kSamplesPerPiece, [&](size_t begin, size_t end) {
+            stretchSamples(src + begin * sb, format, end - begin, params, lower, upper, dst + begin);
+        });
+        return;
+    }
     std::vector<float> buf;
     buf.reserve(n);
     normalizedSamples(src, format, n, 0, 1, lower, upper, buf);
@@ -247,6 +267,13 @@ void applyStretch(PixelBuffer& px, const std::vector<StretchParams>& params, dou
 
 void normalizeSamples(uint8_t* data, SampleFormat format, size_t n, double lower, double upper) {
     if (!isFloat(format) || !(upper > lower) || (lower == 0 && upper == 1)) return;
+    if (pieceCount(n, kSamplesPerPiece) > 1) {
+        const size_t sb = sampleBytes(format);
+        parallelPieces(n, kSamplesPerPiece, [&](size_t begin, size_t end) {
+            normalizeSamples(data + begin * sb, format, end - begin, lower, upper);
+        });
+        return;
+    }
     const double scale = 1.0 / (upper - lower);
     if (format == SampleFormat::Float32) {
         float* p = reinterpret_cast<float*>(data);

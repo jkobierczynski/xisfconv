@@ -498,7 +498,7 @@ PYTHON_GROUPS = (
     ("Writing", ("write", "Writer", "Image", "Keywords", "Card", "PropertyDict", "Table", "TableField", "DataBlock")),
     ("Whole files", ("convert", "rewrite", "rewrite_in_place", "stored_as_requested", "RewriteResult", "verify", "Report")),
     ("Stretch and astrometry", ("auto_stretch", "apply_stretch", "StretchParams", "wcs_flip_rows")),
-    ("The library", ("library_version", "library_path", "codec_available")),
+    ("The library", ("library_version", "library_path", "codec_available", "set_threads", "threads", "hardware_threads")),
 )
 
 

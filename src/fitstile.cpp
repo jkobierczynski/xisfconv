@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 Jurgen Kobierczynski
 #include "fitstile.hpp"
+#include "parallel.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <exception>
 #include <limits>
 
 #include <zlib.h>
@@ -363,9 +365,10 @@ void decodeTiledImage(const TiledImage& image, RandomBytes& unit, const TilePut&
         if (rowsEnd) unit.read(0, static_cast<size_t>(rowsEnd), rowsCopy.data());
     }
     const uint8_t* table = all ? all : rowsCopy.data();
-    std::vector<uint8_t> heapCopy;
-    // Bytes of a variable-length array field of a row.
-    auto heapField = [&](const TileColumn& column, uint64_t row, const uint8_t*& data, uint64_t& bytes) {
+    // Bytes of a variable-length array field of a row (copied into `heapCopy` where the unit is
+    // not in memory).
+    auto heapField = [&](const TileColumn& column, uint64_t row, const uint8_t*& data, uint64_t& bytes,
+                         std::vector<uint8_t>& heapCopy) {
         const size_t width = column.wide ? 8 : 4;
         const uint64_t at = row * image.rowBytes + column.offset;
         if (column.offset + 2 * width > image.rowBytes) throw Error("invalid column layout in the compressed image table");
@@ -401,29 +404,75 @@ void decodeTiledImage(const TiledImage& image, RandomBytes& unit, const TilePut&
         }
     };
 
-    std::vector<uint64_t> index(ndim, 0), start(ndim), size(ndim);
-    for (uint64_t row = 0; row < image.rows; ++row) {
-        // Position and size of this tile; tiles at the upper edges may be smaller.
-        uint64_t r = row, tilePixels = 1;
+    // Where a tile is in the image; tiles at the upper edges may be smaller.
+    struct Place {
+        std::vector<uint64_t> start, size;
+        uint64_t pixels = 1;
+    };
+    auto placeOf = [&](uint64_t row) {
+        Place place;
+        place.start.resize(ndim);
+        place.size.resize(ndim);
+        uint64_t r = row;
         for (size_t d = 0; d < ndim; ++d) {
-            index[d] = r % tilesPerAxis[d];
+            const uint64_t index = r % tilesPerAxis[d];
             r /= tilesPerAxis[d];
-            start[d] = index[d] * image.tile[d];
-            size[d] = std::min(image.tile[d], image.naxis[d] - start[d]);
-            tilePixels *= size[d];
+            place.start[d] = index * image.tile[d];
+            place.size[d] = std::min(image.tile[d], image.naxis[d] - place.start[d]);
+            place.pixels *= place.size[d];
         }
-        const size_t n = static_cast<size_t>(tilePixels);
+        return place;
+    };
+    // The stored bytes of a tile, from the column that has them: read one after another (the unit
+    // need not be read from several threads at once); decoded side by side.
+    enum class From { Compressed, Gzipped, Plain, Nothing };
+    struct Stored {
+        From from = From::Nothing;
+        const uint8_t* data = nullptr;
+        uint64_t bytes = 0;
+        std::vector<uint8_t> copy;
+        std::exception_ptr error;   // (thrown where the tile is decoded: in the order of the tiles)
+    };
+    auto fetch = [&](uint64_t row, Stored& t) {
+        t = Stored();
+        try {
+            const uint8_t* data = nullptr;
+            uint64_t bytes = 0;
+            heapField(*compressed, row, data, bytes, t.copy);
+            try {
+                if (bytes > 0) {
+                    t.from = From::Compressed;
+                } else if (gzipped && gzipped->variable && (heapField(*gzipped, row, data, bytes, t.copy), bytes > 0)) {
+                    t.from = From::Gzipped;
+                } else if (plain && plain->variable && (heapField(*plain, row, data, bytes, t.copy), bytes > 0)) {
+                    t.from = From::Plain;
+                }
+            } catch (const Unsupported&) {
+                throw;
+            } catch (const Error& e) {
+                if (e.kind == ErrorKind::Io || e.kind == ErrorKind::Cancelled) throw;   // (not about the tile)
+                throw Error("tile " + std::to_string(row) + ": " + e.what(), e.kind);
+            }
+            t.data = data;
+            t.bytes = bytes;
+        } catch (...) {
+            t.error = std::current_exception();
+        }
+    };
+    // The samples of a tile, of the image's type, big-endian.
+    auto decode = [&](uint64_t row, const Place& place, const Stored& stored, std::vector<uint8_t>& samples) {
+        const size_t n = static_cast<size_t>(place.pixels);
         const std::string label = "tile " + std::to_string(row);
+        if (stored.error) std::rethrow_exception(stored.error);
 
         // The tile as integers or raw samples: `values`, n elements of `width` big-endian bytes.
         std::vector<uint8_t> values;
         size_t width = 0;
         bool raw = false;  // already samples of the image's type (not quantized)
-        const uint8_t* data = nullptr;
-        uint64_t bytes = 0;
-        heapField(*compressed, row, data, bytes);
+        const uint8_t* data = stored.data;
+        const uint64_t bytes = stored.bytes;
         try {
-            if (bytes > 0) {
+            if (stored.from == From::Compressed) {
                 if (image.algorithm == "RICE_1" || image.algorithm == "RICE_ONE") {
                     values = riceDecode(data, static_cast<size_t>(bytes), n, image.riceBytePix, image.riceBlockSize);
                     width = static_cast<size_t>(image.riceBytePix);
@@ -445,12 +494,12 @@ void decodeTiledImage(const TiledImage& image, RandomBytes& unit, const TilePut&
                     }
                     raw = floating && !quantized;
                 }
-            } else if (gzipped && gzipped->variable && (heapField(*gzipped, row, data, bytes), bytes > 0)) {
+            } else if (stored.from == From::Gzipped) {
                 // a tile that could not be quantized: its samples, gzip-compressed
                 values = gunzip(data, static_cast<size_t>(bytes), n * sampleSize, n * sampleSize);
                 width = sampleSize;
                 raw = true;
-            } else if (plain && plain->variable && (heapField(*plain, row, data, bytes), bytes > 0)) {
+            } else if (stored.from == From::Plain) {
                 values.assign(data, data + bytes);
                 width = elementBytes(plain->type);
                 raw = floating && ((plain->type == 'E' && bitpix == -32) || (plain->type == 'D' && bitpix == -64));
@@ -467,7 +516,7 @@ void decodeTiledImage(const TiledImage& image, RandomBytes& unit, const TilePut&
         }
 
         // Convert to samples of the image's type.
-        std::vector<uint8_t> samples;
+        samples.clear();
         if (raw || (!floating && width == sampleSize)) {
             if (width != sampleSize) throw Error(label + ": unexpected sample size");
             samples.swap(values);
@@ -512,24 +561,53 @@ void decodeTiledImage(const TiledImage& image, RandomBytes& unit, const TilePut&
                 }
             }
         }
-
-        // Copy the tile into the image, one line along the first axis at a time.
-        const size_t lineBytes = static_cast<size_t>(size[0]) * sampleSize;
-        const uint64_t lines = tilePixels / size[0];
+    };
+    // Copies a tile into the image, one line along the first axis at a time.
+    auto deliver = [&](const Place& place, const std::vector<uint8_t>& samples) {
+        const size_t lineBytes = static_cast<size_t>(place.size[0]) * sampleSize;
+        const uint64_t lines = place.pixels / place.size[0];
         std::vector<uint64_t> at(ndim, 0);  // position within the tile, axes 1..n-1
         for (uint64_t line = 0; line < lines; ++line) {
             uint64_t dest = 0, stride = 1;
             for (size_t d = 0; d < ndim; ++d) {
-                dest += (start[d] + (d == 0 ? 0 : at[d])) * stride;
+                dest += (place.start[d] + (d == 0 ? 0 : at[d])) * stride;
                 stride *= image.naxis[d];
             }
             put(dest * sampleSize, samples.data() + static_cast<size_t>(line) * lineBytes, lineBytes);
             for (size_t d = 1; d < ndim; ++d) {
-                if (++at[d] < size[d]) break;
+                if (++at[d] < size_t(place.size[d])) break;
                 at[d] = 0;
             }
         }
-        progressTick(static_cast<uint64_t>(n) * sampleSize);
+        progressTick(place.pixels * sampleSize);
+    };
+
+    // The tiles a few at a time: as many as make some 4 MiB of pixels for each thread (one at a
+    // time with one thread, as before).
+    const unsigned threads = threadLimit();
+    std::vector<Place> places;
+    std::vector<Stored> stored;
+    std::vector<std::vector<uint8_t>> samples;
+    for (uint64_t row = 0; row < image.rows;) {
+        places.clear();
+        uint64_t batchBytes = 0;
+        const uint64_t budget = threads > 1 ? uint64_t(threads) << 22 : 0;
+        do {
+            places.push_back(placeOf(row + places.size()));
+            batchBytes += places.back().pixels * sampleSize;
+        } while (row + places.size() < image.rows && batchBytes < budget);
+        const size_t count = places.size();
+        if (stored.size() < count) {
+            stored.resize(count);
+            samples.resize(count);
+        }
+        for (size_t k = 0; k < count; ++k) fetch(row + k, stored[k]);
+        parallelFor(count, [&](size_t k, unsigned) { decode(row + k, places[k], stored[k], samples[k]); });
+        for (size_t k = 0; k < count; ++k) {
+            deliver(places[k], samples[k]);
+            stored[k] = Stored();
+        }
+        row += count;
     }
 }
 

@@ -15,6 +15,10 @@
 #include <random>
 
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #include <fcntl.h>
 #include <io.h>
 #include <share.h>
@@ -175,8 +179,15 @@ void RawFile::read(uint64_t position, void* out, size_t n, const char* what) con
     while (n > 0) {
         const size_t want = std::min<size_t>(n, size_t(1) << 30);
 #ifdef _WIN32
-        if (_lseeki64(fd_, static_cast<__int64>(position), SEEK_SET) < 0) throw Error(std::string("read error in ") + what, ErrorKind::Io);
-        const int got = _read(fd_, p, static_cast<unsigned>(want));
+        // At a place of its own, as pread: threads read one file at once (a checksum beside the
+        // decompression of the same block).
+        OVERLAPPED at{};
+        at.Offset = static_cast<DWORD>(position);
+        at.OffsetHigh = static_cast<DWORD>(position >> 32);
+        DWORD done = 0;
+        const HANDLE handle = reinterpret_cast<HANDLE>(_get_osfhandle(fd_));
+        if (handle == INVALID_HANDLE_VALUE) throw Error(std::string("read error in ") + what, ErrorKind::Io);
+        const long long got = ReadFile(handle, p, static_cast<DWORD>(want), &done, &at) ? static_cast<long long>(done) : -1;
 #else
         const ssize_t got = ::pread(fd_, p, want, static_cast<off_t>(position));
         if (got < 0 && errno == EINTR) continue;
@@ -363,6 +374,7 @@ public:
         const uint8_t* all = bytes_->contiguous();
         return all ? all + offset_ : nullptr;
     }
+    bool readableByThreads() const override { return bytes_->readableByThreads(); }
 
 private:
     std::shared_ptr<RandomBytes> bytes_;

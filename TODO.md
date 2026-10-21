@@ -102,6 +102,9 @@ Open checks of the Python package:
 
 Done since:
 
+- [x] The work on a file spread over the cores: tiles, strips and subblocks side by side,
+      checksums beside decompression, samples a piece per core; `--jobs` for several files at
+      once (0.26.0)
 - [x] Conversions and rewrites read and write an image a piece at a time, with temporary files
       for what does not fit the memory limit; Ctrl-C stops one large image (0.20.0)
 - [x] A compression level and byte shuffling off for conversions and rewrites, and for the tool

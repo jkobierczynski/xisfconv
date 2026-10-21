@@ -205,6 +205,19 @@ public:
     // that decodedBlock gives is the stored one where it is not compressed, else a Store.
     static XisfChecksumState verifyBlockChecksum(RandomBytes& bytes, const std::string& checksum, const std::string& what);
     static std::shared_ptr<RandomBytes> decodedBlock(const XisfBlockView& block, const std::string& what, uint64_t expectedSize = 0);
+    // The checks verifyBlockChecksum makes before it computes the digest (a warning for a checksum
+    // it cannot verify): the algorithm and the digest it expects, or "" where there is nothing to
+    // verify, with the state that makes it in `state`.
+    static std::string checksumToVerify(const std::string& checksum, const std::string& what, std::string& expected,
+                                        XisfChecksumState& state);
+    // The digest computed and compared (no warning: this may run on a thread of the pool).
+    static void compareDigest(RandomBytes& bytes, const std::string& algorithm, const std::string& expected, const std::string& what);
+    // decodedBlock, with its checksum verified first if `verify`: beside the decompression where
+    // the stored bytes can be read by two threads at once. A mismatch is reported as by
+    // verifyBlockChecksum, also where the decompression fails too.
+    static std::shared_ptr<RandomBytes> verifiedDecodedBlock(const XisfBlockView& block, const std::string& what,
+                                                             uint64_t expectedSize, bool verify,
+                                                             XisfChecksumState* state = nullptr);
     // Decompresses a compressed block to `out` (still byte-shuffled, if it was), with the checks
     // of decodeBlock.
     static void decodeBlockTo(const XisfBlockView& block, const std::string& what, uint64_t expectedSize, ByteSink& out);
