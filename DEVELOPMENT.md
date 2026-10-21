@@ -415,6 +415,7 @@ brought are in the sections below.
 | | 0.24.0 | The images of an open FITS or ASDF file read from their place, without the headers before them |
 | | 0.25.0 | XISF tables of values read and written through the API; data blocks of types without a name handed over as their bytes |
 | 21 October | 0.26.0 | The work on a file spread over the cores; `--threads`, `--jobs`, `--subblocks` |
+| | 0.26.1 | Many threads hold what one holds: TIFF strips read one by one, smaller batches of PNG rows and FITS tiles, subblocks within the memory limit |
 
 ## Purpose and scope
 
@@ -1448,6 +1449,12 @@ in the row filters and 45 % in zlib; a stretched TIFF 80 % in the stretch and th
   subblock that a helper has begun is finished.
 - **fork()**: a child of a process with helpers has none, and the lock may have been held: it gets
   a pool of its own (`pthread_atfork`).
+- **Memory.** Threads must not make a conversion hold more than one thread does (the pieces of
+  0.20): the batches are small (a TIFF group of some 2 MiB of strips, each read by itself; PNG rows
+  2 MiB at most; FITS tiles 4 MiB at most), and subblocks are taken together only as far as
+  `Store::fitsInMemory` allows. 0.26.0 read a group of TIFF strips at once, which made a
+  stretched TIFF on 8 cores hold twice what one core held; the test of the pieces now compares
+  16 threads with one.
 - **`--jobs`** converts files in threads of the tool, each with a context of its own. The checks
   before a conversion (two inputs with one output, an output that is an input) stay one after
   another; an output is counted as written when its job starts, so the second of two inputs with

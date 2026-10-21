@@ -91,4 +91,4 @@ environment = { CMAKE_PREFIX_PATH = "/tmp/zstd-static", MACOSX_DEPLOYMENT_TARGET
 [tool.cibuildwheel.windows]
 # static zlib, zstd and C runtime, as for the release binary of the tool
 before-all = "vcpkg install zlib:x64-windows-static zstd:x64-windows-static"
-environment = { CMAKE_ARGS = "-DXISFCONV_PORTABLE=ON -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=x64-windows-static" }
+environment = { CMAKE_ARGS = "-DXISFCONV_PORTABLE=ON -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=x64-windows-static -DVCPKG_APPLOCAL_DEPS=OFF" }

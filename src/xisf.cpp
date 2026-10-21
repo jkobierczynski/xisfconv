@@ -703,7 +703,7 @@ void XisfFile::decodeBlockTo(const XisfBlockView& block, const std::string& what
         size_t end = first;
         uint64_t bytes = 0;
         while (end < parts.size() && end - first < 2 * size_t(threads) &&
-               (end == first || bytes + parts[end].size <= (uint64_t(256) << 20))) {
+               (end == first || (bytes + parts[end].size <= (uint64_t(256) << 20) && Store::fitsInMemory(bytes + parts[end].size)))) {
             bytes += parts[end].size;
             ++end;
         }

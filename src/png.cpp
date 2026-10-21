@@ -197,28 +197,30 @@ void writePng(const std::string& path, const PngImage& image, int level) {
     // then given to deflate one after the other, as one stream
     const size_t bandRows = static_cast<size_t>(std::min<uint64_t>(rowsPerPiece(width * sb * channels), height));
     std::vector<uint8_t> band(bandRows * width * sb * channels);
-    std::vector<uint8_t> raw((bandRows + 1) * rowLen);   // the last row of the band before, then the band's
-    std::vector<std::vector<uint8_t>> filteredRows(bandRows);
+    // A few rows at a time, while they are in the cache: some 256 KiB of them for each thread, and
+    // 2 MiB at most (what a conversion holds stays about what it held with one thread).
+    // `raw` holds the row before them and those rows interleaved, `filteredRows` them filtered.
+    const size_t step = std::min(bandRows, std::max<size_t>(1, std::min<size_t>(size_t(threadLimit()) << 18, size_t(2) << 20) / std::max<size_t>(rowLen, 1)));
+    std::vector<uint8_t> raw((step + 1) * rowLen);
+    std::vector<std::vector<uint8_t>> filteredRows(step);
     try {
         for (size_t bandFirst = 0; bandFirst < height; bandFirst += bandRows) {
             const size_t bandCount = std::min(bandRows, height - bandFirst);
             for (size_t c = 0; c < channels; ++c) px.readRows(c, bandFirst, bandCount, band.data() + c * bandRows * width * sb);
             progressTick(bandCount * rowLen);
-            if (bandFirst > 0) std::memcpy(raw.data(), raw.data() + bandRows * rowLen, rowLen);   // (the band before was whole)
-            // A few rows at a time, while they are in the cache: some 256 KiB of them for each thread.
-            const size_t step = std::max<size_t>(1, (size_t(threadLimit()) << 18) / std::max<size_t>(rowLen, 1));
             for (size_t first = 0; first < bandCount; first += step) {
                 const size_t count = std::min(step, bandCount - first);
+                const bool top = bandFirst + first == 0;   // (the first row of the image has none above it)
                 // interleave planar channels; PNG samples are big-endian
                 // (what the loops use as values of their own: written bytes cannot change them)
                 const size_t w = width, nc = channels, ss = sb, pp = bpp, len = rowLen, stride = bandRows;
                 uint8_t* const rows = raw.data();
                 const uint8_t* const planes = band.data();
                 parallelPieces(count, 8, [=](size_t from, size_t to) {
-                    for (size_t r = first + from; r < first + to; ++r) {
-                        uint8_t* const cur = rows + (r + 1) * len;
+                    for (size_t k = from; k < to; ++k) {
+                        uint8_t* const cur = rows + (k + 1) * len;
                         for (size_t c = 0; c < nc; ++c) {
-                            const uint8_t* const src = planes + (c * stride + r) * w * ss;
+                            const uint8_t* const src = planes + (c * stride + first + k) * w * ss;
                             if (ss == 1) {
                                 for (size_t x = 0; x < w; ++x) cur[x * pp + c] = src[x];
                             } else {
@@ -234,17 +236,18 @@ void writePng(const std::string& path, const PngImage& image, int level) {
                 });
                 parallelPieces(count, 8, [&](size_t from, size_t to) {
                     static thread_local std::vector<uint8_t> tmp;   // (filterRow's room, one for each thread)
-                    for (size_t r = first + from; r < first + to; ++r) {
-                        const uint8_t* cur = raw.data() + (r + 1) * rowLen;
-                        filteredRows[r].clear();
-                        filterRow(cur, bandFirst + r ? cur - rowLen : nullptr, rowLen, bpp, filteredRows[r], tmp);
+                    for (size_t k = from; k < to; ++k) {
+                        const uint8_t* cur = raw.data() + (k + 1) * rowLen;
+                        filteredRows[k].clear();
+                        filterRow(cur, top && k == 0 ? nullptr : cur - rowLen, rowLen, bpp, filteredRows[k], tmp);
                     }
                 });
-                for (size_t r = first; r < first + count; ++r) {
-                    zs.next_in = filteredRows[r].data();
-                    zs.avail_in = static_cast<uInt>(filteredRows[r].size());
+                for (size_t k = 0; k < count; ++k) {
+                    zs.next_in = filteredRows[k].data();
+                    zs.avail_in = static_cast<uInt>(filteredRows[k].size());
                     pump(Z_NO_FLUSH);
                 }
+                std::memcpy(raw.data(), raw.data() + count * rowLen, rowLen);   // (the row above the next ones)
             }
         }
         zs.next_in = nullptr;

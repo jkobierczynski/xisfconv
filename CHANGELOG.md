@@ -9,6 +9,17 @@ in [`DEVELOPMENT.md`](DEVELOPMENT.md).
 Under "changed" stands what makes the same command, or the same call, do something else than
 before.
 
+## 0.26.1 (21 October 2026)
+
+Fixed
+- With many threads a conversion held more than with one: up to twice as much for a stretched
+  TIFF on a machine with 8 cores (the strips of a TIFF file were read many at a time), and some
+  more for PNG output and for tile-compressed FITS input. Now the threads together hold about
+  what one thread holds, and subblocks are taken side by side only as far as the memory limit
+  allows. (The memory test of the tool failed on the macOS runner.)
+- The Windows build of the CI no longer has vcpkg copy DLLs beside the programs (there are
+  none, the libraries are static): that step failed once when another step held a program open.
+
 ## 0.26.0 (21 October 2026)
 
 **The work on a file spread over the cores of the machine.**

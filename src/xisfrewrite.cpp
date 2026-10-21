@@ -303,7 +303,8 @@ Packed compressBlock(const std::shared_ptr<RandomBytes>& raw, size_t itemSize, c
     for (uint64_t first = 0; first < count;) {
         uint64_t end = first + 1;
         if (together) {
-            while (end < count && end - first < 2 * uint64_t(threads) && (end + 1 - first) * chunk <= (uint64_t(256) << 20)) ++end;
+            while (end < count && end - first < 2 * uint64_t(threads) && (end + 1 - first) * chunk <= (uint64_t(256) << 20) &&
+                   Store::fitsInMemory((end + 1 - first) * chunk)) ++end;
         }
         std::vector<std::vector<uint8_t>> pieces;
         if (end - first > 1) {

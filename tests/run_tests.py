@@ -7906,13 +7906,22 @@ def test_pieces():
                  "env = dict(os.environ); env['XISFCONV_MEMORY_LIMIT'] = sys.argv[1]\n"
                  "subprocess.run(sys.argv[2:], env=env, check=True)\n"
                  "print(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss)\n")
-        for flags in (["-o", os.path.join(d, "m.xisf"), "--codec", "zlib"], ["-o", os.path.join(d, "m.tif"), "--stretch"]):
+        def peak(flags):
             rss = subprocess.run([sys.executable, "-c", probe, "0", EXE, big_src, "-f", "-q", *flags], capture_output=True, text=True)
             kib = int(rss.stdout.split()[-1]) if rss.returncode == 0 and rss.stdout.split() else 10 ** 9
             if sys.platform == "darwin" and kib != 10 ** 9:
                 kib //= 1024        # (macOS gives ru_maxrss in bytes, Linux in KiB)
+            return kib
+        for flags in (["-o", os.path.join(d, "m.xisf"), "--codec", "zlib"], ["-o", os.path.join(d, "m.tif"), "--stretch"]):
+            kib = peak(flags)
             check(kib < 40 * 1024, f"pieces: a conversion of a 24 MB image ({' '.join(flags[2:])}) with no memory for held data "
                                    f"takes {kib // 1024} MiB")
+        # Many threads hold about what one thread holds (0.26).
+        for flags in (["-o", os.path.join(d, "m.tif"), "--stretch"], ["-o", os.path.join(d, "m.png"), "--stretch"],
+                      ["-o", os.path.join(d, "m.fits.fz")], ["-o", os.path.join(d, "m.xisf"), "--codec", "zlib", "--subblocks", "1M"]):
+            one, many = peak(flags + ["--threads", "1"]), peak(flags + ["--threads", "16"])
+            check(many < one + 6 * 1024, f"pieces: {' '.join(flags[2:])} with 16 threads takes {many // 1024} MiB, "
+                                         f"with one {one // 1024} MiB")
 
 
 if __name__ == "__main__":

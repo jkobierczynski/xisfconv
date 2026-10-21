@@ -167,7 +167,9 @@ void writePage(Output& out, const TiffPage& page, bool deflate, uint64_t& prevNe
     // Strips a few at a time: read together, then each made ready (predictor, byte order,
     // Deflate) side by side, and written in their order. One at a time with one thread.
     const unsigned threads = threadLimit();
-    const size_t group = threads > 1 ? std::max<size_t>(1, std::min<size_t>(4 * size_t(threads), (size_t(32) << 20) / (rowsPerStrip * std::max<size_t>(rowBytes, 1)))) : 1;
+    // (some 2 MiB of strips at a time, read one by one: what a conversion holds stays what it
+    // held with one thread, about a piece of the image and these strips)
+    const size_t group = threads > 1 ? std::max<size_t>(1, std::min<size_t>(2 * size_t(threads), (size_t(2) << 20) / (rowsPerStrip * std::max<size_t>(rowBytes, 1)))) : 1;
     std::vector<uint8_t> strips, channel;
     std::vector<std::vector<uint8_t>> tmps(threads), compressed(group);
     std::vector<uLongf> compressedSize(group);
@@ -175,17 +177,20 @@ void writePage(Output& out, const TiffPage& page, bool deflate, uint64_t& prevNe
         const size_t groupRows = std::min(rowsPerStrip * group, height - y0);
         const size_t stripCount = (groupRows + rowsPerStrip - 1) / rowsPerStrip;
         strips.resize(groupRows * rowBytes);
-        // Interleave planar channels into chunky rows (host byte order).
-        if (spp == 1) {
-            px.readRows(0, y0, groupRows, strips.data());
-        } else {
-            channel.resize(groupRows * width * sb);
-            for (size_t c = 0; c < spp; ++c) {
-                px.readRows(c, y0, groupRows, channel.data());
-                for (size_t r = 0; r < groupRows; ++r) {
-                    uint8_t* dst = strips.data() + r * rowBytes;
-                    const uint8_t* src = channel.data() + r * width * sb;
-                    for (size_t x = 0; x < width; ++x) std::memcpy(dst + (x * spp + c) * sb, src + x * sb, sb);
+        // Interleave planar channels into chunky rows (host byte order), a strip at a time.
+        for (size_t first = 0; first < groupRows; first += rowsPerStrip) {
+            const size_t rows = std::min(rowsPerStrip, groupRows - first);
+            if (spp == 1) {
+                px.readRows(0, y0 + first, rows, strips.data() + first * rowBytes);
+            } else {
+                channel.resize(rows * width * sb);
+                for (size_t c = 0; c < spp; ++c) {
+                    px.readRows(c, y0 + first, rows, channel.data());
+                    for (size_t r = 0; r < rows; ++r) {
+                        uint8_t* dst = strips.data() + (first + r) * rowBytes;
+                        const uint8_t* src = channel.data() + r * width * sb;
+                        for (size_t x = 0; x < width; ++x) std::memcpy(dst + (x * spp + c) * sb, src + x * sb, sb);
+                    }
                 }
             }
         }

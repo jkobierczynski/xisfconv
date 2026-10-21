@@ -582,8 +582,9 @@ void decodeTiledImage(const TiledImage& image, RandomBytes& unit, const TilePut&
         progressTick(place.pixels * sampleSize);
     };
 
-    // The tiles a few at a time: as many as make some 4 MiB of pixels for each thread (one at a
-    // time with one thread, as before).
+    // The tiles a few at a time: as many as make some 1 MiB of pixels for each thread, 4 MiB at
+    // most, so that many threads hold about what one does (one at a time with one thread, as
+    // before).
     const unsigned threads = threadLimit();
     std::vector<Place> places;
     std::vector<Stored> stored;
@@ -591,7 +592,7 @@ void decodeTiledImage(const TiledImage& image, RandomBytes& unit, const TilePut&
     for (uint64_t row = 0; row < image.rows;) {
         places.clear();
         uint64_t batchBytes = 0;
-        const uint64_t budget = threads > 1 ? uint64_t(threads) << 22 : 0;
+        const uint64_t budget = threads > 1 ? std::min(uint64_t(threads) << 20, uint64_t(4) << 20) : 0;
         do {
             places.push_back(placeOf(row + places.size()));
             batchBytes += places.back().pixels * sampleSize;
